@@ -1093,4 +1093,8 @@ int hos_oot_options_front(void) {
     const int64_t t = __atomic_load_n(&options_seen_ns, __ATOMIC_RELAXED);
     return t && hos_now_ns() - t < 200000000LL;
 }
+/* ((Triforce, 11-18) the Mods entry under the game's lists is the Windows half's (mods_list_tick): here no list's last button
+   has the cursor, so nn_hid.c never keeps a Down from the game. Without it every Linux build of v0.5.0 stopped at the link,
+   "undefined reference to hos_oot_mods_down" (#bug-tracker, 11-18). tests/test_oot_menu_linux_half.py) */
+int hos_oot_mods_down(void) { return 0; }
 #endif

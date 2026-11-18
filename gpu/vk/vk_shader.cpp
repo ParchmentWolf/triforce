@@ -687,7 +687,7 @@ Shader::Profile make_profile() {
     // (hookshot) gathers nudged by 1/512 of a texel on AMD's and Intel's drivers, as Eden and Lichii have it (vk_vendor.h; in the
     // cache's stamp)
     p.need_gather_subpixel_offset = dev.fixes.gather_offset;
-    p.min_ssbo_alignment = dev.props.limits.minStorageBufferOffsetAlignment;
+    p.min_ssbo_alignment = storage_binding_align();   // (at least 16: vk_internal.h)
     return p;
 }
 
@@ -701,7 +701,7 @@ Shader::HostTranslateInfo host_info() {
     h.needs_demote_reorder = false;
     h.support_snorm_render_buffer = true;
     h.support_viewport_index_layer = true;
-    h.min_ssbo_alignment = dev.props.limits.minStorageBufferOffsetAlignment;
+    h.min_ssbo_alignment = storage_binding_align();
     h.support_geometry_shader_passthrough = false;
     h.support_conditional_barrier = true;   // (barriers in loops kept: see the WebGPU renderer's 4f5e3e6)
     return h;
@@ -1752,7 +1752,10 @@ uint64_t disk_stamp() {
     // the pinned graphics profile even if the base profile already has the requested width)
     const uint32_t lanes[] = {profile().warp_size_potentially_larger_than_guest ? 1u : 0u, profile().max_subgroup_size,
                               profile().has_broken_spirv_fragment_shuffle ? 1u : 0u, (uint32_t)dev.sg32_stages,
-                              getenv("RX_VK_WARP64") ? 1u : 0u};
+                              getenv("RX_VK_WARP64") ? 1u : 0u,
+                              // (and where the translation starts a storage binding: offsets are counted from there, so a cache
+                              // made on a 16-aligned GPU is no use on a 64-aligned one in the same folder, a laptop's two GPUs)
+                              (uint32_t)storage_binding_align()};
     add(lanes, sizeof lanes);
     // (the records keep Shader::Info as it lies in memory: a cache written by another C++ library (the MSVC build's, then the
     // llvm-mingw one's libc++) has other layouts, and reading it crashed at start. The library and the sizes, so it starts again)
@@ -4111,7 +4114,11 @@ const Program* seed_variant_of(const uint64_t code[3], bool mesh, const uint32_t
     struct Reset { ~Reset() { questions_in = nullptr, answers_in = nullptr; } } reset;
     if (mesh) translate_mesh_into(*p, *blank, by_stage[6] ? &code_of[6] : nullptr, code_of[7], nullptr, fs, color_types);
     else translate_into(*p, *blank, &code_of[0], fs, nullptr, color_types);
-    if (p->failed) return nullptr;
+    if (p->failed) {   // (upstream #2358: a failed variant's modules went nowhere; ours forget their note too)
+        for (Stage& st : p->stages)
+            if (st.module) stage_module_destroy(st.module);
+        return nullptr;
+    }
     std::lock_guard lk(shader_mu);
     auto& variants = programs[p->key];
     for (auto& v : variants)

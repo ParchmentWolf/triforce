@@ -30,8 +30,12 @@ sealed partial class Shell
     // to 1.1 GB in 13,230 files, 3.9 times its size)
     const int ToolsUnpackedTimes = 5;
     // (the build's steps, and the stone each one lights when it is done; the last one makes the whole crest gleam)
+    // ((Triforce, 11-18) "shaders": the game's --prepare-shaders after the folder is put together (nx2/make_game.py prepare_shaders;
+    // its "@@stage shaders" and progress, gpu/vk/vk_main.cpp). Without a row it ran under four finished steps with no bar: an
+    // update on an AMD card sat there over an hour and looked stuck)
     static readonly (string Id, S Text, int Stone)[] Stages =
-        { ("read", S.Read, Art.Emerald), ("lift", S.Lift, Art.Sapphire), ("compile", S.Compile, Art.Ruby), ("finish", S.Finish, -1) };
+        { ("read", S.Read, Art.Emerald), ("lift", S.Lift, Art.Sapphire), ("compile", S.Compile, Art.Ruby), ("finish", S.Finish, -1),
+          ("shaders", S.Shaders, -1) };
 
     // parts of Main.xaml
     readonly Grid Root, InstallPage, FetchPage, SetupPage, BuildPage, NupRow, AskLayer;
@@ -844,7 +848,8 @@ sealed partial class Shell
         var tools = Tools.Find();
         if (tools == null) { Say(T(S.ToolsMissing), "Bad", "Bad"); return; }
         var args = new List<string> { "--check" };
-        args.AddRange(UseNup.IsChecked == true ? new[] { "--nup", NupPath.Text } : new[] { "--exefs", ExefsPath.Text });
+        // (the romfs folder too: NX2navi's holds one packed romfs.bin, which the builder refuses, nx2/make_game.py refuse_packed_romfs)
+        args.AddRange(UseNup.IsChecked == true ? new[] { "--nup", NupPath.Text } : new[] { "--exefs", ExefsPath.Text, "--romfs", RomfsPath.Text });
         var (ok, text) = await Runner.Check(tools, args);
         if (serial != checkSerial) return;
         sourceOk = ok;
@@ -960,6 +965,7 @@ sealed partial class Shell
             if (current != null && rows.TryGetValue(current, out var was)) was.Done();
             current = id;
             if (rows.TryGetValue(id, out var row)) row.Begin();
+            ShowClock();   // (the note under the title is the step's: the shaders' says what that step is)
         }
         else if (line.StartsWith("@@progress "))
         {
@@ -1042,7 +1048,7 @@ sealed partial class Shell
 
     void ShowClock()
     {
-        if (runner != null) BuildNote.Text = T(S.Patience) + "  " + T(S.Elapsed) + ": " + Span(elapsed.Elapsed);
+        if (runner != null) BuildNote.Text = (current == "shaders" ? T(S.ShadersNote) : T(S.Patience)) + "  " + T(S.Elapsed) + ": " + Span(elapsed.Elapsed);
     }
 
     static string Span(TimeSpan t) => t.TotalHours >= 1 ? (int)t.TotalHours + " h " + t.Minutes + " min" : t.TotalMinutes >= 1 ? t.Minutes + " min" : t.Seconds + " s";

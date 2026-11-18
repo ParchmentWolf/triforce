@@ -4234,6 +4234,7 @@ bool import_in_background(uint64_t guest, uint64_t size, const char** why) {
     return true;
 }
 } // namespace
+bool pools_mirrored() { return mirror_on(); }   // ((Triforce, upstream 018a1d2e #2464) vk_draw.cpp uniform_range's default)
 uint64_t device_vram_bytes() {
     uint64_t vram = 0;
     for (uint32_t h = 0; h < dev.memory.memoryHeapCount; h++)
@@ -4424,8 +4425,14 @@ bool mirror_pieces_on() {
     static const bool on = [] {
         const char* e = getenv("RX_VK_MIRROR_PIECES");
         const bool can = dev.sparse_buffers && dev.features.sparseResidencyBuffer;
-        const bool v = can && (e ? atoi(e) != 0 : memory_trial_on());
-        logf("vk: mirrors in pieces: %s%s", v ? "on" : "off", !can ? " (no sparse residency buffers)" : e ? " (RX_VK_MIRROR_PIECES)" : "");
+        // ((Triforce, 11-18) not by default on NVIDIA before Turing (device IDs below 0x1e00: GTX 10 series, GTX 900): a GTX
+        // 1070 lost the GPU after the opening cutscene, the next submission stopped in its waits for a mirror's new pieces
+        // (VRAM 6.2 of 7 GB, textures being evicted), every time until RX_VK_MIRROR_PIECES=0; with it a new game played
+        // (#bug-tracker "Crash when starting a new game"). Whole mirrors there, as before the pieces)
+        const bool old_nvidia = dev.props.vendorID == 0x10de && dev.props.deviceID < 0x1e00;
+        const bool v = can && (e ? atoi(e) != 0 : !old_nvidia && memory_trial_on());
+        logf("vk: mirrors in pieces: %s%s", v ? "on" : "off", !can ? " (no sparse residency buffers)" : e ? " (RX_VK_MIRROR_PIECES)"
+             : old_nvidia ? " (NVIDIA before Turing: whole mirrors)" : "");
         return v;
     }();
     return on;

@@ -486,6 +486,22 @@ bool create_device() {
     // and 4 (LLPC) draws them natively, as before. tests/test_task_mesh_fallback_devices.py
     task_mesh_fallback = dev.props.vendorID == 0x1002 && amd_older;
 #endif
+    {   // ((Triforce, 11-18) the menu's Mesh shaders row, mesh_shaders= in triforce_options.ini: 1 Compute fallback on any GPU with
+        // mesh shaders (an RX 7700S's glowing walls went with it, #bug-tracker); 0 Auto, the rule above. RX_VK_TASK_MESH_FALLBACK over it)
+        char exe[MAX_PATH];
+        const DWORD n = game_module_path(exe, MAX_PATH);
+        std::string ini(exe, n);
+        ini = ini.substr(0, ini.find_last_of("\\/") + 1) + "triforce_options.ini";
+        if (FILE* f = fopen(ini.c_str(), "r")) {
+            char line[80];
+            while (fgets(line, sizeof line, f))
+                if (!strncmp(line, "mesh_shaders=", 13)) {
+                    if (atoi(line + 13) == 1) task_mesh_fallback = true;
+                    break;
+                }
+            fclose(f);
+        }
+    }
     if (const char* e = getenv("RX_VK_TASK_MESH_FALLBACK")) task_mesh_fallback = atoi(e) != 0;
     dev.task_mesh_fallback = task_mesh_fallback && dev.mesh_shader && f12.bufferDeviceAddress && !getenv("RX_VK_NO_MESH_FALLBACK");
     if (dev.task_mesh_fallback) logf("vk: task + mesh programs use the compute fallback (RX_VK_TASK_MESH_FALLBACK=0: native)");
@@ -1102,10 +1118,17 @@ bool started_up() {
     if (prepare_only()) {
         // (three parts: the programs, the pipelines the notes predict, then those they name; most of the time is the first)
         static int part;
+        // ((Triforce, 11-18) the bar's share of each part as it takes its time: on NVIDIA the programs are most of it (56 s of
+        // ~70 on an RTX 4070 SUPER); elsewhere the pipelines, which AMD's driver builds in seconds each (an update on an AMD card
+        // ran over an hour in that last part and sat at 90% and more: Setup's "Preparing shaders" row shows this bar)
+        static const bool nvidia = dev.props.vendorID == 0x10de;
         const auto progress = [](size_t done, size_t total) {
             static size_t last = ~(size_t)0;
             if (!total) return;
-            static const size_t from[3] = {0, 700, 900}, span[3] = {700, 200, 100};
+            static const size_t from_nv[3] = {0, 700, 900}, span_nv[3] = {700, 200, 100};
+            static const size_t from_other[3] = {0, 300, 400}, span_other[3] = {300, 100, 600};
+            const size_t* from = nvidia ? from_nv : from_other;
+            const size_t* span = nvidia ? span_nv : span_other;
             const size_t at = from[part] + done * span[part] / total;
             if (at == last) return;
             last = at;

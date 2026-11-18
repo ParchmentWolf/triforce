@@ -2749,7 +2749,22 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
         // stayed zero, and the foliage's dithered LOD crossfade, which reads them, left trees bare at mid distance, #1151.
         // 3D images take the usage on the driver's word for the 2D one: the query does not cover 2D_ARRAY_COMPATIBLE's
         // per-slice attachment views)
-        if (format_props(raw).optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) {
+        // ((Triforce) not for 3D images on NVIDIA's Pascal and older (device IDs below 0x1e00: GTX 10 series, GTX 900): that
+        // driver takes the usage and the per-slice views, then loses the device on the first draw or even a clear into one
+        // (upstream #2327: GTX 1080, driver 581.80; here a GTX 1070, 581.80, at the area load after the opening cutscene and
+        // at every save load). Without the usage the views are not made and the noise pass is left out there (draw(): trees
+        // bare at mid distance, as before #1151) until upstream's separate-attachment path is ported. RX_VK_BC3D_TARGET=1:
+        // the usage anyway, =0: never)
+        static const int bc3d_env = getenv("RX_VK_BC3D_TARGET") ? atoi(getenv("RX_VK_BC3D_TARGET")) : -1;
+        const bool old_nvidia = dev.props.vendorID == 0x10de && dev.props.deviceID < 0x1e00;
+        const bool bc3d_target = bc3d_env >= 0 ? bc3d_env != 0 : !old_nvidia;
+        if (x.type == VK_IMAGE_TYPE_3D && !bc3d_target) {
+            static std::atomic<int> told{0};
+            if (told++ == 0)
+                logf("vk: 3D BC images are not made render targets (%s; NVIDIA before Turing loses the device on them): the "
+                     "noise pass is left out (RX_VK_BC3D_TARGET=1: made anyway)",
+                     bc3d_env == 0 ? "RX_VK_BC3D_TARGET=0" : "NVIDIA device id below 0x1e00");
+        } else if (format_props(raw).optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) {
             // (asked with the flags a 3D image is made with below; a refused image is made again without the usage)
             const VkImageCreateFlags asked = flags | (x.type != VK_IMAGE_TYPE_3D ? 0u
                 : VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT | (dev.view_2d_of_3d ? VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT : 0u));

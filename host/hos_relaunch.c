@@ -43,6 +43,9 @@ static void relaunch(void) {
     swprintf(pid, 16, L"%lu", (unsigned long)GetCurrentProcessId());
     SetEnvironmentVariableW(L"HOS_RESTART_OF", pid);
     if (CreateProcessW(exe, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        /* ((Triforce, 11-18) this run is in front: the new one may take the front for its window (display.c), which it
+           otherwise opened behind another window once this one had gone, and the controllers did nothing there) */
+        AllowSetForegroundWindow(pi.dwProcessId);
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
     } else {

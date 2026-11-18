@@ -120,6 +120,20 @@ int main(void) {
     got = frame(OOT_SPRINT_MOVE, OOT_SPRINT_LS, 0, 1, ZL);
     CHECK(!on && got == ZL, "targeting ends it, and ZL is the game's");
 
+    /* ((Triforce, 11-18) a conversation: Link's update goes on in a state no sprint is in, and the click hides the text box
+       there: it is the game's, and starts nothing) */
+    fresh();
+    frame(OOT_SPRINT_STOP, OOT_SPRINT_LS, 0, 1, 0);
+    got = frame(OOT_SPRINT_STOP, OOT_SPRINT_LS, 0, 1, LS);
+    CHECK(got == LS, "in a conversation the click reaches the game");
+    got = frame(OOT_SPRINT_STOP, OOT_SPRINT_LS, 0, 1, LS);
+    CHECK(!on && got == LS, "the whole press stays the game's, no sprint");
+    got = frame(OOT_SPRINT_MOVE, OOT_SPRINT_LS, 0, 1, 0);
+    got = frame(OOT_SPRINT_MOVE, OOT_SPRINT_LS, 0, 1, LS);
+    CHECK(got == 0, "back in play the click is the sprint's again");
+    frame(OOT_SPRINT_MOVE, OOT_SPRINT_LS, 0, 1, 0);
+    CHECK(on, "and starts it");
+
     /* no update of Link: a menu. The press is the game's and starts nothing */
     fresh();
     frame(OOT_SPRINT_MOVE, OOT_SPRINT_LS, 0, 1, 0);

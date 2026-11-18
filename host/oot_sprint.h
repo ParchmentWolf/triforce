@@ -4,11 +4,13 @@
    right after it loads those flags (nx2/oot_patches.py patch_sprint), and they put the bit in while the button's sprint
    is on: the game's own sprint then runs, with its speed, animation, camera and every rule of its own that ends it.
 
-   The button: the left stick's click (which the game does not use) or B, the bottom face button of the Nintendo layout.
+   The button: the left stick's click or B, the bottom face button of the Nintendo layout.
    Toggle: a press starts the sprint, the next press or Link's state ends it. Hold: sprint while it is held. During
    gameplay the button is kept from the game, so it does not also do its own action; B only for a press that begins
    while Link moves, and then until it is let go, so B puts the weapon away as usual otherwise and the game never sees
-   half a press. A press made in a menu, a cutscene or a load (no update of Link within OOT_SPRINT_POLLS polls of the
+   half a press. ((Triforce, 11-18) The stick's click only for a press that begins while Link is in a state a sprint can
+   be in (OOT_SPRINT_STOP is not): the game does use it, to hide the text box in a conversation, where Link's update goes
+   on, and with the click kept from it there that did nothing (#bug-tracker 11-18).) A press made in a menu, a cutscene or a load (no update of Link within OOT_SPRINT_POLLS polls of the
    controller) starts nothing. With the game's Swap Jump Controls B is the jump: the stick's click is the one to use.
 
    Here: the logic alone, for tests/test_sprint.py. host/oot_sprint.c reads Link and the settings. */
@@ -67,8 +69,9 @@ typedef struct {
     int moved;          /* step only: the sprint has moved since it started */
     double wait_frames; /* step only: 60 Hz frames stood still */
     int last_button;    /* step only: the setting at the last update */
+    int sprintable;     /* Link's state at his last update was one a sprint can be in (not OOT_SPRINT_STOP) */
 } OotSprint;
-#define OOT_SPRINT_INIT {0, 0, 0, OOT_SPRINT_POLLS, 0, 0, 0, 0, 0, 0.0, -1}
+#define OOT_SPRINT_INIT {0, 0, 0, OOT_SPRINT_POLLS, 0, 0, 0, 0, 0, 0.0, -1, 0}
 
 #define OOT_SPRINT_GET(f) __atomic_load_n(&(f), __ATOMIC_SEQ_CST)
 #define OOT_SPRINT_SET(f, v) __atomic_store_n(&(f), (v), __ATOMIC_SEQ_CST)
@@ -91,7 +94,7 @@ static inline void oot_sprint_pad(OotSprint *s, int button, uint64_t *buttons) {
     /* A press is decided at its start, for its whole length: kept from the game, and the sprint's, when it begins in
        gameplay (B: while Link moves); else the game's alone, and no sprint's */
     if (now & ~s->last & bit) {
-        const int mine = gameplay && (button != OOT_SPRINT_B || OOT_SPRINT_GET(s->moving));
+        const int mine = gameplay && (button == OOT_SPRINT_B ? OOT_SPRINT_GET(s->moving) : OOT_SPRINT_GET(s->sprintable));
         OOT_SPRINT_SET(s->latched, mine);
         if (mine) __atomic_fetch_or(&s->pressed, bit, __ATOMIC_SEQ_CST);
     } else if (!(now & bit)) {
@@ -112,6 +115,7 @@ static inline int oot_sprint_step(OotSprint *s, int kind, int button, int hold, 
     int on = OOT_SPRINT_GET(s->active);
     if (OOT_SPRINT_GET(s->zl_held)) kind = OOT_SPRINT_STOP;   /* targeting: the game's own stance */
     OOT_SPRINT_SET(s->moving, kind == OOT_SPRINT_MOVE);
+    OOT_SPRINT_SET(s->sprintable, kind != OOT_SPRINT_STOP);
     if (button == OOT_SPRINT_OFF) {
         on = 0;
     } else if (hold) {

@@ -488,8 +488,17 @@ static DWORD WINAPI display_main(void *p) {
     /* (no activate: shown at the bottom of the z-order, so a game in front keeps its focus) */
     if (noactivate)
         SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    else
+    else {
         ShowWindow(hwnd, SW_SHOW);
+        /* ((Triforce, 11-18) brought to the front: after the Insert menu's Restart now the new window opened behind
+           another one (the run that started it had exited meanwhile, and the window it handed the front to kept it), and
+           the controllers, which count only while the game is in front (nn_hid.c), did nothing until the game was quit
+           and started by hand (#bug-tracker "Controller fails to work upon restart"). The run before allows it
+           (hos_relaunch.c AllowSetForegroundWindow); a start from Setup or an icon is in front already) */
+        SetForegroundWindow(hwnd);
+        if (GetForegroundWindow() != hwnd)
+            hos_log("display: the window did not come to the front at its start (controllers count once it is in front)");
+    }
     if (getenv("HOS_FULLSCREEN") && atoi(getenv("HOS_FULLSCREEN"))) set_fullscreen(hwnd, 1);
     RAWINPUTDEVICE rid = {1, 2, 0, hwnd};   /* generic desktop mouse: WM_INPUT while the window is in front */
     RegisterRawInputDevices(&rid, 1, sizeof rid);

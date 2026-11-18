@@ -623,8 +623,10 @@ std::string mic_key(const char* name) {
     std::string k(name ? name : "");
     for (char& c : k)   // (a device's name goes into triforce_options.ini: a line break in it would add lines there)
         if ((unsigned char)c < 0x20 || c == 0x7f) c = ' ';
-    if (k.size() <= kMicNameKept) return k;
-    return k.substr(0, text_char_start(k, kMicNameKept));
+    if (k.size() > kMicNameKept) k = k.substr(0, text_char_start(k, kMicNameKept));
+    // (and no spaces at the end: a saved line's end, made one above, and those an older build saved with the name)
+    while (!k.empty() && k.back() == ' ') k.pop_back();
+    return k;
 }
 /// buf cut back to whole UTF-8 characters (snprintf may have cut one)
 void utf8_whole(char* buf) {
@@ -730,6 +732,7 @@ const char* tx_robust(int v) {
     static const char* t[] = {"Auto", "Off", "On"};
     return (unsigned)v < 3 ? t[v] : t[0];
 }
+const char* tx_mesh(int v) { return v == 1 ? "Compute fallback" : "Auto"; }   // ((Triforce, 11-18) opts.mesh_mode, vk_main.cpp)
 // (Triforce) The Debug tab's Replay helper threads row (opts.replay_threads; vk_replay.cpp par_threads_max): Off, or the
 // parallel replay tried on 2 to 8 threads as RX_VK_PARALLEL_AUTO=<n> does. The switches go over the row for a run
 const char* replay_threads_env() {
@@ -897,6 +900,9 @@ MENU_HINTS(hn_wide_menus, 0, "The menus stretched over the whole screen, as befo
            "The menus in the middle 16:9; beside them, what the game draws there, out of focus.",
            "The menus in the middle 16:9; black beside them.")
 MENU_HINTS(hn_robust, 0, "Off, on every card.", "Can be faster on some NVIDIA cards.", "Always on.")
+MENU_HINTS(hn_mesh, 0, "As the game finds best for this GPU: the fallback on AMD's RX 6000 driver, native mesh shaders elsewhere.",
+           "Every mesh draw through compute shaders: a little slower. Try it if walls glow or the GPU stops responding on an AMD "
+           "card. The shaders are prepared again once.")
 MENU_HINTS(hn_fps, 0, nullptr, "With frame generation on, the game's own rate too.",
            "In the counter's place in the top right corner, a see-through panel: the GPU's and the CPU's load, temperatures and memory, "
            "the frame rate with its lows, the frame times and their graph, the waits per frame and the picture's settings. It "
@@ -1141,6 +1147,11 @@ Row rows[] = {
     {TAB_GRAPHICS, "Robust buffers", &opts.robust, 0, 2, 1, tx_robust,
      "Bounds-checked buffer reads: a read past a buffer's end is dropped instead of stopping the GPU. Applies after a "
      "restart.", hn_robust, true},
+    // ((Triforce, 11-18) a player's RX 7700S: glowing doors and walls with native mesh shaders, gone with the compute fallback
+    // (#bug-tracker). The row's key, mesh_shaders, is read where the device is made: vk_main.cpp)
+    {TAB_GRAPHICS, "Mesh shaders", &opts.mesh_mode, 0, 1, 1, tx_mesh,
+     "How the game's mesh-shader draws run. Try Compute fallback on an AMD card that shows glowing walls or loses the GPU. "
+     "Applies after a restart.", hn_mesh, true},
     {TAB_SYSTEM, "Game", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},   // ((Triforce) 11-17: a section)
 
     // (Triforce: language.txt's choice, not the options file's. Its entries are counted when the file is read: lang_load)
@@ -4697,7 +4708,6 @@ void menu_init() {
             if (!strcmp(line, "dynamic_resolution")) old_dynres = atoi(eq + 1);
             if (!strcmp(line, "microphone_device")) {   // (hookshot: the microphone, by its name)
                 mic_want = mic_key(eq + 1);
-                while (!mic_want.empty() && (mic_want.back() == '\n' || mic_want.back() == '\r')) mic_want.pop_back();
             }
         }
         fclose(f);

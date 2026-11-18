@@ -108,6 +108,7 @@ struct Options {
     int prompts = 0;      // the button icons: 0 Auto (the controller), 1 Switch, 2 Xbox, 3 PS4, 4 PS5, 5 Steam Deck (host/prompts.c),
                           // (Triforce) 6 Keyboard & mouse
     int robust = 1;       // bounds-checked buffer access: 0 Auto (off), 1 Off (the default since 11-17, the owner's), 2 On (gpu/vk/vk_main.cpp; RX_VK_ROBUST)
+    int mesh_mode = 0;    // (Triforce, 11-18) the game's mesh-shader draws: 0 Auto (vk_main.cpp's rule), 1 Compute fallback (RX_VK_TASK_MESH_FALLBACK over it)
     int descriptor_reuse = 1;  // (on by default since options_version 4) a draw keeps its descriptors through other slots' registrations (gpu/vk/vk_draw.cpp; RX_VK_DESC_SLOTGEN)
     int sampler_cache = 1;     // (on by default since options_version 5) sampler ids answer their parameters without the registrations' lock (gpu/vk/vk_draw.cpp; RX_VK_SAMPLER_CACHE)
     int fast_pipeline_link = 1;   // (Triforce, the Debug tab; on by default since options_version 5) Fast pipeline link: a new pipeline is linked from its stage libraries first

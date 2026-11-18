@@ -162,6 +162,12 @@ sealed partial class Shell
             rows["read"].Done(); rows["lift"].Done(); rows["compile"].Begin(); rows["compile"].Progress(0.41);
             SetButtons(cancel: true);
             await Shot(dir, "13-build");
+            // ((Triforce, 11-18) the shaders' step after the folder: its own row and bar, and the note that says what it is)
+            rows["compile"].Done(); rows["finish"].Done(); rows["shaders"].Begin(); rows["shaders"].Progress(0.37);
+            BuildNote.Text = T(S.ShadersNote) + "  " + T(S.Elapsed) + ": 1 h 17 min";
+            await Shot(dir, "13b-build-shaders");
+            foreach (var r in rows.Values) r.Reset();
+            rows["read"].Done(); rows["lift"].Done(); rows["compile"].Begin(); rows["compile"].Progress(0.41);
 
             Log.Text = string.Join("\n", new[]
             {

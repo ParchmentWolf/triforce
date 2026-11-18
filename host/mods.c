@@ -204,12 +204,14 @@ static void code_record_load(void) {
     if (built) nbuilt = mod_code_parse(text, built, BUILT_MOST);
     free(text);
 }
-static void code_patches(const Mod *mod) {
+/* (returns how many of this mod's patches wait for a build: new since it, or changed) */
+static int code_patches(const Mod *mod) {
     char pat[MAX_PATH];
     snprintf(pat, sizeof pat, "%s\\exefs\\*", mod->path);
     WIN32_FIND_DATAA fd;
     HANDLE f = FindFirstFileA(pat, &fd);
-    if (f == INVALID_HANDLE_VALUE) return;
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    int waits = 0;
     do {
         if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || !mod_code_is_patch(fd.cFileName)) continue;
         char path[MAX_PATH], rel[MOD_CODE_PATH];
@@ -224,9 +226,11 @@ static void code_patches(const Mod *mod) {
         else if (state == MOD_CODE_REFUSED) hos_log("mods: %s was not applied when the game was built: %s", rel, why);
         else if (state == MOD_CODE_CHANGED) hos_log("mods: %s changed since the game was built: the game has it as it was then", rel);
         else hos_log("mods: %s is not built into the game", rel);
-        code_waits += state == MOD_CODE_CHANGED || state == MOD_CODE_WAITS;
+        waits += state == MOD_CODE_CHANGED || state == MOD_CODE_WAITS;
     } while (FindNextFileA(f, &fd));
     FindClose(f);
+    code_waits += waits;
+    return waits;
 }
 /* (and the patches the game has that the mods folder no longer does, with or without a mods folder) */
 static void code_patches_gone(void) {
@@ -281,10 +285,20 @@ static void mods_scan(void) {
     for (int i = 0; i < nmods; i++) {
         char dir[MAX_PATH];
         snprintf(dir, sizeof dir, "%s\\romfs", mods[i].path);
-        const int files = index_romfs(dir, "", 0);
-        code_patches(&mods[i]);   /* (Triforce: its exefs patches, built in or waiting) */
+        /* (Triforce: its exefs patches, built in or waiting, first. (11-18) A mod whose code waits for a build keeps its RomFS
+           files waiting too: the game crashed at its start with a mod's new files over its old code (Classic Item Slots
+           put in by the Mods menu, #bug-tracker "Crashing on startup"; a build put them in step). They come with the code,
+           at the next build. HOS_MODS_SPLIT=1: the files now anyway, as before) */
+        const int waits = code_patches(&mods[i]);
+        static int split = -1;
+        if (split < 0) split = getenv("HOS_MODS_SPLIT") && atoi(getenv("HOS_MODS_SPLIT")) == 1;
+        const int hold = waits > 0 && !split;
+        const int files = hold ? 0 : index_romfs(dir, "", 0);
         cheat_files(&mods[i]);    /* (and its cheat file) */
-        hos_log("mods: %s: %d RomFS files", mods[i].name, files);
+        if (hold)
+            hos_log("mods: %s: its RomFS files wait for the build too, with its code (%d patch(es) not built in yet)", mods[i].name, waits);
+        else
+            hos_log("mods: %s: %d RomFS files", mods[i].name, files);
     }
     hos_log("mods: %d mods from %s: %zu RomFS entries", nmods, root, table_n);
 }
@@ -340,7 +354,10 @@ static uint64_t zs_content_size(const char *host_path) {
    address 0). So a mod's file gets at least its unpacked size and room beside it: an eighth of it, 128 KB at least, and
    64 KB more (a model needs about 8 KB, and 3 to 4 KB a material and a shape: 99 of the game's own fitted, 11-17). The
    game's own files keep the table's figure; a figure is only ever raised. size: the table's, path: the guest's path */
+volatile LONG hos_mods_size_hook_seen;   /* ((Triforce, 11-18) the lifted code calls the hook below: prompts.c asks */
+int hos_prompts_font_file(const char *key, char *out, size_t cap);   /* prompts.c */
 uint64_t hos_mods_table_size(uint64_t size, uint64_t path) {
+    if (!hos_mods_size_hook_seen) InterlockedExchange(&hos_mods_size_hook_seen, 1);
     if (!table_n || !path) return size;
     const char *p = (const char *)GP(path);
     char rel[MAX_PATH], key[MAX_PATH];
@@ -352,6 +369,20 @@ uint64_t hos_mods_table_size(uint64_t size, uint64_t path) {
     Entry *e = find(key);
     int packed = 1;
     if (!e) {
+        /* ((Triforce, 11-18) the button prompts' font, larger than the game's: with a mod's own size table served, ours
+           (prompts/rsizetable.zs, which has room for it) is not, so its room comes from here instead. Before, prompts.c
+           gave the prompts up whenever a mod had a size table (#bug-tracker 11-18: "Button Prompt UI Broken", with the
+           Young Link Rides Pony Epona mod) */
+        char built[MAX_PATH];
+        if (hos_prompts_font_file(key, built, sizeof built)) {
+            const uint64_t real = zs_content_size(built);
+            const uint64_t need = real ? (real + (64u << 10) + 0xfff) & ~(uint64_t)0xfff : 0;
+            static volatile LONG told_font;
+            if (need > (uint32_t)size && !InterlockedExchange(&told_font, 1))
+                hos_log("mods: the button prompts' font gets %llu bytes to load in (the size table's %llu; the font %llu unpacked)",
+                        (unsigned long long)need, (unsigned long long)(uint32_t)size, (unsigned long long)real);
+            return need > (uint32_t)size ? need : size;
+        }
         snprintf(key, sizeof key, "%s", rel);
         lower_slash(key);
         e = find(key), packed = 0;

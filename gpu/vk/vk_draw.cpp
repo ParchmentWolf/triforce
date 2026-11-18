@@ -3503,7 +3503,19 @@ VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_
                 return {cur->stream, at, n};
             }
         // (RX_VK_UB_SNAPSHOT=1: the contents as they are now, in the stream, not the pool the GPU reads later)
-        static const bool snapshot = getenv("RX_VK_UB_SNAPSHOT") != nullptr;
+        // ((Triforce, upstream 018a1d2e #2464) on by default on Intel when the pools have no VRAM mirror (vk_memory.cpp
+        // mirror_on off: integrated GPUs): the GPU then reads the game's memory itself when it runs the frame, and by then the
+        // game has written the next frame's uniforms over the ones submitted. Kokiri's depth prepass drew the ground with other
+        // objects' matrices, and the fog pass painted sky over it (the white forest on Intel Core Ultra iGPUs). Other GPUs with
+        // no mirror keep it off until it is measured there. RX_VK_UB_SNAPSHOT=0: off; any other value: on)
+        // ((Triforce, 11-18) and on AMD's integrated GPUs too, which have no mirror either: the same white forest over Kokiri on
+        // an AMD Radeon iGPU (#bug-tracker "Texture White and Glow"), and the scene and the interface flickering on a ROG Ally X
+        // (Radeon 890M class, "Screen flicker, UI flicker ... on Ally X"). A discrete GPU without its mirror keeps it off)
+        static const bool snapshot = [] {
+            const char* e = getenv("RX_VK_UB_SNAPSHOT");
+            if (e) return !(*e == '0' && !e[1]);
+            return (dev.props.vendorID == 0x8086 || dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) && !pools_mirrored();
+        }();
         BufferRef b = snapshot ? BufferRef{} : gpu_buffer_bind(u.addr, n, false);
         if (b && b.offset % align == 0) return {b.buffer, b.offset, n};
         const uint64_t at = stream_alloc(n, align);   // (unaligned or outside the pools: copied into the stream)
@@ -3926,7 +3938,7 @@ void build_descriptors(const NvnState& s, const Program& p, bool keep = false) {
         w.descriptorType = type;
         return w;
     };
-    const uint64_t salign = std::max<uint64_t>(dev.props.limits.minStorageBufferOffsetAlignment, 4);
+    const uint64_t salign = storage_binding_align();   // (the translator's: vk_internal.h)
     for (const Stage& st : p.stages) {
         const Shader::Info& info = st.info;
         const int ns = st.nvn_stage;

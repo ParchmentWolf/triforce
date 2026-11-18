@@ -563,10 +563,16 @@ static int build(char *out, size_t cap) {
     char dir[MAX_PATH], path[MAX_PATH];
     int face;
     if (!setup(dir, sizeof dir, &face)) return 0;
-    /* (a mod's size table is served, not ours: the faces' fonts, larger than the game's, do not fit it) */
+    /* (a mod's size table is served, not ours: the faces' fonts, larger than the game's, do not fit it. ((Triforce, 11-18)
+       unless the lifted code asks host/mods.c's hos_mods_table_size for each file's room, which gives the font its own: so
+       only when that hook has not run in this game, an older build of it) */
+    extern volatile LONG hos_mods_size_hook_seen;
     if (hos_mods_has(SIZES_PATH, ".rsizetable.zs")) {
-        hos_log("prompts: a mod has the resource size table: the game's own icons in texts");
-        return 0;
+        if (!hos_mods_size_hook_seen) {
+            hos_log("prompts: a mod has the resource size table: the game's own icons in texts");
+            return 0;
+        }
+        hos_log("prompts: a mod has the resource size table: the font's room comes from the size hook (host/mods.c)");
     }
     snprintf(path, sizeof path, "%sprompts/%s/External.bfotf", dir, faces[face]);
     long n;
@@ -653,6 +659,15 @@ static int build_camera(char *out, size_t cap) {
     free(runs);
     free(t);
     return ok;
+}
+
+int hos_prompts_romfs(const char *key, char *out, size_t cap);
+/* ((Triforce, 11-18) mods.c's size hook: for the font's key (lower case, '/', packed name), the font built for this run
+   (built now if it was not), 1 with one; 0 for any other key or with no prompts. A mod's own font is the mod's: the hook
+   finds that one first) */
+int hos_prompts_font_file(const char *key, char *out, size_t cap) {
+    if (strcmp(key, FONT_PATH)) return 0;
+    return hos_prompts_romfs(FONT_PATH, out, cap);
 }
 
 /* mods.c: the file for a RomFS path the prompts replace (key: lower case, '/'), 1 with one. Asked only when no mod has

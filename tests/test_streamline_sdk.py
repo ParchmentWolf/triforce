@@ -176,6 +176,38 @@ class StreamlineSdkTest(unittest.TestCase):
             self.assertRegex(digest, r"^[0-9a-f]{64}$", name)
         self.assertEqual(set(sl.GAME_LICENSE_NAMES), {name for name, _ in licenses})
 
+    def test_dlss_beside_streamline(self):
+        """(11-18) with Streamline up NGX finds nvngx_dlss.dll only in dlssg: make_game.py puts a copy of the ngx one there,
+        and takes it away with Streamline's files (the folder then goes too) or when the build has no DLSS"""
+        sys.path.insert(0, str(ROOT / "nx2"))
+        try:
+            mg = load("make_game_for_test", ROOT / "nx2" / "make_game.py")
+        finally:
+            sys.path.remove(str(ROOT / "nx2"))
+        sdk, game = self.dir / "sdk", self.dir / "game"
+        sl.fetch(str(sdk), say=self.say, archive=zipfile.ZipFile(io.BytesIO(archive_bytes())))
+        (game / "ngx").mkdir(parents=True)
+        (game / "ngx" / "nvngx_dlss.dll").write_bytes(b"dlss")
+        saved = (mg.streamline_script, mg.LINUX, os.environ.get("HOOKSHOT_STREAMLINE_SDK"))
+        mg.streamline_script, mg.LINUX = (lambda: sl), False
+        try:
+            os.environ["HOOKSHOT_STREAMLINE_SDK"] = str(sdk)
+            dst = Path(mg.place_dlssg_runtime(str(game)))
+            self.assertEqual((dst / "nvngx_dlss.dll").read_bytes(), b"dlss")
+            (game / "ngx" / "nvngx_dlss.dll").unlink()   # (a build without DLSS: no stale copy)
+            mg.place_dlssg_runtime(str(game))
+            self.assertFalse((dst / "nvngx_dlss.dll").exists())
+            (dst / "nvngx_dlss.dll").write_bytes(b"old")   # (a build without Streamline: the folder goes whole)
+            os.environ["HOOKSHOT_STREAMLINE_SDK"] = ""
+            self.assertIsNone(mg.place_dlssg_runtime(str(game)))
+            self.assertFalse(dst.exists())
+        finally:
+            mg.streamline_script, mg.LINUX = saved[0], saved[1]
+            if saved[2] is None:
+                os.environ.pop("HOOKSHOT_STREAMLINE_SDK", None)
+            else:
+                os.environ["HOOKSHOT_STREAMLINE_SDK"] = saved[2]
+
     def test_make_game(self):
         src = (ROOT / "nx2" / "make_game.py").read_text(encoding="utf-8")
         for needle in ("fetch_streamline_sdk(a)", "place_dlssg_runtime(out)", 'os.environ["HOOKSHOT_STREAMLINE_SDK"] = sdk',

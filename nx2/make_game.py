@@ -480,6 +480,7 @@ def check(a, work):
         bid = build_id(os.path.join(probe, "exefs", "main"))
         shutil.rmtree(probe, ignore_errors=True)
     else:
+        refuse_packed_romfs(a.romfs)   # (Setup passes the romfs folder too since 11-18)
         bid = build_id(os.path.join(a.exefs, "main"))
     if bid.startswith(BUILD_ID):
         say("check", "ok", "This is the version Triforce supports (build %s)." % bid[:8])
@@ -1157,6 +1158,19 @@ def refuse_dump_links(folder):
                      % (folder, path))
 
 
+PACKED_ROMFS = ("This romfs folder is NX2navi's: it holds the game's data packed in one file (romfs.bin), which Triforce cannot "
+                "read, so the game would crash at start. Choose your game file (.nup) instead, or romfs and exefs folders with "
+                "the game's files unpacked in them.")
+
+
+def refuse_packed_romfs(folder):
+    """(Triforce, 11-18) NX2navi keeps the game's RomFS as one image, <its game folder>\\romfs\\romfs.bin (+ index.json), not as
+    files: chosen as the romfs folder, it passed (only the exefs is checked) and the game was built without its data. It then
+    crashed at start in the game's own setup, a 0x268-byte allocation coming back null (f_80c4afa0: two players, 11-18)"""
+    if folder and os.path.isfile(os.path.join(folder, "romfs.bin")):
+        fail(PACKED_ROMFS)
+
+
 def long_path(p):
     """(Windows) p as an extended-length path (\\\\?\\...): a game folder whose deepest file passes 260 characters still links
     and is read (#1468); Python takes these without Windows' long-paths setting. Elsewhere, or one already: as is (nup.py's)"""
@@ -1586,15 +1600,28 @@ def fetch_streamline_sdk(a):
 def place_dlssg_runtime(out):
     """(NVIDIA DLSS frame generation) a game built with NVIDIA's Streamline (HOOKSHOT_STREAMLINE_SDK, as nx2/build.py takes it)
     gets Streamline's DLLs, nvngx_dlssg.dll and their license texts in its dlssg folder, where gpu/vk/vk_dlssg.cpp looks. A
-    folder built with them before and without them now loses them. Returns the folder, or None"""
+    folder built with them before and without them now loses them. Returns the folder, or None
+
+    (Triforce, 11-18) DLSS's own runtime too, a copy of the one place_ngx_runtime put in ngx (so this runs after it): with
+    Streamline up, NGX looks for nvngx_dlss.dll only in the dlssg folder, and without it there DLSS upscaling did not start
+    ("not available on this GPU (0xbad00004)"), so the menu offered no DLSS while frame generation was on"""
     sl = streamline_script()
     if sl is None:
         return None
     sdk = os.environ.get("HOOKSHOT_STREAMLINE_SDK", "")
+    dlss_copy = os.path.join(out, "dlssg", "nvngx_dlss.dll")
     if LINUX or not sl.complete(sdk):
+        with contextlib.suppress(OSError):   # (before Streamline's files: the folder is left empty and goes with them)
+            os.remove(dlss_copy)
         sl.remove_runtime(out)
         return None
     dst = sl.install_runtime(sdk, out)
+    dlss = os.path.join(out, "ngx", "nvngx_dlss.dll")
+    if os.path.isfile(dlss):
+        copy_writable(dlss, dlss_copy)
+    else:   # (a build without NVIDIA DLSS: no stale copy of an earlier one's)
+        with contextlib.suppress(OSError):
+            os.remove(dlss_copy)
     print("NVIDIA DLSS frame generation: %s (NVIDIA's, under NVIDIA's licenses: never share this game folder)" % dst, flush=True)
     return dst
 
@@ -1812,6 +1839,7 @@ def main(a=None):
             fail("This game folder has no copy of the game files to update from: it was built before updates came in. Choose your game files "
                  "in Triforce Setup and build into the same folder once; updates after that work by themselves.")
         check_cache_paths(out, (kept, romfs))
+        refuse_packed_romfs(romfs)   # (a folder built from NX2navi's before the check: it never started)
         shutil.copytree(kept, exefs)
         check_modules(exefs)
         stand_in_damaged_files(out, romfs)   # (a folder unpacked by an earlier builder from a 23.3 GB dump)
@@ -1871,6 +1899,7 @@ def main(a=None):
         stand_in_damaged_files(out, romfs, unpacked_seen)
     else:
         check_cache_paths(out, (kept, romfs))
+        refuse_packed_romfs(a.romfs)
         refuse_dump_links(a.exefs)
         refuse_dump_links(a.romfs)
         shutil.copytree(a.exefs, exefs)   # (unpacked in place: the user's copy stays as it is)

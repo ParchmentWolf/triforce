@@ -1644,6 +1644,19 @@ static void occlusion_switch(void) {
    a message says it once at boot; the game starts anyway. The text, or 0 when there is enough */
 #define HOS_MEMORY_NEEDED_MB 10240ull
 static int memory_notice_text(unsigned long long ram_mb, unsigned long long swap_mb, char *out, size_t cap) {
+    /* ((Triforce, 11-18) and no swap at all below 40 GB of memory: a player's PC of 32 GB with Windows' page file off
+       crashed as every save loaded, 17 "commit ... failed (error 1455)" before it: the game's own memory and the
+       renderer's reach about 21 GB there, and without a page file the other programs' share counts against the same
+       limit. With the page file back on it played (#bug-tracker 11-18) */
+    if (swap_mb == 0 && ram_mb < 40960ull) {
+        snprintf(out, cap,
+                 "This PC has %.1f GB of memory and no swap (the page file on Windows is turned off). Loading a save the game "
+                 "uses about 21 GB, and without a page file Windows can run out and the game closes.\n\nOn Windows: search "
+                 "\"Adjust the appearance and performance of Windows\", Advanced, Virtual memory: Change, tick \"Automatically "
+                 "manage paging file size for all drives\", then restart the PC. It starts now anyway.",
+                 ram_mb / 1024.0);
+        return 1;
+    }
     if (ram_mb + swap_mb >= HOS_MEMORY_NEEDED_MB) return 0;
     snprintf(out, cap,
              "This PC has %.1f GB of memory and %.1f GB of swap (the page file on Windows). The game needs about %llu GB of the "
@@ -1672,7 +1685,10 @@ static void memory_notice(void) {
         hos_log("boot: %llu MB of memory, %llu MB of swap", ram, swap);
         return;
     }
-    hos_log("boot: LOW MEMORY: %llu MB of memory, %llu MB of swap, below the ~%llu MB the game needs", ram, swap, HOS_MEMORY_NEEDED_MB);
+    if (swap == 0 && ram + swap >= HOS_MEMORY_NEEDED_MB)   /* ((Triforce, 11-18) memory_notice_text's no-swap case) */
+        hos_log("boot: NO PAGE FILE: %llu MB of memory, 0 MB of swap: loading a save can run out of memory (error 1455)", ram);
+    else
+        hos_log("boot: LOW MEMORY: %llu MB of memory, %llu MB of swap, below the ~%llu MB the game needs", ram, swap, HOS_MEMORY_NEEDED_MB);
     if (getenv("HOS_HEADLESS")) return;
 #ifndef _WIN32
     int hos_sdl_load(void);

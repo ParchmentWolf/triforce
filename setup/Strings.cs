@@ -23,6 +23,8 @@ enum S
     Download, Updating, UpdateFailed,
     // (the report of a build that stopped, English only as well)
     CopyReport, ReportCopied, ReportNotCopied,
+    // ((Triforce, 11-18) the shaders' step after the folder is put together: English only as well)
+    Shaders, ShadersNote,
 }
 
 static class Strings
@@ -38,6 +40,8 @@ static class Strings
         "The build stopped", "Build cancelled", "You can start again from the same folder.", "Stop the build and close?", "Language", "Stop and close", "Keep building",
         "Downloading the new version", "Updating your game", "The update could not be downloaded",
         "Copy report", "Report copied", "The clipboard is in use: try again",
+        "Preparing shaders",
+        "Your game is built; its shaders are being prepared once so it doesn't stutter later. On AMD graphics cards this can take an hour or more.",
     };
     static readonly string[] Fr =
     {

@@ -64,7 +64,7 @@ def check_sources():
     load = block(mods, "static void code_record_load(")
     check("hos_game_path_a(path, MAX_PATH);" in load and "MOD_CODE_RECORD" in load and "mod_code_parse(text, built, BUILT_MOST)" in load,
           "the record is not read from the game folder")
-    patches = block(mods, "static void code_patches(")
+    patches = block(mods, "static int code_patches(")
     check('snprintf(rel, sizeof rel, "%s/exefs/%s", mod->name, fd.cFileName);' in patches and "mod_code_is_patch(fd.cFileName)" in patches
           and "mod_code_state(built, nbuilt, rel, mod_code_fnv(data, len), len, &why)" in patches,
           "a mod's patch files are not held against the record by the path the build wrote")
@@ -78,6 +78,14 @@ def check_sources():
           "the record is not read before the mods are walked, or what is gone not said after")
     scan = block(mods, "static void mods_scan(")
     check("code_patches(&mods[i]);" in scan and "code_patches_gone" not in scan, "what is gone is only said when there is a mods folder")
+    # ((Triforce, 11-18) a mod whose code waits for a build keeps its RomFS files waiting too: its new files over the old
+    # code crashed the game at its start; HOS_MODS_SPLIT=1 loads them anyway)
+    check("const int waits = code_patches(&mods[i]);" in scan and "const int hold = waits > 0 && !split;" in scan
+          and 'const int files = hold ? 0 : index_romfs(dir, "", 0);' in scan and "HOS_MODS_SPLIT" in scan,
+          "a mod whose code waits for a build still has its RomFS files read")
+    check(scan.index("code_patches(&mods[i]);") < scan.index("index_romfs(dir"), "the RomFS files are read before the mod's code is known")
+    check("waits += state == MOD_CODE_CHANGED || state == MOD_CODE_WAITS;" in patches and "return waits;" in patches,
+          "code_patches does not say how many of a mod's patches wait")
     check("exefs patches are left out" not in mods, "host/mods.c still says exefs patches are left out")
     # (the walk both sides make: the path under the mods folder is the mod's name, exefs, the file)
     check('out.append(("%s/exefs/%s" % (name, entry), path))' in (ROOT / "nx2" / "code_mods.py").read_text(encoding="utf-8"),
@@ -166,6 +174,7 @@ void hos_mod_cheats_add(const char *mod, const char *path) {
 }
 void hos_mod_cheats_ready(void) { printf("cheats: ready\n"); }
 int hos_prompts_romfs(const char *key, char *out, size_t cap) { (void)key, (void)out, (void)cap; return 0; }
+int hos_prompts_font_file(const char *key, char *out, size_t cap) { (void)key, (void)out, (void)cap; return 0; }
 int main(void) {
     hos_mods_init(NULL);
     char found[MAX_PATH];
@@ -222,7 +231,12 @@ def mods_c_itself(cc, tmp, out, mods, main_id):
     check(sum("is off (its name starts with -)" in line for line in log) == 2 and sum("is off (its name starts with _)" in line for line in log) == 1,
           "the mods that are off:\n" + said)
     # (the build's walk of the same folder, nx2/code_mods.py find_mods, finds the same mods in the same order)
-    walk_c = [line[len("mods: "):line.rindex(": ")] for line in log if line.endswith(" RomFS files")]
+    held = " its RomFS files wait for the build too, with its code"
+    walk_c = [line[len("mods: "):line.rindex(": ")] if line.endswith(" RomFS files") else line[len("mods: "):line.index(":" + held)]
+              for line in log if line.endswith(" RomFS files") or held in line]
+    # ((Triforce, 11-18) the mods whose code waits for a build (edited, new, retried) keep their RomFS files out until it)
+    check(sorted(line[len("mods: "):line.index(":" + held)] for line in log if held in line) == ["edited", "new", "retried"],
+          "the mods whose RomFS files wait with their code:\n" + said)
     walk_py = [name for name, _ in code_mods.find_mods(str(mods))]
     check(walk_c == walk_py and "a/b/c/d" in walk_py and "contents/0400486024DEC000/deep" in walk_py and len(walk_py) == 12
           and walk_py.index("A-upper") < walk_py.index("a/b/c/d") < walk_py.index("art") < walk_py.index("Zed") < walk_py.index("zz-cheats"),
