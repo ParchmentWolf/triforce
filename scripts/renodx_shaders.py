@@ -207,6 +207,23 @@ def fetch_one(url, digest, dst, opener=urllib.request.urlopen):
     return True
 
 
+# ((Triforce) v0.5.0) Files RenoDX's sources include under another case than the repository names them: src/shaders/tonemap.hlsl
+# includes "./tonemap/dice.hlsl", the file is DICE.hlsl. Windows' file names ignore case; on Linux every RenoDX build failed
+# there (output_0x92D6F81D.frag.slang, "failed to find include file") and was made without RenoDX's HDR. The fetched file is
+# also written under the name included, unchanged; where names ignore case it is already there
+CASE_COPIES = {"src/shaders/tonemap/DICE.hlsl": "src/shaders/tonemap/dice.hlsl"}
+
+
+def case_copies(folder, digests):
+    for path, name in CASE_COPIES.items():
+        src = os.path.join(folder, "renodx", *path.split("/"))
+        dst = os.path.join(folder, "renodx", *name.split("/"))
+        if not os.path.isfile(src) or (os.path.exists(dst) and os.path.samefile(src, dst)):
+            continue
+        if not (os.path.isfile(dst) and sha256(dst) == digests[path]):
+            shutil.copyfile(src, dst)
+
+
 def slangc(folder, platform):
     return os.path.join(folder, "slang", *SLANG[platform][2].split("/"))
 
@@ -217,6 +234,7 @@ def fetch(folder, platform, opener=urllib.request.urlopen, say=print):
     for path, digest in FILES:
         if fetch_one(BASE + "/" + path, digest, os.path.join(folder, "renodx", *path.split("/")), opener):
             say("renodx: %s" % path)
+    case_copies(folder, dict(FILES))
     url, digest, _ = SLANG[platform]
     slang = os.path.join(folder, "slang")
     mark = os.path.join(slang, "archive.sha256")

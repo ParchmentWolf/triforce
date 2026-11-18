@@ -55,6 +55,9 @@ for h in $(grep -rhoE 'gpu/vk/[A-Za-z0-9_]+[.]h' host | sort -u); do if [ -f "$h
 cp -a third_party/zstd "$T/third_party/"
 cp -a third_party/opus "$T/third_party/"
 cp -a third_party/kenney_input "$T/third_party/"
+# ((Triforce) v0.5.0: SMAA's lookup textures, which gpu/vk/vk_aa.cpp includes: left out of v0.5.0's first AppImage, and every
+# Linux build stopped at vk_aa.cpp. scripts/linux/check_player_build.sh now checks every relative include of the image's sources)
+cp -a third_party/smaa "$T/third_party/"
 # (NVIDIA DLSS, when ticked in the builder: scripts/ngx_sdk.py and the Vulkan back end's sources, compiled with HOOKSHOT_NGX_SDK)
 mkdir -p "$T/scripts"
 cp scripts/ngx_sdk.py "$T/scripts/"
