@@ -49,16 +49,17 @@ int main(int argc, char **argv) {
     const unsigned w = atoi(argv[2]), h = atoi(argv[3]);
     assert(output_mode() == mode);
     assert(hos_output_size(0) == w && hos_output_size(1) == h);
-    assert(hos_rt_pool_size(305ull << 20) == ((mode == 2 ? 687ull : mode == 4 ? 610ull : mode == 5 ? 900ull : 512ull) << 20));   // (512 MB at least: nn_applet.c)
-    assert(kLastOutput == 5);
-    assert(output_choice(-1) == 0 && output_choice(4) == 4 && output_choice(5) == 5 && output_choice(6) == 0);
+    assert(hos_rt_pool_size(305ull << 20) == ((mode == 2 ? 687ull : mode == 4 ? 610ull : mode == 5 || mode == 6 ? 900ull : 512ull) << 20));   // (512 MB at least: nn_applet.c)
+    assert(kLastOutput == 6);
+    assert(output_choice(-1) == 0 && output_choice(4) == 4 && output_choice(5) == 5 && output_choice(6) == 6 && output_choice(7) == 0);
     assert(step_output_choice(3, -1) == 3);
     assert(step_output_choice(3, 1) == 0 && step_output_choice(0, -1) == 3);
     assert(step_output_choice(0, 1) == 1 && step_output_choice(1, -1) == 0);
     assert(step_output_choice(1, 1) == 2 && step_output_choice(2, -1) == 1);
     assert(step_output_choice(2, 1) == 4);
-    assert(step_output_choice(4, -1) == 2 && step_output_choice(4, 1) == 5);
-    assert(step_output_choice(5, -1) == 4 && step_output_choice(5, 1) == 5);
+    assert(step_output_choice(4, -1) == 2 && step_output_choice(4, 1) == 6);   // ((Triforce) 5120x2160 between 5120x1440 and 5120x2880)
+    assert(step_output_choice(6, -1) == 4 && step_output_choice(6, 1) == 5);
+    assert(step_output_choice(5, -1) == 6 && step_output_choice(5, 1) == 5);
     opts.output_res = mode;
     opts.handheld = handheld();
     assert(strcmp(tx_output_res(mode), argv[4]) == 0);
@@ -82,16 +83,18 @@ int main(int argc, char **argv) {
 }
 '''
     cases = (
-        (0, 0, None, 0, 2560, 1440, "2048x1152 (game's)"),
+        (0, 0, None, 0, 2560, 1440, "2048x1152"),
         (1, 0, None, 1, 2560, 1440, "2560x1440"),
         (2, 0, None, 2, 3840, 2160, "3840x2160"),
         (3, 0, None, 3, 1920, 1080, "1920x1080"),
         (1, 0, "3", 3, 1920, 1080, "1920x1080"),
-        (3, 1, "3", 0, 2560, 1440, "2048x1152 (game's)"),
-        (4, 1, None, 0, 2560, 1440, "2048x1152 (game's)"),
-        (6, 0, None, 0, 2560, 1440, "2048x1152 (game's)"),
+        (3, 1, "3", 0, 2560, 1440, "2048x1152"),
+        (4, 1, None, 0, 2560, 1440, "2048x1152"),
+        (7, 0, None, 0, 2560, 1440, "2048x1152"),
         (5, 0, None, 5, 5120, 2880, "5120x2880"),
         (4, 0, None, 4, 5120, 1440, "5120x1440"),
+        (6, 0, None, 6, 5120, 2160, "5120x2160"),
+        (1, 0, "6", 6, 5120, 2160, "5120x2160"),
     )
     with tempfile.TemporaryDirectory(prefix="output-resolution-") as tmp:
         work = Path(tmp)
@@ -106,7 +109,7 @@ int main(int argc, char **argv) {
             if override is not None:
                 env["HOS_OUTPUT_RES"] = override
             subprocess.run([str(exe), str(mode), str(w), str(h), label], cwd=work, env=env, check=True)
-    print("PASS: output sizes, menu order, 1080p override, handheld, render-target budgets and DLSS sizes at 1080p, 5120x1440 and 5120x2880")
+    print("PASS: output sizes, menu order, 1080p override, handheld, render-target budgets and DLSS sizes at 1080p, 5120x1440, 5120x2160 and 5120x2880")
 
 
 if __name__ == "__main__":

@@ -26,7 +26,8 @@
 enum { OOT_HUD_MIDDLE = 0, OOT_HUD_LEFT = -1, OOT_HUD_RIGHT = 1 };
 
 /* The screens that keep the whole picture, by their class (the first word of the screen object), a bit each: bit k of
-   the keep mask keeps screen k whole (the Insert menu's Ultrawide menus row clears the menus' bits 1 and 3). */
+   the keep mask keeps screen k whole (the Insert menu's Ultrawide menus row clears the menus' bit 1; the two fades
+   are never squeezed: one colour in the middle alone leaves the picture showing at the sides). */
 #define OOT_HUD_KEEP_N 4
 static const uint64_t oot_hud_keep_classes[OOT_HUD_KEEP_N] = {
     0x84c0d098ULL,   /* the item wheel's background */

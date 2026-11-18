@@ -8,7 +8,12 @@
 // Those inputs are made in vk_fsr3_inputs.cpp; fsr3_upscale below is the dispatch's side: the network's input in, FSR's
 // picture squared back into the network's output, as vk_dlss.cpp's dlss_out.comp does for DLSS.
 //
-// RX_VK_FSR=0: never (the row stays), =1: FSR 3.1 over the Insert menu's Upscaler row.
+// RX_VK_FSR=0: never (the row stays), =1: FSR 3.1 over the Insert menu's Upscaler row, =2: its Native AA over the row.
+//
+// Native AA (the row's AMD FSR 3.1 Native AA, upscaler_rows.h FSR3_AA): the same passes with the 3D drawn at the
+// output's full size (vk_temporal.h temporal_full_scale tells the game so, as for DLAA and FSR 4's native AA), FSR's
+// own anti-aliasing mode at a scale of 1. The game's dispatch is then its full-size pass, the render size the
+// output's; nothing else differs.
 #pragma once
 
 #include <cstdint>
@@ -56,9 +61,13 @@ struct Inputs {
 
 } // namespace fsr3
 
-/// FSR 3.1 upscales: the Insert menu's Upscaler row says FSR 3.1 (upscaler_rows.h FSR3) and neither RX_VK_DLSS nor
-/// RX_VK_FSR4 is set over it (vk_temporal.h temporal_env_chosen), or RX_VK_FSR=1; and it runs here
+/// FSR 3.1 upscales: the Insert menu's Upscaler row says FSR 3.1 or its Native AA (upscaler_rows.h FSR3, FSR3_AA) and
+/// neither RX_VK_DLSS nor RX_VK_FSR4 is set over it (vk_temporal.h temporal_env_chosen), or RX_VK_FSR=1 or 2; and it
+/// runs here
 bool fsr3_wanted();
+/// ...as its Native AA, the 3D at full size: the row's AMD FSR 3.1 Native AA, or RX_VK_FSR=2 (1: the Render resolution
+/// row's mode, whatever the row says)
+bool fsr3_native();
 
 /// A gameplay upscale's dispatch, as vk_temporal.h's temporal_upscale takes it (vk_draw.cpp's fsr3_stand_in finds them the same
 /// way). With FSR 3.1's frame interpolation on, the dispatch's input and this frame's camera become its inputs here

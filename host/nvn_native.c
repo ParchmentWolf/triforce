@@ -19,6 +19,7 @@
    own procs (program builders, native images, sparse tile layouts, recording modes). The SDK's exports reach the
    same functions as the proc table (nvn2_dispatch, from gen/nvn2_exports.c). */
 #include "hos.h"
+#include "guest_bounds.h"   /* ((Triforce) hos_span_ok: the game's first and count checked without an int overflow) */
 #include "../gpu/render/rx_nvn.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -1054,10 +1055,14 @@ static void dump_stage(uint64_t code, uint64_t ctl) {
     MEMORY_BASIC_INFORMATION mbi;
     while (n < 0x10000 && VirtualQuery(GP(code + n), &mbi, sizeof mbi) && mbi.State == MEM_COMMIT) n += 0x1000;
     FILE *f = fopen(path, "wb");
+    int io = hos_guest_io_begin(GP(code), n);   /* (Triforce: the kernel reads guest memory here: rx_backend.c) */
     if (f) { fwrite(GP(code), 1, (size_t)n, f); fclose(f); }
+    hos_guest_io_end(io);
     snprintf(path, sizeof path, "%s/%010llx.ctl", dir, (unsigned long long)code);
     f = fopen(path, "wb");
+    io = hos_guest_io_begin(GP(ctl), 0x800);
     if (f) { fwrite(GP(ctl), 1, 0x800, f); fclose(f); }
+    hos_guest_io_end(io);
 }
 static int set_shaders(nvn_prog *o, int n, const uint8_t *sd, int stride) {
     if (n < 0 || n > 6) return 0;
@@ -1918,7 +1923,7 @@ NV(nvnCommandBufferClearDepthStencil) {
 }
 NV(nvnCommandBufferSetViewports) {
     const int first = I(1), n = I(2);
-    if (n < 0 || first < 0 || first + n > 16) die("SetViewports %d+%d", first, n);
+    if (!hos_span_ok(first, n, 16)) die("SetViewports %d+%d", first, n);   /* ((Triforce) first + n in an int wrapped) */
     nvn_p_viewports *r = REC(CB(P(0)), NOP_VIEWPORTS, nvn_p_viewports);
     r->first = first, r->n = n;
     memcpy(r->v, PN(3, 16 * (size_t)n), 16 * (size_t)n);
@@ -2010,7 +2015,7 @@ NV(nvnCommandBufferBindVertexStreamState) {
     hw_fix(o, 4 * (16 + (uint64_t)n));
 }
 static void bind_vbufs(nvn_cmd *o, int first, int n, const NVNbufferRange *rg) {
-    if (n < 0 || first < 0 || first + n > 16) die("BindVertexBuffers %d+%d", first, n);
+    if (!hos_span_ok(first, n, 16)) die("BindVertexBuffers %d+%d", first, n);   /* ((Triforce) as SetViewports) */
     nvn_p_bind_vbuf *r = RECN(o, NOP_BIND_VBUF, nvn_p_bind_vbuf, r, n);
     r->first = first, r->n = n;
     memcpy(r->r, rg, sizeof *rg * (size_t)n);
@@ -2564,6 +2569,8 @@ NV(nvnQueuePresentTexture) {
     extern volatile LONG64 hos_present_count;   /* display.c */
     InterlockedIncrement64(&hos_present_count);
     hos_vi_native_presented();
+    void hos_mod_cheats_frame(void);   /* (Triforce) mod_cheats.c: the mods' cheat files, once a game frame; nothing without one */
+    hos_mod_cheats_frame();
 }
 
 /* ---- NVN2 (mkw-recomp): what the Switch 2's NVN adds, as MKW uses it ---- */

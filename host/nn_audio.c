@@ -34,6 +34,7 @@
 #endif
 #include "../gpu/vk/vk_api.h"   /* (HOS_OPT_VOLUME: the menu's Master volume) */
 #include "hos_paths.h"   /* (the game folder: triforce_options.ini, au_menu_output) */
+#include "menu_sound.h"   /* ((Triforce) the options' own sounds, added to each block: render_frame) */
 
 void hos_system_event_init(uint64_t key, int autoclear);
 void hos_system_event_signal(uint64_t key);
@@ -589,6 +590,9 @@ static void render_frame(int16_t *pcm, int channels) {   /* 240 frames of the de
             lim_env = want < lim_env ? want : lim_env + (want - lim_env) * 0.0004f;
             for (int ch = 0; ch < nch; ch++) out[ch][i] *= lim_in * lim_env * lim_out;
         }
+    /* (Triforce) the options' own sounds, the game's interface sounds (menu_sound.c), into the front left and right:
+       after the limiter, which is the game's mix's own, and before the Master volume, which is over them too */
+    hos_menu_sound_frame(out[0], out[1], FRAME);
     {   /* (Triforce) the Insert menu's Master volume, over everything the game mixed and after the limiter, so the
            limiter works on the game's own levels. A change is ramped across the frame (5 ms): no click */
         static float master_now = -1.0f;
@@ -1566,7 +1570,9 @@ HLE(_ZN2nn5audio16AppendWaveBufferEPNS0_9VoiceTypeEPKNS0_10WaveBufferE) {
                 FILE *f = fopen(path, "wb");
                 if (f) {
                     fwrite(v->coefs, 1, 32, f);
+                    const int io = hos_guest_io_begin(GP(w.buffer), (uint64_t)w.size);   /* (Triforce: rx_backend.c) */
                     fwrite(GP(w.buffer), 1, (size_t)w.size, f);
+                    hos_guest_io_end(io);
                     fclose(f);
                 }
             }

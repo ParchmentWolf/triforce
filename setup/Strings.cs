@@ -21,6 +21,8 @@ enum S
     Stopped, Cancelled, CancelledNote, CloseQuestion, LanguageLabel, StopClose, KeepBuilding,
     // (the update, English only for now: Strings.Text falls back to it)
     Download, Updating, UpdateFailed,
+    // (the report of a build that stopped, English only as well)
+    CopyReport, ReportCopied, ReportNotCopied,
 }
 
 static class Strings
@@ -35,6 +37,7 @@ static class Strings
         "Putting the game folder together", "Show details", "Hide details", "Cancel", "Back", "Open folder", "Play", "Your game is ready", "built in",
         "The build stopped", "Build cancelled", "You can start again from the same folder.", "Stop the build and close?", "Language", "Stop and close", "Keep building",
         "Downloading the new version", "Updating your game", "The update could not be downloaded",
+        "Copy report", "Report copied", "The clipboard is in use: try again",
     };
     static readonly string[] Fr =
     {

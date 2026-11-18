@@ -19,6 +19,7 @@ Each is a runtime switch where it can be, so the game's own path stays reachable
 """
 import glob
 import os
+import re
 import sys
 import whole_write   # (rewrites written beside and moved over: issue 1197)
 
@@ -174,6 +175,27 @@ def patch_menu_tick(source):
     hook = "    hos_oot_menu_tick(c, c->x[0]);   /* (nx2/oot_patches.py: the menus' mouse) */\n"
     return (source[:at] + hook + source[at:]).replace(
         '#include "a64.h"\n', '#include "a64.h"\nextern void hos_oot_menu_tick(Ctx *c, uint64_t screen);\n', 1)
+
+
+MOD_SIZE_CALL = "c->x[30] = 0x801b64e4ULL; f_836e3d30(c);\n"
+MOD_SIZE_HOOK = ("    c->x[0] = hos_mods_table_size(c->x[0], recomp_load64(c, c->x[29] + 24));"
+                 "   /* (nx2/oot_patches.py: room for the mods' files, host/mods.c) */\n")
+
+
+def patch_mod_sizes(source):
+    """((Triforce) 11-17) f_801b6340 asks the ResourceSizeTable (RESTBL, f_836e3d30: the CRC of the path, a binary search) how
+    much memory a file's load needs; the file's resource heap is made that size (f_801b6840). A mod's file served instead of the
+    game's (host/mods.c) can need more than the table gives it: a model with more materials and shapes than the original fails
+    its gsys::ModelResource allocations, which the game does not check (the Dark Link mod's Deku Shield and Slingshot: a write
+    to address 0 on loading a child save). The host raises the size for a mod's file to its real size and room beside it
+    (hos_mods_table_size); the game's own files keep the table's"""
+    if MOD_SIZE_CALL not in source:
+        return source, 0
+    if "hos_mods_table_size(" in source:   # (made before: a lift patched again)
+        return source, 1
+    out = source.replace(MOD_SIZE_CALL, MOD_SIZE_CALL + MOD_SIZE_HOOK, 1)
+    out = out.replace('#include "a64.h"\n', '#include "a64.h"\nextern uint64_t hos_mods_table_size(uint64_t size, uint64_t path);\n', 1)
+    return out, 1
 
 
 TEXT_HEAD = "void f_80b1e140(Ctx *__restrict A64_NOESC c) {"
@@ -558,6 +580,78 @@ def patch_sprint(s):
     return s, done
 
 
+# (Triforce) The host's zstd decoder (host/host_zstd.h has what the two functions are and the rules; HOS_HOST_ZSTD, off unless
+# set). The game's own zstd, linked into main: f_8010b380 (main+0xeb380) is ZSTD_decompressMultiFrame, f_80115c80 (main+0xf5c80)
+# the stream feed its loading threads decode through. At the head of each the host is asked first: it answers the call (x0 the
+# result, the function returns) or says 0 and the game's code runs as it is. hos_host_zstd is 0 once the switch was read as off,
+# and the call is no longer made. A switch at run time, so that it takes no new translation to turn on or off.
+# Only the supported build's: the heads are found by address, and by lines only these two functions have (their shape below), so
+# a function of that name with other code (another game version, a changed lift) is left as it is.
+# (Triforce) The shapes are matched with the store marks' spellings taken out (_unmarked, below). The page marks of a group of
+# stores (a64_lift.mark_groups) are made after these patches (nx2/chunks.py edit_c): a store of a group becomes
+# recomp_storeN_sp( and an A64_MARK line follows the group. The lift as it stands on disk has them, these patches see the text
+# before them. The stream feed's begin stores (+48 and +0 through x19) are such a group: its shape, read from the lift on disk,
+# was never in the text the patch saw, and every build said "found at 1 of 2 places" (the stream feed left out). The lines are
+# written as the text is before the marks, the text the patch sees (tests/test_host_zstd.py holds them to that).
+ZSTD_SITES = (
+    ("void f_8010b380(Ctx *__restrict A64_NOESC c) {\n", "hos_zstd_multiframe",
+     # (the eighth argument kept and tested, and the dictionary read from a DDict's +8 and +16)
+     ("    recomp_store64_sp(c,c->x[31] + 104,c->x[7]);\nif (c->x[7] != 0) { goto L_8010fd78; }\n",
+      "L_8010fd78:;\n    c->x[8]=recomp_load64(c,c->x[31] + 104);\n"
+      "    { uint64_t _b=c->x[8]; int64_t _o=8; { uint64_t _p0,_p1; recomp_ldp64(c,(_b+_o),&_p0,&_p1); c->x[5]=_p0; c->x[6]=_p1; } }\n")),
+    ("void f_80115c80(Ctx *__restrict A64_NOESC c) {\n", "hos_zstd_stream",
+     # (the phase read from the state, the "done" result, the error code asked of zstd, and the stores of a begin. (Triforce)
+     # And every field host/host_zstd.h reads or writes, at its offset: the output and its room (+8, +16) read in phase 2, the
+     # DCtx's "bytes expected next" (HZ_DCTX_EXPECTED, 28776) read first there, the workspace (+24) read at the begin before
+     # the content size goes to +20; the DCtx to +48 and the phase to +0 at its end)
+     ("    c->x[8]=recomp_load8(c,c->x[0] + 0);\n",
+      "    c->x[0] = 0xfffffffdULL;\n",
+      "c->x[30] = 0x8011629cULL; f_80d5ba00(c);\n",
+      "    c->x[22]=recomp_load64(c,c->x[21] + 28776);\n",
+      "    c->x[23]=recomp_load64(c,c->x[19] + 8);\n"
+      "    { uint64_t _r = (uint64_t)(int64_t)(int32_t)recomp_load32(c,c->x[19] + 16); c->x[2] = _r; }\n",
+      "    c->x[21]=recomp_load64(c,c->x[19] + 24);\n    recomp_store32(c,c->x[19] + 20,c->x[8]);\n",
+      "    recomp_store64(c,c->x[19] + 48,c->x[21]);\n    recomp_store8(c,c->x[19] + 0,c->x[8]);\n")),
+)
+ZSTD_HOOK = "    if (hos_host_zstd && %s(c)) return;   /* (nx2/oot_patches.py: the host's zstd decoder, HOS_HOST_ZSTD) */\n"
+ZSTD_DECL = ("extern volatile int hos_host_zstd;\nextern int hos_zstd_multiframe(Ctx *c);\n"
+             "extern int hos_zstd_stream(Ctx *c);\n")
+# (a64_lift.MG_MARK's line, and the _sp spelling of a marked store: mark_groups_lines, stack_stores, frame_stores)
+MARK_LINE = re.compile(r"^    A64_MARK\(\(c->x\[\d+\] \+ \(uint64_t\)\(int64_t\)\(-?\d+\)\), \d+\);\n", re.M)
+MARK_SP = re.compile(r"\brecomp_(store8|store16|store32|store64|stp32|stp64)_sp\(")
+
+
+def _unmarked(text):
+    """(Triforce) text without the store marks' spellings: a group's A64_MARK lines out, recomp_storeN_sp( as recomp_storeN(.
+    The code's shape alone, the same before a64_lift.mark_groups and after it (a second run over a finished lift), and with
+    A64_MARK_EACH, A64_MARK_STACK or A64_MARK_FRAME at lift time. They change only where a store's page is marked, never what
+    the guest's code does, so a shape can count on everything else"""
+    return MARK_SP.sub(r"recomp_\1(", MARK_LINE.sub("", text))
+
+
+def patch_host_zstd(s):
+    """The host decoder's two calls: (s, how many of the two heads are in s with their call, made now or before). A function
+    whose code is not the decoder's (another game version) is left as it is."""
+    done = 0
+    for head_text, name, shape in ZSTD_SITES:
+        at = _function(s, head_text)
+        if at is None:
+            continue
+        head, end = at
+        body = s[head:end]
+        hook = ZSTD_HOOK % name
+        if body.startswith(head_text + hook):
+            done += 1
+        elif hook not in body:
+            plain = _unmarked(body)
+            if all(plain.count(_unmarked(line)) == 1 for line in shape):
+                s = s[:head] + head_text + hook + body[len(head_text):] + s[end:]
+                done += 1
+    if done and ZSTD_DECL not in s:
+        s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + ZSTD_DECL, 1)
+    return s, done
+
+
 def patch_text_speed(s):
     """The scale at the head of the letters' block of f_80b1e140; None when the file has no such function, s unchanged when the
     function is there but its code differs (another game version)."""
@@ -616,6 +710,8 @@ def apply(gen, *, protect_hearts=False, required=False):
     sound_jobs = solver_sites = 0   # (patch_sound_job, patch_solver_steps: the places found with their hooks)
     floor_sites = sim_sites = record_sites = 0   # (patch_floor_carry, patch_sim_steps, patch_record_clock: the same)
     sprint_sites = 0   # (patch_sprint: its two calls)
+    zstd_sites = 0   # (patch_host_zstd: its two calls, the supported build's alone)
+    mod_size_sites = 0   # ((Triforce) patch_mod_sizes: its one call, the supported build's alone)
     for path in sorted(glob.glob(os.path.join(glob.escape(gen), "code_*.c"))):
         with open(path, encoding="utf-8", newline="") as f:
             s = f.read()
@@ -721,6 +817,17 @@ def apply(gen, *, protect_hearts=False, required=False):
         if sprinted != out:
             print("oot_patches: the sprint button in", os.path.basename(path))
         out = sprinted
+        if protect_hearts:   # (found by address: the supported build's functions)
+            zstd, found = patch_host_zstd(out)
+            zstd_sites += found
+            if zstd != out:
+                print("oot_patches: the host's zstd decoder's call(s) in", os.path.basename(path))
+            out = zstd
+            sized, found = patch_mod_sizes(out)
+            mod_size_sites += found
+            if sized != out:
+                print("oot_patches: room for the mods' files in", os.path.basename(path))
+            out = sized
         if out != s:
             whole_write.write_whole(path, out, newline="")
     if sound_jobs != 1:   # (without it, above 60 fps sounds and then the music can stop after a few loading zones)
@@ -736,6 +843,10 @@ def apply(gen, *, protect_hearts=False, required=False):
               % (record_sites, sum(n for _, n in RECORD_SITES)))
     if sprint_sites != 2:   # (without them the Sprint button row does nothing)
         print("oot_patches: WARNING: the sprint button's calls were found at %d of 2 places" % sprint_sites)
+    if protect_hearts and mod_size_sites != 1:   # (without it a mod's bigger model can crash the game: host/mods.c)
+        print("oot_patches: WARNING: the resource size table's lookup was found at %d of 1 place" % mod_size_sites)
+    if protect_hearts and zstd_sites != len(ZSTD_SITES):   # (without them HOS_HOST_ZSTD does nothing, or half: host/hos_zstd.c)
+        print("oot_patches: WARNING: the host's zstd decoder's calls were found at %d of %d places" % (zstd_sites, len(ZSTD_SITES)))
     for what, n in done.items():
         if n != 1:
             print("oot_patches: WARNING: the %s was found %d times" % (what, n))

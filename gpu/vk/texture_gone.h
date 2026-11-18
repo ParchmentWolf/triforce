@@ -11,6 +11,8 @@
 
 #include <cstdint>
 #include <mutex>
+#include <unordered_map>
+#include <vector>
 
 namespace texture_gone {
 
@@ -23,7 +25,16 @@ public:
 
     void went(uint32_t id) {
         std::lock_guard<std::mutex> lk(mu_);
+        // (Triforce, 11-16: and by id, where it went in the count: gone_since is one look, not a walk of all that went since.
+        // The handle cache asks it at every lookup after another texture's end; with hundreds going a frame (the Market's
+        // crowd panned past) the walk was 44 ms of a slow frame's texture lookups. A slot overwritten forgets its id)
+        const uint32_t old = ids_[n_ % kKept];
+        if (old) {
+            auto it = at_.find(old);
+            if (it != at_.end() && it->second == n_ - kKept) at_.erase(it);
+        }
         ids_[n_ % kKept] = id;
+        if (id) at_[id] = n_;
         n_++;
     }
 
@@ -35,14 +46,25 @@ public:
     bool gone_since(uint32_t id, uint64_t since) const {
         std::lock_guard<std::mutex> lk(mu_);
         if (!id || since > n_ || n_ - since > kKept) return true;
-        for (uint64_t i = since; i < n_; i++)
-            if (ids_[i % kKept] == id) return true;
-        return false;
+        auto it = at_.find(id);
+        return it != at_.end() && it->second >= since;
+    }
+
+    /// (Triforce) The numbers recorded from `since` on, in the order they went (appended to out), and how many went in all
+    /// (*now, always). False, and out left as it was, when they cannot all be told: more went since than are kept, or since is
+    /// past the count (view_keep.h)
+    bool went_since(uint64_t since, std::vector<uint32_t>& out, uint64_t* now) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        *now = n_;
+        if (since > n_ || n_ - since > kKept) return false;
+        for (uint64_t i = since; i < n_; i++) out.push_back(ids_[i % kKept]);
+        return true;
     }
 
 private:
     mutable std::mutex mu_;
     uint32_t ids_[kKept] = {};
+    std::unordered_map<uint32_t, uint64_t> at_;   // (id -> its place in the count, the last kKept only)
     uint64_t n_ = 0;
 };
 

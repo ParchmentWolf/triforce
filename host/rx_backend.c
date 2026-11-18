@@ -295,6 +295,28 @@ static void flush_early(void) {
     ReleaseSRWLockExclusive(&early_lock);
 }
 
+/* (Triforce) The lazy write-back (the Debug tab's row, gpu/vk/vk_memory.cpp): pages of guest memory may have no access while
+   the GPU's newest bytes for them are in VRAM. The CPU's own touch faults and the renderer pays it first, but the kernel,
+   handed such a page by ReadFile, WriteFile and the like, fails or reads old bytes, with no fault. So every host call that
+   gives guest memory to the kernel, or changes guest pages' state (a commit, a discard, a decommit), calls
+   hos_guest_io_begin with the range first and hos_guest_io_end with what it returned after it: what is owed there is copied
+   down, and no page is protected until the end. With the row off, or without the Vulkan back end, both return at once.
+   tests/test_lazy_wb_host.py finds the kernel calls in host/ that do neither. */
+static int (*volatile lazy_io_begin)(const void *, uint64_t);   /* (the back end's mkwvk_lazy_io_begin, once it runs) */
+static void (*volatile lazy_io_end)(int);
+int hos_guest_io_begin(const void *p, uint64_t n) {
+    int (*begin)(const void *, uint64_t) = lazy_io_begin;
+    if (!begin || !n) return 0;
+    const int away = hos_vcore_away();   /* (it may wait for the GPU: no virtual core held meanwhile, as rx_guest_imported) */
+    const int held = begin(p, n);
+    if (away) hos_vcore_back();
+    return held;
+}
+void hos_guest_io_end(int held) {
+    void (*end)(int) = lazy_io_end;
+    if (held && end) end(held);
+}
+
 /* dll: mkw_vk.dll (our Vulkan back end) or mkw_eden.dll (Eden's renderer driven natively, gpu/eden): one export */
 static const MkwVkRenderer *load_vulkan(const char *dll) {
     char path[MAX_PATH];
@@ -325,6 +347,10 @@ int rx_start(void *hwnd) {
         const MkwVkRenderer *r = load_vulkan(dll);
         if (r && r->start(hwnd)) {
             vk = r;
+            /* (Triforce: the lazy write-back's two calls, hos_guest_io_begin above; a back end without them has none) */
+            lazy_io_end = (void (*)(int))(void *)GetProcAddress(vk_module, "mkwvk_lazy_io_end");
+            if (lazy_io_end)
+                lazy_io_begin = (int (*)(const void *, uint64_t))(void *)GetProcAddress(vk_module, "mkwvk_lazy_io_begin");
             hos_log("rx: renderer: %s (%s)", eden ? "Eden's" : "Vulkan", dll);
             flush_early();
             return 1;
@@ -501,6 +527,38 @@ int rx_guest_imported(uint64_t lo, uint64_t hi) {
     const int r = vk && vk->guest_imported ? vk->guest_imported(lo, hi) : 0;
     if (away) hos_vcore_back();
     return r;
+}
+/* (Triforce) The census's give-back (hos_mem.c census_offer): release(lo, hi) is run by the Vulkan back end with its import
+   locks held, and only where no import holds the pages (its mkwvk_guest_release, found by name: MkwVkHost and MkwVkRenderer
+   stay as they are), so that none can lock them between the question and the decommit. 1: given back, 0: not (an import holds
+   them, or release refused), -2: a back end without the export (nothing given back). Without the Vulkan back end nothing
+   imports guest memory (rx_guest_imported's answer then), and release runs at once */
+int rx_guest_release(uint64_t lo, uint64_t hi, int (*release)(uint64_t lo, uint64_t hi)) {
+    if (!vk) return release(lo, hi) ? 1 : 0;
+    static int (*volatile fn)(uint64_t, uint64_t, int (*)(uint64_t, uint64_t));
+    static volatile int looked;
+    if (!looked) {
+        fn = (int (*)(uint64_t, uint64_t, int (*)(uint64_t, uint64_t)))(void *)GetProcAddress(vk_module, "mkwvk_guest_release");
+        looked = 1;
+    }
+    if (!fn) return -2;
+    const int away = hos_vcore_away();   /* (as rx_guest_imported: the back end's pool lock) */
+    const int r = fn(lo, hi, release);
+    if (away) hos_vcore_back();
+    return r == 1 ? 1 : 0;
+}
+/* (Triforce) The census's second line (mkw_glue.c census_main): the Vulkan back end's big holders of memory, as text (its
+   mkwvk_memory_holders, found by name). Its length, 0 when there is none */
+int rx_memory_holders(char *out, size_t n) {
+    if (!vk || !n) return 0;
+    static int (*volatile fn)(char *, size_t);
+    static volatile int looked;
+    if (!looked) {
+        fn = (int (*)(char *, size_t))(void *)GetProcAddress(vk_module, "mkwvk_memory_holders");
+        looked = 1;
+    }
+    out[0] = 0;
+    return fn ? fn(out, n) : 0;
 }
 /* (nvn_native.c: the CPU set an event's value) in order with the submits, for the GPU's waits on it */
 int rx_option(int id, int otherwise) { return vk && vk->option ? vk->option(id) : otherwise; }

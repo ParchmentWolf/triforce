@@ -8,6 +8,9 @@
 // to a fraction. A walk through Castle Town with the allowance taken as a 6 GB card's 4,730 MB held 6,907 MB whole,
 // 5,472 MB without the largest level and 4,987 MB without two; a tour sized for an 8 GB card ran 29.6 fps (1% low
 // 11.4) whole and 42.8 (36.4) without the largest level, nothing spilled.
+//
+// The Insert menu's Texture detail row chooses among the same three levels, Automatic (the rule below) unless set;
+// RX_VK_TEX_DETAIL still goes over the row (choose).
 #pragma once
 #include <cstdint>
 #include <cstring>
@@ -42,6 +45,14 @@ inline int parse(const char* v) {
     if (!v) return -1;
     return !strcmp(v, "full") ? kFull : !strcmp(v, "reduced") ? kReduced : !strcmp(v, "low") ? kLow : -1;
 }
+
+/// The Insert menu's Texture detail row (texture_detail= in the options file: 0 Automatic, 1 Full, 2 Reduced, 3 Low) as
+/// a level; -1 for Automatic and for a value past the row.
+inline int from_row(int row) { return row >= 1 && row <= 3 ? row - 1 : -1; }
+
+/// The level in effect: RX_VK_TEX_DETAIL's (asked: parse()) over the row's (row: from_row()) over what the video
+/// memory gives (by_memory: by_vram()).
+inline int choose(int asked, int row, int by_memory) { return asked >= 0 ? asked : row >= 0 ? row : by_memory; }
 
 /// The top levels a texture is made without at that detail level. w, h, levels: the texture whole. The caller has
 /// checked what the sizes cannot say: a decoded ASTC texture, 2D or a 2D array, one sample, sampled only.

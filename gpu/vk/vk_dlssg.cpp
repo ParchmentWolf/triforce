@@ -18,6 +18,18 @@
 // Generation pauses while the menu is open and while a frame has no scene (a pause, a load, a movie), after the new
 // state has held for 12 presents.
 //
+// (Triforce) One wait a frame, after NX2navi's (runtime/vk_dlssg.c vk_dlssg_pace): with the Display tab's Reflex frame
+// limit row on, Reflex's sleep also holds the Game frame rate cap (its frame limit, the driver's minimum interval),
+// and the game's own wait (host/nn_vi.c hos_vi_native_acquire) steps aside. The difficulty that left this out at
+// first is who waits where: the host's wait is on the game's presenting thread where it takes a window texture, the
+// frame's start; Reflex's sleep above is on the replay's thread after a present, and held there with a limit it would
+// hold the game only at its next present, through the present queue, after the pad was read and the frame recorded.
+// So while Reflex holds the limit its sleep is taken on the game's presenting thread, at that same acquire (pace, asked
+// by the host through HOS_OPT_PACE_START: vk_pace.cpp), and frame_start leaves its own out. Who holds a frame is
+// decided there, once a frame, by dlssg_pace.h: Reflex only while frames are being generated, a present went out
+// lately, Streamline took the very limit asked for, and the frames have not shown that Reflex does not hold it; the
+// game's own wait in every other case, from that same frame on. The row is Off by default: the game as before.
+//
 // Built only with HOOKSHOT_STREAMLINE_SDK=<the SDK's folder> (nx2/build.py; NVIDIA's headers stay outside the
 // repository); without it every function answers "off". RX_VK_DLSSG_LOG=1: Streamline's own information lines too.
 #include "vk_dlssg.h"
@@ -32,6 +44,7 @@
 #include <string>
 
 #include "dlss_math.h"
+#include "dlssg_pace.h"   // (Triforce: who holds the frame limit, Reflex or the game's own wait)
 #include "vk_fsr3_inputs.h"
 #include "vk_menu.h"
 #include "vk_paths.h"
@@ -44,6 +57,11 @@
 #include <sl_pcl.h>
 #include <sl_reflex.h>
 #endif
+
+namespace mkwvk {
+bool present_hold_now();     // ((Triforce) vk_replay.cpp, the hold of the last picture: the present under way shows the held picture,
+bool present_after_hold();   //  or is the first shown after a hold)
+}
 
 namespace mkwvk::dlssg {
 
@@ -90,8 +108,10 @@ void device_extensions(std::vector<const char*>&, const std::vector<VkExtensionP
 void gave_up(const char*) {}
 void device_ready(VkPhysicalDevice, VkDevice) {}
 bool active() { return false; }
+bool reflex_on() { return false; }
 void swapchain_created() {}
 void frame_start() {}
+bool pace(int64_t) { return false; }
 void submit_end() {}
 void frame(VkCommandBuffer, uint32_t, uint32_t) {}
 void present_marker(bool) {}
@@ -117,6 +137,7 @@ PFun_slDLSSGGetState* p_dlssg_state;
 PFun_slPCLSetMarker* p_marker;
 PFun_slReflexSetOptions* p_reflex;
 PFun_slReflexSleep* p_sleep;
+PFun_slReflexGetState* p_reflex_state;
 PFN_vkGetInstanceProcAddr p_gipa;
 
 int loaded;                          // 1: Streamline is up and the instance goes through it; -1: given up for this run
@@ -128,6 +149,18 @@ int frames_set = -1;                 // the frames to generate as last set (0 of
 int mode_now, mode_pending;          // generation as the driver has it, and the presents since the other state was wanted
 uint64_t presented, shown;
 constexpr int kSettle = 12;
+// (Triforce) Reflex's frame limit, in microseconds (0 none). want: what pace() asks for (the game's presenting thread
+// writes it); set: what Streamline last took (written where the presents are made, reflex_apply); refused: Streamline
+// refused a limit, so the game's own wait keeps it for the run
+std::atomic<uint32_t> limit_want{0}, limit_set{0};
+std::atomic<bool> limit_refused{false};
+std::atomic<int> low_latency{-1};       // Reflex's sleep runs on this card and driver: 1, 0, -1 while Streamline has not said
+int mode_set = -1;                      // ((Triforce) the NVIDIA Reflex row's value Streamline was last given: frame gives a change)
+std::atomic<int64_t> hosted_ns{0};      // the host's clock after the newest present, 0 before the first
+std::atomic<bool> game_sleeps{false};   // pace() takes Reflex's sleep where the game's frame starts: frame_start leaves its own out
+std::atomic<int> game_in_sleep{0};      // the game's presenting thread is inside that sleep now (shutdown waits for it)
+DlssgPace pace_state;                   // the game's presenting thread's (pace)
+int pace_said = -1;                     // who held the limit as last logged: 1 Reflex, 0 the game's own wait (that thread's too)
 
 void sl_log(sl::LogType type, const char* msg) {
     static const bool all = getenv("RX_VK_DLSSG_LOG") != nullptr;
@@ -174,16 +207,51 @@ bool inverse(const float* m, float out[16]) {
     return dlss_math::reprojection(m, identity, out);   // (identity * inverse(m))
 }
 
+/// (Triforce) Whether Reflex's sleep runs on this card and driver: Streamline takes a frame limit without it and then
+/// sets nothing. Asked until Streamline answers, by reflex_apply alone: slReflexGetState is not thread safe
+void reflex_state() {
+    static sl::ReflexState rs;
+    if (low_latency.load(std::memory_order_relaxed) >= 0) return;
+    void* f = nullptr;
+    if (!p_reflex_state && p_feature(sl::kFeatureReflex, "slReflexGetState", f) == sl::Result::eOk) p_reflex_state = (PFun_slReflexGetState*)f;
+    if (p_reflex_state && p_reflex_state(rs) == sl::Result::eOk) low_latency = rs.lowLatencyAvailable ? 1 : 0;
+}
+
+/// Reflex's mode and frame limit to Streamline: where the device is made, before any present, and after that only on
+/// the thread that makes the presents (swapchain_created, frame): slReflexSetOptions is not thread safe. Streamline
+/// sets both on the swapchain it was told of last and drops them while there is none, so both are set again after
+/// each swapchain, and every call carries both: a call without the limit clears it.
 void reflex_apply() {
     if (!p_reflex) return;
     sl::ReflexOptions o{};
     // (the Insert menu's NVIDIA Reflex row says with or without boost; off there is still on here: DLSS-G needs it)
+    mode_set = opts.reflex;
     o.mode = opts.reflex == 2 ? sl::ReflexMode::eLowLatencyWithBoost : sl::ReflexMode::eLowLatency;
-    o.frameLimitUs = 0;   // (the frame limit stays the game's own pacer's)
-    const sl::Result r = p_reflex(o);
+    // (Triforce: the frame limit is the game's own wait's, 0 here, unless pace() asked for one: the Reflex frame limit row)
+    uint32_t us = limit_refused.load(std::memory_order_relaxed) ? 0 : limit_want.load(std::memory_order_acquire);
+    if (us) reflex_state();   // (only with a limit to give: with the row off Streamline is asked nothing more than before)
+    o.frameLimitUs = us;
+    sl::Result r = p_reflex(o);
+    // (taken: Streamline said so, and Reflex's sleep runs here: where Streamline says it does not, nothing would hold
+    // the limit. Where it has not said, dlssg_pace.h's check of the frames finds a limit nothing holds)
+    bool took = r == sl::Result::eOk && (!us || low_latency.load(std::memory_order_relaxed) != 0);
+    if (!took && us) {
+        limit_refused.store(true, std::memory_order_release);
+        logf("vk: dlssg: Streamline did not take Reflex's frame limit of %.3f ms (%d): the game's own wait keeps the limit "
+             "for the rest of this run", us / 1000.0, (int)r);
+        o.frameLimitUs = us = 0;
+        r = p_reflex(o);
+        took = r == sl::Result::eOk;
+    }
+    limit_set.store(took ? us : 0, std::memory_order_release);
     static int n;
-    if (n++ < 4 || r != sl::Result::eOk)
-        logf("vk: dlssg: Reflex low latency %s (%d)", opts.reflex == 2 ? "on with boost" : "on", (int)r);
+    static uint32_t said_us;
+    if (n < 4 || r != sl::Result::eOk || (us != said_us && n < 60)) {
+        n++, said_us = us;
+        char limit[48] = "no frame limit";
+        if (us) snprintf(limit, sizeof limit, "frame limit %.3f ms", us / 1000.0);
+        logf("vk: dlssg: Reflex low latency %s, %s (%d)", opts.reflex == 2 ? "on with boost" : "on", limit, (int)r);
+    }
 }
 
 /// The interposer and its plugins: beside the game, or in its dlssg folder
@@ -324,6 +392,7 @@ void device_ready(VkPhysicalDevice physical, VkDevice) {
 }
 
 bool active() { return running.load(std::memory_order_relaxed); }
+bool reflex_on() { return active() && p_reflex; }
 
 void swapchain_created() {
     if (active()) reflex_apply();
@@ -334,13 +403,88 @@ void frame_start() {
     const uint32_t n = frame_no.fetch_add(1) + 1;
     sl::FrameToken* t = token(n);
     // (no hold before the first present: the driver has no present to time the frame by)
-    if (t && p_sleep && presented) p_sleep(*t);
+    // (Triforce: nor while the game's presenting thread takes the sleep itself, where its frame starts: pace)
+    if (t && p_sleep && presented && !game_sleeps.load(std::memory_order_acquire)) p_sleep(*t);
     if ((t = token(n))) {
         // (the game's simulation and its recording of the frame cannot be told apart from here: both markers at the start)
         p_marker(sl::PCLMarker::eSimulationStart, *t);
         p_marker(sl::PCLMarker::eSimulationEnd, *t);
         p_marker(sl::PCLMarker::eRenderSubmitStart, *t);
     }
+}
+
+/// (Triforce) Who holds the frame limit, as a log line when it changes (the first 40). why: the reason the game's own
+/// wait holds it. The game's presenting thread's
+void pace_say(int reflex, uint32_t us, const char* why) {
+    static int lines;
+    if (pace_said == reflex || lines >= 40) return;
+    pace_said = reflex, lines++;
+    if (reflex)
+        logf("vk: dlssg: frame limit: Reflex holds it where each frame starts (%.3f ms%s); the game's own wait steps aside",
+             us / 1000.0, pace_state.shown ? ", the frames on screen" : "");
+    else logf("vk: dlssg: frame limit: the game's own wait holds it (%s)", why);
+}
+
+bool pace(int64_t period_ns) {
+    if (!active()) return false;
+    // (the Reflex frame limit row off, the default: nothing is decided, asked of Streamline or logged, and the frame is the
+    // game's own wait's as before the row; a limit Reflex held until now is taken back at the next present, frame)
+    if (!opts.reflex_limit && !limit_want.load(std::memory_order_relaxed) && pace_said < 0) return false;
+    const int64_t hosted = hosted_ns.load(std::memory_order_acquire), now = host->now_ns();   // (in this order: now is not before hosted)
+    const int mult = shown_mult.load(std::memory_order_relaxed);
+    const bool refused = limit_refused.load(std::memory_order_acquire);
+    const int sleeps = low_latency.load(std::memory_order_relaxed);
+    const bool allowed = opts.reflex_limit != 0 && p_reflex && p_sleep && !refused && sleeps != 0;
+    // (only while frames are being generated: a menu, a load and a movie, where generation pauses, are the game's own
+    // wait's, as NX2navi leaves its movies to its pacer)
+    const uint64_t period = mult > 1 && period_ns > 0 ? (uint64_t)period_ns : 0;
+    uint32_t want = 0;
+    int found = DLSSG_PACE_SAME;
+    bool held = dlssg_pace_step(&pace_state, (uint64_t)now, period, mult, (uint64_t)hosted, allowed,
+                                limit_set.load(std::memory_order_acquire), &want, &found) != 0;
+    limit_want.store(want, std::memory_order_release);   // (handed to Streamline before the next present: frame)
+    const double ms = (double)period / 1e6;
+    if (found == DLSSG_PACE_FAST)
+        logf("vk: dlssg: Reflex does not hold the frame limit (over half of %d frames came sooner than three quarters of "
+             "%.2f ms): the game's own wait holds it for the rest of this run", DLSSG_PACE_WINDOW, ms);
+    else if (found == DLSSG_PACE_SHOWN)
+        logf("vk: dlssg: Reflex held the frames on screen to the limit, not the frames the game draws (over half of %d "
+             "came about %d times %.2f ms apart): it is given %.2f ms over the multiplier from now on", DLSSG_PACE_WINDOW, mult, ms, ms);
+    else if (found == DLSSG_PACE_SLOW)
+        logf("vk: dlssg: the frames still came about %d times %.2f ms apart: the game's own wait holds the limit for the "
+             "rest of this run", mult, ms);
+    if (held) {
+        // (Reflex's sleep here, where the game's frame starts, in the host's wait's place. The number is the frame after
+        // the one the replay's thread is on; the sleep itself is the driver's and takes none, VK_NV_low_latency2's
+        // vkLatencySleepNV. A sleep Streamline does not take leaves the frame, and the rest of the run, to the game's
+        // own wait: never neither)
+        // (counted while this thread is inside Streamline: shutdown waits for it before Streamline goes, and nothing is
+        // called once the exit has begun)
+        game_in_sleep.fetch_add(1);
+        const bool up = running.load();
+        sl::FrameToken* t = up ? token(frame_no.load(std::memory_order_relaxed) + 1) : nullptr;
+        const sl::Result r = t ? p_sleep(*t) : sl::Result::eErrorInvalidParameter;
+        game_in_sleep.fetch_sub(1);
+        if (r != sl::Result::eOk) {
+            held = false, pace_state.bad = 1, pace_state.last_ns = 0;
+            limit_want.store(0, std::memory_order_release);
+            if (up)
+                logf("vk: dlssg: Reflex's sleep was not taken where the game's frame starts (%d): the game's own wait holds "
+                     "the limit for the rest of this run", (int)r);
+        }
+    }
+    game_sleeps.store(held, std::memory_order_release);
+    if (held) pace_say(1, want, nullptr);
+    else if (!want)   // (a limit Streamline has yet to take is no change: it is handed over at the next present)
+        pace_say(0, 0, !opts.reflex_limit ? "the Reflex frame limit row is Off"
+                       : !p_reflex || !p_sleep ? "this Streamline has no Reflex sleep"
+                       : refused ? "Streamline refused the limit"
+                       : !sleeps ? "Reflex's sleep does not run on this card and driver"
+                       : pace_state.bad ? "Reflex did not hold the limit"
+                       : !period ? "no frame is generated now"
+                       : hosted ? "no present for 200 ms"
+                                : "no present yet");
+    return held;
 }
 
 void submit_end() {
@@ -350,12 +494,25 @@ void submit_end() {
 
 void frame(VkCommandBuffer cmd, uint32_t out_width, uint32_t out_height) {
     if (!active()) return;
+    // (Triforce) Reflex's frame limit as the game's presenting thread last asked for it (pace), before this present: on
+    // the thread that makes the presents, as every call of Streamline's options. The game's own wait stands aside only
+    // once Streamline took it (limit_set)
+    if ((limit_want.load(std::memory_order_acquire) != limit_set.load(std::memory_order_acquire) &&
+         !limit_refused.load(std::memory_order_relaxed)) ||
+        (opts.reflex == 2) != (mode_set == 2))   // ((Triforce) the NVIDIA Reflex row changed between On and On + Boost)
+        reflex_apply();
     const uint32_t n = frame_no.load();
     sl::FrameToken* t = token(n);
     if (!t) return;
     const sl::ViewportHandle vp(0);
     fsr3_inputs::Frame in;
-    const bool have = fsr3_inputs::take(in) && in.depth_image && in.motion_image;
+    // (Triforce, the hold of the last picture: vk_replay.cpp do_present) a present of the held picture is a frame with no
+    // scene: the held frame's depth and motion taken and dropped, never given with a picture they are not of; and the first
+    // frame shown after a hold is a new start, nothing generated between it and the picture before the hold
+    static bool after_hold;
+    const bool held = present_hold_now();
+    const bool have = fsr3_inputs::take(in) && in.depth_image && in.motion_image && !held;
+    if (held || present_after_hold()) after_hold = true;   // (the latter too where the hold had no picture to show)
     int want = have && !menu_is_open();
     if (want == mode_now) mode_pending = 0;
     else if (++mode_pending >= kSettle) mode_now = want, mode_pending = 0;
@@ -409,7 +566,8 @@ void frame(VkCommandBuffer cmd, uint32_t out_width, uint32_t out_height) {
         c.depthInverted = sl::Boolean::eTrue;   // (FSR's copy of the depth: 1 at the near plane)
         c.cameraMotionIncluded = sl::Boolean::eTrue;
         c.motionVectors3D = sl::Boolean::eFalse;
-        c.reset = in.reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+        c.reset = in.reset || after_hold ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+        after_hold = false;
         p_constants(c, *t, vp);
         last = c, have_last = true;
         sl::Resource rd(sl::ResourceType::eTex2d, (void*)in.depth_image, nullptr, (void*)in.depth, (uint32_t)VK_IMAGE_LAYOUT_GENERAL);
@@ -446,6 +604,8 @@ void frame(VkCommandBuffer cmd, uint32_t out_width, uint32_t out_height) {
 }
 
 void present_marker(bool after) {
+    // (Triforce: when the newest present went out, for pace: with the Reflex frame limit row on only)
+    if (after && opts.reflex_limit && active()) hosted_ns.store(host->now_ns(), std::memory_order_release);
     sl::FrameToken* t = active() ? token(frame_no.load()) : nullptr;
     if (!t) return;
     p_marker(after ? sl::PCLMarker::ePresentEnd : sl::PCLMarker::ePresentStart, *t);
@@ -483,6 +643,9 @@ void shutdown() {
     // as the process exits right after this)
     dev.present_mu.lock();
     running = false, loaded = -1;
+    // (Triforce: nor the game's presenting thread inside Reflex's sleep, pace: a frame's time at most. Waited for half a
+    // second, then Streamline goes as it did before that sleep was there)
+    for (int i = 0; i < 100 && game_in_sleep.load(); i++) Sleep(5);
     if (p_shutdown) p_shutdown();
     logf("vk: dlssg: Streamline shut down");
 }

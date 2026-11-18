@@ -12,6 +12,11 @@ gives the same programs other bytes (its fragment NaN guard, its execution modes
 CRC-32 of the module Hookshot makes (RX_VK_DUMP_ALL_SPV=<folder> writes them, named by it). A change to Hookshot's emitter
 changes those: dump again and match by what the shader reads.
 
+(Triforce) RenoDX's mod has two tone mappers, Vanilla and PsychoV35. RenoDRT, which RenoDX's library among the fetched
+sources has and the mod does not call, and the gamma correction come from three files of Triforce's own that are compiled
+together with RenoDX's scene shaders and its encoder (gpu/vk/shaders/renodx_glue; GLUE below). RenoDX's sources are compiled
+as fetched: nothing of them is changed or kept.
+
 Usage:  python -I scripts/renodx_shaders.py [--platform linux|windows] [<folder>]
           <folder>: default work/renodx. Then build with HOOKSHOT_RENODX=<folder> (nx2/make_game.py --renodx does both).
         python -I scripts/renodx_shaders.py --from <renodx checkout> <slangc> [<folder>]
@@ -68,6 +73,15 @@ ALSO = {
 }
 FLAGS = ["-stage", "fragment", "-O3", "-g0", "-entry", "main", "-Wno-30056", "-Wno-15205", "-Wno-30081", "-Wno-41035",
          "-DNDEBUG", "-target", "spirv"]
+
+# (Triforce) What RenoDX's mod does not have and NX2navi's HDR does: RenoDRT as a third tone mapper and the gamma
+# correction. Triforce's own files in GLUE_DIR, with none of RenoDX's code in them, compiled in front of RenoDX's shader by
+# its part (the third entry of a SHADERS row): 2 the two scene shaders, 0 the output encoder; the fog (1) is compiled as
+# it is. Each says in its head how it meets RenoDX's source. GLUE_FILES: all of them, with the one the others include;
+# their bytes are in the header's stamp, so a change to one compiles the header again
+GLUE_DIR = os.path.join(ROOT, "gpu", "vk", "shaders", "renodx_glue")
+GLUE = {0: "triforce_output.slangi", 2: "triforce_scene.slangi"}
+GLUE_FILES = ("triforce_settings.slangi", "triforce_output.slangi", "triforce_scene.slangi")
 
 # (path in RenoDX's repository, its SHA-256): its license, and what the four shaders read (slangc -depfile lists them)
 FILES = [
@@ -229,10 +243,21 @@ def fetch(folder, platform, opener=urllib.request.urlopen, say=print):
     os.remove(archive)
 
 
+def glue_bytes():
+    """(Triforce) The glue files as the header's stamp takes them: each one's name and its bytes, line ends as LF (a
+    checkout with CRLF is the same glue)"""
+    out = []
+    for name in GLUE_FILES:
+        with open(os.path.join(GLUE_DIR, name), "rb") as f:
+            out.append((name, f.read().replace(b"\r\n", b"\n")))
+    return out
+
+
 def stamp():
-    """What a compiled header is made from: the commit, the compiler, the shaders and their flags. In the header's first line,
-    so one made from something else is made again"""
+    """What a compiled header is made from: the commit, the compiler, the shaders and their flags, and (Triforce) the glue
+    compiled with them. In the header's first line, so one made from something else is made again"""
     h = hashlib.sha256(repr((COMMIT, SLANG_VERSION, SHADERS, FLAGS, FILES, sorted(ALSO.items()))).encode())
+    h.update(repr((sorted(GLUE.items()), glue_bytes())).encode())
     return "// renodx_shaders.py %s" % h.hexdigest()[:16]
 
 
@@ -245,22 +270,50 @@ def current(folder):
         return f.readline().rstrip("\n") == stamp()
 
 
-def compile_header(renodx, compiler, out_path, say=print, first_line=None):
+def unit(name, kind):
+    """(Triforce) What is compiled for one of RenoDX's shaders that has glue (GLUE, by its part): the glue, then RenoDX's
+    source as it is, both found by name in the folders compile_command gives the compiler. The two first lines are those
+    RenoDX's shader opens with, which have to come before anything else. None: the shader is compiled alone"""
+    if kind not in GLUE:
+        return None
+    return ('#version 450\n#extension GL_EXT_scalar_block_layout : require\n'
+            '// scripts/renodx_shaders.py: Triforce\'s glue, then RenoDX\'s shader\n#include "%s"\n#include "%s"\n' % (GLUE[kind], name))
+
+
+def compile_command(compiler, name, kind, src, tmp, crc):
+    """The compiler's command for one shader, run in RenoDX's folder of them (src), and the SPIR-V file it writes. A shader
+    with glue: its unit written into tmp and compiled from there, with RenoDX's folder and the glue's to find the two in"""
+    spv = os.path.join(tmp, "%08X.spv" % crc)
+    text = unit(name, kind)
+    if text is None:
+        return [compiler, name] + FLAGS + ["-o", spv], spv
+    path = os.path.join(tmp, "%08X.frag.slang" % crc)
+    with open(path, "w", newline="\n", encoding="utf-8") as f:
+        f.write(text)
+    return [compiler, path, "-I", src, "-I", GLUE_DIR] + FLAGS + ["-o", spv], spv
+
+
+def compile_header(renodx, compiler, out_path, say=print, first_line=None, run=subprocess.run):
     """renodx_spv.h from a RenoDX checkout (or the folder's renodx/) with slangc"""
     src = os.path.join(renodx, *GAME.split("/"))
     lines = ([first_line] if first_line else []) + [
         "// Generated by scripts/renodx_shaders.py from RenoDX (MIT, Carlos Lopez): do not edit, never commit.",
         "// Each array replaces the module of Hookshot's whose CRC-32 names it (vk_renodx.cpp).", "#pragma once",
-        "#include <cstdint>", ""]
+        "#include <cstdint>"]
+    if GLUE:   # (what vk_renodx.cpp looks for before it says the rows of the glue do something)
+        lines += ["// (Triforce) the scene shaders and the encoder are compiled with gpu/vk/shaders/renodx_glue: RenoDRT, the gamma correction",
+                  "#define RENODX_SPV_GLUE 1"]
+    lines.append("")
     with tempfile.TemporaryDirectory() as tmp:
         for crc, name, kind, what in SHADERS:
-            spv = os.path.join(tmp, "%08X.spv" % crc)
-            r = subprocess.run([compiler, name] + FLAGS + ["-o", spv], cwd=src, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            command, spv = compile_command(compiler, name, kind, os.path.abspath(src), tmp, crc)
+            r = run(command, cwd=src, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             if r.returncode or not os.path.isfile(spv):
                 raise ValueError("renodx: %s did not compile (%s)" % (name, r.stdout.decode("utf-8", "replace").strip()[-400:]))
-            data = open(spv, "rb").read()
+            with open(spv, "rb") as f:
+                data = f.read()
             words = struct.unpack("<%dI" % (len(data) // 4), data)
-            lines.append("// %s: %s" % (name, what))
+            lines.append("// %s: %s%s" % (name, what, ", with %s" % GLUE[kind] if kind in GLUE else ""))
             lines.append("static const uint32_t RENODX_%08X[] = {" % crc)
             for i in range(0, len(words), 12):
                 lines.append("    " + ", ".join("0x%08x" % w for w in words[i:i + 12]) + ",")

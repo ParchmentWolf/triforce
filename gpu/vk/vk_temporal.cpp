@@ -33,8 +33,8 @@
 //
 // The Insert menu's Upscaler row (opts.dlss, upscaler_rows.h) chooses the engine; RX_VK_DLSS=1 / 2 (DLSS, DLAA) or
 // RX_VK_FSR4=1 / 2 (FSR 4, its native anti-aliasing) over it, and =0 takes that engine out for the run. AMD FSR 3.1
-// (vk_fsr3.cpp, the row's value 3 or RX_VK_FSR=1) has inputs of its own (vk_fsr3_inputs.cpp): while it upscales, this chain
-// stands aside.
+// (vk_fsr3.cpp, the row's value 3, 6 for its Native AA, or RX_VK_FSR=1 / 2) has inputs of its own (vk_fsr3_inputs.cpp):
+// while it upscales, this chain stands aside.
 // RX_VK_DLSS_DEBUG=motion: the motion vectors shown instead of the picture (|x|, |y| over 16 px as red and green, the actors'
 // in it); =characters: a grey picture, blue where a draw moves by itself (not as the camera moves what is there: a still
 // character is grey), brighter the further apart, up to 8 px; =alternate: every other frame the game's own upscale (a test's reference beside the engine's). (The names are
@@ -56,6 +56,7 @@
 #include "dlss_actor.h"
 #include "dlss_checks.h"
 #include "dlss_math.h"
+#include "stream_order.h"
 #include "upscaler_rows.h"
 #include "vk_dlss.h"
 #include "vk_draw.h"
@@ -78,6 +79,7 @@
 namespace mkwvk {
 
 namespace ur = upscaler_rows;
+bool present_held_last();   // ((Triforce) vk_replay.cpp: the last present held its frame, the hold of the last picture)
 
 namespace {
 int env_switch(const char* name) {   // (-1: unset)
@@ -115,7 +117,8 @@ bool temporal_wanted() { return temporal_mode() != ur::GAME; }
 namespace {
 bool pre_wanted(int mode);   // (below: the engine, or AMD FSR 3.1, before the game's bloom and tone mapping)
 }
-bool temporal_full_scale() { return ur::full_scale(temporal_mode()); }
+// (AMD FSR 3.1's Native AA too, which is not an engine of this chain: vk_fsr3.cpp fsr3_native)
+bool temporal_full_scale() { return ur::full_scale(temporal_mode()) || fsr3_native(); }
 
 namespace {
 
@@ -720,6 +723,10 @@ int actor_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, co
     } timed{s};
     std::vector<State::Skin> skins = std::move(s.skins);
     s.skins.clear();
+    // (Triforce: noted by the parallel replay's threads in the order they recorded them: in stream order again, each named by
+    // its place among its model's draws in it, as on the replay thread alone. stream_order.h renumber)
+    stream_order::renumber(skins, [](const State::Skin& k) { return k.k.stream_pos; },
+                           [](State::Skin& k) -> uint64_t& { return k.key; });
     std::unordered_map<uint64_t, State::Pose> old = std::move(s.poses);
     s.poses.clear();
     if (motion_mode() != kMotionBones || skins.empty() || !make_actor_pipeline()) return 0;
@@ -843,6 +850,9 @@ std::vector<State::Captured> take_captures() {
     State& s = st();
     std::vector<State::Captured> c = std::move(s.captured);
     s.captured.clear(), s.captured_models.clear();
+    // (Triforce: in stream order and named again, as the skinned draws are in actor_motion)
+    stream_order::renumber(c, [](const State::Captured& k) { return k.k.stream_pos; },
+                           [](State::Captured& k) -> uint64_t& { return k.key; });
     s.capture_bytes_peak = std::max(s.capture_bytes_peak, s.capture_used);
     s.capture_at = (s.capture_at + 1) % kCaptureBuffers;
     s.capture_used = 0;
@@ -1616,7 +1626,9 @@ bool chain(VkCommandBuffer cmd, int mode, Engine& engine, const Camera& cam, con
 
     const uint64_t now = texture_frame_no();
     const uint64_t last = s.last_frame;
-    const bool reset = !last || now - last > 2;
+    // (Triforce, the hold of the last picture: vk_replay.cpp do_present) and after a present that held its frame: what was drawn
+    // while new textures were still owed (the dummy in their place) is not carried into the picture shown after the hold
+    const bool reset = !last || now - last > 2 || present_held_last();
     struct {
         float reproject[16];
         float jitter[2];
@@ -1780,12 +1792,32 @@ bool temporal_pre_point(const Texture* color0, uint64_t program, bool* late) {
         return false;
     }
     if (!s.cam.valid || !s.cam.color || texture_frame_no() - s.cam.frame > 1) return false;
-    if (color0 == s.cam.color) return s.pre_candidate = {}, false;   // (the scene still being drawn)
-    const State::PrePoint here{program, color0->format, color0->width, color0->height};
-    if (!s.pre_candidate.program) s.pre_candidate = here;
-    // (the point only as the first draw after the scene's last: a frame whose first is another (the point learnt from a
-    // frame without the bloom, whose first was the tone mapping) is left to the dispatch, which learns this frame's)
-    return here == s.pre_key && s.pre_candidate == here;
+    // (a draw into the scene: the scene still being drawn. The point only as the first draw after the scene's last: a frame
+    // whose first is another (the point learnt from a frame without the bloom, whose first was the tone mapping) is left to
+    // the dispatch, which learns this frame's. Triforce: the rule is stream_order.h's, which the dry pass asks the same way)
+    return stream_order::pre_point_step(s.pre_candidate, s.pre_key, color0 == s.cam.color, [&] {
+        return State::PrePoint{program, color0->format, color0->width, color0->height};
+    });
+}
+
+bool temporal_pre_point_dry(const Texture* color0, uint64_t (*program)(void*), void* ctx) {
+    if (!color0 || !pre_wanted(temporal_mode())) return false;
+    State& s = st();
+    std::lock_guard lk(s.mu);
+    // (pending: the caller records such a command buffer on the replay thread alone, before it gets here; and the rest as
+    // temporal_pre_point, without its log of late draws, which only a pending frame has)
+    if (s.pre_pending) return false;
+    if (!s.cam.valid || !s.cam.color || texture_frame_no() - s.cam.frame > 1) return false;
+    return stream_order::pre_point_step(s.pre_candidate, s.pre_key, color0 == s.cam.color, [&] {
+        return State::PrePoint{program(ctx), color0->format, color0->width, color0->height};
+    });
+}
+
+bool temporal_pre_pending() {
+    if (!pre_wanted(temporal_mode())) return false;
+    State& s = st();
+    std::lock_guard lk(s.mu);
+    return s.pre_pending;
 }
 
 Texture* temporal_pre_tonemap(VkCommandBuffer cmd) {

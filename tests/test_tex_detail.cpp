@@ -44,6 +44,21 @@ int main() {
     expect(parse(nullptr) == -1 && parse("auto") == -1 && parse("") == -1 && parse("1") == -1, "auto, unset, anything else");
     expect(parse("full") == kFull && parse("reduced") == kReduced && parse("low") == kLow, "the three names");
 
+    // ---- the Texture detail row: Automatic, then the same three levels; the switch over it, the card under it
+    expect(from_row(0) == -1 && from_row(1) == kFull && from_row(2) == kReduced && from_row(3) == kLow, "the row's four values");
+    expect(from_row(-1) == -1 && from_row(4) == -1 && from_row(99) == -1, "a value past the row: Automatic");
+    for (int card = kFull; card <= kLow; card++) {
+        expect(choose(-1, from_row(0), card) == card, "Automatic, no switch: the card's own level");
+        for (int row = 1; row <= 3; row++) {
+            expect(choose(-1, from_row(row), card) == row - 1, "the row over the card's own");
+            for (int asked = kFull; asked <= kLow; asked++)
+                expect(choose(asked, from_row(row), card) == asked, "the switch over the row");
+        }
+        for (int asked = kFull; asked <= kLow; asked++)
+            expect(choose(asked, from_row(0), card) == asked, "the switch over Automatic");
+    }
+    expect(choose(parse("auto"), from_row(2), kFull) == kReduced, "RX_VK_TEX_DETAIL=auto leaves the row");
+
     // ---- what a texture loses
     expect(skip(kFull, 2048, 2048, 12) == 0, "full: nothing");
     expect(skip(kReduced, 2048, 2048, 12) == 1, "reduced: the largest level");

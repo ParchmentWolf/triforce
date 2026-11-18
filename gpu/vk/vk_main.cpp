@@ -20,6 +20,7 @@
 #include "vk_framegen.h"
 #include "vk_internal.h"
 #include "gpu_choice.h"
+#include "present_mode.h"   // (the swapchain's present mode: the VSync row and the switches)
 #include "vk_menu.h"
 #include "vk_dlss.h"
 #include "vk_fsr4.h"
@@ -222,6 +223,8 @@ bool pick_device() {
     }
     dev.physical = all[best];
     vkGetPhysicalDeviceProperties(dev.physical, &dev.props);
+    // (Triforce, 11-16) the recorder thread by default on NVIDIA with 12 logical processors or more (vk_recorder.h mode_from_env)
+    recorder_auto(dev.props.vendorID == 0x10DE && std::thread::hardware_concurrency() >= 12);
     vkGetPhysicalDeviceMemoryProperties(dev.physical, &dev.memory);
     return true;
 }
@@ -373,7 +376,7 @@ bool create_device() {
     // (bounds-checked buffer access: an out-of-range access dropped instead of faulting the device. On by default: the GPU
     // culling pass 53caac5f faulted the device while a save loaded, about one start in three, and the scene's lighting read garbage
     // for single frames (the black flashes); with it, neither in A/B runs at the same GPU time. Lichii's OoT branch keeps it on too.
-    // The 'Robust buffers' row of triforce_options.ini chooses (0 Auto: on, on every vendor; 1 Off; 2 On); RX_VK_ROBUST=0 or 1
+    // The 'Robust buffers' row of triforce_options.ini chooses (0 Auto: off since 11-17, the owner's call; 1 Off; 2 On); RX_VK_ROBUST=0 or 1
     // over it. Off is null descriptors only: some NVIDIA cards ran slower with it on, issues 394, 418, 419)
     static const bool robust = []() -> bool {
         if (const char* e = getenv("RX_VK_ROBUST")) return atoi(e) != 0;
@@ -381,7 +384,7 @@ bool create_device() {
         const DWORD n = game_module_path(exe, MAX_PATH);   // (the game folder, not bin beside the launcher: vk_paths.h)
         std::string ini(exe, n);
         ini = ini.substr(0, ini.find_last_of("\\/") + 1) + "triforce_options.ini";
-        int v = 0;   // (Auto)
+        int v = 1;   // (no line: Off, the row's default)
         if (FILE* f = fopen(ini.c_str(), "r")) {
             char line[80];
             while (fgets(line, sizeof line, f))
@@ -391,7 +394,8 @@ bool create_device() {
                 }
             fclose(f);   // (once: the PR closed it twice when the row said Auto)
         }
-        return v != 1;   // (Auto and On: on)
+        // ((Triforce) 11-17, the owner's "keep robust buffers off by default": Auto is off now; only On (2) turns it on)
+        return v == 2;
     }();
     const bool robust_ok = robust && robust2.robustBufferAccess2 && f.features.robustBufferAccess;
     robust2.robustBufferAccess2 = robust_ok ? VK_TRUE : VK_FALSE;
@@ -414,6 +418,7 @@ bool create_device() {
     dev.eds3_clamp = dev.dynamic_state3 && eds3.extendedDynamicState3DepthClampEnable;
     dev.eds3_blend = dev.dynamic_state3 && eds3.extendedDynamicState3ColorBlendEnable &&
                      eds3.extendedDynamicState3ColorBlendEquation && eds3.extendedDynamicState3ColorWriteMask;
+    bool amd_older = false;   // (AMD's Windows driver for RDNA 1 and 2: vk_vendor.h amd_older_compiler; the task + mesh default below)
     {   // (hookshot) the vendor and driver workarounds this device needs: vk_vendor.h, each forced by its RX_VK_ switch
         VkPhysicalDeviceDriverProperties drv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
         VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
@@ -425,6 +430,7 @@ bool create_device() {
         facts.device_type = p2.properties.deviceType;
         facts.driver_info = drv.driverInfo;
         dev.fixes = vendor_fixes(facts);
+        amd_older = amd_older_compiler(facts);
         vendor_fixes_env(dev.fixes, [](const char* name) -> const char* { return getenv(name); });
         logf("vk: vendor fixes for %s (%s): out-of-bounds texel fetches 0 %d, NaN tests by bits %d, gather offset %d",
              drv.driverName, drv.driverInfo, (int)dev.fixes.fetch_bounds, (int)dev.fixes.nan_bits, (int)dev.fixes.gather_offset);
@@ -470,9 +476,15 @@ bool create_device() {
     // (driver 0x800161) the native path lost the device within minutes at Hyrule Castle's entrance, while the fallback played
     // 25 minutes there with none. Navi 21 is 0x73bf (RX 6800, 6800 XT, 6900 XT), 0x73af (RX 6900 XT, XTXH boards) and 0x73a5
     // (RX 6950 XT): the same chip on the same driver, not tested on their own. Navi 22 is 0x73df (RX 6700 XT)
-    task_mesh_fallback = dev.props.vendorID == 0x1002 &&
-                         (dev.props.deviceID == 0x73bf || dev.props.deviceID == 0x73af || dev.props.deviceID == 0x73a5 ||
-                          dev.props.deviceID == 0x73df);
+    // (Triforce, after NX2navi's mesh_fallback = auto) Every GPU of that driver branch now, not those four chips alone: AMD's
+    // Windows driver for RDNA 1 and 2, the one whose driverInfo names the "AMD proprietary shader compiler" (vk_vendor.h
+    // amd_older_compiler). It has mesh shaders on RDNA 2 only, so this is the RX 6000 cards and that generation's integrated
+    // GPUs. NX2navi's players lost the device minutes into play on RX 6600 to RX 6950 XT cards alike, with the pass in
+    // progress one that starts with a native mesh draw, and the reports here of a game that stops after the first cutscene
+    // name an RX 6600 beside the RX 6700 XT. That the native mesh path is the cause on the other chips is not shown: this
+    // is the path that played where it was tried, at the cost of a compute pass for each mesh draw. The driver for RDNA 3
+    // and 4 (LLPC) draws them natively, as before. tests/test_task_mesh_fallback_devices.py
+    task_mesh_fallback = dev.props.vendorID == 0x1002 && amd_older;
 #endif
     if (const char* e = getenv("RX_VK_TASK_MESH_FALLBACK")) task_mesh_fallback = atoi(e) != 0;
     dev.task_mesh_fallback = task_mesh_fallback && dev.mesh_shader && f12.bufferDeviceAddress && !getenv("RX_VK_NO_MESH_FALLBACK");
@@ -560,6 +572,24 @@ void swap_views_make(VkImageUsageFlags usage, VkFormat format) {
     }
 }
 
+// (Triforce) the present mode of the swapchain there is (present_mode.h's numbers; -1 none yet, or offscreen): the VSync row
+// says what its choice came to on this driver
+static std::atomic<int> present_mode_now{-1};
+int swapchain_present_mode() { return present_mode_now.load(std::memory_order_relaxed); }
+
+// (Triforce) The GPU the game renders on, its LUID (VkPhysicalDeviceIDProperties.deviceLUID, 8 bytes), for the performance
+// overlay's GPU load: Windows' counters name an adapter by it (perf_machine.cpp; after NX2navi's perf_gpu_once). False when
+// there is no device yet or the driver gives none
+bool gpu_device_luid(uint8_t out[8]) {
+    if (!dev.physical) return false;
+    VkPhysicalDeviceIDProperties id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+    VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &id};
+    vkGetPhysicalDeviceProperties2(dev.physical, &p2);
+    if (!id.deviceLUIDValid) return false;
+    std::memcpy(out, id.deviceLUID, VK_LUID_SIZE);
+    return true;
+}
+
 bool create_swapchain(uint32_t width, uint32_t height) {
     VkSurfaceCapabilitiesKHR caps;
     VkResult result = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(dev.physical, dev.surface, &caps);
@@ -622,23 +652,24 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     }
     if (result != VK_SUCCESS || modes.empty())
         logf("vk: querying present modes failed (VkResult %d, count %u); trying mandatory FIFO mode", (int)result, n);
-    VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
     const bool force_fifo = getenv("RX_VK_FIFO") != nullptr;   // (as on a card or driver with vsync forced)
-    if (!force_fifo) {
-        for (auto m : modes)
-            if (m == VK_PRESENT_MODE_MAILBOX_KHR) mode = m;
-        // (Windows, no mailbox: AMD's driver has none, and FIFO held anything under 60 fps at 30.
-        //  Linux: immediate on NVIDIA's X11 path turns vblank off for every output, so the other
-        //  monitor and other programs tear. RX_VK_IMMEDIATE=1 still asks for it.)
-        const bool want_immediate = getenv("RX_VK_IMMEDIATE") != nullptr;
+    // (Windows, no mailbox: AMD's driver has none, and FIFO held anything under 60 fps at 30.
+    //  Linux: immediate on NVIDIA's X11 path turns vblank off for every output, so the other
+    //  monitor and other programs tear. RX_VK_IMMEDIATE=1 still asks for it.)
+    const bool want_immediate = getenv("RX_VK_IMMEDIATE") != nullptr;
+    // (Triforce) the Insert menu's VSync row off asks for immediate too, wherever the surface lists it; on, the choice is the
+    // one above, from before the row. present_mode.h has the rule, the two switches still over the row
+    bool has_mailbox = false, has_immediate = false;
+    for (auto m : modes) has_mailbox |= m == VK_PRESENT_MODE_MAILBOX_KHR, has_immediate |= m == VK_PRESENT_MODE_IMMEDIATE_KHR;
 #ifdef _WIN32
-        if (want_immediate || mode == VK_PRESENT_MODE_FIFO_KHR)
+    const bool windows = true;
 #else
-        if (want_immediate)
+    const bool windows = false;
 #endif
-            for (auto m : modes)
-                if (m == VK_PRESENT_MODE_IMMEDIATE_KHR) mode = m;
-    }
+    const present_mode::Mode chosen = present_mode::choose(has_mailbox, has_immediate, opts.vsync != 0, windows, force_fifo, want_immediate);
+    const VkPresentModeKHR mode = chosen == present_mode::kMailbox     ? VK_PRESENT_MODE_MAILBOX_KHR
+                                  : chosen == present_mode::kImmediate ? VK_PRESENT_MODE_IMMEDIATE_KHR
+                                                                       : VK_PRESENT_MODE_FIFO_KHR;
     VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     ci.surface = dev.surface;
     ci.minImageCount = std::max(caps.minImageCount, 4u);   // (hookshot: mailbox with frame interpolation: an image always free)
@@ -727,8 +758,9 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     dev.swap_format = fmt.format;
     dev.swap_extent = {width, height};
     dev.swap_images = std::move(images);
-    logf("vk: swapchain %ux%u, %u images, %s", width, height, n,
-         mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo");
+    logf("vk: swapchain %ux%u, %u images, %s%s", width, height, n, present_mode::name(chosen),
+         force_fifo ? " (RX_VK_FIFO)" : want_immediate ? " (RX_VK_IMMEDIATE)" : opts.vsync ? "" : " (VSync off)");
+    present_mode_now.store((int)chosen, std::memory_order_relaxed);
     swap_views_make(ci.imageUsage, mutable_view ? view_formats[1] : fmt.format);
     reflex_swapchain_created(sc);   // (NVIDIA Reflex: its sleep mode on the new swapchain)
     dlssg::swapchain_created();     // (Triforce, DLSS frame generation: Streamline's Reflex mode is the swapchain's too)

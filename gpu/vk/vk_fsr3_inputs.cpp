@@ -23,7 +23,9 @@
 #include "vk_draw.h"   // (descriptors_disturbed)
 #include "vk_fsr3.h"
 #include "vk_fsr3fi.h"
+#include "vk_fsr4.h"   // (Triforce: fsr4fg, AMD FSR 4's frame generation takes these inputs too)
 #include "vk_texture.h"
+#include "vk_temporal.h"   // ((Triforce) temporal_scene_format: the run's scene format, B10G11R11 or RenoDX's RGBA16F)
 
 #include "shaders/fsr3_prep_comp_spv.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
@@ -213,13 +215,18 @@ VkImageView depth_view(Texture* t) {
 
 } // namespace
 
-// (Triforce: or NVIDIA DLSS frame generation, which takes the same depth and motion: vk_dlssg.cpp)
-bool wanted() { return fsr3_wanted() || fsr3fi::frames_wanted() != 0 || dlssg::active(); }
+// (Triforce: or NVIDIA DLSS frame generation, which takes the same depth and motion: vk_dlssg.cpp; or AMD FSR 4's frame
+// generation, the Frame generation row's AMD FSR 4: vk_fsr4.h fsr4fg)
+bool wanted() { return fsr3_wanted() || fsr3fi::frames_wanted() != 0 || dlssg::active() || fsr4fg::frames_wanted(); }
 
 void note_scene_draw(const Texture* color0, uint32_t width, uint32_t height, Texture* depth, uint64_t camera,
                      uint64_t camera_size) {
     if (!color0 || !depth || !camera || camera_size < 0x230 || width < 640 || height < 360) return;
-    if (color0->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || !wanted()) return;
+    // ((Triforce, 11-16: DLSS frame generation never made a frame for the owner, HDR Native with RenoDX) the scene's target in
+    // the format this run draws it in, as vk_temporal.cpp's note takes it: B10G11R11, or RGBA16F where the run's scene is
+    // (RenoDX's HDR, host/nn_vi.c hos_scene_rgba16f). With B10G11R11 alone no camera was kept in an RGBA16F run, so frame
+    // generation's inputs were never made and it stayed paused)
+    if (!temporal_scene_format(color0->format) || !wanted()) return;
     State& s = st();
     std::lock_guard lk(s.mu);
     const uint64_t now = texture_frame_no();

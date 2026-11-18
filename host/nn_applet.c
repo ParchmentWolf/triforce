@@ -108,13 +108,14 @@ static int handheld(void) {
     return v;
 }
 /* (hookshot) The Insert menu's Output resolution (output_res=, HOS_OUTPUT_RES over it), docked only: 0 the game's 2048 x 1152,
-   1 2560 x 1440, 2 3840 x 2160, 3 1920 x 1080, 4 5120 x 1440, 5 5120 x 2880. The game's frame is its display size (2560 x 1440 as shipped;
+   1 2560 x 1440, 2 3840 x 2160, 3 1920 x 1080, 4 5120 x 1440, 5 5120 x 2880, 6 5120 x 2160 ((Triforce) after the others: a
+   saved number keeps its size). The game's frame is its display size (2560 x 1440 as shipped;
    nx2/oot_patches.py apply_output_size asks hos_output_size) times its graphics scale (GetCurrentGraphicsScale: 0 x1, 1 x0.8,
    2 x0.667). Here it saw scale 1 (x0 left at the call before's answer), so 2048 x 1152; each explicit size uses x1. */
 static int output_mode(void) {
     static int v = -1;
     if (v < 0) {
-        static const char *const names[] = {"2048x1152 (the game's)", "2560x1440", "3840x2160", "1920x1080", "5120x1440", "5120x2880"};
+        static const char *const names[] = {"2048x1152 (the game's)", "2560x1440", "3840x2160", "1920x1080", "5120x1440", "5120x2880", "5120x2160"};
         v = getenv("HOS_OUTPUT_RES") ? atoi(getenv("HOS_OUTPUT_RES")) : ini_option("output_res", 0);
         if ((unsigned)v >= sizeof names / sizeof *names || handheld()) v = 0;
         hos_log("oe: output resolution %s", names[v]);
@@ -127,6 +128,7 @@ uint32_t hos_output_size(int height) {
     case 3: return height ? 1080 : 1920;
     case 4: return height ? 1440 : 5120;
     case 5: return height ? 2880 : 5120;
+    case 6: return height ? 2160 : 5120;   /* ((Triforce) 5120 x 2160) */
     default: return height ? 1440 : 2560;
     }
 }
@@ -151,7 +153,9 @@ uint64_t hos_rt_pool_size(uint64_t game) {
     if (wide_px > px) px = wide_px;
     const uint64_t scaled = px > 2560 * 1440 ? (game * px / (2560 * 1440) + 0xfffff) & ~0xfffffULL : game;
     const uint64_t minimum = 512ULL << 20, five_k = 900ULL << 20;
-    const int is_five_k = hos_output_size(0) == 5120 && hos_output_size(1) == 2880;
+    /* ((Triforce) and the 5120 x 2160 output: scaled, its pool is 915 MB, more than any pool known to pass the game's reservation
+       at a 5120-wide output; 900 MB ran the 3D at the full 5120 x 2880, a third more pixels) */
+    const int is_five_k = hos_output_size(0) == 5120 && hos_output_size(1) >= 2160;
     extern int hos_scene_rgba16f(void);
     /* (local, RenoDX port) the scene's colour target at 8 bytes a pixel in place of 4: room for it and its copies, at 3840 x 2160 33 MB each */
     const uint64_t rgba16f = hos_scene_rgba16f() ? 128ULL << 20 : 0;
@@ -162,8 +166,8 @@ uint64_t hos_rt_pool_size(uint64_t game) {
     if (!logged++) {
         hos_log("applet: render target pool %llu MB (the game's %llu MB)", (unsigned long long)(v >> 20), (unsigned long long)(game >> 20));
         if (v != asked)
-            hos_log("applet: render target pool: %llu MB asked (the 5120x2880 output with an RGBA16F scene), kept to %llu MB: more fails the game's reservation at boot",
-                    (unsigned long long)(asked >> 20), (unsigned long long)(v >> 20));
+            hos_log("applet: render target pool: %llu MB asked (the %ux%u output), kept to %llu MB: more fails the game's reservation at boot",
+                    (unsigned long long)(asked >> 20), hos_output_size(0), hos_output_size(1), (unsigned long long)(v >> 20));
     }
     return v;
 }

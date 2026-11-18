@@ -32,6 +32,9 @@ void device_ready(VkPhysicalDevice physical, VkDevice device);
 /// Frame generation runs in this session (the swapchain's presents go through Streamline). The game's frames then
 /// reach the display from the replay's thread alone, and Reflex is Streamline's.
 bool active();
+/// (Triforce) Reflex runs through Streamline in this session (frame generation runs and Streamline has Reflex): the
+/// renderer's own Reflex (vk_reflex.cpp) stands aside, and the Insert menu's NVIDIA Reflex row shows Streamline's
+bool reflex_on();
 
 /// A swapchain was made: Reflex's mode is the swapchain's and is set again.
 void swapchain_created();
@@ -39,6 +42,12 @@ void swapchain_created();
 /// Where a frame of the game starts (after the present of the one before): Reflex's sleep, then the frame's first
 /// latency markers. Frames are numbered from here.
 void frame_start();
+/// (Triforce) Where a frame of the game starts, on the game's presenting thread (the host's window acquire, asked
+/// through vk_pace.cpp), period_ns the period of the Game frame rate cap in effect: who holds this frame to it
+/// (dlssg_pace.h). true: Reflex does, and its sleep was taken inside this call: the host's own wait steps aside.
+/// false: the host waits as before, and frame_start keeps Reflex's sleep. Always false with the Reflex frame limit
+/// row off, while no frame is generated, and in a build without Streamline.
+bool pace(int64_t period_ns);
 /// The frame's submissions went out.
 void submit_end();
 /// Before the present's command buffer ends: this frame's camera, depth and motion for Streamline, and generation on

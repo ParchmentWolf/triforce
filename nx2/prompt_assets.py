@@ -3,12 +3,14 @@ and Kenney's Input Prompts (CC0, third_party/kenney_input).
 
     python -I nx2/prompt_assets.py --romfs <dir> --out <game folder>/prompts
 
-Writes <out>/<face>/External.bfotf for each face (switch, xbox, ps4, ps5, steamdeck). Every text in the game draws its button icons
+Writes <out>/<face>/External.bfotf for each face (switch, xbox, ps4, ps5, steamdeck, keyboard). Every text in the game draws its button icons
 from Font2/Scalable/External.*.bfotf (dialogue, the control hints, menus): A B X Y at U+E040..E043, L R ZL ZR at E044..E047, Plus
 and Minus at E04B and E04C, the stick presses at E056 and E057, the d-pad at E060..E063. Each written font has one icon per pad
 input at U+F700 + HOS_PAD_* (gpu/vk/vk_api.h), and each of those Switch buttons' code points in a cmap segment of its own: the
 game (host/prompts.c) points each one at the icon of the pad input bound to that button when it serves the font, so the icons
-follow the controls, changed ones too.
+follow the controls, changed ones too. (Triforce) The keyboard face (the keyboard and mouse; nx2/prompt_keys.py draws it, from
+nothing but a font of the repository's) has an icon per key that can be bound instead, at U+F700 + its key code, and what is
+said of a pad input below is a key code's there.
 
 The textures with button icons (the ocarina's notes, the letters on black, the controller in the pause menu) the same way, with
 Pillow, astc_encoder and texture2ddecoder: <out>/Common.bntx is the game's UI/Layout2Archive/Common bntx decompressed, and
@@ -78,10 +80,19 @@ def zs_dictionary(romfs, which=b"zs.zsdic"):
 
 
 def read_zs(romfs, rel, dictionary):
+    """(Triforce, as NX2navi's tools/pad_prompts.py unpack) The file goes to the decompressor a piece at a time and the
+    pieces' outputs are joined once. Given the whole file in one call the library grows one bytes object by copying as the
+    output comes, and the textures (69 MB packed, 244 MB unpacked) took 20 s of this tool's 80 that way"""
     import zstandard
-    d = zstandard.ZstdDecompressor(dict_data=zstandard.ZstdCompressionDict(dictionary))
+    d = zstandard.ZstdDecompressor(dict_data=zstandard.ZstdCompressionDict(dictionary)).decompressobj()
     with open(os.path.join(romfs, rel), "rb") as f:
-        return d.decompressobj().decompress(f.read())
+        raw = f.read()
+    parts = []
+    for at in range(0, len(raw), 1 << 16):
+        parts.append(d.decompress(raw[at:at + (1 << 16)]))
+        if d.eof:
+            break
+    return b"".join(parts)
 
 
 def size_table(romfs, dictionary, game_size, font_size):
@@ -415,43 +426,56 @@ def face_layers(b, tex, face, otf):
     """this face's images, as layers (in textures.bin's order), each a hand-made one if nx2/prompt_faces/<face>/ has it"""
     from PIL import Image, ImageDraw
     import prompt_draw
-    icons = Icons(face, otf)
+    keys = bool(FACES.get(face, {}).get("keys"))   # ((Triforce) the keyboard and mouse: an icon per key code, no controller)
+    if keys:
+        import prompt_keys
+    icons = prompt_keys.Icons() if keys else Icons(face, otf)
+    # (what a Switch button can be on: its name in icons, its number in textures.bin, its name in a layer's)
+    inputs = [(vk, vk, "key%d" % vk) for vk in sorted(icons.code)] if keys else [(p, i, p) for i, p in enumerate(PADS)]
     layers = []
+    made = {}   # ((Triforce) an input's image is the same on every texture of one size: made once, and encoded once)
 
     def keep(sw, pad):   # (the Switch face's default controls: the game's own textures)
         return pad in icons.code and not (face == "switch" and DEFAULT[SW[sw]] == pad)
 
-    for name, sw in NOTES.items():
-        t = tex[name]
-        w, h = t[2], t[3]
-        for pad in PADS:
-            if not keep(sw, pad):
-                continue
+    def note(pad, w, h):
+        if ("note", pad, w, h) not in made:
             icon, shape, holes = icons.masks(pad, int(min(w, h) * 0.9))
             im = Image.new("RGBA", (w, h), (0, 0, 0, 0))
             o = ((w - icon.width) // 2, (h - icon.height) // 2)
             im.paste(Image.new("RGBA", icon.size, (255, 255, 255, 255)), o, shape)
             im.paste(Image.new("RGBA", icon.size, (0, 0, 0, 255)), o, holes)
-            layers.append(Layer(f"{name}.{pad}.png", name, SW[sw], PADS.index(pad), im))
-    for name, sw in LETTERS.items():
-        t = tex[name]
-        w, h = t[2], t[3]
-        for pad in PADS:
-            if not keep(sw, pad):
-                continue
+            made["note", pad, w, h] = im
+        return made["note", pad, w, h]
+
+    def letter_of(pad, w, h):
+        if ("letter", pad, w, h) not in made:
             icon, shape, holes = icons.masks(pad, int(min(w, h) * 0.9))
-            letter = holes if holes.getbbox() else icon   # (an icon with no letter in it: its shape)
+            # (an icon with no letter in it: its shape; a mouse's: the mouse, not what its outline leaves)
+            letter = holes if holes.getbbox() and pad not in getattr(icons, "plain", ()) else icon
             im = Image.new("L", (w, h), 0)
             im.paste(letter, ((w - letter.width) // 2, (h - letter.height) // 2))
-            layers.append(Layer(f"{name}.{pad}.png", name, SW[sw], PADS.index(pad), im))
+            made["letter", pad, w, h] = im
+        return made["letter", pad, w, h]
+
+    for name, sw in NOTES.items():
+        t = tex[name]
+        for pad, at, label in inputs:
+            if keep(sw, pad):
+                layers.append(Layer(f"{name}.{label}.png", name, SW[sw], at, note(pad, t[2], t[3])))
+    for name, sw in LETTERS.items():
+        t = tex[name]
+        for pad, at, label in inputs:
+            if keep(sw, pad):
+                layers.append(Layer(f"{name}.{label}.png", name, SW[sw], at, letter_of(pad, t[2], t[3])))
     own = None
-    if face != "switch":
+    if face != "switch" and not keys:   # ((Triforce) the keyboard has no picture: the page keeps the game's controller)
         hand = override(face, PICTURES[0] + ".png")
         own = Image.open(hand).convert("RGBA") if hand else prompt_draw.picture(
             face, decode(b, tex[PICTURES[0]]).convert("RGBA"), Icons("switch", otf))
     if own:
         layers += picture_layers(b, tex, own)
-    for name in PICTURES if face != "switch" and not own else ():
+    for name in PICTURES if face != "switch" and not own and not keys else ():
         t = tex[name]
         im = decode(b, t)
         px = im.load()
@@ -480,7 +504,7 @@ def face_layers(b, tex, face, otf):
 def face_textures(b, tex, layers):
     """textures.bin's entries for these layers: [(Switch button, pad input, runs)], Switch button 0xff for those always written"""
     from PIL import ImageChops
-    entries, made = [], {}
+    entries, made, encoded = [], {}, {}
     for layer in layers:
         t, im = tex[layer.texture], layer.im
         made[layer.name] = im
@@ -493,7 +517,13 @@ def face_textures(b, tex, layers):
                 x0, y0, x1, y1 = min(x0, bx0), min(y0, by0), max(x1, bx1), max(y1, by1)
             entries.append((layer.sw, layer.pad, runs(t, im, (x0, y0, x1, y1))))
         else:
-            entries.append((layer.sw, layer.pad, runs(t, im)))
+            # ((Triforce) the same image on another texture of that size and format, a note or a letter on another Switch
+            # button: the same blocks, at that texture's place. The notes were encoded six times over, the letters four)
+            same = (id(im), t[1], t[2], t[3], t[4])
+            if same not in encoded:
+                encoded[same] = (t[5], runs(t, im))
+            data, rs = encoded[same]
+            entries.append((layer.sw, layer.pad, [[off - data + t[5], piece] for off, piece in rs]))
     return entries
 
 
@@ -874,12 +904,15 @@ def hint_panes(blarc):
     return out or None
 
 
-def write_hint(path, otf, panes):
+def write_hint(path, otf, panes, names=None):
+    """(names: the glyph of each input's icon, in the inputs' order, None for a number that is no input: the pad inputs',
+    or the keyboard face's 256 key codes')"""
     from fontTools.ttLib import TTFont
     hmtx = TTFont(io.BytesIO(otf))["hmtx"]
+    names = names or [f"pad_{p}" for p in PADS]
     with open(path, "wb") as f:
-        f.write(b"HPHN" + struct.pack("<I", len(PADS)))
-        f.write(b"".join(struct.pack("<f", round(max(0, hmtx[f"pad_{p}"][0] - HINT_FITS) * HINT_SCALE)) for p in PADS))
+        f.write(b"HPHN" + struct.pack("<I", len(names)))
+        f.write(b"".join(struct.pack("<f", round(max(0, hmtx[n][0] - HINT_FITS) * HINT_SCALE) if n else 0.0) for n in names))
         f.write(struct.pack("<I", len(panes)) + b"".join(struct.pack("<IB3xf", at, slot, x) for at, slot, x in panes))
 
 
@@ -1074,10 +1107,23 @@ def main():
     for face in a.faces.split(","):
         d = os.path.join(a.out, face)
         os.makedirs(d, exist_ok=True)
-        plain = face_font(otf, face)
+        names = None
+        if FACES.get(face, {}).get("keys"):   # ((Triforce) the keyboard and mouse: its icons are drawn, nx2/prompt_keys.py)
+            try:
+                import prompt_keys
+                plain, binds = prompt_keys.game_font(otf)
+            except (Exception, SystemExit) as e:   # (tools without the labels' font, a game font it cannot take: the
+                # controllers' faces are made all the same, and the game shows its own icons for the keyboard)
+                print(f"prompts: {face} was not made ({e})", file=sys.stderr)
+                os.rmdir(d)
+                continue
+            prompt_keys.write_binds(os.path.join(d, "keys.bin"), binds)
+            names = prompt_keys.hint_names()
+        else:
+            plain = face_font(otf, face)
         font = wrap(key, plain)
         if hint:
-            write_hint(os.path.join(d, "hint.bin"), plain, hint)
+            write_hint(os.path.join(d, "hint.bin"), plain, hint, names)
         largest = max(largest, len(font))
         with open(os.path.join(d, "External.bfotf"), "wb") as f:
             f.write(font)

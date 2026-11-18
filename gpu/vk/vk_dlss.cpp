@@ -359,7 +359,7 @@ int prepare(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t
     ::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);   // (NGX records into cmd itself: what this thread recorded through vk_work.h reaches cmd first)
     const NVSDK_NGX_Result r = NGX_VULKAN_CREATE_DLSS_EXT(cmd, 1, 1, &s.feature, s.params, &cp);
     const double made_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    note_work();   // (NGX's own commands, which vk_work.h does not see: the next full_barrier is not left out)
+    note_work(cmd);   // (NGX's own commands, which vk_work.h does not see: the next full_barrier is not left out)
     if (NVSDK_NGX_FAILED(r) || !s.feature) {
         logf("vk: NVIDIA DLSS: its feature was not made (%#x) for %ux%u -> %ux%u", (unsigned)r, max_w, max_h, ow, oh);
         s.feature = nullptr;
@@ -402,7 +402,7 @@ bool evaluate(VkCommandBuffer cmd, const TemporalFrame& f) {
     ep.InMVScaleX = ep.InMVScaleY = 1.0f;
     ::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);   // (NGX records into cmd itself: what this thread recorded through vk_work.h reaches cmd first)
     const NVSDK_NGX_Result r = NGX_VULKAN_EVALUATE_DLSS_EXT(cmd, s.feature, s.params, &ep);
-    note_work();   // (as at its creation: the barrier after it, and the game's next one, are recorded)
+    note_work(cmd);   // (as at its creation: the barrier after it, and the game's next one, are recorded)
     if (NVSDK_NGX_FAILED(r)) {
         logf("vk: NVIDIA DLSS: its evaluation failed (%#x)", (unsigned)r);
         return false;

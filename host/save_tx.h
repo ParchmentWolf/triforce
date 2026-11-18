@@ -292,6 +292,40 @@ static int save_tx_enabled(void) {
     return !(e && e[0] == '0');
 }
 
+/* (Triforce) The save's lock between the game and Setup: <user>\save.lock, opened without sharing at the run's first save
+   mount and held until the process ends (Windows lets go of it however the game ends). Setup's copy of a save (setup/Guard.cs
+   SaveLock, setup/Saves.cs Copy) holds the same file across the whole copy: it found a running game by its process alone, so a
+   game started after that look and before the copy's end mounted half a save and wrote it back over the copy when it closed.
+   A game started while Setup copies waits here for the lock, up to wait_ms. 1: held; 0: another program held it all that time
+   (the save is mounted anyway, as before, and the log says so); -1: it could not be made (nothing is locked: as before).
+   HOS_SAVE_LOCK=0: none taken (2). */
+#ifndef ERROR_SHARING_VIOLATION   /* (host/posix/windows.h has neither: no such refusal there, the lock is always had) */
+#define ERROR_SHARING_VIOLATION 32L
+#endif
+#ifndef ERROR_LOCK_VIOLATION
+#define ERROR_LOCK_VIOLATION 33L
+#endif
+static HANDLE save_tx_lock_handle = INVALID_HANDLE_VALUE;
+static int save_tx_lock(const char *user, int wait_ms) {
+    const char *e = getenv("HOS_SAVE_LOCK");
+    if (e && e[0] == '0') return 2;
+    if (save_tx_lock_handle != INVALID_HANDLE_VALUE) return 1;
+    char p[HOS_FS_PATH];
+    if (!user || snprintf(p, sizeof p, "%s\\save.lock", user) >= (int)sizeof p) return -1;
+    tx_make_dirs(user);
+    for (int waited = 0;; waited += 50) {
+        const HANDLE h = CreateFileA(p, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h != INVALID_HANDLE_VALUE) {
+            save_tx_lock_handle = h;
+            return 1;
+        }
+        const DWORD why = GetLastError();
+        if (why != ERROR_SHARING_VIOLATION && why != ERROR_LOCK_VIOLATION) return -1;
+        if (waited >= wait_ms) return 0;
+        Sleep(50);
+    }
+}
+
 /* The first mount of the save in a run: the disk put right after a run that died, then the working copy made from the
    committed save. 1: mount p->work; 0: the working copy could not be made, mount p->save as before. note (may be NULL) gets
    a line for the log when the recovery found something to do */

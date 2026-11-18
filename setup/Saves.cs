@@ -281,23 +281,37 @@ static class Saves
 
     /// Copies one save set over another: the destination's old files are moved to the backup folder first (nothing is merged slot by
     /// slot: the copy is exactly the source). Returns the backup folder, or null when there was nothing to back up.
+    /// ((Triforce) The games' save locks are held across all of it (Guard.cs SaveLock: a game that runs refuses it, one started
+    /// meanwhile waits), and the copy is made as <save>.partial and swapped in once complete (Guard.cs Partial): a copy that fails
+    /// or is cut off leaves the destination as it was, never half a save. TRIFORCE_SAVE_LOCK=0: no lock, as before)
     public static string? Copy(string from, string to, string backupRoot, string label)
     {
         var src = Path.GetFullPath(from).TrimEnd('\\');
         var dst = Path.GetFullPath(to).TrimEnd('\\');
         if (!Install.Allowed(dst)) throw new InvalidOperationException(Install.TestOnly);
         if (string.Equals(src, dst, StringComparison.OrdinalIgnoreCase)) throw new InvalidOperationException("That is the same save folder.");
+        var locking = Environment.GetEnvironmentVariable("TRIFORCE_SAVE_LOCK") != "0";
+        using var dstLock = locking ? SaveLock.Take(dst) : null;
+        using var srcLock = locking && !string.Equals(SaveLock.PathOf(src), SaveLock.PathOf(dst), StringComparison.OrdinalIgnoreCase) ? SaveLock.Take(src) : null;
+        Partial.Recover(dst);
+        var partial = Partial.Stage(src, dst);
         string? backup = null;
-        if (Directory.Exists(dst) && Directory.EnumerateFileSystemEntries(dst).Any())
+        try
         {
-            var safe = string.Concat(label.Select(c => Path.GetInvalidFileNameChars().Contains(c) || c == ' ' ? '-' : c));
-            backup = Path.Combine(backupRoot, DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss") + "_" + safe);
-            Directory.CreateDirectory(backup);
-            CopyTree(dst, backup);
-            Directory.Delete(dst, true);
+            if (Directory.Exists(dst) && Directory.EnumerateFileSystemEntries(dst).Any())
+            {
+                var safe = string.Concat(label.Select(c => Path.GetInvalidFileNameChars().Contains(c) || c == ' ' ? '-' : c));
+                backup = Path.Combine(backupRoot, DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss") + "_" + safe);
+                Directory.CreateDirectory(backup);
+                CopyTree(dst, backup);
+            }
         }
-        Directory.CreateDirectory(dst);
-        CopyTree(src, dst);
+        catch (Exception)
+        {
+            Partial.Remove(partial);
+            throw;
+        }
+        Partial.SwapIn(partial, dst);
         // (into Triforce: its working copy and any finished commit still waiting belong to the save that was replaced, and the game
         // would put such a commit over the copy at its next start)
         if (TriforceTx(dst) is { } tx && Directory.Exists(tx))
