@@ -1277,9 +1277,9 @@ struct Controls {
                 // across from its own side's eye (about 3 cm out from the head's middle), either way
                 const float off_eye = std::fabs((shield ? side[shield] : -side[shield]) - 0.032f);
                 const float dx = poses[shield].p[0] - head[0], dz = poses[shield].p[2] - head[2];
-                const bool near = dx * dx + dz * dz < shield_reach * shield_reach;
-                keep = shielding ? ahead > std::cos(shield_off) && off_eye < 0.19f && near
-                                 : ahead > std::cos(shield_on) && off_eye < 0.12f && near && !at_face;
+                const bool in_reach = dx * dx + dz * dz < shield_reach * shield_reach;   // (not "near": windows.h defines it)
+                keep = shielding ? ahead > std::cos(shield_off) && off_eye < 0.19f && in_reach
+                                 : ahead > std::cos(shield_on) && off_eye < 0.12f && in_reach && !at_face;
             }
             shielding = keep && !x.ocarina.load();
             if (shielding) set_bit(ZL, true);
