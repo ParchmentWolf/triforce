@@ -435,7 +435,22 @@ bool create_device() {
         logf("vk: vendor fixes for %s (%s): out-of-bounds texel fetches 0 %d, NaN tests by bits %d, gather offset %d",
              drv.driverName, drv.driverInfo, (int)dev.fixes.fetch_bounds, (int)dev.fixes.nan_bits, (int)dev.fixes.gather_offset);
     }
-    dev.eds3_a2c = dev.dynamic_state3 && eds3.extendedDynamicState3AlphaToCoverageEnable;
+    // ((Triforce, 11-18, EstebanGGM's port of NX2navi issue #67) AMD's older proprietary shader compiler (vk_vendor.h
+    // amd_older_compiler) applies alpha to coverage while the dynamic state says off: white stippling over foliage, grass, Link's
+    // hair and tunic on RX 470-590 (#bug-tracker "Texture glitch again ... (RX 580)", 11-18 screenshots). There the state goes in
+    // the pipeline instead. Only where the driver has no fast-linking pipeline libraries (the RX 580's 26.5.2: "pipeline
+    // libraries no"): fast pipeline link needs this dynamic state (gpl_wanted), and an RX 6000 card on the same driver keeps it.
+    // Those cards' pipelines are new to the driver's caches once (the state is in them now). RX_VK_DYN_A2C=0/1 decides outright
+    {
+        const bool eds3_a2c = dev.dynamic_state3 && eds3.extendedDynamicState3AlphaToCoverageEnable;
+        bool want = !(amd_older && !dev.graphics_pipeline_library);
+        if (const char* e = getenv("RX_VK_DYN_A2C"); e && *e) want = atoi(e) != 0;
+        dev.eds3_a2c = eds3_a2c && want;
+        if (eds3_a2c && !dev.eds3_a2c)
+            logf("vk: alpha to coverage in the pipelines, not dynamic (%s; RX_VK_DYN_A2C=1: dynamic)",
+                 getenv("RX_VK_DYN_A2C") && *getenv("RX_VK_DYN_A2C") ? "RX_VK_DYN_A2C=0"
+                                                                    : "AMD's older compiler draws it while it is off");
+    }
     dev.vk12 = f12;
     dev.vk13 = f13;
     {   // (hookshot, after TotK Recomp's vk_caps.c) NVN's programs are written for 32 lanes: the translator is told 32, and the lane

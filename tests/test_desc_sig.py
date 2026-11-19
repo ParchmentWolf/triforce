@@ -86,7 +86,8 @@ def check_source(source):
     need("const bool sig_hit = sig_walked && last_desc_valid && last_desc_prog == &p && pushed()[0].cmd == cmd &&\n"
          "                         pushed()[0].layout == p.layout && desc_sig::hit(sig_bound(), sig, &p);" in draw,
          "a hit does not need the last draw's program and its push at the bind point", fails)
-    need("const int sig_mode = !same_gens && !no_reuse ? desc_sig_mode() : 0;" in draw, "the walk runs where the draw keeps them anyway",
+    need("const int sig_mode = !same_gens && !no_reuse && !strict ? desc_sig_mode() : 0;" in draw,
+         "the walk runs where the draw keeps them anyway (or a draw that may not defer in a frame that left textures: redrawn.h)",
          fails)
     need("const bool same_desc = same_gens || (sig_hit && sig_mode == 1);" in draw, "a checked hit is not built", fails)
     build = draw[draw.index("if (!same_desc) {"):]

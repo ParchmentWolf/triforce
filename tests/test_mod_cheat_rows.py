@@ -161,7 +161,7 @@ int main() {
 
 
 def check_sources(menu, header, api, replay, readme):
-    table = menu[menu.index("Row rows[] = {"):menu.index("constexpr int kQuitRow")]
+    table = menu[menu.index("Row rows[] = {"):menu.index("constexpr int kRowsEnd")]
     # a row for every slot, after Bug capture (F8) and its heading, before the Controls tab's rows
     slots = int(re.search(r"constexpr int kSlots = (\d+);", (ROOT / "gpu/vk/mod_cheat_rows.h").read_text(encoding="utf-8")).group(1))
     starts = [int(n) for n in re.findall(r"MOD_CHEAT_ROWS8\((\d+)\)", table)]
@@ -192,7 +192,7 @@ def check_sources(menu, header, api, replay, readme):
           "the guides do not say Change on a cheat's row")
     tick = block(menu, "void menu_tick() {")
     press = tick.index("else if (mod_cheat_slot(r.name) >= 0) changed |= mod_cheats.press(mod_cheat_slot(r.name), press[3], press[4], press[7]);")
-    check(tick.index("} else if (r.cheat >= 0) cheat_press(") < press < tick.index("else if (press[7] && share_row(r))")
+    check(tick.index("if (r.cheat >= 0) cheat_press(") < press < tick.index("else if (press[7] && share_row(r))")
           < tick.index("else if (press[7] && !r.value && can_bind()) page = 1"), "a press on a cheat's row is not taken before the rows that act by name or open a page")
     # the host's side of it
     ids = block(api, "enum { HOS_OPT_MODCHEAT_TEXT")

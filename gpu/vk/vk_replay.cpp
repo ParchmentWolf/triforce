@@ -1684,6 +1684,14 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
         if (p == end) return;
         nvn_op_hdr h;
         std::memcpy(&h, p, sizeof h);
+        if (h.size < 8) {   // (Triforce-dev, diagnostics: an op that cannot be one: the stream was freed or written over)
+            static int logged;
+            if (logged++ < 20)
+                logf("vk: replay: op %u of size %u at %p (recording value %llu, %s): the rest of this command buffer is left out",
+                     (unsigned)h.op, (unsigned)h.size, (const void*)p, (unsigned long long)rec_value_now,
+                     dry ? "dry" : worker ? "worker" : "serial");
+            return;
+        }
         const uint8_t* a = p + 8;
         const uint32_t avail = h.size - 8;
         if (dry && dry_tail_find) dry_tail_check(p, h, a, avail, s);
@@ -3491,6 +3499,7 @@ struct QueueRun {   // (a queue stopped at a wait)
     std::deque<LaterSubmit> later;   // (its queue's submits since)
     bool blocked() const { return waiting || !later.empty(); }
     uint64_t oldest() const { return waiting ? value : later.front().value; }
+    uint64_t at_present = 0;         // (Triforce-dev: the oldest() it was stopped with at the last present; drain_stale)
 };
 std::unordered_map<uint64_t, QueueRun> qruns;
 std::atomic<int> blocked_n{0}, drain_waiters{0};    // (queues stopped, for the other threads; those in wait_queue_empty)
@@ -3498,6 +3507,7 @@ std::chrono::steady_clock::time_point blocked_since;
 uint64_t done_max = 0, signaled = 0;                // (the newest value recorded whole; the timeline's last signal)
 int64_t st_stops, st_resumed, st_forced_waits, st_forced[4], st_resume_captures;   // (made to go by: presents, releases, waits, time)
 double st_stopped_max_ms;
+extern int64_t st_present_waits, st_present_waits_out;
 bool event_waits_on() {
     static const bool v = !getenv("RX_VK_EVENT_WAITS") || atoi(getenv("RX_VK_EVENT_WAITS")) != 0;
     return v;
@@ -3567,6 +3577,9 @@ void log_order_stats() {
          (long long)st_forced_waits, (long long)st_forced[0], (long long)st_forced[1], (long long)st_forced[2], hold_ms(),
          (long long)st_forced[3], st_stopped_max_ms, (long long)st_waits_met, (long long)st_waits_unmet,
          (long long)st_resume_captures);
+    if (st_present_waits)
+        logf("vk: presents that waited for their frame's signal: %lld (%lld in vain)", (long long)st_present_waits,
+             (long long)st_present_waits_out);
 }
 
 // ---- a burst: the pieces replayed one after the other with no memory work between them (a submit's job: its own
@@ -3800,6 +3813,36 @@ void drain(int why) {
         if (best == UINT64_MAX) break;
         resume_queue(bq, qruns[bq].waiting);
     }
+    burst_end();
+    update_blocked();
+}
+
+/// (Triforce-dev) A present on the replay thread, with the game a frame ahead: the stopped queues whose waits are met go
+/// on, and only those stopped since the present before (the same submission still waiting: nothing but a present makes a
+/// load's go) are made to go past their waits. What stopped since is mostly the NEXT frame's work, handed over early and
+/// waiting for a signal that comes after this present: drain(0) made it go ahead of its signaller, ~11,000 waits gone
+/// past in a 150 s Market walk against 0 on the submitting thread, and the 3D scene black for a frame now and then.
+/// RX_VK_PRESENT_DRAIN=2
+void drain_stale() {
+    burst_begin(0);
+    schedule();
+    std::vector<uint64_t> stale;
+    for (const auto& [queue, q] : qruns)
+        if (q.blocked() && q.at_present == q.oldest()) stale.push_back(queue);
+    if (!stale.empty()) {
+        st_forced[0]++;
+        for (;;) {
+            schedule();
+            uint64_t best = UINT64_MAX, bq = 0;
+            for (const uint64_t queue : stale) {
+                const QueueRun& q = qruns[queue];
+                if (q.blocked() && q.oldest() < best) best = q.oldest(), bq = queue;
+            }
+            if (best == UINT64_MAX) break;
+            resume_queue(bq, qruns[bq].waiting);
+        }
+    }
+    for (auto& [queue, q] : qruns) q.at_present = q.blocked() ? q.oldest() : 0;
     burst_end();
     update_blocked();
 }
@@ -5460,9 +5503,18 @@ void do_present(const nvn_tex* t, const int crop[4]) {
         }
         texture_end_recording(r.cmd), memory_end_submission(r.cmd);
         full_barrier(r.cmd);
-        submit_recording(r);   // (nothing is stopped at a present: drain)
+        // (Triforce-dev) a present that leaves work stopped (drain_stale) signals the timeline only as far as no older
+        // submission is unfinished, as finish_recording does: signalled up to its own value, the host freed the stopped
+        // submissions' command copies (nvn_native.c free_dead_copies) and their replay went on in freed memory
+        done_max = std::max(done_max, value);
+        {
+            const uint64_t oldest = oldest_unfinished();
+            const uint64_t at = oldest == UINT64_MAX ? done_max : std::min(done_max, oldest - 1);
+            const bool signal = at > signaled;
+            if (signal) signaled = at;
+            submit_recording(r, signal, at);
+        }
         if (pushed.load() < value) pushed = value;
-        done_max = std::max(done_max, value), signaled = std::max(signaled, value);
         if (fg_after) {
             // (its slot is free again once the next submit's value is reached: that one comes after it)
             Recording& g = begin_recording(value + 1);
@@ -6522,6 +6574,100 @@ bool async_on() {
     return on;
 }
 
+int64_t st_present_waits, st_present_waits_out;   // (Triforce-dev: presents that waited for their frame's signal; in vain)
+/// One job of the replay thread
+void run_job(Job& j) {
+    switch (j.kind) {
+    case JOB_SUBMIT:
+        lab_ab::delay("replay");   // (lab: the replay thread, once a frame)
+        submit_job(j.handles, j.value, j.queue);
+        break;
+    case JOB_PRESENT:   // (the frame's work whole before it is shown)
+        // (Triforce, 11-14) With the game a frame ahead of the replay, what is stopped at a present is mostly the NEXT
+        // frame's work: the worker queues hand theirs over early, each waiting for the main queue's signal of that
+        // frame, which comes after this present. Made to go here it ran ahead of its signaller: one present in ten at the
+        // Market (1,499 of 15,000, 14,375 waits gone past) against 29 in a run of the submitting thread's replay. So a
+        // present can let on what may go and force nothing (RX_VK_PRESENT_DRAIN=0); work that stays stopped then goes on
+        // at its signal, or after hold_ms as anywhere. NOT the default: the first run with it stood at a loading screen
+        // for good (the Market save, 5 draws a frame for six minutes, 11-14 03:20): a load waits for work only a present
+        // makes go. The picture with the presents forcing showed no flicker (0 cell blinks in 6,472 frames)
+        if (static const bool keep = getenv("RX_VK_PRESENT_DRAIN") && atoi(getenv("RX_VK_PRESENT_DRAIN")) == 0; async_unforced() && keep) {
+            burst_begin(0);
+            schedule();
+            burst_end();
+        } else if (static const bool stale = getenv("RX_VK_PRESENT_DRAIN") && atoi(getenv("RX_VK_PRESENT_DRAIN")) == 2; async_unforced() && stale) {
+            // (Triforce-dev) The present and the CPU's signal that lets the frame's stopped work on come from two of the
+            // game's threads: one frame in 25 at the Market the present was handed over first (0.15 ms before the signal).
+            // Shown at once it was the frame before again, and the next present had two frames' work before it (34 ms).
+            // When nothing stopped has gone on since the last present, the jobs behind this one are done first, until
+            // stopped work goes on or RX_VK_PRESENT_WAIT_MS (8) have passed
+            static const int wait_ms = getenv("RX_VK_PRESENT_WAIT_MS") ? std::max(0, atoi(getenv("RX_VK_PRESENT_WAIT_MS"))) : 8;
+            static int64_t resumed_at_present = -1;
+            if (wait_ms && blocked_n.load() && st_resumed == resumed_at_present) {
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
+                st_present_waits++;
+                while (blocked_n.load() && st_resumed == resumed_at_present) {
+                    Job k;
+                    {
+                        std::unique_lock lk(q_mu);
+                        if (!q_cv.wait_until(lk, deadline, [] { return !q_jobs.empty(); })) break;
+                        if (q_jobs.front().kind == JOB_PRESENT) break;
+                        k = std::move(q_jobs.front()), q_jobs.pop_front();
+                    }
+                    run_job(k);
+                    update_blocked();
+                }
+                if (st_resumed == resumed_at_present) st_present_waits_out++;
+            }
+            drain_stale();
+            resumed_at_present = st_resumed;
+        } else {
+            drain(0);
+        }
+        present_value = j.value;
+        do_present(j.has_tex ? &j.tex : nullptr, j.has_crop ? j.crop : nullptr);
+        break;
+    case JOB_TEXTURE_RELEASED:   // (after the stopped work that may use it)
+        // (Triforce: with nothing forced the release is kept until the stopped work has gone on, as on the submitting
+        // thread's replay: update_blocked makes it then)
+        if (async_unforced() && hold_releases() && blocked_n.load()) {
+            std::lock_guard hl(held_mu);
+            held_tex_releases.push_back(j.tex);
+            st_held_releases++;
+            break;
+        }
+        drain(1);
+        do_texture_released(&j.tex);
+        break;
+    case JOB_PROGRAM_RELEASED:
+        if (async_unforced() && hold_releases() && blocked_n.load()) {
+            std::lock_guard hl(held_mu);
+            held_prog_releases.push_back(j.prog);
+            st_held_releases++;
+            break;
+        }
+        drain(1);
+        do_program_released(&j.prog);
+        break;
+    case JOB_REGISTER_TEXTURE: register_texture_copy(j.id, j.tex, j.has_view ? &j.view : nullptr); break;
+    case JOB_REGISTER_SAMPLER: register_sampler_copy(j.id, j.samp); break;
+    case JOB_EVENT_SIGNAL:   // (the CPU set an event: the stopped ones may go on)
+        ev_values[j.ev_gpu] = j.ev_value;
+        if (j.ev_capture) {   // (the CPU's writes up to its signal, for what goes on from here: see event_signal_queued)
+            std::lock_guard lk(replay_mu);
+            uint64_t v = rec_value_now;
+            for (const auto& [queue, q] : qruns)
+                if (q.waiting) v = std::max(v, q.value);
+            memory_take_capture(v, completed());
+            st_resume_captures++;
+        }
+        burst_begin(0);
+        schedule();
+        burst_end();
+        break;
+    }
+}
+
 void replay_thread_main() {
     SetThreadDescription(GetCurrentThread(), L"mkw_vk replay");
     SetThreadPriority(GetCurrentThread(), replay_prio::own_thread(replay_prio_level()));   // ((Triforce) RX_VK_REPLAY_PRIO: replay_prio.h)
@@ -6584,69 +6730,7 @@ void replay_thread_main() {
                      kinds[j.kind], (unsigned long long)j.value, (unsigned long long)j.queue,
                      std::chrono::duration<double, std::milli>(t_start - j.queued).count(), (unsigned long long)completed());
         }
-        switch (j.kind) {
-        case JOB_SUBMIT:
-            lab_ab::delay("replay");   // (lab: the replay thread, once a frame)
-            submit_job(j.handles, j.value, j.queue);
-            break;
-        case JOB_PRESENT:   // (the frame's work whole before it is shown)
-            // (Triforce, 11-14) With the game a frame ahead of the replay, what is stopped at a present is mostly the NEXT
-            // frame's work: the worker queues hand theirs over early, each waiting for the main queue's signal of that
-            // frame, which comes after this present. Made to go here it ran ahead of its signaller: one present in ten at the
-            // Market (1,499 of 15,000, 14,375 waits gone past) against 29 in a run of the submitting thread's replay. So a
-            // present can let on what may go and force nothing (RX_VK_PRESENT_DRAIN=0); work that stays stopped then goes on
-            // at its signal, or after hold_ms as anywhere. NOT the default: the first run with it stood at a loading screen
-            // for good (the Market save, 5 draws a frame for six minutes, 11-14 03:20): a load waits for work only a present
-            // makes go. The picture with the presents forcing showed no flicker (0 cell blinks in 6,472 frames)
-            if (static const bool keep = getenv("RX_VK_PRESENT_DRAIN") && atoi(getenv("RX_VK_PRESENT_DRAIN")) == 0; async_unforced() && keep) {
-                burst_begin(0);
-                schedule();
-                burst_end();
-            } else {
-                drain(0);
-            }
-            present_value = j.value;
-            do_present(j.has_tex ? &j.tex : nullptr, j.has_crop ? j.crop : nullptr);
-            break;
-        case JOB_TEXTURE_RELEASED:   // (after the stopped work that may use it)
-            // (Triforce: with nothing forced the release is kept until the stopped work has gone on, as on the submitting
-            // thread's replay: update_blocked makes it then)
-            if (async_unforced() && hold_releases() && blocked_n.load()) {
-                std::lock_guard hl(held_mu);
-                held_tex_releases.push_back(j.tex);
-                st_held_releases++;
-                break;
-            }
-            drain(1);
-            do_texture_released(&j.tex);
-            break;
-        case JOB_PROGRAM_RELEASED:
-            if (async_unforced() && hold_releases() && blocked_n.load()) {
-                std::lock_guard hl(held_mu);
-                held_prog_releases.push_back(j.prog);
-                st_held_releases++;
-                break;
-            }
-            drain(1);
-            do_program_released(&j.prog);
-            break;
-        case JOB_REGISTER_TEXTURE: register_texture_copy(j.id, j.tex, j.has_view ? &j.view : nullptr); break;
-        case JOB_REGISTER_SAMPLER: register_sampler_copy(j.id, j.samp); break;
-        case JOB_EVENT_SIGNAL:   // (the CPU set an event: the stopped ones may go on)
-            ev_values[j.ev_gpu] = j.ev_value;
-            if (j.ev_capture) {   // (the CPU's writes up to its signal, for what goes on from here: see event_signal_queued)
-                std::lock_guard lk(replay_mu);
-                uint64_t v = rec_value_now;
-                for (const auto& [queue, q] : qruns)
-                    if (q.waiting) v = std::max(v, q.value);
-                memory_take_capture(v, completed());
-                st_resume_captures++;
-            }
-            burst_begin(0);
-            schedule();
-            burst_end();
-            break;
-        }
+        run_job(j);
         update_blocked();
         if (ft && (j.kind == JOB_SUBMIT || j.kind == JOB_PRESENT || j.kind == JOB_EVENT_SIGNAL)) {
             int64_t ft_d1 = 0;

@@ -75,6 +75,9 @@ bool sampler_of(int id, nvn_samp_par* p) {
     if (policy == "standard-border") std::fill(std::begin(p->border), std::end(p->border), 1.0f);
     if (policy == "reduction" || policy == "compare-reduction" || policy == "custom-reduction") p->reduction = 1;
     if (policy == "wrap") p->ws = NVN_WRAP_MODE_REPEAT, p->wt = NVN_WRAP_MODE_MIRRORED_REPEAT, p->wr = NVN_WRAP_MODE_CLAMP_TO_BORDER;
+    // ((Triforce, 11-18) anisotropy is raised only on samplers whose U and V repeat (EstebanGGM's aniso_tiled): a tiled one, and
+    // a clamped one that stays as the game has it)
+    if (policy == "anisotropy") p->ws = NVN_WRAP_MODE_REPEAT, p->wt = NVN_WRAP_MODE_MIRRORED_REPEAT;
     if (policy == "lod-clamp") p->lod_bias = 100, p->lod_min = -3, p->lod_max = -1;
     return true;
 }
@@ -83,7 +86,7 @@ const char* getenv(const char* name) {
     if (!std::strcmp(name, "RX_VK_PUSH_ALL") && descriptor_policy == "descriptor-whole") return "1";
     if (!std::strcmp(name, "RX_VK_SAMPLER_CACHE") && cache_off) return "0";
     if (!std::strcmp(name, "RX_VK_SHADOW_PCF") && policy == "compare-pcf-off") return "0";
-    if (!std::strcmp(name, "RX_VK_ANISO") && policy == "anisotropy") return "16";
+    if (!std::strcmp(name, "RX_VK_ANISO") && (policy == "anisotropy" || policy == "anisotropy-clamped")) return "16";
     if (!std::strcmp(name, "RX_VK_FORCE_LINEAR") && policy == "force-linear") return "1";
     return nullptr;
 }
@@ -290,6 +293,7 @@ void run(const std::string& test) {
     if (test == "reduction" || test == "custom-reduction") assert(saved.reduced && saved.reduction == VK_SAMPLER_REDUCTION_MODE_MIN);
     if (test == "compare-reduction") assert(!saved.reduced);
     if (test == "anisotropy") assert(ci.anisotropyEnable && ci.maxAnisotropy == 8);
+    if (test == "anisotropy-clamped") assert(!ci.anisotropyEnable);
 }
 } // namespace fixture
 int main(int argc, char** argv) {

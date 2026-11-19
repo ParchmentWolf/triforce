@@ -1,0 +1,7 @@
+bin/
+obj/
+out/
+# never: anything decoded from a game (the launcher reads it at run time)
+ui/audio/
+ui/img/game/
+ui/img/save*.jpg

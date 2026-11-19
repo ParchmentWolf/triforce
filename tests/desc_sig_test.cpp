@@ -100,6 +100,8 @@ struct World {
 Texture textures[16];
 thread_local bool view_slot_known = true;
 thread_local bool upload_defer_ok = false;
+thread_local bool draw_may_defer = true;   // ((Triforce, redrawn.h) set by vk_draw.cpp draw: may this draw leave textures)
+bool texture_owes(const Texture*) { return false; }   // ((Triforce) no texture here still owes bytes)
 uint32_t texture_slot_version(int slot) { return w.version[(uint32_t)slot]; }
 uint64_t sampler_registrations_generation() { return w.samp; }
 uint64_t texture_destroy_generation() { return w.destroy; }

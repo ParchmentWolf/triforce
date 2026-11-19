@@ -1364,17 +1364,11 @@ Row rows[] = {
      "Keeps the game's large textures that have no transparency in half the video memory, with the same picture. Off: as "
      "before. Turn it off if textures look wrong. Applies after a restart.",
      hn_tex_bc1, true, true},
-    {TAB_SYSTEM, "Exit", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},   // ((Triforce) 11-17: a section)
-    // (Restart and Quit stay the table's last two: kRestartRow and kQuitRow count back from its end)
-    {TAB_SYSTEM, "Restart", nullptr, 0, 0, 0, nullptr,
-     "Starts the game again. Save your progress first. Press Enter or A twice to restart. Esc or B "
-     "cancels."},
-    {TAB_SYSTEM, "Quit", nullptr, 0, 0, 0, nullptr,
-     "Save your progress first. Press Enter or A twice to quit. Esc or B cancels."},
+    // ((Triforce) 11-19, the owner: Restart and Quit moved to the pause menu's System page, as the game's own button under
+    // Mods (draw_mods_row; its dialog draw_quit_ask)
 
 };
-constexpr int kQuitRow = sizeof rows / sizeof rows[0] - 1;
-constexpr int kRestartRow = kQuitRow - 1;
+constexpr int kRowsEnd = sizeof rows / sizeof rows[0];   // (the table's end: tests read the table up to here)
 const Row* pending = nullptr;   // (Restart or Quit: shows Confirm until its second press)
 bool cheats_env = false;   // (HOS_OOT_CHEATS=1: on whatever the Debug tab says)
 /// The debug tools: the Debug tab's row, or HOS_OOT_CHEATS=1
@@ -1414,6 +1408,10 @@ constexpr int kModsCats = 6;
 const char* const kModsCatNames[kModsCats] = {"All", "Gameplay", "Models", "Audio", "Interface", "Installed"};
 int mods_cat = 0;
 int mods_cat_pick = -1;   // (a click on a category's tab: taken by the next tick)
+/// ((Triforce) 11-18) after a card's author and category: a WiP or a kit (a program of its own) says so
+std::string mods_kind(const mods::Mod& m) {
+    return m.kit ? "  \xC2\xB7  Own program" : m.wip ? "  \xC2\xB7  Work in progress" : "";
+}
 bool mods_in_cat(const mods::Mod& m, int cat) {
     auto has = [&m](const char* w) { return m.category.find(w) != std::string::npos; };
     switch (cat) {
@@ -1438,6 +1436,13 @@ std::atomic<int> mods_box[5];              // (the last button's box and the pit
 std::atomic<int64_t> mods_list_ns{0};      // (prof_now at the last report)
 std::atomic<int> mods_enter{0};            // (the host's word: 1 the cursor onto the entry, 2 a click on it)
 std::atomic<int> mods_press{0};            // (presses the host passed on while Mods has the cursor: HOS_MODS_PRESS_*)
+// ((Triforce) 11-19, the owner: "I want quit and restart moved from our custom settings menu to [under Mods on the pause menu's
+// System page]. IT NEEDS TO LOOK NATIVE". One button fits under Mods at the list's own pitch above the prompts, so it is Quit,
+// as the game's own button, and its dialog asks Quit Game / Restart Game / Cancel (his choice). The title's list has Mods only)
+int mods_row_sel = 0;                      // (the entry with the cursor: 0 Mods, 1 Quit)
+bool quit_ask = false;                     // (Quit's dialog is open)
+int quit_sel = 0;                          // (its choice: 0 Quit Game, 1 Restart Game, 2 Cancel)
+bool quit_entry_shown() { return (mods_list_bits.load(std::memory_order_relaxed) & HOS_MODS_LIST_TITLE) == 0; }
 bool mods_list_fresh() {
     const int64_t t = mods_list_ns.load(std::memory_order_relaxed);
     return t && prof_now() - t < 150000000LL;
@@ -2834,7 +2839,7 @@ void draw_options(ui::Ctx& c) {
     static float help_tall = 0, help_tall_w = 0;
     if (help_tall_w != cap_w) help_tall_w = cap_w, help_tall = measure_help(c, cap_w);
     // (the guides: what the buttons do on this row, as the game's own say only that)
-    const bool confirms = &selr == &rows[kRestartRow] || &selr == &rows[kQuitRow];
+    const bool confirms = false;   // ((Triforce) 11-19: no Restart and Quit rows any more: the pause menu's Quit)
     ui::Prompt prompt_list[5] = {{ui::kLeftRight, "Change"}, {ui::kTabs, "Category"}, {ui::kBack, "Back"}};
     int prompts_n = 3;
     if (!selr.value) prompt_list[0] = {ui::kConfirm, confirms ? (pending == &selr ? "Confirm" : selr.name) : "Open"};
@@ -2890,7 +2895,7 @@ void draw_options(ui::Ctx& c) {
                 vm = halves_meet(va, vb);
             }
         } else if (!r.value) {   // (a page, or Restart and Quit: Confirm until the second press)
-            const bool ends = &r == &rows[kRestartRow] || &r == &rows[kQuitRow];
+            const bool ends = false;
             if (pending == &r) choice_cell(c, va, vb, "Press again", selected, false, false);
             else choice_cell(c, va, vb, ends ? r.name : share_row(r) ? share_label(share_row(r)) : "Open", selected, false, true, false, true);
         } else {
@@ -3993,7 +3998,7 @@ void draw_mods(ui::Ctx& c) {
         ui::text_mid(c, c.f.strong, 19 * s, tx, a.y + 22 * s, ui::kInkBright, m.name.c_str());
         c.d->PopClipRect();
         c.d->PushClipRect(ImVec2(tx, a.y), ImVec2(b.x - 12 * s, b.y), true);
-        const std::string by = "by " + m.author + (m.category.empty() ? "" : "  \xC2\xB7  " + m.category);
+        const std::string by = "by " + m.author + (m.category.empty() ? "" : "  \xC2\xB7  " + m.category) + mods_kind(m);
         ui::text_mid(c, c.f.body, 15 * s, tx, a.y + 48 * s, ui::kSoft, by.c_str());
         const std::string counts = mods_count(m.likes) + " likes  \xC2\xB7  " + mods_count(m.views) + " views";
         ui::text_mid(c, c.f.body, 13.5f * s, tx, a.y + 70 * s, ui::alpha(ui::kSoft, 0.72f), counts.c_str());
@@ -4001,10 +4006,11 @@ void draw_mods(ui::Ctx& c) {
         if (sel) ui::glow(c, a, b);
         hits.add(a.x, std::max(a.y, list_top), b.x, std::min(b.y, bottom), menu_hit::kListLine, i);
     }
-    if (n && (more || feed == mods::Feed::Loading)) {   // (the foot of the list: the next page comes when the choice is near it)
+    if (n && (more || feed == mods::Feed::Loading)) {   // ((Triforce) 11-18, the foot of the list: the pages come by themselves)
         const float y = list_top + n * pitch - at + 16 * s;
-        if (y < bottom) ui::text_mid_centre(c, c.f.body, 15 * s, (left + right) * 0.5f, y, ui::kDim,
-                                            feed == mods::Feed::Loading ? "Loading more..." : "More below");
+        if (y < bottom) ui::text_mid_centre(c, c.f.body, 15 * s, (left + right) * 0.5f, y, feed == mods::Feed::Failed ? ui::kAccent : ui::kDim,
+                                            feed == mods::Feed::Failed ? "GameBanana stopped answering: Confirm on the search bar tries again"
+                                                                       : "Loading more...");
     }
     c.d->PopClipRect();
     if (!n) {   // (no list yet: asking, or the answer that failed; (Triforce) a search's: asking, or none found)
@@ -4036,6 +4042,7 @@ void draw_mods(ui::Ctx& c) {
         files = (int)m.files.size();
         can_install = m.details_state == 2 && files > 0;
         install_label = m.update ? "Update" : m.installed ? "Reinstall" : "Install";
+        if (m.kit) install_label = m.update ? "Update and start" : m.installed ? "Start" : "Install and start";
         const float x0 = hx0, x1 = hx1, pad = ui::lu(c, 64), y0 = top, y1 = bar - 8 * s;
         ui::box(c, ImVec2(x0, y0), ImVec2(x1, y1));
         c.d->PushClipRect(ImVec2(x0, y0), ImVec2(x1, y1), true);
@@ -4045,7 +4052,7 @@ void draw_mods(ui::Ctx& c) {
         mods_picture(c, m, pa, pb, &made);
         y = pb.y + 16 * s;
         y += ui::para(c, c.f.strong, 20 * s, ImVec2(x0 + pad, y), ui::kInk, m.name.c_str(), w) + 4 * s;
-        const std::string by = "by " + m.author + (m.category.empty() ? "" : "  \xC2\xB7  " + m.category);
+        const std::string by = "by " + m.author + (m.category.empty() ? "" : "  \xC2\xB7  " + m.category) + mods_kind(m);
         ui::text(c, c.f.body, 15 * s, ImVec2(x0 + pad, y), ui::kAccent, by.c_str());
         y += 24 * s;
         std::string counts = mods_count(m.likes) + " likes  \xC2\xB7  " + mods_count(m.views) + " views";
@@ -4059,6 +4066,10 @@ void draw_mods(ui::Ctx& c) {
             ui::diamond(c, ImVec2(x0 + pad + 5 * s, y + 9 * s), 4 * s, ui::kGoldHi);
             y += ui::para(c, c.f.strong, 14 * s, ImVec2(x0 + pad + 16 * s, y), ui::kGoldHi, line.c_str(), w - 16 * s) + 2 * s;
             if (!f.description.empty()) y += ui::para(c, c.f.body, 13.5f * s, ImVec2(x0 + pad + 16 * s, y), ui::kSoft, f.description.c_str(), w - 16 * s);
+            if (m.kit)   // ((Triforce) 11-18) a program of its own, not a mod in the game's mods folder
+                y += ui::para(c, c.f.body, 13.5f * s, ImVec2(x0 + pad + 16 * s, y + 2 * s), ui::kAccent,
+                              "A program of its own: it goes into the kits folder beside the game and starts in a window of its own, "
+                              "where it shows its steps. No restart.", w - 16 * s) + 2 * s;
             y += 8 * s;
         }
         c.d->AddLine(ImVec2(x0 + pad, y), ImVec2(x1 - pad, y), ui::alpha(ui::kEdge, 0.8f), std::max(1.0f, s));
@@ -4126,6 +4137,14 @@ void draw_mods(ui::Ctx& c) {
         ui::prompt_bar(c, p, 1);
         return;
     }
+    if (inst.job == mods::Job::Done && inst.kit) {   // ((Triforce) 11-18) a kit: started in its own window, no restart
+        static const char* const labels[] = {"OK"};
+        mods_btn = 0;
+        mods_dialog(c, "Started!", inst.mod_name + "\n" + inst.message, labels, 1, 1, "Started", "In its own window");
+        const ui::Prompt p[] = {{ui::kConfirm, "OK"}};
+        ui::prompt_bar(c, p, 1);
+        return;
+    }
     if (inst.job == mods::Job::Done) {
         static const char* const labels[] = {"Restart Now", "Later"};
         mods_dialog(c, "Installed!", inst.mod_name + "\n" + inst.message + "\nRestart the game to play with it.", labels, 2, 1, "Installed", "Restart to apply");
@@ -4176,10 +4195,14 @@ void draw_mods_row(ui::Ctx& c, bool sel) {
     const float cx = (x0 + x1) * 0.5f, cy = (y0 + y1) * 0.5f - pitch;
     const bool title = (mods_list_bits.load(std::memory_order_relaxed) & HOS_MODS_LIST_TITLE) != 0;
     const ImVec2 m = ui::at(c, cx, cy);
-    if (!title) {
-        const ImVec2 a = ui::at(c, cx - 336, cy + 72), b = ui::at(c, cx + 336, cy - 72);
-        ui::button(c, a, b, "Mods", sel);
-        hits.add(a.x, a.y, b.x, b.y, menu_hit::kButton, 0);
+    if (!title) {   // (Mods, then Quit under it by the list's own pitch: the game's own buttons)
+        static const char* const names[2] = {"Mods", "Quit"};
+        for (int i = 0; i < 2; i++) {
+            const float y = cy - pitch * i;
+            const ImVec2 a = ui::at(c, cx - 336, y + 72), b = ui::at(c, cx + 336, y - 72);
+            ui::button(c, a, b, names[i], sel && mods_row_sel == i);
+            hits.add(a.x, a.y, b.x, b.y, menu_hit::kButton, i);
+        }
         return;
     }
     const float px = ui::lu(c, 78);
@@ -4219,6 +4242,34 @@ void draw_mods_row_shut(ui::Ctx& c) {
     draw_mods_row(k, false);
     hits = saved;
     for (int i = vtx0; i < c.d->VtxBuffer.Size; i++) c.d->VtxBuffer[i].pos.x += ox;
+}
+
+/// ((Triforce) 11-19) Quit's dialog, as the game's own system dialogs: the game dimmed, the banner, the question, its buttons
+/// on PaCommonBtnThin's plate (as draw_ask), the chosen one with the game's cursor round it; A chooses, B is Cancel
+void draw_quit_ask(ui::Ctx& c) {
+    // (the game behind dimmed as its own dialogs do it, deep enough that the Basic Controls panel's text does not show through)
+    c.d->AddRectFilled(ImVec2(0, 0), ImVec2(c.w, c.h), ui::rgba(8, 5, 2, 220));
+    ui::banner(c, 0, "Quit");
+    ui::text_mid_centre(c, c.f.body, ui::lu(c, 54 * ui::kType), c.w * 0.5f, ui::at(c, 0, 300).y, ui::kInk, "Quit the game?");
+    ui::text_mid_centre(c, c.f.body, ui::lu(c, 52), c.w * 0.5f, ui::at(c, 0, 200).y, ui::kSoft, "Progress since your last save is lost.");
+    const float bw = ui::lu(c, 336), bh = ui::lu(c, 72);
+    static const char* const labels[3] = {"Quit Game", "Restart Game", "Cancel"};
+    for (int i = 0; i < 3; i++) {
+        const float my = ui::at(c, 0, -10.0f - 188.0f * i).y;
+        const ImVec2 a(c.w * 0.5f - bw, my - bh), b(c.w * 0.5f + bw, my + bh);
+        ui::button(c, a, b, labels[i], i == quit_sel);
+        hits.add(a.x, a.y, b.x, b.y, menu_hit::kButton, 10 + i);
+    }
+    // (no prompts of its own: the pause menu's Select and Back stay under it, and say the same)
+}
+
+/// ((Triforce) 11-19) Quit Game / Restart Game: as the old Restart and Quit rows did, the settings and the pipeline cache kept first
+void end_game(bool restart) {
+    save();
+    pipeline_cache_save(true);
+    memory_trial_orderly_end();
+    logf(restart ? "menu: Restart Game" : "menu: Quit Game");
+    if (const HWND window = app_window()) PostMessageA(window, restart ? WM_APP + 9 : WM_CLOSE, 0, 0);
 }
 
 void draw_ask(ui::Ctx& c) {
@@ -4356,7 +4407,7 @@ void draw_menu(ui::Ctx& c, bool perf_under) {
         columns(k, &cx0, &cx1, &hx0, &hx1, &narrow);
         ui::column_bg(k, cx0, cx1);
     }
-    if (row) {}   // (drawn above)
+    if (row) { if (quit_ask) draw_quit_ask(k); }   // (the entries: drawn above; Quit's dialog over them)
     else if (page == 5) draw_ask(k);
     else if (page == 1) draw_controls(k);
     else if (page == 3) draw_teleport(k);
@@ -5441,7 +5492,9 @@ void mods_tick(bool* press, bool tab_left, bool tab_right, bool mouse, bool move
         return;
     }
     if (ended) {
-        if (inst.job == mods::Job::Done) {
+        if (inst.job == mods::Job::Done && inst.kit) {   // ((Triforce) 11-18) a kit started: OK alone
+            if (press[5] || press[7]) mods::clear_done(), mods_btn = 0, changed = true;
+        } else if (inst.job == mods::Job::Done) {
             if (press[1] || press[2] || press[3] || press[4]) mods_btn ^= 1, changed = true;
             if (press[7] && mods_btn == 0) {   // (Restart Now: as the restart question's, everything saved first)
                 logf("mods: restart now, to load %s", inst.mod_name.c_str());
@@ -5560,7 +5613,7 @@ void mods_tick(bool* press, bool tab_left, bool tab_right, bool mouse, bool move
             if ((press[3] || press[4]) && files > 1) m.file_choice = (m.file_choice + files + (press[4] ? 1 : -1)) % files, changed = true;
             if (press[7] && m.details_state == 2 && files) install = mods_choice;
         } else if (press[7]) {   // (Confirm on the bar: tried again after a failure; else the on-screen keyboard (a pad), or the results)
-            if (!n && feed == mods::Feed::Failed) retry = true;
+            if (feed == mods::Feed::Failed) retry = true;   // ((Triforce) 11-18: also a list that stopped with cards in it)
             else if (pad_last || !n) keyboard = true;
             else mods_choice = 0, mods_follow = true, changed = true;
         }
@@ -5569,14 +5622,15 @@ void mods_tick(bool* press, bool tab_left, bool tab_right, bool mouse, bool move
     if (install >= 0) {
         mods::install(install);
         mods_btn = 0, changed = true;
-    } else if (retry) {   // (try again: the search, or the list)
+    } else if (retry) {   // (try again: the search, or the list; (Triforce) 11-18: a list that stopped on a page goes on from it)
         if (searching) mods_retire(mods::search(mods::search_text()));
+        else if (n_all) mods::load_more();
         else mods_retire(mods::open());
         changed = true;
     } else if (keyboard) {
         mods_kbd = true, mods_kbd_row = 1, mods_kbd_col = 0, changed = true;
     }
-    if (at >= n - 4 && mods::more() && feed == mods::Feed::Ready) mods::load_more();   // (the next page, near the end of the cards shown)
+    // ((Triforce) 11-18) the next pages: asked for by the engine one after another (vk_mods.cpp fetch_page), not by the cursor
     if (feed == mods::Feed::Loading) changed = true;   // (drawn again as it comes)
     {   // (a picture or the details came in since the last drawing: drawn again, now and then)
         static int64_t last = 0;
@@ -5593,12 +5647,13 @@ void menu_tick() {
         if (!open_now.load() && mods_list_fresh()) {
             open_now = true, embed_open = false, listening = 0, mods_btn = 0, mods_follow = true;
             page = enter == 2 ? kModsPage : kModsRowPage;
+            mods_row_sel = enter == 3 ? 1 : 0, quit_ask = enter == 3, quit_sel = 0;   // ((Triforce) 11-19: 3, Quit clicked)
             if (enter == 2) mods_open_page();
             auto_pad = pad_last;
             ui::want_glyphs();
             // (its own: before the options' state is taken. (Triforce, 11-17) the system menu's, as the game's list it is under)
-            mods_sound(enter == 2 ? HOS_MENU_SOUND_SYS_DECIDE : HOS_MENU_SOUND_SYS_CURSOR);
-            logf("menu: the Mods entry %s", enter == 2 ? "clicked" : "has the cursor");
+            mods_sound(enter >= 2 ? HOS_MENU_SOUND_SYS_DECIDE : HOS_MENU_SOUND_SYS_CURSOR);
+            logf("menu: the %s entry %s", enter == 3 ? "Quit" : "Mods", enter >= 2 ? "clicked" : "has the cursor");
             menu_refresh = true;
         }
     }
@@ -5634,7 +5689,13 @@ void menu_tick() {
     // buttons the Switch's A and B are bound to as Enter and Esc, as in the game (vk_menu_keys.h; with the Nintendo layout A
     // is the right face button), not while a binding waits for its button
     static uint32_t pad_held = 0;
-    const uint32_t raw = mine && host && host->pad_raw ? host->pad_raw() : 0, pad_press = raw & ~pad_held;
+    // ((Triforce, 11-18) the controllers as the game has them: also with its window behind another one when "Controller in
+    // background" is on (host/nn_hid.c pads_in_background: HOS_INPUT_BACKGROUND over the row). They were the front window's
+    // only here, so with the row on and another window in front the game took the pad and the menu did not: L and R did not
+    // reach our tabs from the game's Options screen, the owner's for a while. The keys stay the front window's)
+    static const char* pad_bg_env = getenv("HOS_INPUT_BACKGROUND");
+    const bool pads_ok = mine || (pad_bg_env ? atoi(pad_bg_env) != 0 : opts.pad_background != 0);
+    const uint32_t raw = pads_ok && host && host->pad_raw ? host->pad_raw() : 0, pad_press = raw & ~pad_held;
     const uint32_t chord = 1u << HOS_PAD_BACK | 1u << HOS_PAD_START;
     const bool chord_now = (raw & chord) == chord && (pad_held & chord) != chord;
     pad_held = raw;
@@ -5999,15 +6060,43 @@ void menu_tick() {
             else teleport_choice = std::clamp(teleport_step_rows(teleport_choice, rows) + (press[4] - press[3]), 0, kTeleports - 1);
             if (teleport_choice != was) teleport_follow = true, changed = true;
         }
-    } else if (open_now.load() && page == kModsRowPage) {   // (Triforce) the cursor on the Mods entry under the game's list
-        if (mouse && (ptr.pressed & HOS_MOUSE_LEFT) && hits.at((float)mx, (float)my).part == menu_hit::kButton) press[7] = true;
+    } else if (open_now.load() && page == kModsRowPage) {   // (Triforce) the cursor on the entries under the game's list
+        const bool quit_here = quit_entry_shown();
+        if (!quit_here) mods_row_sel = 0, quit_ask = false;
+        if (mouse) {   // (the cursor on an entry or a dialog button chooses it; a click is A)
+            const menu_hit::Hit hit = hits.at((float)mx, (float)my);
+            if (hit.part == menu_hit::kButton) {
+                if (quit_ask && hit.index >= 10 && hit.index - 10 != quit_sel && (moved || ptr.pressed))
+                    quit_sel = hit.index - 10, mods_sound(HOS_MENU_SOUND_SYS_CURSOR), changed = true;
+                if (!quit_ask && hit.index < 2 && hit.index != mods_row_sel && (moved || ptr.pressed))
+                    mods_row_sel = hit.index, mods_sound(HOS_MENU_SOUND_SYS_CURSOR), changed = true;
+                if (ptr.pressed & HOS_MOUSE_LEFT) press[7] = true;
+            }
+        }
         if (!mods_list_fresh()) {   // (the game's list went: its screen closed under it)
-            open_now = false, page = 0, changed = true;
-        } else if (press[7]) {   // (A: Mods opens)
-            page = kModsPage, mods_btn = 0, mods_follow = true, changed = true;
-            mods_open_page();
-        } else if (press[1] || press[5] || press[0] || press[6] || tab_left || tab_right) {   // (Up or Back: the game's cursor again)
-            open_now = false, page = 0, changed = true;
+            open_now = false, page = 0, quit_ask = false, mods_row_sel = 0, changed = true;
+        } else if (quit_ask) {   // (Quit's dialog: Up and Down its buttons, A chooses, B is Cancel)
+            if (press[1] && quit_sel > 0) quit_sel--, mods_sound(HOS_MENU_SOUND_SYS_CURSOR), changed = true;
+            else if (press[2] && quit_sel < 2) quit_sel++, mods_sound(HOS_MENU_SOUND_SYS_CURSOR), changed = true;
+            else if (press[7]) {
+                mods_sound(quit_sel == 2 ? HOS_MENU_SOUND_CANCEL : HOS_MENU_SOUND_SYS_DECIDE);
+                if (quit_sel == 2) quit_ask = false;
+                else end_game(quit_sel == 1), quit_ask = false, open_now = false, page = 0;
+                changed = true;
+            } else if (press[5] || press[0] || press[6]) quit_ask = false, mods_sound(HOS_MENU_SOUND_CANCEL), changed = true;
+            press[1] = press[2] = press[5] = press[0] = press[6] = false, tab_left = tab_right = false;
+        } else if (press[7]) {   // (A: Mods opens; on Quit its dialog)
+            if (mods_row_sel == 1) quit_ask = true, quit_sel = 0, mods_sound(HOS_MENU_SOUND_SYS_DECIDE), changed = true;
+            else {
+                page = kModsPage, mods_btn = 0, mods_follow = true, changed = true;
+                mods_open_page();
+            }
+        } else if (press[2] && quit_here && mods_row_sel == 0) {   // (Down from Mods: Quit)
+            mods_row_sel = 1, mods_sound(HOS_MENU_SOUND_SYS_CURSOR), changed = true;
+        } else if (press[1] && mods_row_sel == 1) {   // (Up from Quit: Mods)
+            mods_row_sel = 0, mods_sound(HOS_MENU_SOUND_SYS_CURSOR), changed = true;
+        } else if (press[1] || press[5] || press[0] || press[6] || tab_left || tab_right) {   // (Up from Mods, or Back: the game's cursor again)
+            open_now = false, page = 0, mods_row_sel = 0, changed = true;
         }
     } else if (open_now.load() && page == kModsPage) {   // (Triforce) the Mods page
         mods_tick(press, tab_left, tab_right, mouse, moved, ptr, mx, my, changed);
@@ -6101,27 +6190,8 @@ void menu_tick() {
             }
         }
         Row& r = rows[tab_row_to_global(cur_tab, selected)];
-        const bool confirm_selected = &r == &rows[kQuitRow] || &r == &rows[kRestartRow];
-        if (pending && (pending != &r || !mine)) pending = nullptr, changed = true;
-        if (press[7] && confirm_selected) {
-            if (mine && !press[5]) {
-                if (pending != &r) {
-                    pending = &r, changed = true;
-                } else {   // (as Restart now: saved first, as the window's own close does not force the pipeline cache)
-                    save();
-                    pipeline_cache_save(true);
-                    memory_trial_orderly_end();
-                    pending = nullptr;
-                    if (&r == &rows[kRestartRow]) {   // (the restart question's Restart now: the window closes, then the game starts again)
-                        logf("menu: restart");
-                        open_now = false, changed = true;
-                        if (const HWND window = app_window()) PostMessageA(window, WM_APP + 9, 0, 0);
-                    } else if (const HWND window = app_window()) {
-                        PostMessageA(window, WM_CLOSE, 0, 0);
-                    }
-                }
-            }
-        } else if (r.cheat >= 0) cheat_press(r.cheat, press, changed);   // (a debug tool: on the Debug tab itself)
+        if (pending) pending = nullptr, changed = true;
+        if (r.cheat >= 0) cheat_press(r.cheat, press, changed);   // (a debug tool: on the Debug tab itself)
         // (Triforce: a mod's cheat: Left On, Right Off, confirm flips; the host takes the change, menu_take_mod_cheat. Before the
         // rows that act by their name or open a page: a cheat's name is the file's)
         else if (mod_cheat_slot(r.name) >= 0) changed |= mod_cheats.press(mod_cheat_slot(r.name), press[3], press[4], press[7]);
@@ -6209,8 +6279,93 @@ void menu_tick() {
     }
 }
 
+/// (Triforce, 11-19) Benchmark mode's panel (host/hos_bench.c, HOS_BENCHMARK; MkwVkHost.bench): what the run does, drawn over
+/// the game in the launcher's look, top left, clear of the middle: near-black at 85% with a thin gold edge, the title in gold,
+/// the scene and its place in the run, the live frame rate big with the scene's 1% low beside it, the newest frame times as
+/// a line (the 60 fps time marked), the whole run's progress as a gold bar along the panel's foot and how to stop it.
+/// While the start loads the save, while a teleport loads the next place and at the end it says so in the scene's line
+bool bench_now(MkwVkBench* b) { return host && host->bench && host->bench(b) && b->phase != MKWVK_BENCH_OFF; }
+void draw_bench(ui::Ctx& c, const MkwVkBench& b) {
+    ImFont* title_f = c.f.heading ? c.f.heading : c.f.strong;
+    ImFont* body = c.f.body ? c.f.body : c.f.strong;
+    ImFont* strong = c.f.strong ? c.f.strong : body;
+    ImFont* digits = c.f.number ? c.f.number : strong;
+    if (!body || !title_f) return;
+    const float k = std::max(0.6f, c.h / 1080.0f);
+    const ImU32 gold = ui::rgba(224, 178, 62), ink = ui::rgba(243, 234, 213), soft = ui::rgba(243, 234, 213, 165),
+                faint = ui::rgba(243, 234, 213, 110), bg = ui::rgba(10, 9, 8, 217);
+    const float m = std::floor(28 * k), pad = std::floor(22 * k), pw = std::floor(440 * k);
+    const float t_px = 28 * k, l_px = 21 * k, big = 64 * k, unit_px = 22 * k, small = 15.5f * k, low_px = 30 * k;
+    const float graph_h = 64 * k, bar_h = std::max(3.0f, std::floor(5 * k));
+    const float x0 = m + pad, x1 = m + pw - pad;
+    // (the heights first: the panel keeps one size through the run)
+    const float h_title = t_px * 1.15f, h_line = l_px * 1.3f, h_big = big * 1.05f;
+    const float ph = std::ceil(pad + h_title + 6 * k + h_line + 14 * k + h_big + 12 * k + graph_h + 16 * k + bar_h + 12 * k + small * 1.2f + pad);
+    const ImVec2 a(m, m), z(m + pw, m + ph);
+    c.d->AddRectFilled(a, z, bg, 6 * k);
+    c.d->AddRect(a, z, ui::alpha(gold, 0.85f), 6 * k, 0, std::max(1.0f, 1.25f * k));
+    float y = m + pad;
+    c.d->AddText(title_f, t_px, ImVec2(x0, y), gold, "Triforce benchmark");
+    y += h_title + 6 * k;
+    char line[160];
+    switch (b.phase) {
+    case MKWVK_BENCH_BOOT: snprintf(line, sizeof line, "Loading your newest save"); break;
+    case MKWVK_BENCH_TRAVEL: snprintf(line, sizeof line, "Going to %s", b.name); break;
+    case MKWVK_BENCH_DONE: snprintf(line, sizeof line, "Finished \xC2\xB7 the launcher has your results"); break;
+    case MKWVK_BENCH_STOPPED: snprintf(line, sizeof line, "Stopped \xC2\xB7 the launcher has what was measured"); break;
+    case MKWVK_BENCH_FAILED: snprintf(line, sizeof line, "%s", b.line[0] ? b.line : "The benchmark could not finish"); break;
+    default: snprintf(line, sizeof line, "Scene %d of %d \xC2\xB7 %s", b.scene, b.scenes, b.name); break;
+    }
+    c.d->PushClipRect(ImVec2(x0, y), ImVec2(x1, y + h_line), true);   // (a long name or reason stays inside the panel)
+    c.d->AddText(body, l_px, ImVec2(x0, y), b.phase == MKWVK_BENCH_FAILED ? ui::rgba(236, 120, 96) : ink, line);
+    c.d->PopClipRect();
+    y += h_line + 14 * k;
+    {   // (the live rate, big; the scene's 1% low at the right. Finished: the whole run's average and its lowest 1% low)
+        const bool live = b.phase == MKWVK_BENCH_SETTLE || b.phase == MKWVK_BENCH_MEASURE || b.phase == MKWVK_BENCH_DONE;
+        char fps[16], low[16];
+        snprintf(fps, sizeof fps, live && b.fps > 0 ? "%.0f" : "--", b.fps);
+        snprintf(low, sizeof low, live && b.low1 > 0 ? "%.0f" : "--", b.low1);
+        const ImVec2 fs = ui::size_of(digits, big, fps);
+        c.d->AddText(digits, big, ImVec2(x0, y), live ? ink : faint, fps);
+        c.d->AddText(strong, unit_px, ImVec2(x0 + fs.x + 10 * k, y + big * 0.98f - unit_px * 1.25f), gold, "fps");
+        const ImVec2 ls = ui::size_of(strong, low_px, low), ll = ui::size_of(body, small, "1% low");
+        c.d->AddText(body, small, ImVec2(x1 - ll.x, y + 4 * k), soft, "1% low");
+        c.d->AddText(strong, low_px, ImVec2(x1 - ls.x, y + 4 * k + small * 1.25f), live ? ink : faint, low);
+    }
+    y += h_big + 12 * k;
+    {   // (the frame times: the newest at the right, 0 at the bottom, the top 33 ms or the longest shown; the 60 fps time marked)
+        const ImVec2 g0(x0, y), g1(x1, y + graph_h);
+        c.d->AddRectFilled(g0, g1, ui::rgba(0, 0, 0, 110), 3 * k);
+        const int n = std::min<int>(b.graph_n, MKWVK_BENCH_GRAPH);
+        float most = 33.4f;
+        for (int i = 0; i < n; i++) most = std::max(most, std::min(b.graph_ms[i], 250.0f));
+        const float top = g0.y + 4 * k, bot = g1.y - 3 * k;
+        const float y60 = bot - 16.667f / most * (bot - top);
+        c.d->AddLine(ImVec2(g0.x, y60), ImVec2(g1.x, y60), ui::rgba(243, 234, 213, 40), 1.0f);
+        if (n >= 2) {
+            static ImVec2 pts[MKWVK_BENCH_GRAPH];
+            for (int i = 0; i < n; i++) {
+                const float t = std::min(b.graph_ms[i], most);
+                pts[i] = ImVec2(g1.x - (g1.x - g0.x) * (float)(n - 1 - i) / (MKWVK_BENCH_GRAPH - 1), bot - t / most * (bot - top));
+            }
+            const bool live = b.phase == MKWVK_BENCH_SETTLE || b.phase == MKWVK_BENCH_MEASURE;
+            c.d->AddPolyline(pts, n, live ? gold : ui::alpha(gold, 0.4f), ImDrawFlags_None, std::max(1.0f, 1.5f * k));
+        }
+    }
+    y += graph_h + 16 * k;
+    {   // (the whole run's progress)
+        const float p = std::clamp(b.progress, 0.0f, 1.0f);
+        c.d->AddRectFilled(ImVec2(x0, y), ImVec2(x1, y + bar_h), ui::rgba(243, 234, 213, 36), bar_h * 0.5f);
+        if (p > 0) c.d->AddRectFilled(ImVec2(x0, y), ImVec2(x0 + (x1 - x0) * p, y + bar_h), gold, bar_h * 0.5f);
+    }
+    y += bar_h + 12 * k;
+    if (b.phase < MKWVK_BENCH_DONE) c.d->AddText(body, small, ImVec2(x0, y), faint, "Esc stops the benchmark");
+}
+
 void menu_record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h) {
     const bool start = startup_on.load(std::memory_order_acquire);
+    static MkwVkBench bench;   // ((Triforce) benchmark mode: its panel over everything else)
+    const bool bench_on = bench_now(&bench);
     if (!start) bugshot_record(cmd, index, w, h);   // (Triforce: a bug capture's picture of this frame, before anything is drawn over it)
     const bool fps = opts.show_fps && !start;   // (no game frames yet: not "0 FPS" over the start-up screen)
     const bool open = open_now.load(std::memory_order_relaxed);
@@ -6219,7 +6374,7 @@ void menu_record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h) {
     const int64_t game_seen = game_options_ns.load(std::memory_order_relaxed);
     const bool game_tab = !open && !start && embed_allowed() && game_seen && prof_now() - game_seen < 250000000LL && embed_since;
     const bool mods_row = !open && !start && mods_list_fresh();   // ((Triforce) the Mods entry under the game's list)
-    if (!start && !fps && !open && !note && !game_tab && !mods_row) {   // (nothing shows: no ImGui frame, no render pass)
+    if (!start && !fps && !open && !note && !game_tab && !mods_row && !bench_on) {   // (nothing shows: no ImGui frame, no render pass)
         // (but a new window size or Menu size since the last bake: one frame with nothing drawn that bakes the menu's glyphs
         // and measures its page for the new size, so the next open has no hitch whatever was resized while nothing showed)
         if (prebake_needed(w, h) && ui::begin(w, h)) {
@@ -6257,6 +6412,10 @@ void menu_record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h) {
     }
     if (fps && !full) draw_fps(c, (open && page != kModsRowPage) || game_tab);   // ((Triforce) the Mods entry: the counter stays where the game list has it)
     if (note) draw_notice(c);
+    if (bench_on) {   // ((Triforce) benchmark mode's panel, in the overlay's own fonts, over the rest
+        ui::Ctx bc = ui_ctx(w, h);
+        draw_bench(bc, bench);
+    }
     ::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);   // (Dear ImGui records into cmd directly, its backend through its own pointers: what this thread recorded through vk_work.h reaches cmd first)
     ui::record(cmd, index, w, h);
 }
@@ -6267,7 +6426,9 @@ void menu_record_image(VkCommandBuffer cmd, VkImage image, VkImageView view, uin
     const bool note = !open && notice_text[0] && prof_now() < notice_until;
     const bool game_tab = !open && game_options_shown() && embed_since;
     const bool mods_row = !open && mods_list_fresh();
-    if (!open && !fps && !note && !game_tab && !mods_row) return;
+    static MkwVkBench bench;   // ((Triforce) benchmark mode's panel, in the shots too)
+    const bool bench_on = bench_now(&bench);
+    if (!open && !fps && !note && !game_tab && !mods_row && !bench_on) return;
     if (!ui::begin(w, h)) return;
     // ((Triforce) a still: with no window's frames stepping the easing (menu_record), the lists stand where the selection asks.
     // Before, a headless shot, and tests/ui_preview.cpp's pictures, showed every list at its top whatever was selected)
@@ -6282,6 +6443,10 @@ void menu_record_image(VkCommandBuffer cmd, VkImage image, VkImageView view, uin
     }
     if (fps && !full) draw_fps(c, (open && page != kModsRowPage) || game_tab);   // ((Triforce) the Mods entry: the counter stays where the game list has it)
     if (note) draw_notice(c);
+    if (bench_on) {
+        ui::Ctx bc = ui_ctx(w, h);
+        draw_bench(bc, bench);
+    }
     ::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);   // (Dear ImGui records into cmd directly, its backend through its own pointers: what this thread recorded through vk_work.h reaches cmd first)
     ui::record_to(cmd, image, view, w, h);
 }

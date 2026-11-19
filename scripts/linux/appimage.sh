@@ -76,6 +76,12 @@ find "$T" -name __pycache__ -prune -exec rm -rf {} +
 
 # ---- what it builds with ----
 cp -a "$DEPS/python" "$APPDIR/usr/python"
+# the launcher window (launcher/build.ps1 -Rid linux-x64 makes it; without it the classic builder window opens)
+if [ -f launcher/out/triforce-launcher ]; then
+    mkdir -p "$APPDIR/usr/bin"
+    cp launcher/out/triforce-launcher "$APPDIR/usr/bin/" && chmod +x "$APPDIR/usr/bin/triforce-launcher"
+    cp launcher/out/triforce.png "$APPDIR/usr/bin/" 2>/dev/null || true
+fi
 cp "$DEPS/tk/libtcl9tk9.0.so" "$DEPS/tk/libXft.so.2" "$DEPS/tk/libXrender.so.1" "$APPDIR/usr/python/lib/"
 mkdir -p "$L/emsdk"
 cp -a "$DEPS/emsdk/upstream" "$L/emsdk/"

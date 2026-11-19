@@ -145,7 +145,7 @@ int main() {
 
 
 def check_sources(menu, api, replay, readme):
-    table = menu[menu.index("Row rows[] = {"):menu.index("constexpr int kQuitRow")]
+    table = menu[menu.index("Row rows[] = {"):menu.index("constexpr int kRowsEnd")]
     entries = re.findall(r'\{(TAB_\w+), "([^"]+)", ([^,]+),', table)
     # ((Triforce) 11-17) a section's heading (its entry ends "..., -1, true}") is not a row
     headings = set(re.findall(r'\{TAB_\w+, "([^"]+)", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true\}', table))
@@ -155,10 +155,10 @@ def check_sources(menu, api, replay, readme):
     check(tuple(names[at + 1:at + 1 + len(ALL_ROWS)]) == ALL_ROWS, "the save rows do not stand directly after Discord status: %r" % names[at + 1:at + 5])
     for tab, name, value in entries[at + 1:at + 1 + len(ALL_ROWS)]:
         check(tab == "TAB_SYSTEM" and value == "nullptr", "%s is not a row of the System tab that acts on a press" % name)
-    check(names[-2:] == ["Restart", "Quit"], "Restart and Quit are no longer the table's last two")
+    check("Restart" not in names and "Quit" not in names, "Restart and Quit are rows again (11-19: they are the pause menu's Quit)")
     tick = block(menu, "void menu_tick() {")
     press = tick.index("else if (press[7] && share_row(r)) share_press(share_row(r)), press[7] = false, changed = true;")
-    check(tick.index("} else if (r.cheat >= 0) cheat_press(") < press < tick.index("else if (press[7] && !r.value && can_bind()) page = 1"),
+    check(tick.index("if (r.cheat >= 0) cheat_press(") < press < tick.index("else if (press[7] && !r.value && can_bind()) page = 1"),
           "a press on a save row is not taken before the rows that open a page")
     draw = block(menu, "void draw_options(ui::Ctx& c) {")
     check('ends ? r.name : share_row(r) ? share_label(share_row(r)) : "Open"' in draw, "a save row's label is not drawn in its value's place")

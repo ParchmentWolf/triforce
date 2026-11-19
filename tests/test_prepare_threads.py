@@ -47,6 +47,13 @@ def check_source():
          ['getenv("RX_VK_PREPARE_THREADS")', "GlobalMemoryStatusEx(&ms)", "ram_free = ms.ullAvailPhys;",
           "GetPriorityClass(GetCurrentProcess())", "cls == ABOVE_NORMAL_PRIORITY_CLASS || cls == HIGH_PRIORITY_CLASS",
           "prepare_threads::count(cpus, ram_free, above_normal, e ? atoi(e) : 0)", "MemAvailable"])
+    # ((Triforce) the translation pass's workers: fewer on AMD's driver for RDNA 1 and 2, told apart as vk_vendor.h tells it)
+    translate = block(draw, "unsigned prepare_translate_workers() {")
+    need("vk_draw.cpp: prepare_translate_workers()", translate,
+         ["amd_older = amd_older_compiler(facts);", "facts.driver_info = drv.driverInfo;", "prepare_workers()",
+          "prepare_threads::translate(all, amd_older, e && atoi(e) > 0)"])
+    need("vk_draw.cpp: prepare_run()", block(draw, "bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {"),
+         ["background ? std::clamp(cpus / 4, 2u, 4u) : prepare_translate_workers()"])
     # (the preparation before the title: the count is the rule's, and the workers stay below normal priority)
     for name, marker in [("state_list_prepare", "void state_list_prepare(void (*progress)(size_t done, size_t total)) {"),
                          ("warm_libraries", "bool warm_libraries(void (*progress)(size_t done, size_t total)) {")]:
@@ -59,7 +66,7 @@ def check_source():
     prepare = block(draw, "bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {")
     need("vk_draw.cpp: prepare_run()", prepare,
          # (behind the game: its own count and idle priority, as before)
-         ["const unsigned workers = background ? std::clamp(cpus / 4, 2u, 4u) : prepare_workers();",
+         ["const unsigned workers = background ? std::clamp(cpus / 4, 2u, 4u) : prepare_translate_workers();",
           "SetThreadPriority(GetCurrentThread(), background ? THREAD_PRIORITY_IDLE : THREAD_PRIORITY_BELOW_NORMAL);",
           "for (unsigned i = 0; i < workers; i++) threads.emplace_back(worker);"])
     if "cpus / 2" in prepare:

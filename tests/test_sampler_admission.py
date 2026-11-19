@@ -53,7 +53,7 @@ def main():
              "independent", "valid-after-failure", "owner-commit", "seen-commit", "mine-commit", "failure-commit",
              "registration", "shared-thread", "concurrent", "nearest", "linear", "compare", "compare-explicit",
              "compare-pcf-off", "custom-border", "standard-border", "reduction", "compare-reduction", "anisotropy",
-             "unknown-id", "force-linear", "wrap", "lod-clamp", "custom-reduction",
+             "anisotropy-clamped", "unknown-id", "force-linear", "wrap", "lod-clamp", "custom-reduction",
              "descriptor-push", "descriptor-pool", "descriptor-compute", "descriptor-old", "descriptor-whole"]
     with tempfile.TemporaryDirectory(prefix="sampler-admission-") as temp:
         cpp, exe = Path(temp) / "fixture.cpp", Path(temp) / "fixture.exe"

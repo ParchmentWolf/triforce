@@ -953,6 +953,11 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
     memset(stick, 0, 4 * sizeof *stick);
     void hos_mouse_native_stick(int held);
     scripted_input(buttons, stick);
+    /* ((Triforce, 11-19) benchmark mode (host/hos_bench.c) drives the game itself: its presses and stick alone, with the window
+       in front or behind other windows; the player's devices do not count while it runs (a mouse or a pad would move the camera
+       it measures) */
+    int hos_bench_input_only(void);
+    if (hos_bench_input_only()) return;
     /* A scripted run (a test) takes no input from the player's devices until 5 s after its last press (a variable
        left set in a shell no longer leaves the game without controls), and otherwise the pads count only
        while the game's window is in front, like the keyboard: XInput is global, so a test run in the background
@@ -975,7 +980,17 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
         static const char *env;
         static int looked;
         if (!looked) looked = 1, env = getenv("HOS_INPUT_BACKGROUND");
-        if (pads_in_background(env, rx_option(4, 0))) pads_read(buttons, stick);
+        /* ((Triforce, 11-18) while the Insert menu is open the pads are its own here too (it reads them in the background
+           now: gpu/vk/vk_menu.cpp pads_ok), as in front below; read all the same, so the menu's bits stay current) */
+        if (pads_in_background(env, rx_option(4, 0))) {
+            uint64_t pb = 0;
+            int32_t ps[4] = {0};
+            pads_read(&pb, ps);
+            if (!rx_option(1, 0)) {
+                *buttons |= pb;
+                stick_max(stick, ps);
+            }
+        }
         return;
     }
     {   /* (Triforce) The options' tabs inside the game's own Options screen (host/oot_menu.c, gpu/vk/vk_menu.cpp): one of

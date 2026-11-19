@@ -475,6 +475,7 @@ class OotOptionsScreenTests(unittest.TestCase):
             (tmp / "gpu" / "vk" / "vk_api.h").write_text(VK_API_H, encoding="utf-8")
             shutil.copy(ROOT / "host" / "oot_menu.c", tmp / "host" / "oot_menu.c")
             shutil.copy(ROOT / "host" / "guest_bounds.h", tmp / "host" / "guest_bounds.h")   # (set_item_key's buffer check)
+            (tmp / "host" / "hos_bench.h").write_text(HOS_BENCH_H, encoding="utf-8")   # ((Triforce, 11-19) benchmark mode: off here)
             (tmp / "host" / "t.c").write_text(OPTIONS_FIXTURE, encoding="utf-8")
             binary = tmp / "t.exe"
             other_half = ["-DHOS_OOT_MENU_NO_MOUSE"] if sys.platform == "win32" else []
@@ -488,6 +489,18 @@ class OotOptionsScreenTests(unittest.TestCase):
             self.assertEqual(build.returncode, 0, build.stderr)
             run = subprocess.run([str(binary)], text=True, capture_output=True, timeout=30)
             self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+
+
+# ((Triforce, 11-19) host/hos_bench.h's two calls oot_menu.c makes, benchmark mode off: the menus as a player has them)
+HOS_BENCH_H = """#pragma once
+#include <stdint.h>
+enum { HOS_BENCH_MENU_NONE, HOS_BENCH_MENU_PRESS_A };
+static inline int hos_bench_on(void) { return 0; }
+static inline int hos_bench_menu(uint64_t screen, uint64_t vt, int focus, int focused_entry, int entries, int *entry) {
+    (void)screen, (void)vt, (void)focus, (void)focused_entry, (void)entries, (void)entry;
+    return HOS_BENCH_MENU_NONE;
+}
+"""
 
 
 class OotMenuMouseTests(unittest.TestCase):
@@ -506,6 +519,7 @@ class OotMenuMouseTests(unittest.TestCase):
             (tmp / "gpu" / "vk" / "vk_api.h").write_text(VK_API_H, encoding="utf-8")
             shutil.copy(ROOT / "host" / "oot_menu.c", tmp / "host" / "oot_menu.c")
             shutil.copy(ROOT / "host" / "guest_bounds.h", tmp / "host" / "guest_bounds.h")   # (set_item_key's buffer check)
+            (tmp / "host" / "hos_bench.h").write_text(HOS_BENCH_H, encoding="utf-8")   # ((Triforce, 11-19) benchmark mode: off here)
             (tmp / "host" / "t.c").write_text(FIXTURE, encoding="utf-8")
             binary = tmp / "t.exe"
             build = subprocess.run([compiler, "-std=gnu11", "-Wall", "-O1", "-g", "-D_WIN32_WINNT=0x0601",

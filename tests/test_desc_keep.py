@@ -27,7 +27,7 @@ from pathlib import Path
 RUN_ALL_ARGS = ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"]
 
 ROOT = Path(__file__).resolve().parents[1]
-CASES = ["header", "on", "off", "no-reuse", "sampler-cache-off", "late-defer", "texture", "compute", "texture-moved", "texture-dummy",
+CASES = ["header", "on", "off", "no-reuse", "sampler-cache-off", "late-defer", "texture", "compute", "texture-moved", "texture-dummy", "texture-dummy-redrawn",
          "texture-no-sampler", "uniform", "uniform-stream", "uniform-moved", "c1", "storage", "check", "check-bad"]
 
 

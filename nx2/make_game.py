@@ -1397,11 +1397,11 @@ def lift_key_file(rel):
     return not (rel in LIFT_KEY_NOT or rel.startswith("prompt_faces/") or (name.startswith("test_") and name.endswith(".py")))
 
 
-def lift_key(exefs, work, env):
+def lift_key(exefs, work, env, chunks=True):
     """What the lift's output depends on: the game's code, the translator (nx2/ but for LIFT_KEY_NOT, the vendored a64-kit), the HLE
     functions host/ defines (hooked in the lift; the rest of host/ is compiled after it, so a change there alone does not lift again),
     the hot list and chunk boundaries, the lift's environment and the Python running it. A file the lift never reads may be in it (a
-    new build then lifts again); one it reads must be"""
+    new build then lifts again); one it reads must be. chunks=False: all of it but the chunk boundaries (key_after_lift)"""
     import kit  # noqa: F401  (a64-kit on the path, for standalone)
     import standalone
     h = hashlib.sha1(sys.version.encode(), usedforsecurity=False)
@@ -1413,7 +1413,9 @@ def lift_key(exefs, work, env):
             dirs[:] = sorted(x for x in dirs if x != "__pycache__")
             files += [(ROOT, os.path.join(d, f)) for f in sorted(fs) if f.endswith((".py", ".c", ".h", ".cpp", ".hpp", ".txt", ".json"))
                       and (top != HERE or lift_key_file(os.path.relpath(os.path.join(d, f), HERE).replace(os.sep, "/")))]
-    files += [(work, os.path.join(work, "hot_funcs.txt")), (work, os.path.join(work, "image", "chunks.txt"))]
+    files.append((work, os.path.join(work, "hot_funcs.txt")))
+    if chunks:
+        files.append((work, os.path.join(work, "image", "chunks.txt")))
     for base, f in files:
         if os.path.isfile(f):
             h.update(os.path.relpath(f, base).replace(os.sep, "/").encode() + bytes(1))
@@ -1422,6 +1424,20 @@ def lift_key(exefs, work, env):
     lift_env = dict(env, **{k: v for k, v in os.environ.items() if k.startswith(("A64_", "OOT_", "RX_"))})
     h.update(repr(sorted(lift_env.items())).encode())
     return h.hexdigest()
+
+
+def key_after_lift(exefs, work, env, key, before, copied):
+    """(Triforce, epicmemes46's 5df76bb) The key a finished lift is kept under. key: the one taken before it; before: that one
+    without the chunk boundaries (lift_key's chunks=False); copied: the boundaries were copied in from the source's
+    work/image/chunks.txt. The lift writes <work>/image/chunks.txt (nx2/chunks.py save): into a work folder that had none, the
+    boundaries the sizes gave. The key taken before it had none in it, the next build's has those, and so the build after every
+    lift into a fresh work folder translated the whole game again, the same game with the same tools. Boundaries the lift wrote
+    are what its own inputs give, so the key is taken again now, as the next build takes it, when nothing but chunks.txt changed
+    meanwhile (an update of the tools during the lift keeps the key from before it, and the next build lifts again). Boundaries
+    copied in from the source are an input, copied again at each build: the key from before the lift stays"""
+    if copied or lift_key(exefs, work, env, chunks=False) != before:
+        return key
+    return lift_key(exefs, work, env)
 
 
 def gen_print(gen):
@@ -1922,7 +1938,8 @@ def main(a=None):
             copy_writable(src, dst)
     os.makedirs(os.path.join(work, "image"), exist_ok=True)
     src = os.path.join(ROOT, "work", "image", "chunks.txt")   # (where the lifted code's files begin: addresses)
-    if os.path.exists(src):
+    chunks_copied = os.path.exists(src)   # ((Triforce) an input then; otherwise the lift writes it: key_after_lift)
+    if chunks_copied:
         copy_writable(src, os.path.join(work, "image", "chunks.txt"))
     env = {"OOT_WORK": work, "OOT_EXEFS": exefs, "OOT_ROMFS": romfs, "OOT_DUMP": out, "RX_RELEASE": "1", "A64_HOT_CHUNK": "1"}
     if os.path.exists(os.path.join(work, "hot_funcs.txt")):
@@ -1944,6 +1961,7 @@ def main(a=None):
         if lifted_before(work, key):   # (never on the second pass: its key was taken away below)
             print("the game was translated with these tools before: translating it again is skipped", flush=True)
         else:
+            key_unchunked = lift_key(exefs, work, env, chunks=False)   # ((Triforce) the inputs but chunks.txt: key_after_lift)
             key_file = os.path.join(work, "sa", "gen", LIFT_KEY)
             if os.path.exists(key_file):
                 os.remove(key_file)   # (a lift stopped halfway leaves no key behind)
@@ -1967,6 +1985,7 @@ def main(a=None):
             if os.path.isfile(os.path.join(work, "sa", "gen", "code_hot.c")):
                 run(PY + ["nx2/split_hot.py", os.path.join(work, "sa", "gen")], env)   # (eight files side by side: ~6 minutes, not 79)
             early.finish()
+            key = key_after_lift(exefs, work, env, key, key_unchunked, chunks_copied)   # ((Triforce) the chunks.txt it wrote in it)
             write_lift_key(work, key)
         cut = lifted_cut_short(gen_dir)
         if not cut:

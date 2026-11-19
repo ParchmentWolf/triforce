@@ -56,6 +56,8 @@ struct World {
 Texture textures[16];
 thread_local bool view_slot_known = true;
 thread_local bool upload_defer_ok = false;
+thread_local bool draw_may_defer = true;   // ((Triforce, redrawn.h) set by vk_draw.cpp draw: may this draw leave textures)
+bool texture_owes(const Texture*) { return false; }   // ((Triforce) no texture here still owes bytes)
 uint32_t texture_slot_version(int slot) { return w.version[(uint32_t)slot]; }
 uint64_t sampler_registrations_generation() { return w.samp; }
 uint64_t texture_destroy_generation() { return w.destroy; }
@@ -64,7 +66,7 @@ uint32_t texture_epoch() { return (uint32_t)w.epoch; }
 uint64_t gpu_bind_stamp() { return w.stamp; }
 uint64_t ub_generation() { return w.ub; }
 VkImageView texture_view_of(uint32_t h, VkImageViewType vt, ViewUse use, VkFormat f, Texture** tex) {
-    CHECK(use == ViewUse::Sample && f == VK_FORMAT_UNDEFINED && upload_defer_ok == (test != "compute"));
+    CHECK(use == ViewUse::Sample && f == VK_FORMAT_UNDEFINED && upload_defer_ok == (test != "compute" && draw_may_defer));
     w.views++;
     const uint32_t slot = h & 0xFFFFF;
     view_slot_known = w.known;
@@ -229,6 +231,24 @@ int run() {
         w.known = true;   // (a registered slot whose texture is not there yet: the same)
         w.version[0x123]++;
         CHECK(tex_resolved(h, &a) && a.known && !a.view && !tex_resolved(h, &b) && a == b);
+        return 0;
+    }
+    if (test == "texture-dummy-redrawn") {   // ((Triforce, redrawn.h) a registered slot's kept dummy: taken by a draw that may
+        // leave textures for later, looked up again by one that may not, so that its texture is made now)
+        w.dummy_slot = true, w.known = true;
+        Tex a, b;
+        CHECK(tex_resolved(h, &a) && a.known && !a.view && !a.tex);
+        CHECK(!tex_resolved(h, &b) && a == b);   // (a draw into the scene: the kept dummy stands for the frame)
+        draw_may_defer = false;                  // (a draw into a text box composed for the first time)
+        CHECK(tex_resolved(h, &b) && a == b);    // (looked up, not taken)
+        CHECK(tex_resolved(h, &b));              // (again: never taken by such a draw)
+        draw_may_defer = true;
+        w.dummy_slot = false;                    // (the texture there now: a real view, which any draw may take)
+        w.version[0x123]++;
+        CHECK(tex_resolved(h, &a) && a.view);
+        draw_may_defer = false;
+        CHECK(!tex_resolved(h, &b) && a == b);
+        draw_may_defer = true;
         return 0;
     }
     if (test == "texture-no-sampler") {   // (a failed sampler is not kept: the draw is left out and the next one tries again)

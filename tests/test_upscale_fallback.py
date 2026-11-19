@@ -161,19 +161,23 @@ bool gameplay_network(uint64_t key) {
     return key == 0xfd029a317a9a4b94ull || key == 0x9dc98871eb7fc101ull;
 }
 enum class ViewUse { Sample, Storage };
+constexpr VkImageView VK_NULL_HANDLE = 0;
 VkImageView texture_view(Texture *t, const nvn_tex *, const nvn_view *v, VkImageViewType type,
-                         ViewUse use, VkFormat *f, VkFormat forced = VK_FORMAT_UNDEFINED) {
+                         ViewUse use, VkFormat *f = nullptr, VkFormat forced = VK_FORMAT_UNDEFINED) {
     assert(!v && type == VK_IMAGE_VIEW_TYPE_2D && lock_depth > 0);
     views++;
     if (t == &src) {
         assert(use == ViewUse::Sample && forced == VK_FORMAT_UNDEFINED);
-        *f = VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
+        if (f) *f = VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
         return missing_input_view ? 0 : (VkImageView)101;
     }
     assert(t == &dst && use == ViewUse::Storage && forced == VK_FORMAT_B10G11R11_UFLOAT_PACK32);
-    *f = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+    if (f) *f = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     return missing_output_view ? 0 : (VkImageView)102;
 }
+// ((Triforce, 11-18) FSR 3.1 for a rejected network's pass, upscale_stub's, when it is the upscaler: not picked here)
+bool fsr3_wanted() { return false; }
+bool fsr3_upscale(VkCommandBuffer, uint64_t, bool, Texture *, VkImageView, Texture *, VkImageView, uint32_t) { return false; }
 static bool typed_upscale(VkCommandBuffer, VkImageView input, VkImageView output, Texture *t,
                           uint32_t level, uint64_t, const char *, bool temporal) {
     assert(input == (VkImageView)101 && output == (VkImageView)102 && t == &dst && level == 0 &&

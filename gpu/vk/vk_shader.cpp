@@ -875,6 +875,150 @@ void program_pack(Program& p) {
     }
 }
 
+// ((Triforce, 11-18) EstebanGGM's port of NX2navi spirv_water.c spirv_water_simplify: the 8-tap water/shadow PCF loops made
+// 1 tap with RX_VK_WATER_QUALITY=1 (medium: the wave shaders) or 2 (low); 0 or high: as translated. On by default (1) only on
+// AMD's older compiler where the driver has no fast-linking pipeline libraries (the RX 580 class, whose frame rate it is
+// for), the cards whose pipelines the alpha-to-coverage rule (vk_main.cpp) makes new to the driver's caches anyway. Outside
+// the translation stamp: make_module rewrites the module, the record keeps the translation)
+int water_quality_mode() {
+    static const int mode = [] {
+        if (const char* e = getenv("RX_VK_WATER_QUALITY"); e && *e) {
+            if (!std::strcmp(e, "high")) return 0;
+            if (!std::strcmp(e, "medium")) return 1;
+            if (!std::strcmp(e, "low")) return 2;
+            const int v = std::atoi(e);
+            return v < 0 ? 0 : v > 2 ? 2 : v;
+        }
+        return dev.fixes.nan_bits && !dev.graphics_pipeline_library ? 1 : 0;
+    }();
+    return mode;
+}
+bool is_dref_op(uint32_t op) { return op == 89 || op == 91 || op == 92 || op == 93; }
+bool spirv_water_simplify(const std::vector<uint32_t>& w, int mode, std::vector<uint32_t>& out) {
+    const uint64_t n = w.size();
+    if (mode <= 0 || n < 6 || w[0] != 0x07230203u) return false;
+    const uint32_t bound = w[3];
+    if (!bound || bound > 2000000u) return false;
+    int em = -1, drv = 0, sin_cos = 0, dref = 0;
+    uint32_t glsl_id = 0, false_id = 0, u32_ty = 0, s32_ty = 0, izero[8]{};
+    int n_iz = 0;
+    for (uint64_t i = 5; i < n;) {
+        const uint32_t op = w[i] & 0xffffu, ln = w[i] >> 16;
+        if (!ln || i + ln > n) return false;
+        if (op == 11 && ln >= 6 && !std::memcmp(&w[i + 2], "GLSL.std.450", 13)) glsl_id = w[i + 1];
+        else if (op == 15 && ln >= 2) { if (em >= 0 && em != (int)w[i + 1]) return false; em = (int)w[i + 1]; }
+        else if (op == 21 && ln >= 4 && w[i + 2] == 32) {
+            if (!w[i + 3] && !u32_ty) u32_ty = w[i + 1];
+            else if (w[i + 3] == 1 && !s32_ty) s32_ty = w[i + 1];
+        } else if (op == 42 && ln >= 3 && !false_id) false_id = w[i + 2];
+        else if (op == 43 && ln == 4 && !w[i + 3] && (w[i + 1] == u32_ty || w[i + 1] == s32_ty) && n_iz < 8)
+            izero[n_iz++] = w[i + 2];
+        else if (op >= 207 && op <= 212) drv++;
+        else if (is_dref_op(op)) dref++;
+        else if (op == 12 && ln >= 5 && glsl_id && w[i + 3] == glsl_id && (w[i + 4] == 13 || w[i + 4] == 14)) sin_cos++;
+        i += ln;
+    }
+    if (em != 4 || !false_id || dref < 9) return false;
+    if (mode == 1 && !(drv > 0 && sin_cos > 0)) return false;
+
+    std::vector<uint64_t> lbl(bound, 0);
+    const bool trace_q = mode >= 2 && dref >= 26 && n_iz > 0;
+    std::vector<uint8_t> def_op(trace_q ? bound : 0, 0);
+    std::vector<uint32_t> def_op1(trace_q ? bound : 0, 0);
+    for (uint64_t i = 5; i < n;) {
+        const uint32_t op = w[i] & 0xffffu, ln = w[i] >> 16;
+        if (op == 248 && ln >= 2 && w[i + 1] < bound) lbl[w[i + 1]] = i;
+        else if (trace_q && (op == 61 || op == 124) && ln >= 4 && w[i + 2] < bound) {
+            def_op[w[i + 2]] = (uint8_t)op;
+            def_op1[w[i + 2]] = w[i + 3];
+        }
+        i += ln;
+    }
+    out.clear();
+    uint64_t prev = 0, last_dref = 0;
+    uint32_t var_q = 0;
+    int hits = 0, dref_cf = 0;
+    for (uint64_t i = 5; i < n;) {
+        const uint32_t op = w[i] & 0xffffu, ln = w[i] >> 16;
+        if (is_dref_op(op)) last_dref = i, dref_cf = 0;
+        if (op == 250 && ln >= 4 && prev && (w[prev] & 0xffffu) == 247 && w[prev + 1] == w[i + 3] &&
+            w[i + 2] != w[i + 3] && w[i + 1] != false_id && last_dref && i - last_dref < 160) {
+            const uint64_t m_off = w[i + 3] < bound ? lbl[w[i + 3]] : 0;
+            if (m_off > i) {
+                int idref = 0, iloop = 0;
+                for (uint64_t k = i + ln; k < m_off;) {
+                    const uint32_t kop = w[k] & 0xffffu, kln = w[k] >> 16;
+                    if (!kln || k + kln > n) break;
+                    if (is_dref_op(kop)) idref++;
+                    else if (kop == 246) iloop++;
+                    k += kln;
+                }
+                if (!iloop && idref == 8) {
+                    if (out.empty()) out = w;
+                    out[i + 1] = false_id;
+                    hits++;
+                } else if (trace_q && !var_q && !iloop && !dref_cf && idref == 25) {
+                    for (uint64_t k = i + ln; k < m_off;) {
+                        const uint32_t kop = w[k] & 0xffffu, kln = w[k] >> 16;
+                        if (!kln || k + kln > n) break;
+                        if (kop == 171 && kln >= 5) {
+                            uint32_t id = w[k + 3];
+                            if (id < bound && def_op[id] == 124) id = def_op1[id];
+                            if (id < bound && def_op[id] == 61) var_q = def_op1[id];
+                            break;
+                        }
+                        k += kln;
+                    }
+                }
+            }
+        }
+        if (op == 246 || op == 250 || op == 251 || op == 253) dref_cf = 1;
+        prev = i;
+        i += ln;
+    }
+    if (var_q && trace_q) {
+        int cnt_pcf = 0;
+        uint64_t store_off = 0;
+        uint32_t var_pcf = 0;
+        for (uint64_t i = 5; i < n;) {
+            const uint32_t op = w[i] & 0xffffu, ln = w[i] >> 16;
+            if (op == 171 && ln >= 5) {
+                int rhs0 = 0;
+                for (int z = 0; z < n_iz; z++) if (w[i + 4] == izero[z]) rhs0 = 1;
+                if (rhs0) {
+                    uint32_t id = w[i + 3];
+                    if (id < bound && def_op[id] == 124) id = def_op1[id];
+                    if (id < bound && def_op[id] == 61 && def_op1[id] == var_q) {
+                        const uint64_t nx = i + ln;
+                        if (nx < n && (w[nx] & 0xffffu) == 62 && (w[nx] >> 16) >= 3 && w[nx + 2] == w[i + 2]) {
+                            cnt_pcf++;
+                            store_off = nx;
+                            var_pcf = w[nx + 1];
+                        }
+                    }
+                }
+            }
+            i += ln;
+        }
+        if (cnt_pcf == 1 && var_pcf && store_off) {
+            int pv_stores = 0;
+            for (uint64_t i = 5; i < n;) {
+                const uint32_t op = w[i] & 0xffffu, ln = w[i] >> 16;
+                if (op == 62 && ln >= 3 && w[i + 1] == var_pcf) pv_stores++;
+                i += ln;
+            }
+            if (pv_stores == 1) {
+                if (out.empty()) out = w;
+                out[store_off + 2] = false_id;
+                hits++;
+            }
+        }
+    }
+    if (hits > 0 && !out.empty()) return true;
+    out.clear();
+    return false;
+}
+
 VkShaderModule make_module(const std::vector<uint32_t>& spirv, uint32_t* renodx = nullptr, uint32_t* crc_out = nullptr) {
     const uint32_t crc = spirv_crc32(spirv);
     if (crc_out) *crc_out = crc;
@@ -890,7 +1034,15 @@ VkShaderModule make_module(const std::vector<uint32_t>& spirv, uint32_t* renodx 
         static std::atomic<int> told{0};
         if (told++ < 16) logf("vk: RenoDX: module %08X replaced (%zu words for %zu)", crc, other->size(), spirv.size());
     }
-    const std::vector<uint32_t>& code = other ? *other : spirv;
+    std::vector<uint32_t> simplified;
+    const bool use_simple = !other && spirv_water_simplify(spirv, water_quality_mode(), simplified);
+    if (use_simple) {
+        static std::atomic<int> w_logged{0};
+        if (w_logged++ < 1)
+            logf("vk: water/shadow 8-tap PCF simplified to 1 tap (%s; RX_VK_WATER_QUALITY=0: off)",
+                 water_quality_mode() == 1 ? "medium: wave shaders" : "low");
+    }
+    const std::vector<uint32_t>& code = other ? *other : use_simple ? simplified : spirv;
     VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     ci.codeSize = code.size() * 4;
     ci.pCode = code.data();

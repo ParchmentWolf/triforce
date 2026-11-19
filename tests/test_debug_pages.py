@@ -38,7 +38,7 @@ def main():
     readme = (ROOT / "readme.md").read_text(encoding="utf-8")
 
     # the rows: tools of the Debug tab (shown with Debug tools on), with no value of the options file
-    rows = menu[menu.index("Row rows[] = {") if "Row rows[] = {" in menu else menu.index("{TAB_DISPLAY,"):menu.index("constexpr int kQuitRow")]
+    rows = menu[menu.index("Row rows[] = {") if "Row rows[] = {" in menu else menu.index("{TAB_DISPLAY,"):menu.index("constexpr int kRowsEnd")]
     for name, tool in (("Game flags", 11), ("Cutscenes", 12), ("Scan amiibo", 13)):
         found = re.findall(r'\{(TAB_\w+), "%s", nullptr, 0, 0, 0, nullptr,\s*(?:"[^\n]*"\s*)+, nullptr, false, true, (\d+)\},' % name, rows)
         check(found == [("TAB_DEBUG", str(tool))], "the row %s is not one tool (%d) of the Debug tab: %s" % (name, tool, found))
