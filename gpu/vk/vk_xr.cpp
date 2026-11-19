@@ -284,12 +284,20 @@ bool init() {
     x.tried = true;
     if (!vk_xr_row_on()) return false;
 #ifdef _WIN32
+    // The loader beside the game first: Khronos's build is openxr_loader.dll, MSYS2's libopenxr_loader.dll (the one the
+    // builders copy). A bare name loads from System32 only, where SteamVR puts no loader.
     void *lib = NULL;
     char beside[PLAT_PATH_MAX];
     char *sep = plat_exe_path(beside, sizeof beside) ? plat_last_sep(beside) : NULL;
-    if (sep && (size_t)(sep + 1 - beside) + sizeof "openxr_loader.dll" <= sizeof beside) {
-        strcpy(sep + 1, "openxr_loader.dll");
-        if (plat_file_exists(beside)) lib = plat_lib_open(beside);
+    static const char *const names[] = {"openxr_loader.dll", "libopenxr_loader.dll"};
+    for (const char *name : names) {
+        if (!sep || lib) break;
+        if ((size_t)(sep + 1 - beside) + strlen(name) + 1 > sizeof beside) continue;
+        strcpy(sep + 1, name);
+        if (plat_file_exists(beside)) {
+            lib = plat_lib_open(beside);
+            rt_log("vr: OpenXR loader %s %s", beside, lib ? "opened" : "did not open (a DLL it needs is missing?)");
+        }
     }
     if (!lib) lib = plat_lib_open("openxr_loader.dll");
 #else
