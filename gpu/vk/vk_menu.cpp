@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cstring>
 #include <iterator>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>   // ((Triforce) the name pages' read of the game's files)
@@ -70,6 +71,8 @@
 #include "ultrawide_rows.h" // ((Triforce) the Ultrawide row's shapes, and its old Monitor's shape read before options_version 6)
 #include "present_mode.h"   // (the VSync row: what its choice comes to on this driver)
 #include "game_language.h"  // (the Game language row: what language.txt chooses and offers)
+#include "game_assets.h"    // ((Triforce) the radial menus' icons from the game's files)
+#include "radial_menu.h"    // ((Triforce) the radial menus: what each slot holds, which is open)
 #include "menu_restart.h"
 #include "mod_cheat_rows.h"   // (Triforce: the System tab's rows for the cheats of the mods' cheat files)
 #include "menu_sound_events.h"   // (Triforce: the options' own sounds: which one a tick asks for, and their queue to the host)
@@ -1266,6 +1269,10 @@ Row rows[] = {
     {TAB_CONTROLS, "Controls", nullptr, 0, 0, 0, nullptr,   // (hookshot: opens its page)
      "The layout preset, the button prompts, and which gamepad button and which keys press each of the Switch's "
      "buttons."},
+    {TAB_CONTROLS, "Radial menus", &opts.radial_menus, 0, 1, 1, tx_onoff,   // ((Triforce) radial_menu.cpp)
+     "In play, holding L opens a radial menu of the D-pad's actions and holding R one of your items, in place of the item "
+     "bar. Point the stick on that side at a slot and let go of the button to use it; flick the stick at a slot and back "
+     "to switch between its variants.", nullptr, false, true},
     {TAB_MOTION, "Motion controls", &opts.gyro, 0, 1, 1, tx_gyro,
      "Aims and looks with the controller's gyroscope where the game uses motion, as on the Switch. Works with Switch Pro "
      "controllers and pads in Switch mode, DualSense and DualShock 4. Shown beside it: whether the connected pad has one.", hn_gyro,
@@ -4548,6 +4555,160 @@ void draw_perf(ui::Ctx& c) {
     }
 }
 
+// ---- (Triforce) The radial menus (radial_menu.cpp radial_menu_open: in place of the game's item bar, L or R held in play), around
+// the middle of the window, slot 0 up and clockwise (kind 1 the D-pad's four actions, 2 the items): each slot the game's icon of what it holds,
+// empty when the save does not own it; the slot the stick is held toward lit, its icon large in the middle, its name under the
+// disc. The icons come from the player's game files: each decoded once on a worker, its texture made here at its first drawing
+// and kept.
+struct WheelIcon {
+    std::string file, tex;
+    std::atomic<int> state{0};   // (0 waiting for the worker, 1 decoded, 2 not in the files)
+    uint8_t* rgba = nullptr;
+    uint32_t w = 0, h = 0;
+    ImTextureData* t = nullptr;
+};
+std::deque<WheelIcon> wheel_icons;   // (the render thread alone adds; a deque keeps each one where it is)
+std::atomic<bool> wheel_worker{false};
+std::mutex wheel_icons_mu;   // (the worker's walk and the render thread's adds)
+
+void wheel_decode() {
+    for (;;) {
+        WheelIcon* todo = nullptr;
+        {
+            std::lock_guard lk(wheel_icons_mu);
+            for (WheelIcon& ic : wheel_icons)
+                if (ic.state.load(std::memory_order_acquire) == 0) {
+                    todo = &ic;
+                    break;
+                }
+        }
+        if (!todo) break;
+        size_t n = 0;
+        uint8_t* bntx = game_asset_load(todo->file.c_str(), &n);
+        const int ok = bntx && game_asset_texture(bntx, n, todo->tex.c_str(), &todo->rgba, &todo->w, &todo->h);
+        free(bntx);
+        if (!ok) logf("vr: wheel icon %s of %s not decoded", todo->tex.c_str(), todo->file.c_str());
+        todo->state.store(ok ? 1 : 2, std::memory_order_release);
+    }
+    wheel_worker.store(false, std::memory_order_release);
+}
+
+/// An icon's texture, nullptr until it is there (or when the files do not have it)
+ImTextureData* wheel_icon(const RadialMenuTex& ic) {
+    if (!ic.file[0] || !ic.tex[0]) return nullptr;
+    WheelIcon* found = nullptr;
+    for (WheelIcon& w : wheel_icons)
+        if (w.file == ic.file && w.tex == ic.tex) found = &w;
+    if (!found) {
+        if (wheel_icons.size() >= 96) return nullptr;
+        std::lock_guard lk(wheel_icons_mu);
+        WheelIcon& w = wheel_icons.emplace_back();
+        w.file = ic.file, w.tex = ic.tex;
+        found = &w;
+    }
+    const int st = found->state.load(std::memory_order_acquire);
+    if (st == 0) {
+        bool idle = false;
+        if (wheel_worker.compare_exchange_strong(idle, true)) std::thread(wheel_decode).detach();
+        return nullptr;
+    }
+    if (st != 1) return nullptr;
+    if (!found->t && found->rgba) {
+        ImTextureData* t = IM_NEW(ImTextureData)();
+        t->Create(ImTextureFormat_RGBA32, (int)found->w, (int)found->h);
+        memcpy(t->GetPixels(), found->rgba, (size_t)found->w * found->h * 4);
+        t->UseColors = true;
+        ImGui::RegisterUserTexture(t);
+        found->t = t;
+        free(found->rgba), found->rgba = nullptr;
+    }
+    return found->t;
+}
+
+/// a count, size high, centred on c or (corner) with its bottom right at c, outlined so it reads over any icon: green full
+/// (max known), yellow at a quarter of the max or less, red none, white otherwise
+void wheel_count(ui::Ctx& c, int n, int max, ImVec2 at, float size, bool corner) {
+    if (n < 0) return;
+    ImFont* font = c.f.strong ? c.f.strong : c.f.body;
+    if (!font) return;
+    char text[16];
+    snprintf(text, sizeof text, "%d", n);
+    const ImVec2 ts = ui::size_of(font, size, text);
+    const ImVec2 p = corner ? ImVec2(at.x - ts.x, at.y - ts.y + size * 0.1f) : ImVec2(at.x - ts.x * 0.5f, at.y - ts.y * 0.5f);
+    const float o = std::max(1.0f, size * 0.07f);
+    for (int dx = -1; dx <= 1; dx++)
+        for (int dy = -1; dy <= 1; dy++)
+            if (dx || dy) c.d->AddText(font, size, ImVec2(p.x + dx * o, p.y + dy * o), ui::rgba(0, 0, 0, 230), text);
+    const ImU32 col = n <= 0 ? ui::rgba(255, 110, 90) : max > 0 && n >= max ? ui::rgba(120, 255, 120)
+                      : max > 0 && n * 4 <= max ? ui::rgba(255, 225, 80) : ui::rgba(255, 255, 255);
+    c.d->AddText(font, size, p, col, text);
+}
+/// a slot's icon centred on p, size wide, and the adult's arrows in a row along its bottom (the one in use framed)
+void wheel_slot_icon(ui::Ctx& c, const RadialMenuSlot& s, ImVec2 p, float size) {
+    const float h = size * 0.5f;
+    if (ImTextureData* t = wheel_icon(s.main)) c.d->AddImage(t->GetTexRef(), ImVec2(p.x - h, p.y - h), ImVec2(p.x + h, p.y + h));
+    if (!s.minis || s.mini_selected < 0) return;
+    const float m = size * 0.3f, gap = m * 0.08f, row = s.minis * m + (s.minis - 1) * gap;
+    float x = p.x - row * 0.5f;
+    const float y = p.y + h - m * 0.75f;
+    for (int i = 0; i < s.minis; i++, x += m + gap) {
+        if (ImTextureData* t = wheel_icon(s.mini[i])) c.d->AddImage(t->GetTexRef(), ImVec2(x, y), ImVec2(x + m, y + m));
+        wheel_count(c, s.mini_count[i], s.mini_max[i], ImVec2(x + m, y + m), m * 0.36f, true);
+        if (i == s.mini_selected) c.d->AddRect(ImVec2(x - 1, y - 1), ImVec2(x + m + 1, y + m + 1), ui::rgba(255, 255, 255), 0, 0, 2.0f);
+    }
+}
+void draw_radial_menu(ui::Ctx& c, int kind, int picked) {
+    const int n = radial_menu_slots(kind);
+    if (n <= 0) return;
+    const ImVec2 mid(c.w * 0.5f, c.h * 0.5f);
+    const float R = 0.36f * std::min(c.w, c.h), r = 0.34f * R, pi = 3.14159265f, step = 2 * pi / n;
+    c.d->AddCircleFilled(mid, R, ui::rgba(24, 18, 12, 235), 96);
+    const auto at = [&](float a, float rad) { return ImVec2(mid.x + std::sin(a) * rad, mid.y - std::cos(a) * rad); };
+    // (each slot's icon as large as fits between its lines and the rings)
+    const float ring = 0.5f * (R + r), chord = 2 * ring * std::sin(step * 0.5f);
+    const float icon = 0.92f * std::min(chord, R - r);
+    RadialMenuSlot s;
+    for (int i = 0; i < n; i++) {
+        const float a0 = (i - 0.5f) * step, a1 = (i + 0.5f) * step;
+        if (i == picked)
+            for (int k = 0; k < 12; k++) {
+                const float b0 = a0 + (a1 - a0) * k / 12, b1 = a0 + (a1 - a0) * (k + 1) / 12;
+                c.d->AddQuadFilled(at(b0, r), at(b0, R - 2), at(b1, R - 2), at(b1, r), ui::rgba(150, 112, 50, 235));
+            }
+        c.d->AddLine(at(a0, r), at(a0, R), ui::kGold, 2.0f);
+        if (radial_menu_slot(kind, i, &s)) {   // (its count between the icon and the inner ring, its swaps by the outer one)
+            wheel_slot_icon(c, s, at(i * step, ring), icon);
+            wheel_count(c, s.count, s.max, at(i * step, 0.5f * (r + ring - icon * 0.5f)), icon * 0.28f, false);
+            if (s.minis && s.mini_selected < 0) {
+                const float m = icon * 0.42f, out = 0.5f * (ring + icon * 0.5f + R), spread = m * 1.1f / out;
+                for (int k = 0; k < s.minis; k++) {
+                    const ImVec2 p = at(i * step + (k - 0.5f * (s.minis - 1)) * spread, out);
+                    if (ImTextureData* t = wheel_icon(s.mini[k]))
+                        c.d->AddImage(t->GetTexRef(), ImVec2(p.x - m * 0.5f, p.y - m * 0.5f), ImVec2(p.x + m * 0.5f, p.y + m * 0.5f));
+                    wheel_count(c, s.mini_count[k], s.mini_max[k], ImVec2(p.x + m * 0.5f, p.y + m * 0.5f), m * 0.36f, true);
+                }
+            }
+        }
+    }
+    c.d->AddCircle(mid, R - 1, ui::kGold, 96, 3.0f);
+    c.d->AddCircle(mid, r, ui::kGold, 64, 2.0f);
+    if (picked < 0 || !radial_menu_slot(kind, picked, &s)) return;
+    {   // (the middle: only what the release equips)
+        RadialMenuSlot only{};
+        only.main = s.now, only.count = -1;
+        wheel_slot_icon(c, only, mid, 1.35f * r);
+    }
+    ImFont* font = c.f.body ? c.f.body : c.f.strong;
+    if (!s.label || !font) return;
+    // (the name on a small box under the disc, as the game names the item under its own bar)
+    const float px = 20 * c.s;
+    const ImVec2 ts = ui::size_of(font, px, s.label);
+    const float padx = 14 * c.s, pady = 7 * c.s;
+    const ImVec2 a(mid.x - ts.x * 0.5f - padx, mid.y + R + 8 * c.s), b(mid.x + ts.x * 0.5f + padx, a.y + ts.y + 2 * pady);
+    ui::box(c, a, b, 0.9f);
+    c.d->AddText(font, px, ImVec2(a.x + padx, a.y + pady), ui::kInk, s.label);
+}
+
 /// (Triforce) The game's own tab inside its Options screen: our header over the screen's own (the same picture), the tabs on
 /// it with "Game" chosen; the rest is the game's. It comes in over the screen's opening and goes with its closing
 void draw_game_tab(ui::Ctx& c) {
@@ -6219,7 +6380,9 @@ void menu_record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h) {
     const int64_t game_seen = game_options_ns.load(std::memory_order_relaxed);
     const bool game_tab = !open && !start && embed_allowed() && game_seen && prof_now() - game_seen < 250000000LL && embed_since;
     const bool mods_row = !open && !start && mods_list_fresh();   // ((Triforce) the Mods entry under the game's list)
-    if (!start && !fps && !open && !note && !game_tab && !mods_row) {   // (nothing shows: no ImGui frame, no render pass)
+    int wheel_slot = -1;
+    const int wheel = open || start ? 0 : radial_menu_open(&wheel_slot);   // ((Triforce) a radial menu open: radial_menu.cpp)
+    if (!start && !fps && !open && !note && !game_tab && !mods_row && !wheel) {   // (nothing shows: no ImGui frame, no render pass)
         // (but a new window size or Menu size since the last bake: one frame with nothing drawn that bakes the menu's glyphs
         // and measures its page for the new size, so the next open has no hitch whatever was resized while nothing showed)
         if (prebake_needed(w, h) && ui::begin(w, h)) {
@@ -6257,6 +6420,7 @@ void menu_record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h) {
     }
     if (fps && !full) draw_fps(c, (open && page != kModsRowPage) || game_tab);   // ((Triforce) the Mods entry: the counter stays where the game list has it)
     if (note) draw_notice(c);
+    if (wheel) draw_radial_menu(c, wheel, wheel_slot);
     ::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);   // (Dear ImGui records into cmd directly, its backend through its own pointers: what this thread recorded through vk_work.h reaches cmd first)
     ui::record(cmd, index, w, h);
 }
@@ -6287,3 +6451,15 @@ void menu_record_image(VkCommandBuffer cmd, VkImage image, VkImageView view, uin
 }
 
 } // namespace mkwvk
+
+// (Triforce) the Controls tab's Radial menus row (radial_menu.cpp)
+int menu_radial_menus() { return mkwvk::opts.radial_menus; }
+
+// (Triforce) the game's language now, as its message archives name it (romfs Mals/<region>.*), for the radial menus' names
+const char* menu_game_mals() {
+    static const char* const mals[mkwvk::game_language::kCount] = {"USen", "EUen", "EUfr", "USfr", "EUde", "EUit", "EUes", "USes",
+                                                                   "USpt", "EUnl", "EUpl", "EUru", "JPja", "KRko", "CNzh", "TWzh"};
+    const int at = mkwvk::lang_saved >= 0 && mkwvk::lang_saved < mkwvk::lang_count ? mkwvk::lang_entries[mkwvk::lang_saved]
+                                                                                  : mkwvk::game_language::kDefault;
+    return at >= 0 && at < mkwvk::game_language::kCount ? mals[at] : "USen";
+}

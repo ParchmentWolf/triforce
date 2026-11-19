@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define MKWVK_API_VERSION 13
+#define MKWVK_API_VERSION 14
 enum { HOS_OPT_CHEAT_HEARTS = 32, HOS_OPT_CHEAT_FLIGHT, HOS_OPT_CHEAT_ACTION, HOS_OPT_CHEAT_CAMERA };
 /* (hookshot) the Motion page's rows (host/pad_sdl.c reads them, vk_replay.cpp's option answers them): Motion controls on
    or off, the horizontal's and the vertical's sensitivity in percent, each turned around, and the deadzone (0 to 2) */
@@ -286,7 +286,18 @@ typedef struct MkwVkRenderer {
     /* (hookshot, the Insert menu) a setting changed from the game's side, kept in the options file: 7 the mouse's sensitivity
        in percent (the - and = keys, host/nn_hid.c) */
     void (*option_set)(int id, int value);
+    /* (Triforce, 14) the radial menus' table (gpu/vk/radial_menu.cpp), for the game's side (host/radial_menu_game.c) */
+    const struct MkwVkRadialMenu *(*radial_menu)(void);
 } MkwVkRenderer;
+
+/* (Triforce) the radial menus (gpu/vk/radial_menu.h has what each does): shown in place of the game's item bar */
+typedef struct MkwVkRadialMenu {
+    int (*pad)(uint64_t *buttons, int32_t left[2], int32_t right[2], int want);
+    int (*used)(int *kind, int *slot);
+    const char *(*equip)(int slot);
+    int (*open)(int *slot);
+    int (*enabled)(void);
+} MkwVkRadialMenu;
 
 /* the DLL's one export: null when Vulkan is not usable (the executable then falls back to WebGPU) */
 typedef const MkwVkRenderer *(*mkwvk_init_fn)(const MkwVkHost *host);

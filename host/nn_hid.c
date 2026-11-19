@@ -25,6 +25,7 @@
    Npad states share one layout (NpadCommonState): { s64 sampling; u64 buttons; s32 lx, ly; s32 rx, ry; u32 attributes;
    pad } = 0x28 bytes. */
 #include "hos.h"
+#include "radial_menu_game.h"   /* ((Triforce) radial_menu_pad_read) */
 #include "hos_paths.h"
 #include <math.h>
 #include <stdio.h>
@@ -1091,6 +1092,7 @@ static void npad_states(Ctx *c) {
     }
     if (connected) {
         read_input(&buttons, stick);
+        radial_menu_pad_read(c, &buttons, stick);   /* ((Triforce) the radial menus: radial_menu_game.c) */
         {   /* (Triforce) the Mods entry under a game list's last button (host/oot_menu.c, gpu/vk/vk_menu.cpp): while the
                game's cursor is on that last button and our menu is shut, Down (the D-pad's, or the left stick held down)
                is the entry's, not the game's: the renderer takes the cursor onto Mods at its first frame */

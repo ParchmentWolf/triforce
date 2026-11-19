@@ -40,6 +40,7 @@
 #include "present_hold.h"  // (Triforce: the hold of the last picture, do_present)
 #include "present_smooth.h"   // (Triforce: Frame pacing on the plain present, RX_VK_PACE_SMOOTH: present_image)
 #include "present_thread.h"   // (Triforce: the present thread, RX_VK_PRESENT_THREAD: present_image)
+#include "radial_menu.h"   // (Triforce: the radial menus' table)
 #include "vk_reflex.h"
 #include "vk_antilag.h"
 #include "vk_draw.h"
@@ -7154,6 +7155,7 @@ void fill_replay_table(MkwVkRenderer& t) {
     t.guest_imported = memory_guest_imported;
     t.nvn_vmap_changing = vmap_changing;
     t.nvn_texture_created = texture_created_of;
+    t.radial_menu = radial_menu_table;   // (Triforce: radial_menu.cpp)
 }
 
 std::atomic<bool> par_active{false};

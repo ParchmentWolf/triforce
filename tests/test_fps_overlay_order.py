@@ -61,6 +61,7 @@ bool can_draw = true;
 float ease_step = 0;
 bool ease_live = false;   // (menu_record's frames step the easing; a still, menu_record_image, is drawn settled)
 int64_t prof_now() { return 1000; }
+int radial_menu_open(int* slot) { *slot = -1; return 0; }   // ((Triforce) the radial menus: never open here)
 namespace ui {
 struct Ctx {};
 bool begin(uint32_t, uint32_t) { calls += "b"; return can_draw; }
@@ -89,6 +90,7 @@ int page = 0;                              // ((Triforce) the menu's page: not t
 constexpr int kModsRowPage = 9;
 void draw_mods_row_shut(ui::Ctx&) { calls += "M"; }
 void draw_notice(ui::Ctx&) { calls += "n"; }
+void draw_radial_menu(ui::Ctx&, int, int) { calls += "w"; }   // ((Triforce) never here: radial_menu_open answers none)
 ''' + fn + r'''
 int main() {
     for (bool startup : {false, true}) for (int fps : {0, 1, 2}) for (bool menu : {false, true}) for (bool can : {true, false}) {

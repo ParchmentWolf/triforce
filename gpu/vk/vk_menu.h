@@ -137,6 +137,7 @@ struct Options {
                        // the options file: the choice is that file's line, which the host reads at the start (host/nn_applet.c)
     int debug_tools = 0;   // (hookshot) the Debug tab's tools (#785: flight, free camera, teleport, inventory): 0 off; HOS_OOT_CHEATS=1 also turns them on
     int mic = 1;          // (hookshot) the ocarina's microphone: 0 Off, 1 the system's default, 2.. a device as host->mic_name lists it (host/nn_audio_in.c)
+    int radial_menus = 0;   // (Triforce) radial menus in place of the game's item bar, L the D-pad's and R the items' (radial_menu.cpp)
 };
 extern Options opts;
 /// (local, RenoDX port) opts.hdr as triforce_options.ini had it at the start (menu_init), before any change in play: what

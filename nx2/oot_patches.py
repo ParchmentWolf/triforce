@@ -129,6 +129,32 @@ def patch_view(source):
     return (source[:start] + body + source[end:]).replace(
         '#include "a64.h"\n', '#include "a64.h"\nextern void hos_oot_free_view(Ctx *c, uint64_t view);\n', 1)
 
+# (Triforce) The radial menus (host/radial_menu_game.c): the item bar is the sequence's ShortCut.module, which pauses the game
+# (ShortCutPauseOn.module), opens its screens through the generic open-screen node (f_80c86420, ScreenName ShortCut_00 and its
+# background ShortCutBG_00), and closes them through the close-screen node (f_80ba0e60). At the start of both nodes the host is
+# asked first: with the radial menus on, the bar's screen (not its background, the paused game's blurred picture) is neither
+# opened nor closed (the node marked done as it marks itself) and a radial menu shows in its place, so the bar never exists;
+# the rest of the module, its pause with it, runs.
+RADIAL_SITES = (("void f_80c86420(Ctx *__restrict A64_NOESC c) {\n", "    if (hos_radial_screen(c, 1)) return;   /* (nx2/oot_patches.py: the radial menus) */\n"),
+                ("void f_80ba0e60(Ctx *__restrict A64_NOESC c) {\n", "    if (hos_radial_screen(c, 0)) return;   /* (nx2/oot_patches.py: the radial menus) */\n"))
+
+
+def patch_radial_screens(source):
+    """The radial menus' hook at the start of the open-screen and close-screen nodes: (source, the indexes of RADIAL_SITES
+    patched here)"""
+    made = []
+    for i, (head, hook) in enumerate(RADIAL_SITES):
+        at = source.find(head)
+        if at < 0 or hook in source:
+            continue
+        at += len(head)
+        source = source[:at] + hook + source[at:]
+        made.append(i)
+    if made:
+        source = source.replace('#include "a64.h"\n', '#include "a64.h"\nextern int hos_radial_screen(Ctx *c, int open);\n', 1)
+    return source, made
+
+
 # Native mouse look (host/mouse_native.c): the player camera's update, f_80644c80 (a virtual method, the camera in x0), hands
 # its camera to the host before anything else, on the game's thread, once a frame; with the menu's Mouse camera on the mouse's
 # motion turns the camera's yaw (+0x1a4) and pitch (+0x18c) there, before the camera reads its input.
@@ -747,6 +773,8 @@ def apply(gen, *, protect_hearts=False, required=False):
         done["player flight rotation"] = 0
         done["free camera"] = 0
         done["mouse camera"] = 0
+        done["radial menus' open-screen hook"] = 0   # ((Triforce) without them the item bar shows behind a radial menu)
+        done["radial menus' close-screen hook"] = 0
         done["scene colour target format"] = 0   # (local, RenoDX port)
     step_sites, step_files = 0, []   # (the divides with the hook, and the files that have it)
     whole_sites = 0   # (the counters of WHOLE_SITES with the whole frames: patch_whole_frames)
@@ -821,6 +849,11 @@ def apply(gen, *, protect_hearts=False, required=False):
             out = view
             done["free camera"] += 1
             print("oot_patches: free camera in", os.path.basename(path))
+        if protect_hearts:
+            out, made = patch_radial_screens(out)
+            for i in made:
+                done["radial menus' close-screen hook" if i else "radial menus' open-screen hook"] += 1
+                print("oot_patches: the radial menus'", "close-screen" if i else "open-screen", "hook in", os.path.basename(path))
         out, sites = patch_frame_seconds(out)
         if STEP_MARK in out:   # (made now, or by an earlier run over this file)
             step_sites += out.count(STEP_MARK)
