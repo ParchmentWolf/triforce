@@ -84,6 +84,7 @@ struct Device {
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkFormat swap_format = VK_FORMAT_UNDEFINED;
+    bool swap_readable = false;   // ((Triforce VR) the swapchain's images can be copied from: VR's copy of the window, vk_xr_capture)
     VkExtent2D swap_extent{};
     std::vector<VkImage> swap_images;
     std::vector<VkImageView> swap_views;   // (hookshot) a view of each, for Dear ImGui's overlays (VK_NULL_HANDLE: none)

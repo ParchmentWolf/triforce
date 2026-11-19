@@ -38,6 +38,7 @@
 #include "vk_aa.h"            // (Triforce: the Anti-aliasing row in place of the game's SMAA)
 #include "dlss_actor.h"
 #include "vk_temporal.h"
+#include "vk_xr.h"            // (Triforce VR: the scene's depth and picture before the HUD)
 #include "vk_fsr3.h"          // (AMD FSR 3.1 in the gameplay upscale's place)
 #include "vk_fsr3_inputs.h"
 #include "vk_dump.h"
@@ -9074,6 +9075,64 @@ bool fsr3_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
     if (out_handle) texture_view_of(out_handle, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Storage, image_format(od.format), &out, &level);
     return fsr3_upscale(cmd, p.key, gameplay_network(p.key), in, dw().imgs[0].imageView, out, dw().imgs[ntex].imageView, level);
 }
+/// (Triforce VR) The gameplay upscale for VR (vk_xr.cpp), found as temporal_stand_in finds it: before it, the scene's depth and
+/// camera kept for the headset's eyes; its output, returned, is then kept before the HUD is drawn over it (XrAfterUpscale, once
+/// the dispatch or whatever stands in for it is recorded). nullptr: not the gameplay upscale, or VR wants neither
+static Texture* xr_before_upscale(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
+    if (!vk_xr_active() || p.stages.empty()) return nullptr;
+    const Stage& st = p.stages[0];
+    if (!gameplay_network(p.key) && !(st.info.uses_cooperative_matrix && st.info.texture_descriptors.size() == 1 &&
+                                      st.info.image_descriptors.size() == 1))
+        return nullptr;
+    if (st.info.image_descriptors.empty()) return nullptr;
+    Texture* out = nullptr;
+    uint32_t level = 0;
+    const auto& od = st.info.image_descriptors[0];
+    if (const uint32_t h = handle_of(s, st, od, 0))
+        texture_view_of(h, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Storage, image_format(od.format), &out, &level);
+    if (!out || !out->image || level) return nullptr;
+    float view[12];
+    VkImageView depth = VK_NULL_HANDLE;
+    uint32_t w = 0, h = 0;
+    if (vk_xr_depth_wanted() && temporal_xr_scene(out, level, view, &depth, &w, &h)) {
+        full_barrier(cmd);   // (the scene's draws into its depth, before the copy reads it)
+        vk_xr_keep_depth(cmd, depth, w, h);
+        vk_xr_scene_camera(view);
+        // (a compute pipeline and push descriptors of VR's own: the next draw or dispatch sets all of its again)
+        last_dyn_valid = false, last_desc_valid = false, last_vb_valid = false, last_pipeline = VK_NULL_HANDLE;
+        vertex_set.on = false, last_ib.on = false;
+        descriptors_disturbed();
+    }
+    return out;
+}
+/// (Triforce VR) the gameplay upscale's output, once recorded, copied for VR's HUD panel and depth stereo (vk_xr_scene_image)
+struct XrAfterUpscale {
+    VkCommandBuffer cmd;
+    Texture* out;
+    ~XrAfterUpscale() {
+        if (!out) return;
+        int init = 0;
+        const VkImage keep = vk_xr_scene_image(out->image, out->width, out->height, out->format, &init);
+        if (!keep) return;
+        full_barrier(cmd);
+        if (init) {
+            VkImageMemoryBarrier2 ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+            ib.srcStageMask = ib.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            ib.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            ib.image = keep, ib.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            dep.imageMemoryBarrierCount = 1, dep.pImageMemoryBarriers = &ib;
+            vkCmdPipelineBarrier2(cmd, &dep);
+        }
+        VkImageCopy cp{};
+        cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        cp.extent = {out->width, out->height, 1};
+        vkCmdCopyImage(cmd, out->image, VK_IMAGE_LAYOUT_GENERAL, keep, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+        full_barrier(cmd);
+    }
+};
 /// (hookshot) A temporal upscaler (NVIDIA DLSS, AMD FSR 4: vk_temporal.cpp) in place of the gameplay upscale network, when
 /// one is on and its inputs are as expected: the network's input as it samples it, its output's storage view
 bool temporal_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
@@ -10681,6 +10740,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
             logf("%s", line);
         }
     }
+    const XrAfterUpscale xr_after{cmd, xr_before_upscale(cmd, s, p)};   // (Triforce VR)
     if (fsr3_stand_in(cmd, s, p)) return void(st_dispatches++);
     if (temporal_stand_in(cmd, s, p)) return void(st_dispatches++);
     if (taau_stand_in(cmd, s, p)) return void(st_dispatches++);

@@ -59,6 +59,8 @@ static uint8_t guest[0x4000];
 #define MOD 0x1000u
 static void hos_log(const char *fmt, ...) { (void)fmt; }
 int rx_option(int id, int otherwise) { (void)id; return otherwise; }
+static int vr_holds_time(void) { return 0; }   /* ((Triforce VR) host/vr_game.c: no headset here) */
+static void vr_update_step(double s) { (void)s; }
 int hos_ini_option(const char *key, int otherwise) { (void)key; return otherwise; }
 enum { HOS_OPT_DISPLAY_CAP = 60 };   /* (gpu/vk/vk_api.h: Monitor's rate, tests/test_fps_cap_monitor.py) */
 static volatile long long presents;

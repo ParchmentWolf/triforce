@@ -5,6 +5,7 @@
 #include "vk_paths.h"
 #include "vk_loader.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdarg>
@@ -18,6 +19,7 @@
 #include "vk_api.h"
 #include "vk_draw.h"
 #include "vk_framegen.h"
+#include "vk_xr.h"   // (Triforce VR)
 #include "vk_internal.h"
 #include "gpu_choice.h"
 #include "present_mode.h"   // (the swapchain's present mode: the VSync row and the switches)
@@ -140,6 +142,15 @@ bool create_instance() {
         std::vector<VkExtensionProperties> all(n);
         vkEnumerateInstanceExtensionProperties(nullptr, &n, all.data());
         dlss_instance_extensions(ext_list, all);
+        {   // (Triforce VR: what the headset's runtime needs, vk_xr.cpp)
+            const char* xr_ext[16];
+            uint32_t xr_n = 0;
+            vk_xr_instance_exts(xr_ext, &xr_n, 16);
+            for (uint32_t i = 0; i < xr_n; i++)
+                if (std::find_if(ext_list.begin(), ext_list.end(), [&](const char* e) { return !std::strcmp(e, xr_ext[i]); }) ==
+                    ext_list.end())
+                    ext_list.push_back(xr_ext[i]);
+        }
         // (hookshot) the HDR10 colour space for the Insert menu's HDR (the menu's settings are read after the instance is made, so
         // whenever the driver has it; the SDR choice in create_swapchain keeps to the sRGB surface)
         if (has_extension(all, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME))
@@ -194,6 +205,7 @@ bool pick_device() {
         target_raw_idx = (int)valid_gpus[k];
     }
 
+    const VkPhysicalDevice xr_gpu = vk_xr_device(dev.instance);   // (Triforce VR: the headset's runtime's GPU, first unless one is chosen)
     for (uint32_t i : valid_gpus) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(all[i], &p);
@@ -201,7 +213,7 @@ bool pick_device() {
             if ((int)i == target_raw_idx) best = (int)i, best_score = 3;
             continue;
         }
-        const int score = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2 :
+        const int score = all[i] == xr_gpu ? 3 : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2 :
                           p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 1 : 0;
         if (score > best_score || (score == best_score && p.driverVersion > best_driver))
             best = (int)i, best_score = score, best_driver = p.driverVersion;
@@ -222,6 +234,7 @@ bool pick_device() {
         return false;
     }
     dev.physical = all[best];
+    vk_xr_device_picked(dev.physical);
     vkGetPhysicalDeviceProperties(dev.physical, &dev.props);
     // (Triforce, 11-16) the recorder thread by default on NVIDIA with 12 logical processors or more (vk_recorder.h mode_from_env)
     recorder_auto(dev.props.vendorID == 0x10DE && std::thread::hardware_concurrency() >= 12);
@@ -284,6 +297,14 @@ bool create_device() {
     if (dlssg::early()) dlssg::device_extensions(want, exts);
     else reflex_device_extensions(want, exts);   // (hookshot: NVIDIA Reflex's, vk_reflex.cpp)
     antilag_device_extensions(want, exts);   // (hookshot: AMD Anti-Lag 2's, vk_antilag.cpp)
+    {   // (Triforce VR: what the headset's runtime needs, vk_xr.cpp)
+        const char* xr_ext[32];
+        uint32_t xr_n = 0;
+        vk_xr_device_exts(exts.data(), (uint32_t)exts.size(), xr_ext, &xr_n, 32);
+        for (uint32_t i = 0; i < xr_n; i++)
+            if (std::find_if(want.begin(), want.end(), [&](const char* e) { return !std::strcmp(e, xr_ext[i]); }) == want.end())
+                want.push_back(xr_ext[i]);
+    }
 
     // the queue: one family for graphics, compute and transfer
     vkGetPhysicalDeviceQueueFamilyProperties(dev.physical, &n, nullptr);
@@ -295,11 +316,14 @@ bool create_device() {
             (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT))
             dev.queue_family = i;
     if (dev.queue_family == UINT32_MAX) return false;
-    const float priority = 1.0f;
+    const float priorities[2] = {1.0f, 1.0f};
+    const float& priority = priorities[0];
+    // (Triforce VR: one more queue of the family for VR's copies, vk_xr.cpp, so the session's thread never takes the replay's)
+    const uint32_t xr_queue = vk_xr_queue(families[dev.queue_family].queueCount, 1);
     VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     q.queueFamilyIndex = dev.queue_family;
-    q.queueCount = 1;
-    q.pQueuePriorities = &priority;
+    q.queueCount = 1 + (xr_queue != UINT32_MAX);
+    q.pQueuePriorities = priorities;
     // (hookshot) The presents on a queue of a compute family of their own, beside the replay's (RX_VK_PRESENT_QUEUE=1 / 0: on /
     // off; on by default with NVIDIA's driver on Windows, where it was measured). On the replay's queue vkQueuePresentKHR blocked
     // with dev.present_mu held, ~0.8 ms a present with frame interpolation at 4x and up to 8, and the game's main and presentation
@@ -537,6 +561,7 @@ bool create_device() {
     dev.present_family = dev.queue_family;
     if (compute_family != UINT32_MAX) vkGetDeviceQueue(dev.device, compute_family, 0, &dev.present_queue), dev.present_family = compute_family;
     dlssg::device_ready(dev.physical, dev.device);
+    vk_xr_device_ready(dev.instance, dev.physical, dev.device, dev.queue_family);   // (Triforce VR: its queue and the session)
     // (with DLSS frame generation the presents stay on the replay's queue: the generated frames are Streamline's work
     // inside the present, on that queue)
     if (dlssg::active()) dev.present_queue = VK_NULL_HANDLE, dev.present_family = dev.queue_family;
@@ -698,6 +723,7 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     // The renderer copies into swapchain images. Readback is optional and only available on surfaces that allow it.
     if (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
         ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    dev.swap_readable = (ci.imageUsage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
     // (hookshot) the overlays Dear ImGui draws (vk_imgui.cpp) render into it. Every surface allows it (the Vulkan spec)
     if (caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
         ci.imageUsage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;

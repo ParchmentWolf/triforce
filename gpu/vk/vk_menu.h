@@ -137,6 +137,26 @@ struct Options {
                        // the options file: the choice is that file's line, which the host reads at the start (host/nn_applet.c)
     int debug_tools = 0;   // (hookshot) the Debug tab's tools (#785: flight, free camera, teleport, inventory): 0 off; HOS_OOT_CHEATS=1 also turns them on
     int mic = 1;          // (hookshot) the ocarina's microphone: 0 Off, 1 the system's default, 2.. a device as host->mic_name lists it (host/nn_audio_in.c)
+    // (Triforce VR) the VR tab (vk_xr.cpp and host/vr_game.c read them through vk_xr_cfg; vr is read at the start)
+    int vr = 0;                 // 0 off, 1 VR through OpenXR
+    int vr_view = 1;            // 0 Theater (the game on a floating screen), 1 Immersive (the game's camera follows the head)
+    int vr_screen_size = 65;    // the floating screen's width, degrees of the view (45 to 125)
+    int vr_screen_curve = 1;    // the floating screen curved around the head
+    int vr_camera = 0;          // Immersive: 0 first person (Link's eyes), 1 third person (the game's camera turned by the head)
+    int vr_view_scale = 100;    // the game's lens over the headset's, percent (50 to 200)
+    int vr_stereo = 0;          // 0 Performant (each eye from one picture and its depth), 1 Balanced (eyes in turn, the game's time held)
+    int vr_depth = 100;         // the eyes' distance, percent of the wearer's own (0 to 200)
+    int vr_eye_up = 0, vr_eye_side = 0, vr_eye_forward = 0;   // first person: the eyes moved from Link's, cm (-30 to 30)
+    int vr_event_up = 0;        // cutscenes: the eyes raised this many cm more (-50 to 50)
+    int vr_controls = 0;        // 0 a gamepad, 1 the Touch controllers
+    int vr_handedness = 0;      // the sword hand: 0 left, 1 right
+    int vr_play = 0;            // 0 Stationary (the game's own gear and aim), 1 Motion (the gear in the hands)
+    int vr_aim_tilt = 35;       // Motion's pointed aim: the controller's ray tilted down, degrees (0 to 60)
+    int vr_swing_speed = 230;   // a sword swing's hand speed, cm a second (100 to 500)
+    int vr_charge_reach = 45;   // how far out from the head a swing must leave the hand to hold the charge, cm (25 to 70)
+    int vr_run_zone = 5;        // first person: running goes straight while the head is within this many degrees (0 to 20)
+    int vr_hud = 0;             // 0 a panel in front of the head, 1 left in the picture
+    int vr_hud_size = 100;      // the HUD panel's width, cm a metre away (40 to 200)
 };
 extern Options opts;
 /// (local, RenoDX port) opts.hdr as triforce_options.ini had it at the start (menu_init), before any change in play: what

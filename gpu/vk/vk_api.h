@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define MKWVK_API_VERSION 13
+#define MKWVK_API_VERSION 14
 enum { HOS_OPT_CHEAT_HEARTS = 32, HOS_OPT_CHEAT_FLIGHT, HOS_OPT_CHEAT_ACTION, HOS_OPT_CHEAT_CAMERA };
 /* (hookshot) the Motion page's rows (host/pad_sdl.c reads them, vk_replay.cpp's option answers them): Motion controls on
    or off, the horizontal's and the vertical's sensitivity in percent, each turned around, and the deadzone (0 to 2) */
@@ -286,7 +286,30 @@ typedef struct MkwVkRenderer {
     /* (hookshot, the Insert menu) a setting changed from the game's side, kept in the options file: 7 the mouse's sensitivity
        in percent (the - and = keys, host/nn_hid.c) */
     void (*option_set)(int id, int value);
+    /* (Triforce VR, 14) VR's table (gpu/vk/vk_xr.cpp), for the game's side (host/vr_game.c, nn_hid.c, nn_vi.c) */
+    const struct MkwVkXr *(*xr)(void);
 } MkwVkRenderer;
+
+/* (Triforce VR) what the game's side asks of VR (gpu/vk/vk_xr.h has what each does). Every function answers "no" (0) while
+   VR has no session */
+typedef struct MkwVkXr {
+    const char *(*cfg)(const char *key);   /* a VR row's value as text ("head", "65"), "" for a key it does not know */
+    int (*head_active)(void);
+    int (*camera)(double pos[3], double at[3], float up[3]);
+    int (*lens)(float *angle);
+    int (*holds_time)(void);
+    void (*update_step)(double seconds);
+    int (*pad)(uint64_t *buttons, int32_t left[2], int32_t right[2]);
+    void (*ocarina)(int on);
+    void (*weapon_out)(int out);
+    void (*child)(int child);
+    void (*hand_item)(const char *model);
+    void (*in_play)(int on);
+    void (*aim_freeze)(int on);
+    int (*pointer)(double dir[3]);
+    void (*aim)(int on, const double origin[3], const double dir[3]);
+    void (*untracked)(void);
+} MkwVkXr;
 
 /* the DLL's one export: null when Vulkan is not usable (the executable then falls back to WebGPU) */
 typedef const MkwVkRenderer *(*mkwvk_init_fn)(const MkwVkHost *host);

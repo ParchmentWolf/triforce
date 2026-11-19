@@ -3,6 +3,7 @@
    so the game takes its SDR path. Frames are paced at the native NVN layer's window acquire (the end of this file). */
 #include "hos.h"
 #include "pace_wait.h"   /* ((Triforce) the acquire's wait to the frame's time: pace_sleep) */
+#include "vr_game.h"      /* ((Triforce VR) Stereo Balanced's hold: realtime_step) */
 #include "step_steady.h"   /* ((Triforce) HOS_STEP_STEADY=1: realtime_step) */
 #include "pace_steady.h"   /* ((Triforce) the Steady frame rate row: steady_period) */
 #include "../gpu/vk/vk_api.h"   /* (HOS_OPT_HDR_*: the Insert menu's HDR, answered by the renderer) */
@@ -569,7 +570,9 @@ static void realtime_step(int64_t now) {
        HOS_FPS_STEP=0, or a lift without the hook (hos_step_probe unset): the rate up to the cap, as before */
     static int timed_step = -1;
     if (timed_step < 0) timed_step = !(getenv("HOS_FPS_STEP") && !atoi(getenv("HOS_FPS_STEP")));
-    const int timed = fps_max() > 60 && timed_step && hos_step_probe;
+    /* ((Triforce VR) and while Stereo Balanced holds the game's time for every second update: host/vr_game.c) */
+    const int holds = vr_holds_time();
+    const int timed = (fps_max() > 60 || holds) && timed_step && hos_step_probe;
     const int top = timed ? 60 : fps_max();
     /* (Triforce, after NX2navi's steady step: host/step_steady.h) HOS_STEP_STEADY (on unless =0): the step is not the mean of the last five
        intervals but that of the last 12 without their longest and shortest, the paced period where it is within 3% of it, and
@@ -589,12 +592,27 @@ static void realtime_step(int64_t now) {
     }
     if (timed) {
         const double secs = secs_avg;
-        const float f = (float)(secs > 4.0 / 60.0 ? 4.0 / 60.0 : secs < 1.0 / 240.0 ? 1.0 / 240.0 : secs);
+        double given = secs;
+        {   /* ((Triforce VR) Stereo Balanced: the updates alternate, one stepping the shortest step and the next the two frames'
+               time, so the two eyes in turn are drawn at one moment of the game) */
+            static int held;
+            static double owed;
+            if (holds) {
+                if (held) owed = secs - 1.0 / 240.0, given = 1.0 / 240.0;
+                else given = secs + owed, owed = 0;
+                held ^= 1;
+            } else {
+                held = 0, owed = 0;
+            }
+        }
+        const float f = (float)(given > 4.0 / 60.0 ? 4.0 / 60.0 : given < 1.0 / 240.0 ? 1.0 / 240.0 : given);
         uint32_t bits;
         memcpy(&bits, &f, 4);
         __atomic_store_n(&hos_frame_seconds_bits, bits, __ATOMIC_RELAXED);   /* (read by the game's threads) */
+        vr_update_step(f);
     } else {
         __atomic_store_n(&hos_frame_seconds_bits, 0, __ATOMIC_RELAXED);
+        vr_update_step(-1);
     }
     const double ratio = secs_avg * 60.0;
     int *slot = (int *)GP(mod + 0x2c8);

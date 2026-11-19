@@ -140,7 +140,7 @@ MENU_FIXTURE = r"""
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); return 1; } } while (0)
 @OPTIONS@
 Options opts;
-struct Row { const char* name; int* value; };
+struct Row { const char* name; int* value; const char* key = nullptr; };   // ((Triforce VR) key: a row's own options file key
 @INI_KEY@
 @RDX_ROW@
 @RDX_APPLIES@

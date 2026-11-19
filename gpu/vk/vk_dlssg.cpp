@@ -33,6 +33,7 @@
 // Built only with HOOKSHOT_STREAMLINE_SDK=<the SDK's folder> (nx2/build.py; NVIDIA's headers stay outside the
 // repository); without it every function answers "off". RX_VK_DLSSG_LOG=1: Streamline's own information lines too.
 #include "vk_dlssg.h"
+#include "vk_xr.h"   // ((Triforce VR) vk_xr_row_on)
 
 #include <atomic>
 #include <cmath>
@@ -90,6 +91,8 @@ const char* state_line = "Not asked for.";
 int asked() {
     static const int v = [] {
         const char* e = getenv("RX_VK_DLSSG");
+        // ((Triforce VR) none with the VR row on: the headset's runtime makes the instance's and the device's extensions its own)
+        if (vk_xr_row_on()) return 0;
         const int row = e && *e ? atoi(e) : ini_value();   // (the row: 0 off, 1 2x, 2 3x, 3 4x; the switch: the multiplier itself)
         const int mult = e && *e ? row : row > 0 ? row + 1 : 0;
         return mult >= 2 ? (mult > 4 ? 4 : mult) : 0;

@@ -35,6 +35,7 @@
 #include <xinput.h>
 #include "../gpu/vk/vk_api.h"   /* (the controls' names: HOS_SW_*, HOS_PAD_*) */
 #include "hos_motion.h"
+#include "vr_game.h"   /* ((Triforce VR) vr_pad_read, vr_motion_history) */
 
 enum { B_A = 0, B_B, B_X, B_Y, B_LS, B_RS, B_L, B_R, B_ZL, B_ZR, B_PLUS, B_MINUS, B_LEFT, B_UP, B_RIGHT, B_DOWN };
 #define STATE_SIZE 0x28
@@ -1091,6 +1092,7 @@ static void npad_states(Ctx *c) {
     }
     if (connected) {
         read_input(&buttons, stick);
+        vr_pad_read(c, &buttons, stick);   /* ((Triforce VR) the Touch controllers, first person's strafe: vr_game.c) */
         {   /* (Triforce) the Mods entry under a game list's last button (host/oot_menu.c, gpu/vk/vk_menu.cpp): while the
                game's cursor is on that last button and our menu is shut, Down (the D-pad's, or the left stick held down)
                is the entry's, not the game's: the renderer takes the cursor onto Mods at its first frame */
@@ -1236,7 +1238,9 @@ HLE(_ZN2nn3hid22GetSixAxisSensorStatesEPNS0_18SixAxisSensorStateEiRKNS0_19SixAxi
     static const float at_rest[18] = {0, 0, -1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1};
     int hos_sdl_motion_history(HosMotionSample *out, int max);   /* pad_sdl.c */
     HosMotionSample h[HOS_MOTION_HISTORY];
-    const int live = count ? hos_sdl_motion_history(h, count) : 0;
+    /* ((Triforce VR) while VR's pointed aim steers the game's motion aim, its readings in place of the pad's: vr_game.c) */
+    int live = count ? vr_motion_history(h, count) : 0;
+    if (!live) live = count ? hos_sdl_motion_history(h, count) : 0;
     /* (each switch between live and at rest moves the numbers a whole history past the last ones given out, so no entry
        of one ever has a number an entry of the other had) */
     if (live) {

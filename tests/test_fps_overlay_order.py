@@ -61,6 +61,8 @@ bool can_draw = true;
 float ease_step = 0;
 bool ease_live = false;   // (menu_record's frames step the easing; a still, menu_record_image, is drawn settled)
 int64_t prof_now() { return 1000; }
+// ((Triforce VR) the HUD panel's place of the counter's overlay)
+float perf_rect[4];
 namespace ui {
 struct Ctx {};
 bool begin(uint32_t, uint32_t) { calls += "b"; return can_draw; }

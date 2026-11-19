@@ -28,6 +28,10 @@ bool temporal_full_scale();
 
 /// A draw into a scene-sized target (colour target 0 and the depth target), with the vertex stage's uniform buffer 3 at
 /// `camera` (its size): the camera of the frame, when that buffer holds one
+/// (Triforce VR, vk_draw.cpp xr_before_upscale) at the gameplay upscale into out (its level): this frame's scene camera's view
+/// (3 x 4, row major) and a sampled view of its depth with its size; false when there is none this frame. Notes the output's
+/// size as the upscalers do, so the scene's draws are known (temporal_scene_size)
+bool temporal_xr_scene(const Texture* out, uint32_t level, float view[12], VkImageView* depth, uint32_t* w, uint32_t* h);
 void temporal_note_scene_draw(const Texture* color0, uint32_t width, uint32_t height, Texture* depth, uint64_t camera,
                               uint64_t camera_size);
 /// Whether a target of width x height can be the scene the gameplay upscale takes (1 to 3 times smaller than its output, as

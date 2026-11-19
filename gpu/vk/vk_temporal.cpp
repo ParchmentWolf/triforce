@@ -65,6 +65,7 @@
 #include "vk_menu.h"
 #include "vk_renodx.h"   // (renodx_built: temporal_scene_format)
 #include "vk_texture.h"
+#include "vk_xr.h"   // (Triforce VR: the scene's camera and depth for the headset)
 
 #include "shaders/dlss_actor_frag_spv.h"
 #include "shaders/dlss_capture_vert_spv.h"
@@ -1131,7 +1132,7 @@ void temporal_note_scene_draw(const Texture* color0, uint32_t width, uint32_t he
     // below: the format, the camera's own size and perspective, the largest in the frame, and the upscale's input)
     if (!color0 || !depth || !camera || camera_size < 0x230 || !temporal_scene_size(width, height)) return;
     // (AMD FSR 3.1 before the bloom keeps the camera here too: the point is found from the scene's target)
-    if (!temporal_scene_format(color0->format) || !(temporal_wanted() || pre_wanted(ur::GAME))) return;
+    if (!temporal_scene_format(color0->format) || !(temporal_wanted() || pre_wanted(ur::GAME) || vk_xr_depth_wanted())) return;
     State& s = st();
     std::lock_guard lk(s.mu);
     const uint64_t now = texture_frame_no();
@@ -1158,6 +1159,20 @@ void temporal_note_scene_draw(const Texture* color0, uint32_t width, uint32_t he
     k.width = width, k.height = height, k.format = color0->format, k.color = color0, k.depth = depth, k.frame = now;
     k.color_id = color0->id, k.depth_id = depth->id, k.noted = texture_destroyed_count();
     k.valid = true;
+    if (vk_xr_depth_wanted()) vk_xr_note_projection(k.proj, host->depth_minus_w());   // (Triforce VR: the depth's planes)
+}
+
+bool temporal_xr_scene(const Texture* out, uint32_t level, float view[12], VkImageView* depth, uint32_t* w, uint32_t* h) {
+    if (out) note_output(out, level);
+    State& s = st();
+    std::lock_guard lk(s.mu);
+    const Camera& k = s.cam;
+    if (!k.valid || texture_frame_no() - k.frame > 1 || !there_still(k) || !k.depth || !(k.depth->usage & VK_IMAGE_USAGE_SAMPLED_BIT) ||
+        k.depth->samples != VK_SAMPLE_COUNT_1_BIT || !(k.depth->aspect & VK_IMAGE_ASPECT_DEPTH_BIT))
+        return false;
+    std::memcpy(view, k.view, sizeof k.view);
+    *depth = depth_view(k.depth), *w = k.depth->width, *h = k.depth->height;
+    return *depth != VK_NULL_HANDLE;
 }
 
 bool temporal_scene_size(uint32_t width, uint32_t height) {

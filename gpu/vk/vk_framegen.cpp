@@ -22,6 +22,7 @@
 #include <cmath>
 
 #include "vk_framegen.h"
+#include "vk_xr.h"   // ((Triforce VR) vk_xr_active)
 #include "framegen_rows.h"    // (Triforce: the Frame generation row's values, AMD FSR 4 among them)
 #include "vk_dlssg.h"
 #include "vk_fsr3_inputs.h"   // (AMD FSR 3.1 frame interpolation's depth and motion)
@@ -587,7 +588,8 @@ int framegen_multiplier() { return !framegen_on() ? 0 : opts.framegen == 1 ? -1 
 bool framegen_on() {
     static const int allow = !getenv("RX_VK_FRAMEGEN") || atoi(getenv("RX_VK_FRAMEGEN")) != 0;
     // (Triforce: not beside NVIDIA DLSS frame generation, whose frames go in at the present itself: vk_dlssg.cpp)
-    return framegen_wanted(opts.framegen, allow) && !dev.offscreen && !fg.failed && !dlssg::active();
+    // ((Triforce VR) nor while VR runs: the headset takes the game's own frames, each with the camera it was drawn from)
+    return framegen_wanted(opts.framegen, allow) && !dev.offscreen && !fg.failed && !dlssg::active() && !vk_xr_active();
 }
 
 // Ultrawide's menus (the Insert menu's Ultrawide menus): which of nx2/oot_wide.py's keep-list screens keep the whole picture, told

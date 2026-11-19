@@ -70,6 +70,7 @@
 #include "ultrawide_rows.h" // ((Triforce) the Ultrawide row's shapes, and its old Monitor's shape read before options_version 6)
 #include "present_mode.h"   // (the VSync row: what its choice comes to on this driver)
 #include "game_language.h"  // (the Game language row: what language.txt chooses and offers)
+#include "vk_xr.h"          // ((Triforce VR) vk_xr_cfg)
 #include "menu_restart.h"
 #include "mod_cheat_rows.h"   // (Triforce: the System tab's rows for the cheats of the mods' cheat files)
 #include "menu_sound_events.h"   // (Triforce: the options' own sounds: which one a tick asks for, and their queue to the host)
@@ -108,8 +109,9 @@ enum MenuTab {
     TAB_AUDIO = 2,
     TAB_CONTROLS = 3,
     TAB_SYSTEM = 4,
-    TAB_DEBUG = 5,   // (the OoT debug tools of #785 and the developer's rows, a tab of their own)
-    TAB_COUNT = 6,
+    TAB_VR = 5,      // (Triforce VR: vk_xr.cpp's rows)
+    TAB_DEBUG = 6,   // (the OoT debug tools of #785 and the developer's rows, a tab of their own)
+    TAB_COUNT = 7,
     TAB_MOTION = TAB_COUNT,   // (hookshot: not a tab of the strip, the Motion page that the Controls tab's Motion row
                               // opens: one past the strip's tabs, so a tab added before TAB_COUNT moves it along)
     TAB_PAGE = TAB_MOTION + 1   // (hookshot: the Controls page's rows, above its grid; no tab shows them)
@@ -131,6 +133,7 @@ struct Row {
                                   // frame generation)
     signed char cheat = -1;   // (a debug tool, on the Debug tab with the tools on: its index in the cheat_ tables, -1 none)
     bool heading = false;     // (a section's title on its tab, not a row: the selection steps over it)
+    const char* key = nullptr;   // ((Triforce VR) the options file's key, where it is not the name's (ini_key))
 };
 /// A row's hints from a table, the value lo first (nullptr: none for that value)
 const char* hint_in(const char* const* t, int n, int lo, int v, int variant) {
@@ -148,6 +151,23 @@ const char* tx_framegen(int v) {
     return t[std::clamp(framegen_rows::shown(v, fsr4fg::offered_known()), 0, (int)framegen_rows::kRowMax)];   // ((Triforce) as known: menu_ahead)
 }
 const char* tx_onoff(int v) { return v ? "On" : "Off"; }
+// (Triforce VR) the VR tab's values
+const char* tx_vr_view(int v) { return v ? "Immersive" : "Theater"; }
+const char* tx_vr_camera(int v) { return v ? "Third person" : "First person"; }
+const char* tx_vr_stereo(int v) { return v == 1 ? "Balanced" : "Performant"; }
+const char* tx_vr_controls(int v) { return v ? "Touch controllers" : "Gamepad"; }
+const char* tx_vr_hand(int v) { return v ? "Right-handed" : "Left-handed"; }
+const char* tx_vr_play(int v) { return v ? "Motion" : "Stationary"; }
+const char* tx_vr_hud(int v) { return v ? "In the picture" : "Panel in front of you"; }
+const char* tx_unit(int v, const char* fmt) {
+    static char b[24];
+    snprintf(b, sizeof b, fmt, v);
+    return b;
+}
+const char* tx_degrees(int v) { return tx_unit(v, "%d degrees"); }
+const char* tx_cm(int v) { return tx_unit(v, "%d cm"); }
+const char* tx_cm_signed(int v) { return tx_unit(v, "%+d cm"); }
+const char* tx_cm_s(int v) { return tx_unit(v, "%d cm/s"); }
 const char* tx_dlssg(int v) { return v == 1 ? "2x" : v == 2 ? "3x" : v == 3 ? "4x" : "Off"; }
 /// (what runs in this session, or why not: vk_dlssg.cpp. Variant 0 stands for the longest line, for the menu's height)
 const char* hn_dlssg(int v, int variant) {
@@ -1289,6 +1309,73 @@ Row rows[] = {
     {TAB_PAGE, "Button prompts", &opts.prompts, 0, HOS_PROMPT_N, 1, tx_prompts,
      "The button icons the game shows, in its texts and menus: those of this controller, or the keyboard's and the "
      "mouse's, for the buttons or keys your controls put each action on.", hn_prompts, true, true},
+    // (Triforce VR) VR through OpenXR (vk_xr.cpp; host/vr_game.c for the camera's rows)
+    {TAB_VR, "VR", &opts.vr, 0, 1, 1, tx_onoff,
+     "Shows the game in a VR headset through OpenXR (for example WiVRn on Linux, SteamVR or Meta's runtime on "
+     "Windows), with the headset connected before the game starts. Applies after a restart.", nullptr, true, true, -1, false, "vr"},
+    {TAB_VR, "View", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},
+    {TAB_VR, "VR mode", &opts.vr_view, 0, 1, 1, tx_vr_view,
+     "Immersive: the world surrounds you in play and in cutscenes, and the game's camera follows your head. Theater: "
+     "the game on a large screen floating in front of you. This menu always shows on the screen.", nullptr, false, true, -1, false, "vr_view"},
+    {TAB_VR, "Screen size", &opts.vr_screen_size, 45, 125, 5, tx_degrees,
+     "How much of your view the floating screen fills, in degrees across: Theater mode, this menu and the title.", nullptr, false, true, -1, false, "vr_screen_size"},
+    {TAB_VR, "Curved screen", &opts.vr_screen_curve, 0, 1, 1, tx_onoff,
+     "Curves the floating screen around you, like a cinema's, so its edges stay as near as its middle. Off: a flat "
+     "screen.", nullptr, false, true, -1, false, "vr_screen_curve"},
+    {TAB_VR, "Camera", &opts.vr_camera, 0, 1, 1, tx_vr_camera,
+     "First person: you see from Link's eyes, Link is hidden while what he holds stays in view, and he faces where you "
+     "look while he stands. Third person: the game's own camera, turned by your head.", nullptr, false, true, -1, false, "vr_camera"},
+    {TAB_VR, "Field of view", &opts.vr_view_scale, 50, 200, 5, tx_percent,
+     "How much of the world the view takes in. The default, 100%, matches the headset's lenses exactly. Higher fits "
+     "more of the world into your view, so everything looks smaller; lower zooms in. Away from 100%, the world seems "
+     "to swim as you turn your head.", nullptr, false, true, -1, false, "vr_view_scale"},
+    {TAB_VR, "Stereo", &opts.vr_stereo, 0, 1, 1, tx_vr_stereo,
+     "Performant: the game draws one picture and each eye's is made from it and its depth at the game's full rate; "
+     "edges beside near things can smear. Balanced: each eye is drawn in turn, true depth everywhere, with the game's "
+     "time standing still for the second eye, so both eyes see the same moment; the world moves at half the game's "
+     "rate. The desktop window shows the left eye in Balanced.", nullptr, false, true, -1, false, "vr_stereo"},
+    {TAB_VR, "Depth", &opts.vr_depth, 0, 200, 5, tx_percent,
+     "How far apart your eyes are in the game's world. 100% matches your own eyes; 0% shows both eyes the same flat "
+     "picture.", nullptr, false, true, -1, false, "vr_depth"},
+    {TAB_VR, "Eye position", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},
+    {TAB_VR, "Height", &opts.vr_eye_up, -30, 30, 1, tx_cm_signed,
+     "Moves your eyes up or down from the height of Link's eyes.", nullptr, false, true, -1, false, "vr_eye_up"},
+    {TAB_VR, "Left and right", &opts.vr_eye_side, -30, 30, 1, tx_cm_signed,
+     "Moves your eyes to Link's right (more) or left (less).", nullptr, false, true, -1, false, "vr_eye_side"},
+    {TAB_VR, "Forward", &opts.vr_eye_forward, -30, 30, 1, tx_cm_signed,
+     "Moves your eyes forward or back from Link's face.", nullptr, false, true, -1, false, "vr_eye_forward"},
+    {TAB_VR, "Cutscene height", &opts.vr_event_up, -50, 50, 1, tx_cm_signed,
+     "Moves your eyes up or down in cutscenes and conversations. They stand Link's height (a child's or an adult's) "
+     "above the game's camera.", nullptr, false, true, -1, false, "vr_event_up"},
+    {TAB_VR, "Controls", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},
+    {TAB_VR, "Control scheme", &opts.vr_controls, 0, 1, 1, tx_vr_controls,
+     "Gamepad: a normal controller (or the keyboard and mouse), as without VR. Touch controllers: A/B the game's A/B, "
+     "X/Y mirror A/B, the sticks' clicks X (jump), the grips ZL/ZR. Swing the sword hand to slash; both hands together "
+     "behind your head draw or put away the sword and shield; the shield held before the eye on its side targets. "
+     "D-pad: both arms shaken upward boots, both hands together before your face the ocarina, both hands beside your "
+     "head Navi, a hand shaken sideways above your head the mask.", nullptr, false, true, -1, false, "vr_controls"},
+    {TAB_VR, "Handedness", &opts.vr_handedness, 0, 1, 1, tx_vr_hand,
+     "Which hand holds the sword (Touch controllers): its swing slashes and charges. The other hand holds the shield.", nullptr, false, true, -1, false, "vr_handedness"},
+    {TAB_VR, "Play style", &opts.vr_play, 0, 1, 1, tx_vr_play,
+     "Stationary: aiming as on a pad. Motion (Touch controllers): the slingshot, bow, hookshot and boomerang aim where "
+     "your sword hand points (the game's motion controls on).", nullptr, false, true, -1, false, "vr_play"},
+    {TAB_VR, "Pointing angle", &opts.vr_aim_tilt, 0, 60, 1, tx_degrees,
+     "Motion: how far below the controller's own pointing line your aim goes. Raise it if the aim sits above where you "
+     "point, lower it if below.", nullptr, false, true, -1, false, "vr_aim_tilt"},
+    {TAB_VR, "Swing speed", &opts.vr_swing_speed, 100, 500, 10, tx_cm_s,
+     "How fast your hand must move for a swing to count as a sword slash. Lower: gentler swings slash.", nullptr, false, true, -1, false, "vr_swing_speed"},
+    {TAB_VR, "Charge reach", &opts.vr_charge_reach, 25, 70, 1, tx_cm,
+     "How far out from your body a swing must leave your hand to keep charging the sword; bringing the hand back in "
+     "releases it. Lower suits shorter arms.", nullptr, false, true, -1, false, "vr_charge_reach"},
+    {TAB_VR, "Straight-ahead zone", &opts.vr_run_zone, 0, 20, 1, tx_degrees,
+     "Running forward in first person, Link runs dead straight while your head is within this many degrees of looking "
+     "straight ahead; turn it further and he follows your head. 0: he always follows your head.", nullptr, false, true, -1, false, "vr_run_zone"},
+    {TAB_VR, "HUD", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},
+    {TAB_VR, "HUD placement", &opts.vr_hud, 0, 1, 1, tx_vr_hud,
+     "Panel in front of you: the hearts, buttons and map float on a panel that moves with your head, and the world is "
+     "shown without them. In the picture: the HUD stays drawn over the world.", nullptr, false, true, -1, false, "vr_hud"},
+    {TAB_VR, "HUD size", &opts.vr_hud_size, 40, 200, 5, tx_cm,
+     "The width of the HUD's panel, a metre in front of you.", nullptr, false, true, -1, false, "vr_hud_size"},
     // Debug: the tools' switch, the tools themselves below it while they are on (cheat: menu_tick does what they do), then the
     // developer's rows
     {TAB_DEBUG, "Debug tools", &opts.debug_tools, 0, 1, 1, tx_onoff,
@@ -1862,7 +1949,7 @@ constexpr int64_t kMarqueeStep = 150000000LL, kMarqueeRest = 1200000000LL;   // 
 int hover_tab = -1;
 int drag_row = -1;
 bool mouse_read = false;   // (the menu has read the mouse since it opened)
-bool is_slider(const Row& r) { return r.value == &opts.sharpness || r.value == &opts.mouse_sens || r.value == &opts.gyro_sens_x || r.value == &opts.gyro_sens_y; }
+bool is_slider(const Row& r) { return r.value == &opts.sharpness || r.value == &opts.mouse_sens || r.value == &opts.gyro_sens_x || r.value == &opts.gyro_sens_y || (r.tab == TAB_VR && r.value && r.hi - r.lo > 2); }
 /// (a scale: the arrows and a click stop at its ends; Rumble strength would go from Off to its strongest)
 bool stops_at_ends(const Row& r) { return r.value == &opts.mouse_sens || r.value == &opts.rumble || r.value == &opts.rumble_curve || r.value == &opts.lstick_dead_zone || r.value == &opts.rstick_dead_zone || r.value == &opts.walk_scale || r.value == &opts.gyro_sens_x || r.value == &opts.gyro_sens_y; }
 /// (the ini's Rumble strength on the menu's steps: 0 to 300, the nearest 25)
@@ -1873,7 +1960,38 @@ std::string ini_path() {
     std::string dir(exe, n);
     return dir.substr(0, dir.find_last_of("\\/") + 1) + "triforce_options.ini";
 }
+// (Triforce VR) the VR rows by their key (vk_xr_cfg; its lower case is the options file's), and their values as text where a
+// value is a choice (choices[v], "|"-separated); a number's text is the number
+struct VrKey {
+    const char* key;
+    int* value;
+    const char* choices;
+};
+const VrKey vr_keys[] = {
+    {"VR", &opts.vr, nullptr},
+    {"VR_VIEW", &opts.vr_view, "screen|head"},
+    {"VR_SCREEN_SIZE", &opts.vr_screen_size, nullptr},
+    {"VR_SCREEN_CURVE", &opts.vr_screen_curve, nullptr},
+    {"VR_CAMERA", &opts.vr_camera, "first|third"},
+    {"VR_VIEW_SCALE", &opts.vr_view_scale, nullptr},
+    {"VR_STEREO", &opts.vr_stereo, "performant|balanced"},
+    {"VR_DEPTH", &opts.vr_depth, nullptr},
+    {"VR_EYE_UP", &opts.vr_eye_up, nullptr},
+    {"VR_EYE_SIDE", &opts.vr_eye_side, nullptr},
+    {"VR_EYE_FORWARD", &opts.vr_eye_forward, nullptr},
+    {"VR_EVENT_UP", &opts.vr_event_up, nullptr},
+    {"VR_CONTROLS", &opts.vr_controls, "gamepad|meta"},
+    {"VR_HANDEDNESS", &opts.vr_handedness, "left|right"},
+    {"VR_PLAY", &opts.vr_play, "stationary|motion"},
+    {"VR_AIM_TILT", &opts.vr_aim_tilt, nullptr},
+    {"VR_SWING_SPEED", &opts.vr_swing_speed, nullptr},
+    {"VR_CHARGE_REACH", &opts.vr_charge_reach, nullptr},
+    {"VR_RUN_ZONE", &opts.vr_run_zone, nullptr},
+    {"VR_HUD", &opts.vr_hud, "panel|picture"},
+    {"VR_HUD_SIZE", &opts.vr_hud_size, nullptr},
+};
 const char* ini_key(const Row& r) {
+    if (r.key) return r.key;
     if (r.value == &opts.output_res) return "output_res";   // (host/nn_applet.c reads it at the start)
     // (rows renamed since their values were first saved keep their keys: an options file from before still loads)
     if (r.value == &opts.resolution) return "resolution";
@@ -2358,8 +2476,8 @@ float scroll_at[TAB_MOTION + 2];   // (the first row shown, eased toward the sel
                                    // the Controls page: kControlsSlot)
 constexpr int kControlsSlot = TAB_MOTION + 1;
 int wheel_rows[TAB_MOTION + 2];   // (the mouse wheel's notches since the last drawing, a slot each: scroll_rows scrolls by them)
-int scrolled_to[TAB_MOTION + 2] = {-1, -1, -1, -1, -1, -1, -1, -1};   // (the selection scroll_rows last brought into view)
-static_assert(TAB_MOTION + 2 == 8, "scrolled_to: a slot for each tab, the Motion page and the Controls page");
+int scrolled_to[TAB_MOTION + 2] = {-1, -1, -1, -1, -1, -1, -1, -1, -1};   // (the selection scroll_rows last brought into view)
+static_assert(TAB_MOTION + 2 == 9, "scrolled_to: a slot for each tab, the Motion page and the Controls page");
 float scroll_want[TAB_MOTION + 2];   // (where scroll_at is going: the wheel moves it, a new selection too)
 float ease_step = 0;     // (this drawing's share of the way: the time since the last one)
 bool ease_live = false;  // ((Triforce) menu_record steps the easing: a window's frames. Without them a still is drawn settled)
@@ -2766,7 +2884,7 @@ void draw_debug_rows(ui::Ctx& c, float cx0, float cx1, float top, float bottom, 
 /// with more than five). sel: the one shown, -1 the game's own. game: "Game" in front of ours, inside the game's Options
 /// screen. hit: the mouse's places noted
 void draw_tabs(ui::Ctx& c, int sel, bool game, bool hit) {
-    static const char* const ours[TAB_COUNT] = {"Display", "Graphics", "Audio", "Controls", "System", "Debug"};
+    static const char* const ours[TAB_COUNT] = {"Display", "Graphics", "Audio", "Controls", "System", "VR", "Debug"};
     const float s = c.s, hh = banner_h(c);
     // (Triforce) the strip's entries in their order: the game's own (-1), ours to System, Debug when shown (Mods is not one:
     // it is an entry of its own under the game's System list and the title's, kModsRowPage)
@@ -4258,6 +4376,9 @@ void draw_ask(ui::Ctx& c) {
 
 void draw_menu(ui::Ctx& c, bool perf_under = false);
 void draw_perf(ui::Ctx& c);
+// ((Triforce VR) where the Full panel was drawn this frame, window pixels {x, y, w, h}; width 0: not drawn. vk_xr.cpp lifts it
+// onto the HUD's panel: menu_perf_rect)
+float perf_rect[4];
 /// The menu's text sizes at this window's unit (and, with Menu size Auto, at the other size Auto can pick), baked ahead by
 /// vk_imgui.cpp a few a frame: the first open then draws with no glyphs to make (it took 2.6 ms at 1080p)
 float prebaked[4] = {0, 0, 0, 0};   // (the units and the width prebake last did; (Triforce) and the Full panel's text size, 0 off)
@@ -4482,6 +4603,7 @@ void draw_perf(ui::Ctx& c) {
     // perf_panel_draw; Full draws no FPS counter beside it, as NX2navi's perf_draw)
     const float m = 12 * k, panel_w = std::ceil(inner + 2 * pad_x), panel_h = std::ceil(content + 2 * pad_y);
     const ImVec2 a(std::floor(c.w - m - panel_w), std::floor(m)), b(a.x + panel_w, a.y + panel_h);
+    perf_rect[0] = a.x, perf_rect[1] = a.y, perf_rect[2] = panel_w, perf_rect[3] = panel_h;   // ((Triforce VR) for the HUD's panel)
     ui::box(c, a, b, kPerfOpacity);
     // (the contents, from the padding in)
     const float x0 = a.x + pad_x, x1 = x0 + inner;
@@ -6219,6 +6341,7 @@ void menu_record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h) {
     const int64_t game_seen = game_options_ns.load(std::memory_order_relaxed);
     const bool game_tab = !open && !start && embed_allowed() && game_seen && prof_now() - game_seen < 250000000LL && embed_since;
     const bool mods_row = !open && !start && mods_list_fresh();   // ((Triforce) the Mods entry under the game's list)
+    perf_rect[2] = 0;   // ((Triforce VR) drawn again below, or not this frame)
     if (!start && !fps && !open && !note && !game_tab && !mods_row) {   // (nothing shows: no ImGui frame, no render pass)
         // (but a new window size or Menu size since the last bake: one frame with nothing drawn that bakes the menu's glyphs
         // and measures its page for the new size, so the next open has no hitch whatever was resized while nothing showed)
@@ -6287,3 +6410,33 @@ void menu_record_image(VkCommandBuffer cmd, VkImage image, VkImageView view, uin
 }
 
 } // namespace mkwvk
+
+// (Triforce VR) a VR row's value by its key, as text: a choice's name, else the number; "" for a key that is not a VR row
+extern "C" const char* vk_xr_cfg(const char* key) {
+    static thread_local char b[24];
+    for (const mkwvk::VrKey& v : mkwvk::vr_keys) {
+        if (strcmp(v.key, key)) continue;
+        const int n = *v.value;
+        if (!v.choices) {
+            snprintf(b, sizeof b, "%d", n);
+            return b;
+        }
+        const char* c = v.choices;
+        for (int i = 0; i < n && c; i++) c = strchr(c, '|'), c = c ? c + 1 : nullptr;
+        if (!c) c = v.choices;
+        const char* end = strchr(c, '|');
+        const size_t len = std::min(sizeof b - 1, end ? (size_t)(end - c) : strlen(c));
+        memcpy(b, c, len), b[len] = 0;
+        return b;
+    }
+    return "";
+}
+
+// (Triforce VR) where the counter's overlay was drawn this frame (window pixels {x, y, w, h}), for vk_xr.cpp to lift it onto
+// the HUD's panel: 0 when not drawn
+static int menu_rect_of(const float f[4], int r[4]) {
+    if (!(f[2] > 0) || !(f[3] > 0)) return 0;
+    for (int i = 0; i < 4; i++) r[i] = (int)(i < 2 ? std::floor(f[i]) : std::ceil(f[i]));
+    return 1;
+}
+int menu_perf_rect(int r[4]) { return menu_rect_of(mkwvk::perf_rect, r); }

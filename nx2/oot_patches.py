@@ -129,6 +129,43 @@ def patch_view(source):
     return (source[:start] + body + source[end:]).replace(
         '#include "a64.h"\n', '#include "a64.h"\nextern void hos_oot_free_view(Ctx *c, uint64_t view);\n', 1)
 
+# (Triforce VR) VR's camera hooks in the same update (host/vr_game.c): where every path of the choice of the frame's position,
+# target and up joins (0x804e4e50, before its fcvt s17, d0: the three in d0-d2, d3-d5 and s7, s16, s6), and right after the
+# load of the camera's vertical angle (0x804e52f8, ldr s0, [x19, #0x13c]), from which the perspective projection is made.
+# Each anchor must be found exactly once, else the function is left as it is (VR then shows the game on its screen alone).
+VR_CAMERA_ANCHORS = ("L_804e4e50:;\n", "L_804e4e50:; A64_POLL(c);\n")
+VR_LENS_LOAD = "(c->x[19]+316ULL)"
+VR_LENS_BLOCK = "L_804e52d0:;"   # (the load at 0x804e52f8 is the first after this label; another path loads the angle too)
+
+
+def patch_vr(source):
+    start = source.find(VIEW_HEAD)
+    if start < 0:
+        return None
+    end = source.find("\n}", start)
+    if end < 0:
+        return None
+    body = source[start:end]
+    if "hos_vr_camera(c);" in body:   # (made before: a lift patched again)
+        return source
+    for anchor in VR_CAMERA_ANCHORS:
+        if body.count(anchor) == 1:
+            break
+    else:
+        return None
+    block = body.find(VR_LENS_BLOCK)
+    if block < 0 or body.count(VR_LENS_BLOCK) != 1:
+        return None
+    lens = body.find(VR_LENS_LOAD, block)
+    end_of_line = body.find("\n", lens)
+    if lens < 0 or end_of_line < 0 or "c->vreg[0]" not in body[body.rfind("\n", 0, lens):end_of_line]:
+        return None
+    body = body[:end_of_line] + "\n    hos_vr_lens(c);" + body[end_of_line:]
+    body = body.replace(anchor, anchor + "    hos_vr_camera(c);\n", 1)
+    return (source[:start] + body + source[end:]).replace(
+        '#include "a64.h"\n', '#include "a64.h"\nextern void hos_vr_camera(Ctx *c);\nextern void hos_vr_lens(Ctx *c);\n', 1)
+
+
 # Native mouse look (host/mouse_native.c): the player camera's update, f_80644c80 (a virtual method, the camera in x0), hands
 # its camera to the host before anything else, on the game's thread, once a frame; with the menu's Mouse camera on the mouse's
 # motion turns the camera's yaw (+0x1a4) and pitch (+0x18c) there, before the camera reads its input.
@@ -747,6 +784,7 @@ def apply(gen, *, protect_hearts=False, required=False):
         done["player flight rotation"] = 0
         done["free camera"] = 0
         done["mouse camera"] = 0
+        done["vr camera"] = 0   # ((Triforce VR) without it VR shows the game on its screen alone: host/vr_game.c)
         done["scene colour target format"] = 0   # (local, RenoDX port)
     step_sites, step_files = 0, []   # (the divides with the hook, and the files that have it)
     whole_sites = 0   # (the counters of WHOLE_SITES with the whole frames: patch_whole_frames)
@@ -821,6 +859,11 @@ def apply(gen, *, protect_hearts=False, required=False):
             out = view
             done["free camera"] += 1
             print("oot_patches: free camera in", os.path.basename(path))
+        vr = patch_vr(out) if protect_hearts else None
+        if vr is not None:
+            out = vr
+            done["vr camera"] += 1
+            print("oot_patches: VR's camera hooks in", os.path.basename(path))
         out, sites = patch_frame_seconds(out)
         if STEP_MARK in out:   # (made now, or by an earlier run over this file)
             step_sites += out.count(STEP_MARK)

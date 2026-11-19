@@ -133,8 +133,10 @@ def check_replay():
           "par_stream_order_only no longer keeps such a frame on the replay thread alone with RX_VK_PARALLEL_TEMPORAL=0")
     handle = function(replay, "const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_stop = false) {")
     serial = handle[:handle.index("// the dry pass")]
-    check("|| par_stream_order_only() || (hooks && temporal_pre_pending())) {" in serial and "replay(cmd, state, h);" in serial,
-          "replay_handle records a frame on workers with RX_VK_PARALLEL_TEMPORAL=0, or with the engine's work pending")
+    check("|| par_stream_order_only() || (hooks && temporal_pre_pending()) ||\n        vk_xr_active()) {" in serial and
+          "replay(cmd, state, h);" in serial,
+          "replay_handle records a frame on workers with RX_VK_PARALLEL_TEMPORAL=0, with the engine's work pending, or while VR "
+          "runs")
     # (the tuner is replay_threads.h's: par_tune_present tells it, and it starts no trial and judges no window then;
     # tests/test_replay_threads_tuner.py runs it)
     tuner = (VK / "replay_threads.h").read_text(encoding="utf-8")

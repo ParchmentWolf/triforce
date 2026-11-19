@@ -562,6 +562,12 @@ int rx_memory_holders(char *out, size_t n) {
 }
 /* (nvn_native.c: the CPU set an event's value) in order with the submits, for the GPU's waits on it */
 int rx_option(int id, int otherwise) { return vk && vk->option ? vk->option(id) : otherwise; }
+/* (Triforce VR) the renderer's VR table (gpu/vk/vk_xr.cpp), for host/vr_game.c, nn_hid.c and nn_vi.c; NULL without one */
+const MkwVkXr *rx_xr(void) {
+    static const MkwVkXr *xr;
+    if (!xr && vk && vk->xr) xr = vk->xr();
+    return xr;
+}
 void rx_option_set(int id, int value) { if (vk && vk->option_set) vk->option_set(id, value); }
 void rx_nvn_event_signal(uint64_t gpu, uint32_t value) {
     if (vk && vk->nvn_event_signal) vk->nvn_event_signal(gpu, value);

@@ -40,6 +40,7 @@
 #include "present_hold.h"  // (Triforce: the hold of the last picture, do_present)
 #include "present_smooth.h"   // (Triforce: Frame pacing on the plain present, RX_VK_PACE_SMOOTH: present_image)
 #include "present_thread.h"   // (Triforce: the present thread, RX_VK_PRESENT_THREAD: present_image)
+#include "vk_xr.h"   // (Triforce VR: the renderer's table, the present's copy for the headset)
 #include "vk_reflex.h"
 #include "vk_antilag.h"
 #include "vk_draw.h"
@@ -3002,7 +3003,10 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     const bool hooks = threads >= 2 && par_temporal_hooks();
     const bool debug = dump_on() || gprof_on() || probe_serial();
     // ((Triforce) and in the early tail, which stays one command buffer: tail_on)
-    if (threads < 2 || !rec_cur || debug || tail_on() || par_stream_order_only() || (hooks && temporal_pre_pending())) {
+    // ((Triforce VR) and while VR runs: its hooks at the gameplay upscale (vk_draw.cpp xr_before_upscale) take the scene's camera
+    // as the stream noted it, so its frames are recorded in order on the replay thread)
+    if (threads < 2 || !rec_cur || debug || tail_on() || par_stream_order_only() || (hooks && temporal_pre_pending()) ||
+        vk_xr_active()) {
         (threads < 2 || !rec_cur ? par_st.alone_off : debug ? par_st.alone_debug : par_st.alone_order)++;
         stream_cb = cb, stream_work = 0;
         suspend_ok = may_stop;
@@ -6244,7 +6248,18 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     }
     checkpoint_mark(f.cmd, index, 'M');   // ((Triforce) RX_VK_CHECKPOINTS)
     menu_record(f.cmd, index, dev.swap_extent.width, dev.swap_extent.height);   // (hookshot) Dear ImGui's overlays, over all of it
-    image_barrier(f.cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    // ((Triforce VR) the window's image, the menu over the game, copied for the headset (vk_xr.cpp); this submit signals it. The
+    // game's own picture with it, where the head's view drew it: its place in src)
+    VkSemaphoreSubmitInfo xr_sig{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
+    VkImageLayout dst_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    if (dev.swap_readable && vk_xr_wants_capture(dev.hdr || hdr_image)) {
+        image_barrier(f.cmd, dst, dst_layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        dst_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        const PresentSourceRect pr = present_source_rect(sw, sh, crop);
+        const int pic[4] = {(int)pr.x, (int)pr.y, src ? (int)pr.w : 0, src ? (int)pr.h : 0};
+        vk_xr_capture(f.cmd, dst, dev.swap_extent, dev.swap_format, src, VK_IMAGE_LAYOUT_GENERAL, pic, &xr_sig);
+    }
+    image_barrier(f.cmd, dst, dst_layout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     dlssg::frame(f.cmd, dev.swap_extent.width, dev.swap_extent.height);   // (Triforce: this frame's camera, depth and motion for Streamline)
     checkpoint_mark(f.cmd, index, 'P');   // ((Triforce) RX_VK_CHECKPOINTS)
     if (vkEndCommandBuffer(f.cmd) == VK_ERROR_DEVICE_LOST) device_lost();
@@ -6265,6 +6280,8 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     si.pCommandBufferInfos = &cb;
     si.signalSemaphoreInfoCount = 1;
     si.pSignalSemaphoreInfos = &signal;
+    const VkSemaphoreSubmitInfo signals[2] = {signal, xr_sig};
+    if (xr_sig.semaphore) si.signalSemaphoreInfoCount = 2, si.pSignalSemaphoreInfos = signals;
     std::unique_lock qk(dev.present_mu);
     if (!pend.cbs.empty()) flush_reason = FR_PRESENT;
     queue_flush_locked();
@@ -6287,6 +6304,7 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
                                                                                         std::memory_order_relaxed);
     res = vkQueueSubmit2(dev.queue, 1, &si, f.done);
     if (res == VK_ERROR_DEVICE_LOST) device_lost();
+    if (res == VK_SUCCESS) vk_xr_captured(&xr_sig);   // ((Triforce VR) the copy is the newest for the headset)
     // ((Triforce) RX_VK_PRESENT_THREAD: a picture of the game's goes on from here on the present thread (present_thread.h), its
     // blit on the queue as before; this thread goes on to its next frame. Otherwise the rest here, as before)
     const PresentOut out{index, smooth_mine};
@@ -7154,6 +7172,7 @@ void fill_replay_table(MkwVkRenderer& t) {
     t.guest_imported = memory_guest_imported;
     t.nvn_vmap_changing = vmap_changing;
     t.nvn_texture_created = texture_created_of;
+    t.xr = vk_xr_table;   // (Triforce VR: vk_xr.cpp)
 }
 
 std::atomic<bool> par_active{false};
