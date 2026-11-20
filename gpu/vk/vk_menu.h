@@ -157,6 +157,8 @@ struct Options {
     int vr_run_zone = 5;        // first person: running goes straight while the head is within this many degrees (0 to 20)
     int vr_hud = 0;             // 0 a panel in front of the head, 1 left in the picture
     int vr_hud_size = 100;      // the HUD panel's width, cm a metre away (40 to 200)
+    int vr_body = 1;            // first person: 0 Link hidden, 1 his arms on the controllers and his head hidden (host/vr_body.c)
+    int vr_arm_reach = 135;     // the arms' stretch to reach the controllers, percent of their length (100 to 160)
 };
 extern Options opts;
 /// (local, RenoDX port) opts.hdr as triforce_options.ini had it at the start (menu_init), before any change in play: what

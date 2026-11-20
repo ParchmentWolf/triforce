@@ -77,6 +77,11 @@ int vk_xr_pointer(double dir[3]);
 void vk_xr_aim(int on, const double origin[3], const double dir[3]);
 // The game's own view this frame (the head's view not applied); its pictures go on the screen
 void vk_xr_untracked(void);
+// host/vr_body.c (VR_BODY arms), the game's thread: each hand controller (0 left, 1 right) in the game's world as the head's
+// view maps the LOCAL space at the last camera update: its grip's place (game units), where it points (the grip's -z) and
+// its palm's facing (the grip's +x out of the left palm, into the right), unit directions; a hand not tracked all 0. 1
+// when any is tracked and the head's view is on
+int vk_xr_hands(double pos[6], double point[6], double palm[6]);
 
 // vk_draw.cpp, the game's scene upscaled into target (w x h, format), the HUD still to
 // be drawn over it: the image VR keeps it in (the caller copies it there in its stream), VK_NULL_HANDLE when the HUD's

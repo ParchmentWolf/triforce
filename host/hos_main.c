@@ -1523,6 +1523,10 @@ void hos_oot_lift_player(Ctx *c, uint64_t actor) {
     const uint64_t movement = components ? recomp_load64(c, components + 800) : 0;
     if (movement < HOS_HEAP_BASE + 0x1d50 || recomp_load64(c, movement + 24) != actor ||
         !hos_oot_is_player(c, movement - 0x1d50)) return;
+    {   /* ((Triforce VR) his bones found for the arms, his head's materials kept hidden in first person: host/vr_body.c) */
+        void vr_body_lift(Ctx *c, uint64_t actor);
+        vr_body_lift(c, actor);
+    }
 
     // Link can be updated by different guest workers on successive frames.
     static SRWLOCK cheats_lock = SRWLOCK_INIT;

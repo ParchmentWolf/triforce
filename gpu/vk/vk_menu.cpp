@@ -159,6 +159,7 @@ const char* tx_vr_controls(int v) { return v ? "Touch controllers" : "Gamepad"; 
 const char* tx_vr_hand(int v) { return v ? "Right-handed" : "Left-handed"; }
 const char* tx_vr_play(int v) { return v ? "Motion" : "Stationary"; }
 const char* tx_vr_hud(int v) { return v ? "In the picture" : "Panel in front of you"; }
+const char* tx_vr_body(int v) { return v ? "Your arms" : "Hidden"; }
 const char* tx_unit(int v, const char* fmt) {
     static char b[24];
     snprintf(b, sizeof b, fmt, v);
@@ -1325,6 +1326,12 @@ Row rows[] = {
     {TAB_VR, "Camera", &opts.vr_camera, 0, 1, 1, tx_vr_camera,
      "First person: you see from Link's eyes, Link is hidden while what he holds stays in view, and he faces where you "
      "look while he stands. Third person: the game's own camera, turned by your head.", nullptr, false, true, -1, false, "vr_camera"},
+    {TAB_VR, "Body", &opts.vr_body, 0, 1, 1, tx_vr_body,
+     "First person (Touch controllers): Your arms: Link stays drawn, his arms follow your hands with what they hold, and "
+     "his head is hidden. Hidden: all of Link is hidden, what he holds stays in view.", nullptr, false, true, -1, false, "vr_body"},
+    {TAB_VR, "Arm reach", &opts.vr_arm_reach, 100, 160, 5, tx_percent,
+     "Your arms: how far Link's arms may stretch to meet your hands, his arms being shorter than yours. 100%: never "
+     "stretched.", nullptr, false, true, -1, false, "vr_arm_reach"},
     {TAB_VR, "Field of view", &opts.vr_view_scale, 50, 200, 5, tx_percent,
      "How much of the world the view takes in. The default, 100%, matches the headset's lenses exactly. Higher fits "
      "more of the world into your view, so everything looks smaller; lower zooms in. Away from 100%, the world seems "
@@ -1989,6 +1996,8 @@ const VrKey vr_keys[] = {
     {"VR_RUN_ZONE", &opts.vr_run_zone, nullptr},
     {"VR_HUD", &opts.vr_hud, "panel|picture"},
     {"VR_HUD_SIZE", &opts.vr_hud_size, nullptr},
+    {"VR_BODY", &opts.vr_body, "hidden|arms"},
+    {"VR_ARM_REACH", &opts.vr_arm_reach, nullptr},
 };
 const char* ini_key(const Row& r) {
     if (r.key) return r.key;

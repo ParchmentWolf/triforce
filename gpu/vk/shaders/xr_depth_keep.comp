@@ -10,12 +10,24 @@ layout(binding = 1, r32f) uniform writeonly image2D kept;
 layout(binding = 2, std430) buffer Rows { uint r[]; } rows;
 layout(push_constant) uniform Push {
     ivec2 size;
+    float nearer;   // +1: a greater stored depth is nearer, -1: a smaller one, 0: kept as it is
 } p;
 
 void main() {
     const ivec2 at = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(at, p.size))) return;
-    const float d = texelFetch(depth, at, 0).r;
+    float d = texelFetch(depth, at, 0).r;
+    // (Triforce VR) the nearest depth within two texels across and one up and down. The picture the eyes are made from is
+    // upscaled and smoothed past the depth's size, so a near thing's edge pixels are part it and part what is behind it,
+    // and the depth there was the background's: those pixels stayed behind while the thing moved by its depth, a faint copy
+    // of its outline beside it in each eye (the hands, the nearest things, showed it most). With its depth grown over them
+    // they go with it; a sliver of the background then goes with its edge instead, which reads as an edge, not a ghost
+    if (p.nearer != 0.0)
+        for (int y = -1; y <= 1; y++)
+            for (int x = -2; x <= 2; x++) {
+                const float n = texelFetch(depth, clamp(at + ivec2(x, y), ivec2(0), p.size - 1), 0).r;
+                if ((n - d) * p.nearer > 0.0) d = n;
+            }
     imageStore(kept, at, vec4(d));
     const uint bits = floatBitsToUint(max(d, 0.0));
     atomicMin(rows.r[at.y], bits);
