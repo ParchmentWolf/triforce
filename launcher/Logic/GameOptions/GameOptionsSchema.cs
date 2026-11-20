@@ -36,6 +36,31 @@ public static class GameOptionsSchema
     /// <summary>GpuNames from Gpus.List() (this PC's display adapters).</summary>
     public static void UseSystemGpus() => GpuNames = () => Gpus.List().Select(g => g.Name).ToList();
 
+    /// <summary>((Triforce) 11-19, ticket "GPU read issue") GpuNames as the game counts them: the game folder's
+    /// triforce_gpus.txt ("&lt;value&gt;\t&lt;name&gt;" lines, gpu/vk/vk_main.cpp pick_device), which the game writes at every
+    /// start. Windows' order of the display adapters (Gpus.List()) is not Vulkan's on every PC: on a laptop with an Intel UHD
+    /// 770 and an RTX 3050 the launcher's "1: NVIDIA" saved the value the game reads as the Intel. Without the file (a game
+    /// that has not started since v0.5.3): Windows' order, as before.</summary>
+    public static void UseGameGpus(Func<string?> gameFolder) => GpuNames = () =>
+    {
+        try
+        {
+            if (gameFolder() is { } g && File.Exists(Path.Combine(g, GpuListFile)))
+            {
+                var names = new List<string>();
+                foreach (var line in File.ReadAllLines(Path.Combine(g, GpuListFile)))
+                {
+                    var tab = line.IndexOf('\t');
+                    if (tab > 0 && int.TryParse(line.AsSpan(0, tab), out var v) && v == names.Count + 1) names.Add(line[(tab + 1)..].Trim());
+                }
+                if (names.Count > 0) return names;
+            }
+        }
+        catch (Exception) { }
+        return Gpus.List().Select(x => x.Name).ToList();
+    };
+    public const string GpuListFile = "triforce_gpus.txt";
+
     // ---- the keys ----
 
     /// <summary>vk_menu.cpp ini_key: a few rows keep the keys they were first saved with; every other row's key is its
@@ -134,6 +159,16 @@ public static class GameOptionsSchema
     {
         try { return GpuNames?.Invoke() ?? Array.Empty<string>(); } catch (Exception) { return Array.Empty<string>(); }
     }
+    /// <summary>((Triforce) 11-20) The GPU device row's card for a value, by the name the row shows for it (GpuNames): what
+    /// GameOptionsFile.Save writes as gpu_device_name beside the number, so that the game finds the card the player clicked
+    /// whatever order the list was in (gpu/vk/gpu_choice.h pick). Null for Auto or a value with no name.</summary>
+    public static string? GpuNameOf(int v)
+    {
+        if (v <= 0) return null;
+        var names = GpuNamesNow();
+        return v - 1 < names.Count && names[v - 1].Trim() is { Length: > 0 } n ? n : null;
+    }
+    public const string GpuNameKey = "gpu_device_name";
     /// <summary>tx_mic without the game's device list: Off, Default, and a device by the name the file keeps
     /// (microphone_device), "Microphone" without one.</summary>
     static string TxMic(int v, IGameOptionValues? o)
@@ -280,7 +315,7 @@ public static class GameOptionsSchema
         Row(GameOptionTab.Display, "High dynamic range", "HDR peak brightness", 400, 10000, 100, 1000, GameOptionKind.Slider, TxNits, false, true,
             "The brightest highlights with HDR on: set it to your display's peak brightness."),
         Row(GameOptionTab.Display, "RenoDX", "RenoDX HDR", 0, 1, 1, 0, GameOptionKind.Choice, TxOnoff, true, true,
-            "With HDR set to Native: RenoDX's tone mapping, eye adaptation and colour grading in place of the game's own, and its rows below. Off: the game's own HDR. Applies after a restart. RenoDX is by Carlos Lopez (clshortfuse), under the MIT license."),
+            "With HDR set to Native: RenoDX's tone mapping, eye adaptation and color grading in place of the game's own, and its rows below. Off: the game's own HDR. Applies after a restart. RenoDX is by Carlos Lopez (clshortfuse), under the MIT license."),
         Row(GameOptionTab.Display, "RenoDX", "RenoDX tonemapper", 0, 2, 1, 1, GameOptionKind.Choice, TxRdxTonemap, false, true,
             "With HDR Native: how the scene's light is brought to the display. Vanilla: the game's own curve. PsychoV35: RenoDX's, which keeps hue and saturation into the highlights, up to the peak brightness. RenoDRT: RenoDX's, which carries the game's SDR look up to the peak by brightness. RenoDX is by Carlos Lopez (clshortfuse), under the MIT license."),
         Row(GameOptionTab.Display, "RenoDX", "RenoDX gamma correction", 0, 2, 1, 0, GameOptionKind.Choice, TxRdxGamma, false, true,
@@ -292,31 +327,31 @@ public static class GameOptionsSchema
         Row(GameOptionTab.Display, "RenoDX", "RenoDX tone slope", 0, 100, 1, 50, GameOptionKind.Slider, TxRdxGrade, false, true,
             "With PsychoV35: the steepness of the tone curve through middle grey. 50 leaves it unchanged."),
         Row(GameOptionTab.Display, "RenoDX", "RenoDX hue clip", 0, 100, 5, 50, GameOptionKind.Slider, TxPercent, false, true,
-            "With PsychoV35: how much bright colours turn as they do where the game's SDR picture clips: fire towards yellow and white. 0% keeps their hue."),
+            "With PsychoV35: how much bright colors turn as they do where the game's SDR picture clips: fire towards yellow and white. 0% keeps their hue."),
         Row(GameOptionTab.Display, "RenoDX", "RenoDX UI brightness", 80, 400, 10, 200, GameOptionKind.Slider, TxNits, false, true,
             "How bright the menus' and the HUD's white is with RenoDX's tonemapper. The scene's follows HDR paper white."),
         Row(GameOptionTab.Display, "RenoDX", "RenoDX color space", 0, 2, 1, 1, GameOptionKind.Choice, TxRdxSpace, false, true,
-            "The colours the picture is taken to be in before HDR10's. Vanilla: the game's own matrix. BT.709: as the SDR picture. DCI-P3: more saturated."),
+            "The colors the picture is taken to be in before HDR10's. Vanilla: the game's own matrix. BT.709: as the SDR picture. DCI-P3: more saturated."),
         Row(GameOptionTab.Display, "RenoDX", "RenoDX exposure", 0, 200, 5, 100, GameOptionKind.Slider, TxPercent, false, true,
             "The scene's brightness before RenoDX's tone mapping. 100% is the game's."),
         Row(GameOptionTab.Display, "RenoDX", "RenoDX highlights", 0, 100, 5, 50, GameOptionKind.Slider, TxRdxGrade, false, true,
-            "RenoDX's colour grading: the bright parts of the scene. 50 is neutral."),
+            "RenoDX's color grading: the bright parts of the scene. 50 is neutral."),
         Row(GameOptionTab.Display, "RenoDX", "RenoDX shadows", 0, 100, 5, 50, GameOptionKind.Slider, TxRdxGrade, false, true,
-            "RenoDX's colour grading: the dark parts of the scene. 50 is neutral."),
+            "RenoDX's color grading: the dark parts of the scene. 50 is neutral."),
         Row(GameOptionTab.Display, "RenoDX", "RenoDX contrast", 0, 100, 5, 50, GameOptionKind.Slider, TxRdxGrade, false, true,
-            "RenoDX's colour grading: the scene's contrast. 50 is neutral."),
+            "RenoDX's color grading: the scene's contrast. 50 is neutral."),
         Row(GameOptionTab.Display, "RenoDX", "RenoDX saturation", 0, 100, 5, 50, GameOptionKind.Slider, TxRdxGrade, false, true,
-            "RenoDX's colour grading: the scene's saturation. 50 is neutral."),
+            "RenoDX's color grading: the scene's saturation. 50 is neutral."),
         Row(GameOptionTab.Display, "RenoDX", "RenoDX highlight saturation", 0, 100, 1, 50, GameOptionKind.Slider, TxRdxGrade, false, true,
-            "With RenoDRT: the strength of the colours of the brightest parts. 50 leaves it unchanged."),
+            "With RenoDRT: the strength of the colors of the brightest parts. 50 leaves it unchanged."),
         Row(GameOptionTab.Display, "RenoDX", "RenoDX blowout", 0, 100, 1, 0, GameOptionKind.Slider, TxRdxGrade, false, true,
-            "With RenoDRT: turns the brightest parts towards white. 0 keeps their colour."),
+            "With RenoDRT: turns the brightest parts towards white. 0 keeps their color."),
         Row(GameOptionTab.Display, "RenoDX", "RenoDX flare", 0, 100, 1, 0, GameOptionKind.Slider, TxRdxGrade, false, true,
             "With RenoDRT: lifts the darkest parts as a little stray light would. 0 keeps black black."),
         Row(GameOptionTab.Display, "RenoDX", "RenoDX hue correction", 0, 100, 5, 100, GameOptionKind.Slider, TxPercent, false, true,
-            "With RenoDRT: how much bright colours keep the hue they have before the tonemapper. 0% lets them shift as the curve takes them."),
+            "With RenoDRT: how much bright colors keep the hue they have before the tonemapper. 0% lets them shift as the curve takes them."),
         Row(GameOptionTab.Display, "RenoDX", "RenoDX color grading", 0, 100, 5, 100, GameOptionKind.Slider, TxPercent, false, true,
-            "With RenoDRT: how much of the game's own colour grading the HDR picture keeps. 0% is the scene without it."),
+            "With RenoDRT: how much of the game's own color grading the HDR picture keeps. 0% is the scene without it."),
         Row(GameOptionTab.Display, "RenoDX", "RenoDX bloom", 0, 100, 5, 50, GameOptionKind.Slider, TxRdxGrade, false, true,
             "How strong the glow around bright things is. 50 is the game's."),
         Row(GameOptionTab.Graphics, "Quality", "Quality preset", 0, 5, 1, 0, GameOptionKind.Choice, TxPreset, false, false,
@@ -443,6 +478,7 @@ public static class GameOptionsSchema
     {
         [VersionKey] = "the file's format: the rules the game reads an older file by (GameOptionsFile.Save writes 7 when it brings an older file up to date)",
         [MicDeviceKey] = "the Microphone row's device, by its name: the game's to choose from the devices it lists",
+        [GpuNameKey] = "the GPU device row's card by its name (11-20): Save writes it with the row; the game finds the card by it first",
         ["layout_preset"] = "the Controls page's Layout preset: choosing one in the game rebinds the pad_ lines, which a changed value alone would not do",
         ["debug_tools"] = "the Debug tab (not ported)",
         ["descriptor_reuse"] = "the Debug tab's Developer rows (not ported)",

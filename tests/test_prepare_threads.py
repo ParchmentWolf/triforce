@@ -54,23 +54,27 @@ def check_source():
           "prepare_threads::translate(all, amd_older, e && atoi(e) > 0)"])
     need("vk_draw.cpp: prepare_run()", block(draw, "bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {"),
          ["background ? std::clamp(cpus / 4, 2u, 4u) : prepare_translate_workers()"])
-    # (the preparation before the title: the count is the rule's, and the workers stay below normal priority)
+    # (the preparation before the title: the count is the rule's, and the workers below normal priority but in a start that
+    # only prepares: prepare_priority, tests/test_prepare_timing.py)
     for name, marker in [("state_list_prepare", "void state_list_prepare(void (*progress)(size_t done, size_t total)) {"),
                          ("warm_libraries", "bool warm_libraries(void (*progress)(size_t done, size_t total)) {")]:
         body = block(draw, marker)
         need("vk_draw.cpp: %s()" % name, body,
              ["const unsigned workers = prepare_workers();", "for (unsigned i = 0; i < workers; i++) threads.emplace_back(",
-              "SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);"])
+              "SetThreadPriority(GetCurrentThread(), prepare_priority());"])
         if "cpus / 2" in body or "hardware_concurrency" in body:
             raise SystemExit("vk_draw.cpp: %s() counts its workers itself again" % name)
     prepare = block(draw, "bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {")
     need("vk_draw.cpp: prepare_run()", prepare,
          # (behind the game: its own count and idle priority, as before)
+         # ((Triforce, v0.5.2) before the title: prepare_workers's, fewer on AMD's older driver: prepare_translate_workers)
          ["const unsigned workers = background ? std::clamp(cpus / 4, 2u, 4u) : prepare_translate_workers();",
-          "SetThreadPriority(GetCurrentThread(), background ? THREAD_PRIORITY_IDLE : THREAD_PRIORITY_BELOW_NORMAL);",
+          "SetThreadPriority(GetCurrentThread(), background ? THREAD_PRIORITY_IDLE : prepare_priority());",
           "for (unsigned i = 0; i < workers; i++) threads.emplace_back(worker);"])
     if "cpus / 2" in prepare:
         raise SystemExit("vk_draw.cpp: prepare_run() starts half the processors' workers again")
+    need("vk_draw.cpp: prepare_translate_workers()", block(draw, "unsigned prepare_translate_workers() {"),
+         ["const unsigned all = prepare_workers();", "prepare_threads::translate(all, amd_older, e && atoi(e) > 0)"])
     # (not asked to change: the predicted pipelines' pass and the precompile)
     need("vk_draw.cpp: predict_run()", block(draw, "void predict_run(void (*progress)(size_t done, size_t total)) {"),
          ["for (unsigned i = 0; i < std::clamp(cpus / 2, 1u, 32u); i++) threads.emplace_back(worker);"])

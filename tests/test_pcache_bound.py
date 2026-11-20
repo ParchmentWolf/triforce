@@ -102,11 +102,13 @@ def check_source():
         raise SystemExit("pcache_init reads the cache's file past the bounded read")
     if "ci.initialDataSize = data.size();" not in init:
         raise SystemExit("the cache is not made from what the bounded read gave")
-    # ((Triforce, 11-18) what is for other shaders is read only when carried (pcache_bound::carried, with the bound), else not at all)
-    carry = "const bool carried = pcache_bound::carried(pcache_same, (uint64_t)std::max<int64_t>(sz, 0), carry, pcache_bound_bytes, ram);"
+    # ((Triforce, 11-18) what is for other shaders is read only when carried: over the stamp change at an update's preparation
+    # (pcache_carry.h, tests/test_pcache_carry.py), or outside it by v0.5.2's size and RAM rule (pcache_bound::carried, with the
+    # bound, where pcache_carry::plain_carry lets it: not over the preparation's own carry); else not at all
+    carry = "pcache_bound::carried(pcache_same, (uint64_t)std::max<int64_t>(sz, 0), carry, pcache_bound_bytes, ram);"
     if carry not in init or init.index(setb) > init.index(carry):
         raise SystemExit("pcache_init does not decide the carry with the bound set, or not by pcache_bound::carried")
-    if init.index("if (!pcache_same && !carried) {", init.index(carry)) > init.index(readb):
+    if init.index("if (!pcache_same && !pcache_carried && !carried) {", init.index(carry)) > init.index(readb):
         raise SystemExit("a file for other shaders that is not carried is read")
     save = between(draw, "void pipeline_cache_save(bool force) {", "\n}\n")
     ask = "if (!pcache_bound::within(n, pcache_bound_bytes)) {"

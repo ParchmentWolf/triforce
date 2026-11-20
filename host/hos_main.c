@@ -268,7 +268,10 @@ static void call_guest(Ctx *c, uint64_t addr, uint64_t sp, const char *what) {
 
 void hos_update_check(void);   /* (host/hos_update.c) */
 #ifndef _WIN32
-/* (linux) Saves live in $XDG_DATA_HOME/hookshot (~/.local/share/hookshot), so a rebuilt game folder still finds them.
+/* (linux) Saves live in $XDG_DATA_HOME/triforce/user (~/.local/share/triforce/user), so a rebuilt game folder still finds
+   them. ((Triforce) 11-19: the folder builds before v0.5.3 used, $XDG_DATA_HOME/hookshot, is renamed to it the first time,
+   in one step (triforce/ itself may hold the builder already, so the saves get a folder of their own there); if that cannot
+   be done the saves stay in the old folder. The launcher looks in both, the new one first.)
    A user/ folder beside the executable from before is moved there the first time, entry by entry. Anything that
    cannot be moved keeps the old place. --user still wins. */
 static int is_dir(const char *p) {
@@ -334,7 +337,20 @@ static const char *saves_dir(const char *beside) {
         snprintf(dir, sizeof dir, "%s/.local/share", home);
     } else return beside;
     CreateDirectoryA(dir, NULL);
-    snprintf(dir + strlen(dir), sizeof dir - strlen(dir), "/hookshot");
+    {
+        char old[MAX_PATH];
+        snprintf(old, sizeof old, "%s/hookshot", dir);
+        snprintf(dir + strlen(dir), sizeof dir - strlen(dir), "/triforce");
+        CreateDirectoryA(dir, NULL);
+        snprintf(dir + strlen(dir), sizeof dir - strlen(dir), "/user");
+        if (is_dir(old) && GetFileAttributesA(dir) == INVALID_FILE_ATTRIBUTES) {   /* (the old folder, and no new one yet) */
+            if (MoveFileExA(old, dir, 0)) hos_log("saves: the save folder %s is now %s", old, dir);
+            else {
+                hos_log("saves: %s could not be renamed to %s (error %lu): the saves stay there", old, dir, (unsigned long)GetLastError());
+                snprintf(dir, sizeof dir, "%s", old);
+            }
+        }
+    }
     CreateDirectoryA(dir, NULL);
     if (GetFileAttributesA(dir) == INVALID_FILE_ATTRIBUTES) return beside;
     char pattern[MAX_PATH];

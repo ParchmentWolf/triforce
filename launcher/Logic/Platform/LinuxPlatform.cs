@@ -41,8 +41,18 @@ public sealed class LinuxPlatform : PlatformBase
     public override string LogFolder(string home) => Path.Combine(StateHome, "triforce");
     // (hookshot_builder.py ngx_sdk_dir: beside the builder's versions, kept across updates)
     public override string NgxSdkFolder(string home) => Path.Combine(DefaultInstallDir, "ngx-sdk");
-    // (host/hos_main.c saves_dir: $XDG_DATA_HOME/hookshot, outside the game folder so a rebuild keeps them)
-    public override string SaveFolder(string game, string uid) => Path.Combine(DataHome, "hookshot", "save", uid);
+    // (host/hos_main.c saves_dir: $XDG_DATA_HOME/triforce/user, outside the game folder so a rebuild keeps them)
+    public override string SaveFolder(string game, string uid) => Path.Combine(UserFolder(game), "save", uid);
+    /// <summary>((Triforce) 11-19) $XDG_DATA_HOME/triforce/user. Until the game has started once on v0.5.3 or later, the saves are
+    /// still where an older build kept them: $XDG_DATA_HOME/hookshot (the game renames that to triforce/user at its next
+    /// start), or the game folder's user/ when the game could not move them out of it. The first of these with a save folder.</summary>
+    public override string UserFolder(string game)
+    {
+        var now = Path.Combine(DataHome, "triforce", "user");
+        foreach (var d in new[] { now, Path.Combine(DataHome, "hookshot"), Path.Combine(game, "user") })
+            if (Directory.Exists(Path.Combine(d, "save"))) return d;
+        return now;
+    }
     public override (string Roaming, string Local) EmulatorDataRoots => (DataHome, ConfigHome);
 
     public override IReadOnlyList<string> SteamRoots()

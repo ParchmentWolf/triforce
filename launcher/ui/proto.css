@@ -10,14 +10,14 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: #000; marg
 .play { transition: filter .15s ease, transform .15s ease; }
 .play:hover { filter: brightness(1.08) saturate(1.05); }
 .play:active { transform: translateY(1px); filter: brightness(.95); }
-.qbtn { transition: background .15s, border-color .15s; } .qbtn:hover { background: rgba(243, 234, 213, .12); border-color: rgba(224, 178, 62, .65); }
+.qbtn { transition: background .15s, border-color .15s; } .qbtn:hover { background: rgba(243, 234, 213, .12); border-color: rgba(var(--gold-rgb), .65); }
 .ch:hover, .qlink:hover, .links b:hover, .lnk:hover { color: var(--gold-hi); }
 .nav a:hover { color: var(--text); }
 .f { transition: transform .15s, outline-color .15s; } .f:hover { outline-color: var(--gold); }
 .sc .p { transition: filter .15s; } .sc:hover .p { filter: brightness(1.08); }
 .wc span:hover { color: var(--text); } .wc span:last-child:hover { background: #a3272f; color: #fff; }
 /* the pad / keyboard focus: a gold ring, only when the last input was not the mouse */
-body.kb .kf { outline: 2px solid var(--gold-hi) !important; outline-offset: 5px; box-shadow: 0 0 0 7px rgba(247, 220, 140, .14); }
+body.kb .kf { outline: 2px solid var(--gold-hi) !important; outline-offset: 5px; box-shadow: 0 0 0 7px rgba(var(--gold-hi-rgb), .14); }
 body.kb .play.kf { outline-offset: 6px; }
 
 /* the logo rise of the reveal */
@@ -31,7 +31,7 @@ body.kb .play.kf { outline-offset: 6px; }
 
 /* drop area while a file is over it, and while it is checked */
 .portal::before, .portal::after, .portal .c { pointer-events: none; } .portal > div { position: relative; z-index: 1; }
-.portal.hot::before { border-color: var(--gold-hi); box-shadow: 0 0 40px rgba(247, 220, 140, .25) inset; }
+.portal.hot::before { border-color: var(--gold-hi); box-shadow: 0 0 40px rgba(var(--gold-hi-rgb), .25) inset; }
 .portal.checking h2::after { content: '…'; }
 .portal.bad::before { border-color: #ff6b76; } .portal.bad p { color: #ff6b76; }
 
@@ -50,7 +50,7 @@ body.kb .play.kf { outline-offset: 6px; }
 
 /* toasts and sheets */
 .toast { position: absolute; left: 50%; top: 70px; z-index: 40; transform: translateX(-50%); padding: 13px 22px; font-size: 14.5px; color: var(--text);
-  background: rgba(16, 14, 10, .96); border: 1px solid rgba(224, 178, 62, .5); box-shadow: 0 20px 50px rgba(0, 0, 0, .6); animation: fadeup .2s ease both; }
+  background: rgba(16, 14, 10, .96); border: 1px solid rgba(var(--gold-rgb), .5); box-shadow: 0 20px 50px rgba(0, 0, 0, .6); animation: fadeup .2s ease both; }
 .toast b { color: var(--emerald); }
 .sheet-bg { position: absolute; inset: 0; z-index: 30; background: rgba(5, 4, 3, .66); display: none; }
 .sheet-bg.open { display: block; animation: glowin .2s ease both; }
@@ -59,7 +59,7 @@ body.kb .play.kf { outline-offset: 6px; }
 .sheet p { margin-top: 8px; font-size: 14.5px; color: var(--text2); }
 .opt { margin-top: 10px; display: grid; grid-template-columns: 1fr auto; padding: 14px 16px; border: 1px solid var(--line); cursor: pointer; }
 .opt:first-of-type { margin-top: 18px; } .opt b { font-weight: 600; } .opt span { font-size: 13px; color: var(--text3); }
-.opt.sel { border-color: var(--gold-hi); background: rgba(224, 178, 62, .08); }
+.opt.sel { border-color: var(--gold-hi); background: rgba(var(--gold-rgb), .08); }
 .sheet .acts { margin-top: 22px; display: flex; justify-content: flex-end; align-items: center; gap: 22px; }
 
 /* settings */
@@ -81,7 +81,7 @@ body.kb .play.kf { outline-offset: 6px; }
 .brun .hud h1 { font-size: 58px; } .brun .fps { font-size: 64px; font-weight: 750; font-variant-numeric: tabular-nums; }
 .brun .fps small { font-size: 20px; color: var(--text2); font-weight: 600; margin-left: 8px; }
 .brun .prog { position: absolute; left: 64px; right: 64px; bottom: 34px; height: 4px; background: rgba(255,255,255,.12); }
-.brun .prog i { display: block; height: 100%; background: linear-gradient(90deg, #9a6a18, #e0b23e); width: 0; transition: width .2s linear; }
+.brun .prog i { display: block; height: 100%; background: linear-gradient(90deg, var(--gold-deep), var(--gold)); width: 0; transition: width .2s linear; }
 .brun .stop { position: absolute; right: 64px; top: 84px; font-size: 14px; color: var(--text2); }
 
 /* mods */
@@ -90,7 +90,7 @@ body.kb .play.kf { outline-offset: 6px; }
 .mod b { font-family: 'Cormorant Garamond', Georgia, serif; font-size: 21px; font-weight: 700; } .mod span { display: block; font-size: 13px; color: var(--text3); margin-top: 2px; }
 .mod em { font-style: normal; font-size: 14px; font-weight: 600; color: var(--gold); } .mod em.inst { color: var(--emerald); }
 .search { position: absolute; left: 64px; top: 150px; width: 420px; height: 38px; display: flex; align-items: center; padding: 0 14px; font-size: 14px; color: var(--text3);
-  border: 1px solid rgba(224, 178, 62, .35); background: rgba(10, 9, 8, .6); }
+  border: 1px solid rgba(var(--gold-rgb), .35); background: rgba(10, 9, 8, .6); }
 .cats { position: absolute; left: 510px; top: 158px; display: flex; gap: 22px; font-size: 14px; color: var(--text3); }
 .cats span.on { color: var(--gold-hi); font-weight: 600; box-shadow: inset 0 -2px 0 var(--gold); padding-bottom: 4px; }
 

@@ -151,11 +151,17 @@ def check_sources(menu, api, replay, readme):
     headings = set(re.findall(r'\{TAB_\w+, "([^"]+)", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true\}', table))
     entries = [e for e in entries if e[1] not in headings]
     names = [e[1] for e in entries]
-    at = names.index("Discord status")
-    check(tuple(names[at + 1:at + 1 + len(ALL_ROWS)]) == ALL_ROWS, "the save rows do not stand directly after Discord status: %r" % names[at + 1:at + 5])
+    # ((Triforce, options_version 7) in their own group on the System tab, Saves & reports, after the Audio tab's rows)
+    at = names.index("Microphone")
+    check(tuple(names[at + 1:at + 1 + len(ALL_ROWS)]) == ALL_ROWS, "the save rows do not stand directly after Microphone: %r" % names[at + 1:at + 5])
+    check(table.index('MENU_HEADING(TAB_SYSTEM, "Saves & reports"),') < table.index('{TAB_SYSTEM, "%s"' % ALL_ROWS[0]),
+          "the save rows are not under their group's heading")
     for tab, name, value in entries[at + 1:at + 1 + len(ALL_ROWS)]:
         check(tab == "TAB_SYSTEM" and value == "nullptr", "%s is not a row of the System tab that acts on a press" % name)
-    check("Restart" not in names and "Quit" not in names, "Restart and Quit are rows again (11-19: they are the pause menu's Quit)")
+    # ((Triforce, v0.5.2) Restart and Quit are no rows any more: the pause menu's Quit under Mods, its dialog draw_quit_ask)
+    check("Restart" not in names and "Quit" not in names, "Restart or Quit is a row of the table again")
+    check('static const char* const labels[3] = {"Quit Game", "Restart Game", "Cancel"};' in menu,
+          "the pause menu's Quit dialog no longer offers Quit Game, Restart Game and Cancel")
     tick = block(menu, "void menu_tick() {")
     press = tick.index("else if (press[7] && share_row(r)) share_press(share_row(r)), press[7] = false, changed = true;")
     check(tick.index("if (r.cheat >= 0) cheat_press(") < press < tick.index("else if (press[7] && !r.value && can_bind()) page = 1"),

@@ -31,7 +31,8 @@ static void write(T& t, uint64_t f) {   // (as texture_written: prev before last
     t.prev = redrawn::prev_on_write(t.prev, t.last, t.gpu && !t.released, f);
     t.last = f, t.gpu = true, t.released = false;
 }
-static bool redrawn_now(const T& t, uint64_t f) { return redrawn::drawn_before(t.prev, t.last, t.gpu && !t.released, f); }
+static bool redrawn_now(const T& t, uint64_t f) { return redrawn::drawn_before(t.prev, t.last, t.gpu && !t.released, f, 1); }
+static bool redrawn_in(const T& t, uint64_t f, uint64_t w) { return redrawn::drawn_before(t.prev, t.last, t.gpu && !t.released, f, w); }
 int main() {
     {   // (a scene target, drawn every frame from frame 10 on)
         T s;
@@ -73,6 +74,25 @@ int main() {
         write(r, 202);
         CHECK(redrawn_now(r, 202) && redrawn_now(r, 203));
     }
+    {   // ((Triforce, 11-19) the window: a target drawn every second or third frame counts as drawn again; a first compose never)
+        T a;
+        write(a, 300);
+        CHECK(redrawn_in(a, 302, 4) && redrawn_in(a, 304, 4) && !redrawn_in(a, 305, 4));
+        CHECK(!redrawn_in(a, 302, 1));   // (v0.5.2's rule)
+        write(a, 302);
+        CHECK(redrawn_in(a, 302, 4));    // (its second draw in frame 302: the write in 300 is within the window)
+        T fresh;
+        CHECK(!redrawn_in(fresh, 400, 4));
+        write(fresh, 400);
+        CHECK(!redrawn_in(fresh, 400, 4));   // (a text box's first compose, its later draws in the same frame too)
+        CHECK(redrawn::kWindow == 4);
+        T z;   // (a window of 0 taken as 1)
+        write(z, 10);
+        CHECK(redrawn_in(z, 11, 0) && !redrawn_in(z, 12, 0));
+        T future;   // (a last write marked after this frame: not before it)
+        write(future, 900);
+        CHECK(!redrawn_in(future, 899, 4));
+    }
     if (!fails) std::printf("PASS\n");
     return fails != 0;
 }
@@ -101,9 +121,14 @@ class RedrawnTests(unittest.TestCase):
         self.assertRegex(tex, r"tex->prev_written = redrawn::prev_on_write\(tex->prev_written, tex->last_written, "
                               r"tex->gpu_written && !tex->released, frame_no\);\n    tex->last_written = frame_no;")
         # (the draw's decision: every colour target and the depth target redrawn, no memory written)
-        self.assertIn("bool may = !program_writes_memory(p);", draw)
-        self.assertIn("may = texture_redrawn(at.color[i]);", draw)
-        self.assertIn("may = texture_redrawn(at.depth);", draw)
+        self.assertIn("bool may = redrawn_off || big || !program_writes_memory(p);", draw)
+        self.assertIn("for (int i = 0; i < at.n && may && !redrawn_off && !big; i++) may = texture_redrawn(at.color[i]);", draw)
+        self.assertIn("if (may && !redrawn_off && !big) may = texture_redrawn(at.depth);", draw)
+        # ((Triforce, 11-19) only small targets under the rule: the text boxes and labels are 262x104 .. 656x113 and 90x34 .. 631x94
+        self.assertIn("return v >= 0 ? (uint64_t)v : 100000ull;", draw)
+        self.assertGreater(100000, 656 * 113)
+        self.assertGreater(100000, 631 * 94)
+        self.assertLessEqual(100000, 480 * 270)
         # (the one gate every deferral path checks, set from it)
         self.assertIn("upload_defer_ok = !compute && draw_may_defer;", draw)
         self.assertEqual(len(re.findall(r"upload_defer_ok = !compute", draw)), 1)

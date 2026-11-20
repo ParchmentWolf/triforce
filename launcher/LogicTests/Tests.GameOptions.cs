@@ -232,6 +232,33 @@ static partial class Tests
             Equal("0: NVIDIA GeForce RTX 4070", L("gpu_device", 1), "gpu 1");
             GameOptionsSchema.UseSystemGpus();   // (not asked here: the tests do not read this PC's registry)
             Check(GameOptionsSchema.GpuNames != null, "the hook is set");
+            // ((Triforce) 11-19) the game's own order, from its triforce_gpus.txt: Windows lists the Intel first on that laptop,
+            // Vulkan the NVIDIA, and the row's values are Vulkan's
+            var g = NewRoot("gpulist");
+            File.WriteAllText(Path.Combine(g, GameOptionsSchema.GpuListFile), "1\tNVIDIA GeForce RTX 3050 6GB Laptop GPU\n2\tIntel(R) UHD Graphics 770\n");
+            GameOptionsSchema.UseGameGpus(() => g);
+            Equal("0: NVIDIA GeForce RTX 3050 6GB Laptop GPU", L("gpu_device", 1), "the game's first card is the row's 1");
+            Equal("1: Intel(R) UHD Graphics 770", L("gpu_device", 2), "and its second the row's 2");
+            File.WriteAllText(Path.Combine(g, GameOptionsSchema.GpuListFile), "garbage\n3\tout of order\n");
+            GameOptionsSchema.UseGameGpus(() => g);
+            Check(GameOptionsSchema.GpuNames!() != null, "a file with nothing usable: Windows' list (no throw)");
+            // ((Triforce) 11-20) Save writes the card's name with its number (gpu_device_name: the game finds it by the name
+            // first), and an empty one for Auto
+            GameOptionsSchema.GpuNames = () => new[] { "AMD Radeon(TM) 860M Graphics", "NVIDIA GeForce RTX 5060 Laptop GPU" };
+            Equal("NVIDIA GeForce RTX 5060 Laptop GPU", GameOptionsSchema.GpuNameOf(2), "the name of the row's 2");
+            Equal(null, GameOptionsSchema.GpuNameOf(0), "Auto has no name");
+            var nf = NewRoot("gpuname");
+            var opt = GameOptionsFile.Load(nf);
+            opt.Set(GameOptionsSchema.GpuKey, 2);
+            opt.Save();
+            var text = File.ReadAllText(Path.Combine(nf, GameOptionsSchema.FileName));
+            Check(text.Contains("gpu_device=2") && text.Contains("gpu_device_name=NVIDIA GeForce RTX 5060 Laptop GPU"),
+                  "the number and the name saved: " + text.Replace("\n", " | "));
+            opt.Set(GameOptionsSchema.GpuKey, 0);
+            opt.Save();
+            text = File.ReadAllText(Path.Combine(nf, GameOptionsSchema.FileName));
+            Check(text.Contains("gpu_device=0") && text.Contains("gpu_device_name=\r\n") || text.Contains("gpu_device_name=\n"),
+                  "Auto: the name emptied: " + text.Replace("\n", " | "));
         }
         finally { GameOptionsSchema.GpuNames = before; }
 

@@ -57,9 +57,8 @@ def main():
     check(at == len(order), "the groups do not cover the tools")
     story = [g for g in groups if g[0] == "Story & amiibo"]
     check(story and order[int(story[0][1]):int(story[0][2])] == [11, 12, 13], "the three rows are not one group of the tab")
-    second = int(re.search(r"constexpr int kDebugSecondColumn = (\d+);", menu).group(1))
-    check(0 < second < len(groups) and "g >= kDebugSecondColumn ? 1 : 0" in menu and "debug_groups[kDebugSecondColumn].from ? 1 : 0" in menu,
-          "the two columns of the tab are not told apart by the group")
+    # ((Triforce, 11-17) one list as every tab's, each group under its heading: tests/test_debug_tab_layout.py)
+    check("out[head] = -1 - g;" in function(menu, "int debug_list("), "the groups do not stand under their headings")
 
     # confirm opens the page; it is drawn, takes the keys and the mouse, and goes back to the tab
     cheats = menu[menu.index("void cheat_press(int i,"):menu.index("void menu_tick() {")]

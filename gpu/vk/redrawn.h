@@ -22,10 +22,20 @@ inline uint64_t prev_on_write(uint64_t prev, uint64_t last, bool live, uint64_t 
     if (last == frame) return prev;   // (written already in this frame: the frame before stays what it was)
     return live ? last : 0;
 }
-/// Whether a target was written in the frame before `frame` (live: as above, now)
-inline bool drawn_before(uint64_t prev, uint64_t last, bool live, uint64_t frame) {
+/// ((Triforce, 11-19) How many frames back a write still counts as the target being drawn again. 1, v0.5.2's rule, made every
+/// target the game draws every second or third frame (reflections, shadow cascades, the water's own passes) make and upload its
+/// textures at once and skip the descriptors' reuse, every time: in a lab A/B with the benchmark Lake Hylia's average fell from
+/// 59.6 to 44.6 fps and its 1 % low from 43.3 to 28.3, Castle Town's from 45.5 to 40.5, and the first visits had 250 and 900 ms
+/// frames (#bug-tracker "Full Stuttering with last Update 0.5.2", "1% low 17.6 fps", "Stuttering & Flickering 0.5.2"). A text box
+/// is composed once and left: its first compose is never drawn before, whatever the window. RX_VK_REDRAWN_FRAMES=<n>: n (1: as
+/// v0.5.2)
+inline constexpr uint64_t kWindow = 4;
+
+/// Whether a target was written in the `window` frames before `frame` (live: as above, now)
+inline bool drawn_before(uint64_t prev, uint64_t last, bool live, uint64_t frame, uint64_t window = kWindow) {
     if (!live || frame == 0) return false;
-    if (last == frame) return prev != 0 && prev + 1 == frame;   // (already marked in this frame: the run before it)
-    return last + 1 == frame;
+    if (window < 1) window = 1;
+    if (last == frame) return prev != 0 && prev + window >= frame;   // (already marked in this frame: the run before it)
+    return last < frame && last + window >= frame;
 }
 }  // namespace redrawn

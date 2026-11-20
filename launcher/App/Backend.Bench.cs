@@ -135,7 +135,7 @@ public sealed partial class Backend
         Send(new JsonObject
         {
             ["t"] = "bench", ["phase"] = "done", ["places"] = places, ["recs"] = recs,
-            ["verdict"] = Benchmark.Summary(r1.Scenes, r2?.Scenes, r2 != null ? benchSecond?.name : null),
+            ["verdict"] = Benchmark.Summary(r1.Scenes, r2?.Scenes, r2 != null ? benchSecond?.name : null) + Benchmark.SkippedNote(r1.Skipped),
             ["eb"] = "Benchmark finished · " + BuildClock.Span(r1.Took + (r2?.Took ?? TimeSpan.Zero)) + (gpu != null ? " · " + gpu : ""),
             ["compare"] = r2 == null && benchSecond != null ? "Compare with " + benchSecond.Value.name : null,
             ["second"] = r2 != null ? benchSecond?.name : null,

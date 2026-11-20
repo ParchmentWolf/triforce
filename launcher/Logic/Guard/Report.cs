@@ -45,14 +45,16 @@ public static class Report
 
     /// <summary>The report for a build that stopped (old Shell.cs CopyTheReport): the launcher's and tools' versions, the OS, the
     /// step it stopped at, why, the command, the game folder and the install with their free space, then the logs.</summary>
-    public static string ForBuild(TriforceContext ctx, BuildResult? result, string buildLines, string? toolsVersion)
+    public static string ForBuild(TriforceContext ctx, BuildResult? result, string buildLines, string? toolsVersion, string? failure = null)
     {
         string Room(string folder) => ctx.FreeBytes(folder) is { } free ? " (" + ctx.Platform.Disk(folder) + " has " + (free >> 30) + " GB free)" : "";
         var step = result?.StoppedAt is { } s && BuildStages.Find(s) is { } st ? "\"" + st.Text + "\"" : "its start";
         var known = new[]
         {
             "Triforce " + BuildInfo.Version + ", tools " + (toolsVersion ?? "none") + ", " + Environment.OSVersion.VersionString,
-            "The build stopped at " + step + " after " + BuildClock.Span(result?.Elapsed ?? TimeSpan.Zero) + ": " + (result?.Failure ?? "no reason given"),
+            result == null && failure != null
+                ? "It stopped before the build itself: " + failure
+                : "The build stopped at " + step + " after " + BuildClock.Span(result?.Elapsed ?? TimeSpan.Zero) + ": " + (result?.Failure ?? failure ?? "no reason given"),
             result?.CommandLine ?? "",
             "Game folder: " + (result?.OutFolder ?? "") + (result?.OutFolder is { } o ? Room(o) : ""),
             "Launcher: " + ctx.Home + Room(ctx.Home),

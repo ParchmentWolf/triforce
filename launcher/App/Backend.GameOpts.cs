@@ -74,7 +74,7 @@ public sealed partial class Backend
     {
         var g = GameDir;
         if (g == null) return null;
-        if (!gpusHooked) { GameOptionsSchema.UseSystemGpus(); gpusHooked = true; }
+        if (!gpusHooked) { GameOptionsSchema.UseGameGpus(() => GameDir); gpusHooked = true; }   // ((Triforce) 11-19: the game's own order)
         GameOptionsFile f;
         try { f = GameOptionsFile.Load(g, MainScreen()); }
         catch (Exception e) { Log.Write("game options: " + e.Message); return null; }

@@ -741,6 +741,15 @@ namespace {
 // ---- (Triforce) Outside the translation stamp, to the next mark (nx2/build.py translation_text; the rule: program_carry.h): the
 // shader modules made of a translation's SPIR-V, which they take const, and their packing. A program read from the cache and one
 // just translated go through them alike, and a record holds the SPIR-V, not the module ----
+// ((Triforce) the fog's froxels behind last frame's depth, by the shape of its module: spv_fog.h, included here, outside the
+// stamp, as make_module patches the module made of a record and leaves the record as it was translated; and on AMD's older
+// shader compiler, the float selects of a NaN constant made selects of the bits: spv_nan_select.h, the same way)
+} // namespace
+} // namespace mkwvk
+#include "spv_fog.h"
+#include "spv_nan_select.h"
+namespace mkwvk {
+namespace {
 /// (local, RenoDX port) The CRC-32 of a module's words as the bytes they are: RenoDX names the shaders it replaces by it
 uint32_t spirv_crc32(const std::vector<uint32_t>& spirv) {
     static const std::array<uint32_t, 256> table = [] {
@@ -1042,7 +1051,49 @@ VkShaderModule make_module(const std::vector<uint32_t>& spirv, uint32_t* renodx 
             logf("vk: water/shadow 8-tap PCF simplified to 1 tap (%s; RX_VK_WATER_QUALITY=0: off)",
                  water_quality_mode() == 1 ? "medium: wave shaders" : "low");
     }
-    const std::vector<uint32_t>& code = other ? *other : use_simple ? simplified : spirv;
+    // ((Triforce) the module the rewrites below start from: the water's simplified one when it was, else the translation)
+    const std::vector<uint32_t>& base = use_simple ? simplified : spirv;
+    // ((Triforce, after NX2navi's 0379b00) the volumetric fog's first compute pass computes the froxels behind last frame's
+    // coarse depth too, rather than writing them as empty: the dark trails beside near objects (spv_fog.h). Its module alone,
+    // found by its shape; the record keeps the translation, so nothing is translated again for it. RX_VK_FOG_CULL=1: the game's
+    // skip kept)
+    std::vector<uint32_t> fog;
+    if (!other) {
+        static const bool kept = spv_fog::cull_kept(getenv("RX_VK_FOG_CULL"));
+        spv_fog::Result found;
+        if (!kept) fog = spv_fog::keep_froxels(base.data(), base.size(), &found);
+        else found = spv_fog::find(base.data(), base.size());
+        if (found.exits) {
+            static std::atomic<int> told{0};
+            if (told++ < 4)
+                logf("vk: fog: module %08X, the volumetric fog's first pass: %s", crc,
+                     found.compare ? (kept ? "froxels behind last frame's depth skipped as the game does (RX_VK_FOG_CULL=1)"
+                                           : "froxels behind last frame's depth computed too (RX_VK_FOG_CULL=1: skipped as the game does)")
+                                   : found.branches + found.shared > 1 ? "its skip's comparison found more than once: left as it is"
+                                   : found.shared   ? "its skip's comparison is read elsewhere too: left as it is"
+                                                    : "its skip's exit found but not its comparison: left as it is");
+        }
+    }
+    // ((Triforce, after NX2navi's e38f42a, issue #156) on AMD's older shader compiler (dev.fixes.nan_bits: RX 5000 and RX 6000,
+    // or RX_VK_NAN_BITS=1), a float select of a constant whose bits are a NaN becomes a select of the bits, which that compiler
+    // cannot fold: stray black or white blocks (spv_nan_select.h). The modules that have one alone, on those cards alone; the
+    // record keeps the translation. RX_VK_NAN_SELECTS=0: left as they are)
+    std::vector<uint32_t> nan_sel;
+    if (!other && dev.fixes.nan_bits) {
+        static const bool selects = spv_nan_select::on(getenv("RX_VK_NAN_SELECTS"));
+        const std::vector<uint32_t>& in = !fog.empty() ? fog : base;
+        spv_nan_select::Result found;
+        if (selects) nan_sel = spv_nan_select::rewrite(in.data(), in.size(), &found);
+        static std::atomic<uint32_t> modules{0}, total{0};
+        if (found.selects) {
+            const uint32_t m = ++modules, t = total += found.selects;
+            if (m <= 4 || m % 64 == 0)
+                logf("vk: NaN selects: module %08X, %u float select(s) of a NaN constant made select(s) of the bits%s (%u modules, "
+                     "%u selects so far; RX_VK_NAN_SELECTS=0: not)", crc, found.selects,
+                     found.left ? ", 16-bit ones left (no 16-bit integer type)" : "", m, t);
+        }
+    }
+    const std::vector<uint32_t>& code = other ? *other : !nan_sel.empty() ? nan_sel : !fog.empty() ? fog : base;
     VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     ci.codeSize = code.size() * 4;
     ci.pCode = code.data();
@@ -1052,7 +1103,7 @@ VkShaderModule make_module(const std::vector<uint32_t>& spirv, uint32_t* renodx 
     // touching that cache. An EDEN_ name: in the program cache's stamp
     static const uint32_t salt = getenv("EDEN_SPV_SALT") ? (uint32_t)strtoul(getenv("EDEN_SPV_SALT"), nullptr, 0) : 0;
     if (salt && spirv.size() > 5) {
-        std::vector<uint32_t> salted = spirv;
+        std::vector<uint32_t> salted = !nan_sel.empty() ? nan_sel : !fog.empty() ? fog : base;
         salted[2] ^= salt;
         ci.pCode = salted.data();
         vkCreateShaderModule(dev.device, &ci, nullptr, &m);
@@ -3805,6 +3856,12 @@ size_t program_cache_load_some(const std::unordered_set<uint64_t>& wanted, const
     }
     return n;
 }
+/// ((Triforce, 11-19) water_quality_mode for vk_draw.cpp's warmed stamp (module_patches): where make_module simplifies the water's
+/// and shadows' modules (by default AMD's older compiler without pipeline libraries: RX 470 to 590) those modules are new to the
+/// driver's caches. v0.5.2 brought it without a new stamp, so those cards' preparation took the old one as done and compiled in
+/// play (#bug-tracker "Texture glitch again ... (RX 580)": "the pre-shader compilation ... is no longer there ... compiling shaders
+/// repeatedly during gameplay"). Here, outside the translation stamp
+int shader_water_mode() { return water_quality_mode(); }
 
 /// (Triforce, test16) The pipeline notes' programs, one key a note in the notes' order (vk_draw.cpp precompile_run): the order the
 /// read-ahead reads in (program_readahead.h notes_order). RX_VK_PROGRAM_READAHEAD_NOTES=0: not used
@@ -3851,6 +3908,30 @@ std::vector<uint64_t> program_cache_keys(std::vector<Program*>* loaded) {
         for (const auto& p : kv.second)
             if (p->ready.load(std::memory_order_acquire) && !p->failed && !p->compute) loaded->push_back(p.get());
     return keys;
+}
+/// ((Triforce) cache_set.h, vk_cache_set.cpp) The part of disk_stamp that only a new build changes: the translator's words as
+/// disk_stamp takes them, and the C++ library and the sizes its records are laid out by. A stamp that changed while this did
+/// not changed by a setting (the depth mode, the GPU's mesh shaders and lanes, the vendor fixes, the Robust buffers row, an
+/// RX_VK_ switch), and the caches of the stamp before can serve again when the setting goes back
+uint64_t program_cache_build_part() {
+    uint64_t h = 0xCBF29CE484222325ull;
+    const auto add = [&h](const void* d, size_t n) {
+        for (size_t i = 0; i < n; i++) h = (h ^ ((const uint8_t*)d)[i]) * 1099511628211ull;
+    };
+    uint64_t translator[2];
+    program_carry::translator_words(carry_on(), kTranslationStamp, HOOKSHOT_SHADER_STAMP, translator);
+    add(translator, sizeof translator);
+    const uint32_t abi[] = {(uint32_t)sizeof(Program), (uint32_t)sizeof(std::vector<uint32_t>),
+#if defined(_LIBCPP_VERSION)
+                            1u, (uint32_t)_LIBCPP_VERSION
+#elif defined(_MSVC_STL_VERSION)
+                            2u, (uint32_t)_MSVC_STL_VERSION
+#else
+                            3u, 0u
+#endif
+    };
+    add(abi, sizeof abi);
+    return h;
 }
 // ---- (Triforce) Inside the translation stamp again ----
 

@@ -27,10 +27,17 @@ public sealed partial class Backend
     readonly StringBuilder logOut = new();
     Timer? logTimer;
     BuildResult? lastResult;
+    // ((Triforce) 11-19, ticket "this is what i get on the new launcher": a failure before the build itself (the tools'
+    // download, the check) left no BuildResult, and Copy report said "stopped at its start after 0 s: no reason given"; the
+    // reason was in launcher.log only. Now the report says it, and setup.log has it too)
+    string? lastFailure;
 
     // the game
     Process? gameProc;
     Timer? runningTimer;
+
+    LauncherColorChoice colorChoice = null!;   // (the page's Color scheme: what state.color sends; RegisterCore)
+    int colorRefused;            // (1 once a 'color' that was not a #rrggbb is logged)
 
     partial void AddSettingsState(JsonObject state);
 
@@ -73,13 +80,16 @@ public sealed partial class Backend
         On("dlssanswer", m => { if ((string?)m["id"] == "yes") new Dlss(ctx).Accept(); SendReveal(); });
         On("screen", _ => { });
         On("open", m => OpenThing((string?)m["arg"] ?? ""));
-        On("report", _ => Copy(Report.ForBuild(ctx, lastResult, runner?.Details ?? "", new Tools(ctx).InstalledVersion)));
+        On("report", _ => Copy(Report.ForBuild(ctx, lastResult, runner?.Details ?? "", new Tools(ctx).InstalledVersion, lastFailure)));
         On("sound", m =>
         {
             ctx.Settings.MusicVolume = (int)Math.Round(((double?)m["music"] ?? .4) * 100);
             ctx.Settings.SoundVolume = (int)Math.Round(((double?)m["sfx"] ?? .7) * 100);
             ctx.Settings.Muted = (bool?)m["muted"] ?? false;
         });
+        // (the page's Color scheme row: ColorArrived takes the color as the message arrives; this keeps the newest one)
+        colorChoice = new LauncherColorChoice(ctx.Settings);
+        On("color", _ => colorChoice.Keep());
         On("closeanswer", m => { if ((string?)m["id"] == "yes") { StopEverything(); host.Close(); } });
         On("uninstallanswer", m =>
         {
@@ -90,12 +100,22 @@ public sealed partial class Backend
         ctx.Platform.NotificationRequested += (_, n) => { Log.Write("notice: " + n.Title + " · " + n.Text); host.Attention(n.Title, n.Text); };
     }
 
+    /// <summary>The page's 'color', called by OnMessage as it arrives, before its handler goes to a worker: only a "#rrggbb" is
+    /// taken (the color state.color sends from then on, also when nothing is written); anything else is left out, with one log
+    /// line a run.</summary>
+    void ColorArrived(JsonNode m)
+    {
+        if (colorChoice.Take(m) != null || Interlocked.Exchange(ref colorRefused, 1) != 0) return;
+        var what = m["hex"]?.ToJsonString() ?? "(none)";
+        Log.Write("color: not a #rrggbb, left out: " + (what.Length > 40 ? what.Substring(0, 40) + "..." : what));
+    }
+
     // ---------------- start ----------------
     void OnReady()
     {
         Send(new JsonObject { ["t"] = "hello", ["chrome"] = host.CustomChrome, ["os"] = OperatingSystem.IsWindows() ? "windows" : "linux" });
         var s = ctx.Settings;
-        var state = new JsonObject { ["sound"] = new JsonObject { ["music"] = s.MusicVolume / 100.0, ["sfx"] = s.SoundVolume / 100.0, ["muted"] = s.Muted } };
+        var state = new JsonObject { ["sound"] = new JsonObject { ["music"] = s.MusicVolume / 100.0, ["sfx"] = s.SoundVolume / 100.0, ["muted"] = s.Muted }, ["color"] = colorChoice.Current };
         AddSettingsState(state);
         SendState(state);
         if (start.SignalUpWhenShown) Startup.SignalUp(ctx);
@@ -323,6 +343,7 @@ public sealed partial class Backend
         Push(true);
         Go("work");
         using var reg = token.Register(() => r.Stop());
+        lastFailure = null;
         var res = lastResult = await r.RunAsync(req, token);
         Push(true);
         FlushLog();
@@ -407,6 +428,9 @@ public sealed partial class Backend
     void WorkFailed(string title, string text, Exception? e)
     {
         if (e != null) Log.Write("work failed: " + e);
+        lastFailure = title + ": " + text + (e != null ? " (" + e.GetType().Name + ": " + e.Message + ")" : "");
+        lastResult = null;
+        try { ctx.Log.Write("work failed: " + lastFailure); } catch (Exception) { }
         FlushLog();
         Send(new JsonObject
         {

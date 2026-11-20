@@ -17,6 +17,8 @@ public static class SettingNames
         SetupSkip = "SetupSkip", Sounds = "Sounds", ModsBuilt = "ModsBuilt";
     // (DESIGN 10: kept per user)
     public const string MusicVolume = "MusicVolume", SoundVolume = "SoundVolume", Muted = "Muted";
+    // (the page's Color scheme, "#rrggbb": LauncherColor)
+    public const string Color = "Color";
 }
 
 /// <summary>Where the settings are kept. Get/Set work on the settings; the Uninstall* calls on the Apps-list entry (Windows,
@@ -221,6 +223,13 @@ public sealed class Settings
     /// <summary>DESIGN 10: 0..100, default 70.</summary>
     public int SoundVolume { get => Percent(SettingNames.SoundVolume, 70); set => Set(SettingNames.SoundVolume, Math.Clamp(value, 0, 100).ToString()); }
     public bool Muted { get => Get(SettingNames.Muted) == "1"; set => Set(SettingNames.Muted, value ? "1" : "0"); }
+    /// <summary>The page's color scheme, "#rrggbb" in lower case: Triforce gold (LauncherColor.Default) when never chosen, as in
+    /// every settings file from before it, or when what is kept does not read as one. Only a color LauncherColor.Parse takes is kept.</summary>
+    public string Color
+    {
+        get => LauncherColor.Parse(Get(SettingNames.Color)) ?? LauncherColor.Default;
+        set => Set(SettingNames.Color, LauncherColor.Parse(value) ?? throw new ArgumentException("Not a #rrggbb color: " + value));
+    }
 
     int Percent(string name, int fallback) => int.TryParse(Get(name), out var v) && v >= 0 && v <= 100 ? v : fallback;
 }

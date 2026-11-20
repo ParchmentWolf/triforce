@@ -79,10 +79,10 @@ VkImageView texture_view_of(uint32_t h, VkImageViewType vt, ViewUse use, VkForma
     *tex = &textures[slot & 15];
     return handle<VkImageView>(v | 1);
 }
-VkSampler sampler_for(int id, bool compare) {
+VkSampler sampler_for(int id, bool compare, bool scene) {   // ((Triforce, S8) scene: the jittered scene's, biased)
     w.samplers++;
     if (w.sampler_fail) return VK_NULL_HANDLE;
-    return handle<VkSampler>(0x7000000ull | (uint64_t)id << 8 | (uint64_t)compare << 4 | w.samp << 32 | w.bias);
+    return handle<VkSampler>(0x7000000ull | (uint64_t)id << 8 | (uint64_t)scene << 5 | (uint64_t)compare << 4 | w.samp << 32 | w.bias);
 }
 struct RecordingRes {
     struct Stream { VkBuffer buffer; };
@@ -109,10 +109,11 @@ Stage vs{0}, fs{1};
 NvnState s{};
 desc_keep::Prog* kp() { return &desc_keep::prog_of(kept_descs(), &prog, 8); }
 struct Tex { VkSampler smp; VkImageView view; Texture* tex; bool known; };
-Tex tex_of(uint32_t h, VkImageViewType vt = VK_IMAGE_VIEW_TYPE_2D, bool compare = false, size_t j = 4, bool keep = true) {
+Tex tex_of(uint32_t h, VkImageViewType vt = VK_IMAGE_VIEW_TYPE_2D, bool compare = false, size_t j = 4, bool keep = true,
+           bool scene = false) {
     Tex t{};
     view_slot_known = !w.known;   // (the taken path must say what the lookup said)
-    t.smp = kept_texture(keep ? kp() : nullptr, j, h, vt, compare, test == "compute", &t.view, &t.tex);
+    t.smp = kept_texture(keep ? kp() : nullptr, j, h, vt, compare, test == "compute", scene, &t.view, &t.tex);
     t.known = view_slot_known;
     CHECK(!upload_defer_ok);
     return t;
@@ -122,9 +123,10 @@ bool operator==(const VkDescriptorBufferInfo& a, const VkDescriptorBufferInfo& b
     return a.buffer == b.buffer && a.offset == b.offset && a.range == b.range;
 }
 /// Resolved (the sampler and, for a handle, the view looked up) or taken (nothing looked up)
-bool tex_resolved(uint32_t h, Tex* out = nullptr, VkImageViewType vt = VK_IMAGE_VIEW_TYPE_2D, bool compare = false) {
+bool tex_resolved(uint32_t h, Tex* out = nullptr, VkImageViewType vt = VK_IMAGE_VIEW_TYPE_2D, bool compare = false,
+                  bool scene = false) {
     const int v0 = w.views, s0 = w.samplers;
-    const Tex t = tex_of(h, vt, compare);
+    const Tex t = tex_of(h, vt, compare, 4, true, scene);
     if (out) *out = t;
     CHECK((w.views - v0) == (h ? w.samplers - s0 : 0));
     return w.samplers != s0;
@@ -213,6 +215,15 @@ int run() {
             CHECK(none.view && w.views == v0 + 1);
         }
         CHECK(!tex_resolved(h));   // (and what was kept is still there)
+        return 0;
+    }
+    if (test == "texture-scene") {   // ((Triforce, S8) a draw into the scene and one into a shadow map: each its own sampler)
+        Tex a, b, c;
+        CHECK(tex_resolved(h, &a) && !tex_resolved(h));
+        CHECK(tex_resolved(h, &b, VK_IMAGE_VIEW_TYPE_2D, false, true) && b.smp != a.smp && b.view == a.view);
+        CHECK(((uint64_t)(uintptr_t)b.smp >> 5 & 1) == 1 && ((uint64_t)(uintptr_t)a.smp >> 5 & 1) == 0);   // (scene passed on)
+        CHECK(!tex_resolved(h, &c, VK_IMAGE_VIEW_TYPE_2D, false, true) && c == b);   // (kept for the scene)
+        CHECK(tex_resolved(h, &c) && c == a && !tex_resolved(h));   // (and back: the other pass's again)
         return 0;
     }
     if (test == "texture-moved") {   // (a destroy while the lookup ran: what it gave is kept with the generation before it)

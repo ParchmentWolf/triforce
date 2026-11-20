@@ -19,6 +19,9 @@ Each is a runtime switch where it can be, so the game's own path stays reachable
 - The OptimizeChangeBank thread's allocations tried again when their heap is full (host/oot_heap_retry.c): f_804566e0's two
   calls of f_80522050, its GPU memory (GPU_ALLOC_SITES), and its two tryAllocs of CPU buffers (HEAP_ALLOC_SITES). They went on
   with a null pointer and crashed writing through it (issue 1697). The supported build only.
+- ((Triforce) 11-19) The texture data compaction thread's step called through the host (host/oot_tex_compact.c): f_807da3f0's
+  call of f_807da480. The host counts the cycles it starts and, with HOS_OOT_TEX_COMPACT_MS set, holds them to a pace; unset,
+  the step runs as shipped. The supported build only.
 """
 import glob
 import os
@@ -780,6 +783,28 @@ def patch_heap_retry(s):
     return s, found
 
 
+# ((Triforce) 11-19) f_807da3f0, the handler of the game's "aglTextureDataMgr::Compaction" thread, calls the compaction's step
+# (f_807da480: with the compaction idle it plans, and starts a cycle that moves a texture's data in the game's heap) at one
+# place, for each message that asks. That call is made through host/oot_tex_compact.c hos_oot_tex_compact, which calls the
+# game's own, counts the cycles started and holds them to a pace when HOS_OOT_TEX_COMPACT_MS says so (unset: as shipped).
+# f_807da480's other callers, the game's own waits for a compaction, stay as they are.
+TEX_COMPACT_OLD = "c->x[30] = 0x807da430ULL; f_807da480(c);"   # (the call's return address: this one place)
+TEX_COMPACT_NEW = "c->x[30] = 0x807da430ULL; hos_oot_tex_compact(c, f_807da480);   /* (nx2/oot_patches.py: host/oot_tex_compact.c) */"
+TEX_COMPACT_DECL = "void hos_oot_tex_compact(Ctx *A64_NOESC c, A64Fn game);\n"
+
+
+def patch_tex_compact(s):
+    """The call above in one file's text: (text, 1 when made now or found made). apply() wants 1 over the whole lift"""
+    if TEX_COMPACT_NEW in s:
+        return s, 1
+    if s.count(TEX_COMPACT_OLD) != 1 or s.count('#include "a64.h"\n') != 1:
+        return s, 0
+    s = s.replace(TEX_COMPACT_OLD, TEX_COMPACT_NEW, 1)
+    if TEX_COMPACT_DECL not in s:
+        s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + TEX_COMPACT_DECL, 1)
+    return s, 1
+
+
 def apply(gen, *, protect_hearts=False, required=False):
     """required: the lift of the supported build (LIFE_BUILD_ID), whole: a missing output-size edit stops it (apply_output_size).
     The other patches only warn when their place is not found once."""
@@ -804,6 +829,7 @@ def apply(gen, *, protect_hearts=False, required=False):
     zstd_sites = 0   # (patch_host_zstd: its two calls, the supported build's alone)
     mod_size_sites = 0   # ((Triforce) patch_mod_sizes: its one call, the supported build's alone)
     heap_sites = [0, 0]   # (the GPU memory's sites, the CPU buffers': patch_heap_retry, the supported build only)
+    tex_compact_sites = 0   # ((Triforce) patch_tex_compact: its one call, the supported build's alone)
     for path in sorted(glob.glob(os.path.join(glob.escape(gen), "code_*.c"))):
         with open(path, encoding="utf-8", newline="") as f:
             s = f.read()
@@ -931,6 +957,11 @@ def apply(gen, *, protect_hearts=False, required=False):
             if sized != out:
                 print("oot_patches: room for the mods' files in", os.path.basename(path))
             out = sized
+            compacted, found = patch_tex_compact(out)
+            tex_compact_sites += found
+            if compacted != out:
+                print("oot_patches: the texture compaction's step through the host in", os.path.basename(path))
+            out = compacted
         if out != s:
             whole_write.write_whole(path, out, newline="")
     if sound_jobs != 1:   # (without it, above 60 fps sounds and then the music can stop after a few loading zones)
@@ -950,6 +981,8 @@ def apply(gen, *, protect_hearts=False, required=False):
         print("oot_patches: WARNING: the sprint button's calls were found at %d of 2 places" % sprint_sites)
     if protect_hearts and mod_size_sites != 1:   # (without it a mod's bigger model can crash the game: host/mods.c)
         print("oot_patches: WARNING: the resource size table's lookup was found at %d of 1 place" % mod_size_sites)
+    if protect_hearts and tex_compact_sites != 1:   # (without it the compaction is neither counted nor paced: host/oot_tex_compact.c)
+        print("oot_patches: WARNING: the texture compaction's step was found at %d of 1 place" % tex_compact_sites)
     if protect_hearts and zstd_sites != len(ZSTD_SITES):   # (without them HOS_HOST_ZSTD does nothing, or half: host/hos_zstd.c)
         print("oot_patches: WARNING: the host's zstd decoder's calls were found at %d of %d places" % (zstd_sites, len(ZSTD_SITES)))
     if protect_hearts and heap_sites != [len(GPU_ALLOC_SITES), len(HEAP_ALLOC_SITES)]:   # (the supported build's functions)

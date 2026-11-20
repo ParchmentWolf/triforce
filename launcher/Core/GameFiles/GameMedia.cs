@@ -16,6 +16,10 @@ public sealed class GameMedia
     /// <summary>Changes whenever a decoder's output would change, so older cache files are not used.</summary>
     const string CacheVersion = "gamemedia-1";
 
+    /// <summary>The same for the sounds alone (the art's files keep their names): "loop-1" since the WAV files carry the
+    /// game's loop in a smpl chunk, so a cache made before is decoded again once, its old files removed.</summary>
+    const string SoundVersion = CacheVersion + "+loop-1";
+
     /// <summary>The title screen's texture archive.</summary>
     public const string TitleArchive = "UI/Layout2Archive/Title.Product.100.Nin_Ounce_NVN2.bntx.zs";
 
@@ -97,7 +101,7 @@ public sealed class GameMedia
             var tracks = new Pcm[paths.Length];
             Parallel.For(0, paths.Length, i => tracks[i] = Bwav.Decode(source.Read(paths[i])));
             return Bwav.ToWav(Bwav.Mix(tracks));
-        });
+        }, SoundVersion);
     }
 
     /// <summary>The names of the textures in an archive (to check a name, or to pick another piece of art).</summary>
@@ -114,9 +118,9 @@ public sealed class GameMedia
     /// source files' stamps. Made by `make` when it is not there (written beside and then moved into place, so a reader
     /// never sees half a file); other versions of the same item are removed then.
     /// </summary>
-    string Cached(string fileName, string[] inputs, Func<byte[]> make)
+    string Cached(string fileName, string[] inputs, Func<byte[]> make, string version = CacheVersion)
     {
-        var identity = new StringBuilder(CacheVersion).Append('|').Append(fileName);
+        var identity = new StringBuilder(version).Append('|').Append(fileName);
         foreach (var input in inputs)
             identity.Append('|').Append(input).Append('=').Append(source.Stamp(input)
                 ?? throw new FileNotFoundException("The game has no " + input + " (" + source.Describe + ")", input));

@@ -4,7 +4,7 @@
    page -> launcher  {t:'ready'}  {t:'win', a:'min'|'max'|'close'}  {t:'pick', kind:'file'|'folder'}  {t:'drop', files:[file:// on Linux]}
                      {t:'cmd', c:<name>, ...args}   (build, stop, retry, play, update, playold, showgame, open, lang, folder, setting,
                                                     saves.import, saves.export, saves.open, mods.*, bench, benchstop, benchapply,
-                                                    report, sound, workback, ...)
+                                                    report, sound, color, workback, ...)
    launcher -> page  {t:'hello', chrome, os}   {t:'state', ...parts}   {t:'go', s}   {t:'check', st, name, msg}
                      {t:'work', ...}   {t:'log', lines}   {t:'toast', html}   {t:'sfx', id}   {t:'bench', ...}   {t:'max', on}
 
@@ -40,32 +40,119 @@ const S = { media: { art: false, music: false, sfx: false }, sound: { music: .4,
 
 /* ---------------- sound: the game's own music and menu sounds (only once a game is known) ---------------- */
 const TRACKS = { saria: "Saria's Song", fairy: 'Fairy Fountain', temple: 'Temple of Time', itemget: 'Item get' };
-const live = [];   // music being played: { el, k, target, rate, name }
-let curTrack = null, unlocked = !!HOST;
-addEventListener('pointerdown', () => unlocked = true, true); addEventListener('keydown', () => unlocked = true, true);
+/* Music plays through Web Audio: a track is read and decoded once into an AudioBuffer and played by a buffer source that
+   loops between the game's own loop points, sample for sample, so an intro plays once and the loop joins with no gap and
+   no jump back to the start (the launcher writes the loop into the WAV as a smpl chunk: launcher/Core/GameFiles/Bwav.cs
+   ToWav). An <audio> element's loop starts the whole file again, intro and all, after a pause: it is only the fallback,
+   for a page without Web Audio or a file it cannot read or decode. A file without a loop (made by an older launcher)
+   loops whole, still without a gap. */
+const live = [];   // music being played: { k, target, rate, name, loop, and src + g (Web Audio) or el (<audio>) once started }
+let curTrack = null, unlocked = !!HOST, actx = null, actxTried = false, lastResume = 0;
+const decoded = new Map();   // track -> Promise of { buf, start, end } (the loop, in seconds), for media version decodedFor
+let decodedFor;
+function audioCtx() {
+  if (actxTried) return actx;
+  actxTried = true;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  // (at the game's rate, so the buffers are not resampled and the loop points stay whole samples)
+  if (AC) try { actx = new AC({ sampleRate: 48000 }); } catch { try { actx = new AC(); } catch { actx = null; } }
+  return actx;
+}
+function unlock() { unlocked = true; if (actx && actx.state === 'suspended') actx.resume().catch(() => {}); }
+addEventListener('pointerdown', unlock, true); addEventListener('keydown', unlock, true);
+/* The loop a WAV file carries, in samples: a smpl chunk's first loop (smpl counts its last sample in; end here is the
+   sample after it), else the whole file. { rate, frames, start, end }, or null for what is not a PCM WAV file. */
+function wavLoop(ab) {
+  const d = new DataView(ab), len = d.byteLength;
+  const tag = at => String.fromCharCode(d.getUint8(at), d.getUint8(at + 1), d.getUint8(at + 2), d.getUint8(at + 3));
+  if (len < 12 || tag(0) !== 'RIFF' || tag(8) !== 'WAVE') return null;
+  let rate = 0, align = 0, frames = 0, loop = null;
+  for (let at = 12; at + 8 <= len;) {
+    const id = tag(at), n = Math.min(d.getUint32(at + 4, true), len - at - 8), body = at + 8;
+    if (id === 'fmt ' && n >= 16) { rate = d.getUint32(body + 4, true); align = d.getUint16(body + 12, true); }
+    else if (id === 'data' && !frames && align) frames = Math.floor(n / align);
+    else if (id === 'smpl' && n >= 60 && d.getUint32(body + 28, true) > 0) loop = { start: d.getUint32(body + 44, true), end: d.getUint32(body + 48, true) + 1 };
+    at = body + n + (n & 1);
+  }
+  if (!rate || !frames) return null;
+  const ok = loop && loop.start < loop.end && loop.end <= frames;
+  return { rate, frames, start: ok ? loop.start : 0, end: ok ? loop.end : frames };
+}
+function track(name) {
+  if (decodedFor !== S.media.v) { decoded.clear(); decodedFor = S.media.v; }
+  let p = decoded.get(name);
+  if (!p) {
+    p = fetch('audio/' + name + '.wav').then(r => { if (!r.ok) throw new Error(name + ': ' + r.status); return r.arrayBuffer(); }).then(ab => {
+      const lp = wavLoop(ab);
+      // (the callback form too: an older WebKit's decodeAudioData returns nothing)
+      return new Promise((ok, no) => { const q = actx.decodeAudioData(ab, ok, no); if (q && q.then) q.then(ok, no); })
+        .then(buf => ({ buf, start: lp ? lp.start / lp.rate : 0, end: lp ? Math.min(lp.end / lp.rate, buf.duration) : buf.duration }));
+    });
+    p.catch(() => { if (decoded.get(name) === p) decoded.delete(name); });
+    decoded.set(name, p);
+  }
+  return p;
+}
+function startBuffer(m, t) {
+  const src = actx.createBufferSource(), g = actx.createGain();
+  src.buffer = t.buf;
+  if (m.loop) { src.loop = true; src.loopStart = t.start; src.loopEnd = t.end; }
+  // (at the level it has now, from the first sample: 0 for a looping track, which fades in; the full level for the
+  // fanfare, which would otherwise wait for the next frame and a ramp, or play silent while frames are held back)
+  const v = level(m);
+  g.gain.value = v;
+  src.connect(g); g.connect(actx.destination);
+  if (!m.loop) src.onended = () => { m.ended = true; if (!m.stopped) oneShotEnded(m); };
+  src.start();
+  m.src = src; m.g = g; m.v = v; m.loading = false;
+}
+function startElement(m) {
+  const el = new Audio('audio/' + m.name + '.wav'); el.loop = m.loop; el.volume = level(m);
+  m.el = el; m.loading = false;
+  el.play().catch(() => { m.blocked = true; });
+  if (!m.loop) el.onended = () => oneShotEnded(m);
+}
+function level(m) { return Math.max(0, Math.min(1, m.k * m.k * (S.sound.muted ? 0 : S.sound.music))); }
+function oneShotEnded(m) { m.target = 0; m.k = 0; if (curTrack === m.name) { curTrack = null; afterOneShot(m.name); } nowPlaying(); }
+function stopVoice(m) {
+  m.dead = true;
+  if (m.el) { m.el.pause(); m.el.removeAttribute('src'); }
+  // (a source that has played to its end fires no second ended: its gain is let go at once)
+  else if (m.src) {
+    m.stopped = true;
+    if (m.ended) m.g.disconnect();
+    else { m.src.onended = () => m.g.disconnect(); try { m.src.stop(actx.currentTime + .05); } catch { m.g.disconnect(); } }
+  }
+  // (a track no longer playing lets go of its decoded samples, up to 30 MB for a long one: read again when wanted)
+  if (m.name !== curTrack && !live.some(o => o !== m && !o.dead && o.name === m.name)) decoded.delete(m.name);
+}
 function music(name, loop = true, fade = 1.4) {
   if (name && !S.media.music) name = null;
   if (curTrack === name) return;
   curTrack = name;
   for (const m of live) { m.target = 0; m.rate = 1 / fade; }
   if (name) {
-    const el = new Audio('audio/' + name + '.wav'); el.loop = loop; el.volume = 0;
-    const m = { el, k: 0, target: 1, rate: 1 / fade, name };
-    el.play().catch(() => { m.blocked = true; });
-    if (!loop) el.onended = () => { m.target = 0; m.k = 0; if (curTrack === name) { curTrack = null; afterOneShot(name); } };
+    // (a one-shot, the item fanfare, starts at its full level: fading it in would swallow its first notes)
+    const m = { k: loop ? 0 : 1, target: 1, rate: 1 / fade, name, loop, loading: true };
     live.push(m);
+    if (audioCtx()) track(name).then(t => { if (!m.dead) startBuffer(m, t); }, () => { if (!m.dead) startElement(m); });
+    else startElement(m);
   }
   nowPlaying();
 }
 let lastT = performance.now();
 function audioTick(t) {
   const dt = Math.min(.1, (t - lastT) / 1000); lastT = t;
-  const mv = S.sound.muted ? 0 : S.sound.music;
+  if (actx && unlocked && actx.state === 'suspended' && t - lastResume > 1000) { lastResume = t; actx.resume().catch(() => {}); }
   for (let i = live.length - 1; i >= 0; i--) {
     const m = live[i];
+    // (a track still being read waits at its first level, so its fade-in is heard whole; one faded out before it starts is dropped)
+    if (m.loading) { if (m.target === 0) { stopVoice(m); live.splice(i, 1); } continue; }
     m.k += Math.sign(m.target - m.k) * Math.min(Math.abs(m.target - m.k), m.rate * dt);
-    m.el.volume = Math.max(0, Math.min(1, m.k * m.k * mv));
-    if (m.k <= 0 && m.target === 0) { m.el.pause(); m.el.removeAttribute('src'); live.splice(i, 1); }
+    const v = level(m);
+    if (m.el) m.el.volume = v;
+    else if (Math.abs(v - m.v) > 1e-4) { m.v = v; m.g.gain.setTargetAtTime(v, actx.currentTime, .015); }
+    if (m.k <= 0 && m.target === 0) { stopVoice(m); live.splice(i, 1); }
     else if (m.blocked && unlocked) { m.blocked = false; m.el.play().catch(() => { m.blocked = true; }); }
   }
 }
@@ -113,7 +200,7 @@ const MUSIC = { welcome: null, reveal: 'saria', work: 'temple', done: 'itemget',
 let screen = null;
 function go(name) {
   if (name === screen || !$('#s-' + name)) return;
-  closeSheet(true); closeVol(true);
+  closeSheet(true); closeVol(true); closeColor();
   screen = name;
   $$('.screen').forEach(s => s.classList.toggle('on', s.id === 's-' + name));
   const busy = FIRST_RUN.includes(name) || name === 'work' || name === 'brun' || name === 'playing';
@@ -137,14 +224,20 @@ function visible(el) { return !!(el.offsetParent || el.getClientRects().length) 
 function focusables() {
   if ($('#sheetBg').classList.contains('open')) return $$('[data-f]', $('#sheet')).filter(visible);
   if ($('#vol').classList.contains('open')) return $$('[data-f]', $('#vol')).concat($('#spk'));
-  const out = $$('[data-f]', $('#s-' + screen)).filter(visible);
+  // ((Triforce, 11-19) before the first screen is shown screen is null and there is no #s-null: a controller's press or a drifting
+  // stick then threw here, in the frame loop)
+  const page = screen && $('#s-' + screen);
+  const out = page ? $$('[data-f]', page).filter(el => visible(el) && !el.closest('.cpick:not(.open)')) : [];
   if (!$('#bar').classList.contains('bare')) out.push(...$$('[data-f]', $('#bar')).filter(visible));
   return out;
 }
 function setFocus(el, sound) {
   if (!el || el === focused) return;
   if (focused) focused.classList.remove('kf');
+  const letGo = focused && focused.id === 'cpSv' && focused.classList.contains('held');   // (the colour square lets go when focus leaves it)
+  if (letGo) focused.classList.remove('held');
   focused = el; el.classList.add('kf');
+  if (letGo || el.id === 'cpSv') colorMsg();
   if (el.tagName === 'INPUT') el.focus(); else if (document.activeElement && document.activeElement.tagName === 'INPUT') document.activeElement.blur();
   if (document.body.classList.contains('kb')) el.scrollIntoView({ block: 'nearest' });
   if (sound) sfx('cursor');
@@ -165,13 +258,20 @@ function move(dx, dy) {
   }
   if (best) setFocus(best, true);
 }
-document.addEventListener('mouseover', e => { const el = e.target.closest('[data-f]'); if (el && focusables().includes(el)) setFocus(el, true); });
+document.addEventListener('mouseover', e => {
+  const el = e.target.closest('[data-f]'); if (!el || !focusables().includes(el)) return;
+  const a = document.activeElement;   // (while a colour field is typed in, the pointer passing over the others does not take it away; a click does)
+  if (a && a.tagName === 'INPUT' && a !== el && a.closest('#cpick')) return;
+  setFocus(el, true);
+});
+document.addEventListener('focusin', e => { if (e.target.tagName === 'INPUT' && e.target.closest('#cpick') && e.target !== focused) setFocus(e.target); });
 document.addEventListener('mousemove', () => document.body.classList.remove('kb'));
 
 /* ---------------- actions ---------------- */
 function activate(el) {
   if (!el) return;
   if (el.tagName === 'INPUT') { el.focus(); return; }
+  if (el.id === 'cpSv') return holdSv();
   if (el.dataset.go) { if (el.dataset.go !== screen) { sfx('decide'); go(el.dataset.go); } return; }
   const act = el.dataset.act; if (!act) return;
   const i = act.indexOf(':'), verb = i < 0 ? act : act.slice(0, i), arg = i < 0 ? '' : act.slice(i + 1);
@@ -192,6 +292,8 @@ function back() {
   if ($('#drawer').classList.contains('open')) return ACTIONS.details();
   if ($('#sheetBg').classList.contains('open')) return closeSheet();
   if ($('#vol').classList.contains('open')) return closeVol();
+  if (focused && focused.id === 'cpSv' && focused.classList.contains('held')) return holdSv();
+  if (CS.open && screen === 'settings') return closeColor('close');
   const b = $('#s-' + screen).dataset.back; if (!b) return;
   sfx('cancel');
   if (ACTIONS[b]) return ACTIONS[b]();
@@ -401,7 +503,7 @@ $('#modQ').addEventListener('keydown', e => { if (e.key === 'Enter' || e.key ===
 /* ---------------- settings: a list the launcher sends, and the game's own Options menu in tabs ---------------- */
 S.settab = 'launcher';
 function launcherRows() {
-  return (S.settings || []).map(r => r.h ? `<h4>${esc(r.h)}</h4>` : r.kind === 'slider' ?
+  return withColorRow(S.settings || []).map(r => r.h ? `<h4>${esc(r.h)}</h4>` : r.kind === 'color' ? colorRow(r) : r.kind === 'slider' ?
     `<div class="row-set" style="cursor:default"><b>${esc(r.label)}</b><div class="rng"><div class="slider" data-f data-vol="${esc(r.id)}" id="row-${esc(r.id)}"><i></i><u></u></div><span data-volv="${esc(r.id)}"></span></div><em></em></div>` :
     `<div class="row-set${r.danger ? ' danger' : ''}${r.off ? ' off' : ''}" data-f data-act="row:${esc(r.id)}" id="row-${esc(r.id)}"><b>${esc(r.label)}</b><span>${esc(r.value || '')}</span><em>${esc(r.actLabel || 'Change')}</em></div>`).join('');
 }
@@ -418,7 +520,9 @@ function drawSettings() {
   if (!tabs.some(t => t.id === S.settab)) S.settab = 'launcher';
   const keep = focused && focused.id;
   $('#setTabs').innerHTML = tabs.map(t => `<span data-f data-act="settab:${t.id}" id="st-${t.id}" class="${t.id === S.settab ? 'on' : ''}">${esc(t.name)}</span>`).join('');
+  const cp = $('#cpick');   // (the open picker is kept as it is, with what is being typed in it, through a redraw)
   $('#set').innerHTML = S.settab === 'launcher' ? launcherRows() : gameRows(S.settab);
+  if (cp && $('#cpick')) { cp.classList.toggle('open', CS.open); $$('.kf', cp).forEach(e => e.classList.remove('kf')); $('#cpick').replaceWith(cp); }
   $('#s-settings').dataset.first = 'st-' + S.settab;
   setVol('music', S.sound.music, true); setVol('sfx', S.sound.sfx, true);
   $('#benchCard').style.display = S.bench && S.bench.available && (S.settab === 'launcher' || S.settab === 'graphics') ? '' : 'none';
@@ -426,7 +530,7 @@ function drawSettings() {
   $('#benchLast').textContent = S.bench && S.bench.last || '';
   if (keep && $('#' + keep) && screen === 'settings') { focused = null; setFocus($('#' + keep)); }
 }
-ACTIONS.settab = (t) => { S.settab = t; drawSettings(); $('#set').scrollTop = 0; setFocus($('#st-' + t)); };
+ACTIONS.settab = (t) => { CS.open = false; S.settab = t; drawSettings(); $('#set').scrollTop = 0; setFocus($('#st-' + t)); };
 ACTIONS.gopt = (key) => cmd('gopt.choose', { key });
 /* the game's sliders: drag, or left / right while focused; the value goes to the launcher when let go */
 function gStep(el, v) {
@@ -451,6 +555,185 @@ function gNudge(d) { if (!focused || !focused.dataset.gkey || focused.closest('.
 function settingRow(id) { cmd('setting', { id }); }
 // (the list is asked for each time the page opens, so it shows what is true now: Steam, shortcuts, the game folder)
 new MutationObserver(() => { if ($('#s-settings').classList.contains('on')) cmd('settings.list'); }).observe($('#s-settings'), { attributes: true, attributeFilter: ['class'] });
+
+/* ---------------- settings: Color scheme (any colour in place of the gold) ---------------- */
+/* One colour stands in for Triforce gold. Every gold the look is made of (theme.css, --gold-*-rgb) sits from it as it sits
+   from gold today: its hue turned by as much, its saturation scaled by as much, its lightness kept in proportion on the way
+   to white or to black. So Triforce gold gives back today's values, and is drawn with theme.css's own (nothing set here).
+   Text on gold takes dark ink or light, whichever reads better on the colour. The row is the page's own, under Sounds; the
+   choice is kept in this window's storage and sent to the launcher ({t:'cmd', c:'color', hex}); a launcher that keeps it
+   sends it back as state.color, and that wins. */
+const GOLD = '#e0b23e';
+const GOLD_SHADES = { 'gold': [224, 178, 62], 'gold-hi': [247, 220, 140], 'gold-lit': [255, 244, 204], 'gold-low': [168, 118, 28], 'gold-deep': [154, 106, 24],
+  'gold-edge': [61, 42, 8], 'gold-glow': [247, 200, 110], 'gold-warm': [255, 196, 92],
+  'gold-w1': [255, 241, 184], 'gold-w2': [232, 184, 64], 'gold-w3': [181, 126, 28], 'gold-w4': [243, 207, 106] };
+const GOLD_INK = { dark: { ink: [61, 42, 8], ink2: [36, 23, 0], emboss: [255, 244, 204] }, light: { ink: [255, 244, 204], ink2: [255, 244, 204], emboss: [36, 23, 0] } };
+const PRESETS = [[GOLD, 'Triforce gold'], ['#c9ccd4', 'Silver'], ['#d98c5f', 'Copper'], ['#e2687a', 'Goron ruby'], ['#c77dda', 'Fairy violet'],
+  ['#5e9cf0', 'Zora sapphire'], ['#4fc3b4', 'Lake Hylia'], ['#79c463', 'Kokiri emerald']];
+const CS = { hex: GOLD, h: 0, s: 0, v: 0, open: false };
+const clamp01 = x => Math.max(0, Math.min(1, x));
+const hexRgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+const rgbHex = c => '#' + c.map(x => Math.round(x).toString(16).padStart(2, '0')).join('');
+function rgbHsl([r, g, b]) {
+  r /= 255; g /= 255; b /= 255;
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn, l = (mx + mn) / 2;
+  if (!d) return [0, 0, l];
+  const h = mx === r ? ((g - b) / d + 6) % 6 : mx === g ? (b - r) / d + 2 : (r - g) / d + 4;
+  return [h * 60, d / (1 - Math.abs(2 * l - 1)), l];
+}
+function hslRgb([h, s, l]) {
+  const k = n => (n + h / 30) % 12, a = s * Math.min(l, 1 - l);
+  return [0, 8, 4].map(n => Math.round(255 * (l - a * Math.max(-1, Math.min(k(n) - 3, 9 - k(n), 1)))));
+}
+function hsvRgb(h, s, v) { const f = n => { const k = (n + h / 60) % 6; return Math.round(255 * (v - v * s * Math.max(0, Math.min(k, 4 - k, 1)))); }; return [f(5), f(3), f(1)]; }
+function rgbHsv([r, g, b]) { const mx = Math.max(r, g, b), d = mx - Math.min(r, g, b); return [d ? rgbHsl([r, g, b])[0] : CS.h, mx ? d / mx : 0, mx / 255]; }
+const GOLD_HSL = rgbHsl(GOLD_SHADES.gold);
+[CS.h, CS.s, CS.v] = rgbHsv(GOLD_SHADES.gold);
+/* a shade of today's gold, moved to the chosen colour (as h, s, l) */
+function moveShade(c, [th, ts, tl]) {
+  const [h, s, l] = rgbHsl(c), [gh, gs, gl] = GOLD_HSL;
+  return hslRgb([(h - gh + th + 360) % 360, Math.min(1, s * ts / gs), l >= gl ? tl + (1 - tl) * (l - gl) / (1 - gl) : tl * l / gl]);
+}
+function lum(c) { const [r, g, b] = c.map(x => { x /= 255; return x <= .04045 ? x / 12.92 : ((x + .055) / 1.055) ** 2.4; }); return .2126 * r + .7152 * g + .0722 * b; }
+function contrast(a, b) { const x = lum(a), y = lum(b); return (Math.max(x, y) + .05) / (Math.min(x, y) + .05); }
+/* Two sets are made from the colour. The polished bars (Play, "Find my best settings", Apply...: --gold-bar-*) take it as
+   it is, but no lighter than BAR_TOP, so their highlight, sheen and foot keep gold's steps on a near-white colour. Text,
+   links, lines, rings and diamonds on the dark ground (--gold-*) take it as it is, but no darker than reads on that ground
+   (TEXT_MIN to 1 on --ink), so a near-black colour cannot hide them, nor the way back to gold. Gold is far from both. */
+const BAR_SHADES = ['gold', 'gold-hi', 'gold-lit', 'gold-low', 'gold-deep', 'gold-edge'], BAR_TOP = .78, INK_BG = [10, 9, 8], TEXT_MIN = 4.5;
+function textSafe([h, s, l]) {
+  while (l < 1 && contrast(moveShade(GOLD_SHADES.gold, [h, s, l]), INK_BG) < TEXT_MIN) l = Math.min(1, l + .005);
+  return [h, s, l];
+}
+function paintColor(hex) {
+  const root = document.documentElement, st = root.style;
+  const vars = Object.keys(GOLD_SHADES).concat('gold-ink', 'gold-ink2', 'gold-emboss', BAR_SHADES.map(n => n.replace('gold', 'gold-bar')));
+  root.classList.toggle('tint', hex !== GOLD);
+  if (hex === GOLD) { vars.forEach(n => st.removeProperty(`--${n}-rgb`)); ['h', 's', 'b'].forEach(n => st.removeProperty('--tint-' + n)); return; }
+  const c = hexRgb(hex), to = rgbHsl(c), tt = textSafe(to), tb = [to[0], to[1], Math.min(to[2], BAR_TOP)];
+  for (const n in GOLD_SHADES) st.setProperty(`--${n}-rgb`, moveShade(GOLD_SHADES[n], tt).join(', '));
+  for (const n of BAR_SHADES) st.setProperty(`--${n.replace('gold', 'gold-bar')}-rgb`, moveShade(GOLD_SHADES[n], tb).join(', '));
+  const bar = moveShade(GOLD_SHADES.gold, tb), dark = moveShade(GOLD_INK.dark.ink, tb), light = moveShade(GOLD_INK.light.ink, tb);
+  const ink = GOLD_INK[contrast(dark, bar) >= contrast(light, bar) ? 'dark' : 'light'];
+  for (const n in ink) st.setProperty(`--gold-${n}-rgb`, moveShade(ink[n], tb).join(', '));
+  st.setProperty('--tint-h', Math.round(((to[0] - GOLD_HSL[0]) % 360 + 540) % 360 - 180) + 'deg');
+  st.setProperty('--tint-s', (to[1] / GOLD_HSL[1]).toFixed(3));
+  st.setProperty('--tint-b', Math.max(.35, Math.min(1.6, to[2] / GOLD_HSL[2])).toFixed(3));
+}
+/* from: where the colour came from (load, host, sv, hue, hex, rgb, preset, reset); the field being typed in is left alone */
+let colorSave = 0;
+function setColor(hex, from) {
+  hex = hex.toLowerCase(); if (hex[0] !== '#') hex = '#' + hex;
+  if (!/^#[0-9a-f]{6}$/.test(hex)) return;
+  // (a choice not sent yet wins over the launcher's kept one, which is older)
+  if (from === 'host' && colorSave) return;
+  if (from !== 'sv' && from !== 'hue') [CS.h, CS.s, CS.v] = rgbHsv(hexRgb(hex));
+  const was = CS.hex; CS.hex = hex;
+  if (hex !== was || from === 'load') paintColor(hex);
+  drawColor(from);
+  if (from === 'host') { try { localStorage.setItem('triforce.color', hex); } catch { } }
+  else if (from !== 'load' && hex !== was) { clearTimeout(colorSave); colorSave = setTimeout(() => { colorSave = 0; try { localStorage.setItem('triforce.color', CS.hex); } catch { } cmd('color', { hex: CS.hex }); }, 400); }
+}
+function fromHsv(from) { setColor(rgbHex(hsvRgb(CS.h, CS.s, CS.v)), from); }
+/* the row goes under Sounds (or last in the Launcher group), unless the launcher sends one with id 'color' itself */
+function withColorRow(list) {
+  if (!list.length || list.some(r => r.id === 'color')) return list.map(r => r.id === 'color' ? Object.assign({}, r, { kind: 'color' }) : r);
+  let at = list.findIndex(r => r.id === 'sfx');
+  if (at < 0) { at = list.findIndex(r => r.h === 'Launcher'); while (at >= 0 && list[at + 1] && !list[at + 1].h) at++; }
+  return at < 0 ? list : list.slice(0, at + 1).concat({ id: 'color', label: 'Color scheme', kind: 'color' }, list.slice(at + 1));
+}
+function colorValue() { return `<i class="sw" style="background:${CS.hex}"></i>${CS.hex.toUpperCase()}`; }
+function colorRow(r) {
+  const o = CS.open ? ' open' : '', [cr, cg, cb] = hexRgb(CS.hex), field = (id, l, v, n) => `<label>${l}<input data-f id="${id}" value="${v}" maxlength="${n}" spellcheck="false" autocomplete="off"></label>`;
+  return `<div class="row-set cs${o}" data-f data-act="color" id="row-color"><b>${esc(r.label || 'Color scheme')}</b><span>${colorValue()}</span><em>${CS.open ? 'Done' : 'Change'}</em></div>` +
+    `<div class="cpick${o}" id="cpick"><div class="cp"><div><div class="cp-sv" data-f id="cpSv"><u></u></div><div class="slider cp-hue" data-f id="cpHue"><u></u></div></div>` +
+    `<div><div class="cp-f">${field('cpHex', 'Hex', CS.hex.toUpperCase(), 7)}${field('cpR', 'R', cr, 3)}${field('cpG', 'G', cg, 3)}${field('cpB', 'B', cb, 3)}</div><p class="cp-msg" id="cpMsg"></p>` +
+    `<div class="cp-pre">${PRESETS.map(([c, n], i) => `<span data-f data-act="cpre:${c}" id="cpp${i}" title="${n}" style="--c:${c}"></span>`).join('')}</div>` +
+    `<div class="cp-foot"><em id="cpName"></em><span class="lnk" data-f data-act="creset" id="cpReset">Reset to gold</span></div></div></div></div>`;
+}
+function drawColor(from) {
+  const row = $('#row-color'); if (!row) return;
+  row.querySelector('span').innerHTML = colorValue();
+  const sv = $('#cpSv'), hu = $('#cpHue'), [r, g, b] = hexRgb(CS.hex);
+  sv.style.setProperty('--cp-h', CS.h); sv.style.setProperty('--cp-c', CS.hex);
+  sv.querySelector('u').style.left = CS.s * 100 + '%'; sv.querySelector('u').style.top = (1 - CS.v) * 100 + '%';
+  hu.style.setProperty('--cp-c', `hsl(${CS.h}, 100%, 50%)`); hu.querySelector('u').style.left = CS.h / 360 * 100 + '%';
+  if (from !== 'hex') { $('#cpHex').value = CS.hex.toUpperCase(); $('#cpHex').classList.remove('bad'); }
+  if (from !== 'rgb') [['#cpR', r], ['#cpG', g], ['#cpB', b]].forEach(([s, v]) => { $(s).value = v; $(s).classList.remove('bad'); });
+  const p = PRESETS.find(x => x[0] === CS.hex);
+  $$('.cp-pre span').forEach(s => s.classList.toggle('on', s.dataset.act === 'cpre:' + CS.hex));
+  $('#cpName').textContent = p ? p[1] : '';
+  colorMsg();
+}
+function colorMsg() {
+  if (!$('#cpMsg')) return;
+  const hexBad = $('#cpHex').classList.contains('bad'), rgbBad = $$('#cpR, #cpG, #cpB').some(i => i.classList.contains('bad'));
+  const sv = $('#cpSv'), on = focused === sv, held = sv.classList.contains('held');
+  $('#cpMsg').textContent = hexBad ? 'Hex: six digits, 0-9 and A-F, as E0B23E' : rgbBad ? 'R, G and B: whole numbers from 0 to 255'
+    : held ? 'Left / Right: saturation · Up / Down: brightness · A or Enter to let go'
+    : on ? 'Drag in the square, or A / Enter to set it with the arrows' : 'Pick in the square, or type the color';
+  $('#cpMsg').classList.toggle('bad', hexBad || rgbBad);
+}
+function openColor() {
+  CS.open = true; $('#row-color').classList.add('open'); $('#cpick').classList.add('open'); $('#row-color em').textContent = 'Done'; drawColor();
+  setTimeout(() => { const s = $('#set'), p = $('#cpick'); if (!p || !CS.open) return; const over = p.offsetTop + p.offsetHeight - s.scrollTop - s.clientHeight; if (over > 0) s.scrollTop += over; }, 260);
+}
+function closeColor(sound) {
+  if (!CS.open) return;
+  CS.open = false;
+  const row = $('#row-color'), p = $('#cpick'); if (!row || !p) return;
+  const inside = focused && p.contains(focused);
+  row.classList.remove('open'); p.classList.remove('open'); $('#cpSv').classList.remove('held'); row.querySelector('em').textContent = 'Change';
+  drawColor();   // (a half-typed field goes back to the colour)
+  if (sound) sfx(sound);
+  if (inside && screen === 'settings') { focused = null; setFocus(row); }
+}
+function holdSv() { const h = $('#cpSv').classList.toggle('held'); sfx(h ? 'decide' : 'cancel'); colorMsg(); }
+/* arrows on the square (while it is held with Enter / A: left / right saturation, up / down brightness; not held, they move
+   on, as anywhere) and on the hue (left / right, as a slider); down from the open row goes into the picker and up from its
+   top line back to the row (the nearest-by-distance move would skip past it) */
+function colorNudge(dx, dy) {
+  if (!focused) return false;
+  if (focused.id === 'cpHue' && dx) { CS.h = Math.max(0, Math.min(359, CS.h + dx * 5)); fromHsv('hue'); }
+  else if (focused.id === 'cpSv' && focused.classList.contains('held')) { CS.s = clamp01(CS.s + dx * .04); CS.v = clamp01(CS.v + dy * .04); fromHsv('sv'); }
+  else if (CS.open && dy < 0 && focused.id === 'row-color') { setFocus($('#cpSv'), true); return true; }
+  else if (dy > 0 && /^cp(Sv|Hex|[RGB])$/.test(focused.id)) { setFocus($('#row-color'), true); return true; }
+  else return false;
+  sfx('cursor'); return true;
+}
+ACTIONS.color = () => CS.open ? closeColor() : openColor();
+ACTIONS.cpre = (hex) => setColor(hex, 'preset');
+ACTIONS.creset = () => setColor(GOLD, 'reset');
+document.addEventListener('pointerdown', e => {
+  const el = e.target.closest('#cpSv, #cpHue'); if (!el) return;
+  e.preventDefault(); setFocus(el, true);
+  const id = el.id;
+  const mv = ev => {
+    const b = $('#' + id).getBoundingClientRect(), x = clamp01((ev.clientX - b.left) / b.width), y = clamp01((ev.clientY - b.top) / b.height);
+    if (id === 'cpHue') CS.h = Math.round(x * 359); else { CS.s = x; CS.v = 1 - y; }
+    fromHsv(id === 'cpHue' ? 'hue' : 'sv');
+  };
+  mv(e);
+  const up = () => { removeEventListener('pointermove', mv); removeEventListener('pointerup', up); sfx('cursor'); };
+  addEventListener('pointermove', mv); addEventListener('pointerup', up);
+});
+/* typed: a whole valid value is used at once; a wrong one is marked, and put back when the field is left */
+document.addEventListener('input', e => {
+  const t = e.target;
+  if (t.id === 'cpHex') {
+    const v = t.value.trim().replace(/^#/, '');
+    t.classList.toggle('bad', /[^0-9a-f]/i.test(v) || v.length > 6);
+    if (/^[0-9a-f]{6}$/i.test(v)) setColor('#' + v, 'hex');
+    colorMsg();
+  } else if (/^cp[RGB]$/.test(t.id)) {
+    const f = $$('#cpR, #cpG, #cpB'), ok = i => /^\d{1,3}$/.test(i.value.trim()) && +i.value <= 255;
+    t.classList.toggle('bad', t.value.trim() !== '' && !ok(t));
+    if (f.every(ok)) setColor(rgbHex(f.map(i => +i.value)), 'rgb');
+    colorMsg();
+  }
+});
+document.addEventListener('focusout', e => { if (/^cp(Hex|[RGB])$/.test(e.target.id)) drawColor(); });
+try { const c = localStorage.getItem('triforce.color'); if (c && /^#[0-9a-f]{6}$/.test(c)) setColor(c, 'load'); } catch { }
 
 /* ---------------- benchmark ---------------- */
 /* a scene's frame times (ms) as a small line: higher = slower, the 16.7 ms line (60 fps) dashed */
@@ -491,6 +774,7 @@ onHost(m => {
       const had = { music: S.media.music, sfx: S.media.sfx };
       for (const k in m) if (k !== 't') S[k] = m[k];
       if (m.sound) { setVol('music', S.sound.music, true); setVol('sfx', S.sound.sfx, true); }
+      if (typeof m.color === 'string') setColor(m.color, 'host');
       if (m.media) {
         document.documentElement.classList.toggle('noart', !S.media.art);
         if (S.media.art) $$('.gamelogo').forEach(i => { if (!i.complete || !i.naturalWidth) i.src = 'img/game/Logo_USEU_00.png?' + (S.media.v || ''); });
@@ -519,7 +803,9 @@ document.addEventListener('keydown', e => {
   if (e.key === 'F2' && !HOST) { e.preventDefault(); return toggleJump(); }
   if (document.activeElement && document.activeElement.tagName === 'INPUT' && !['Escape', 'Enter', 'ArrowDown', 'ArrowUp', 'Tab'].includes(e.key)) return;
   const k = e.key; let used = true;
-  if (focused && focused.dataset.vol && (k === 'ArrowLeft' || k === 'ArrowRight')) { setVol(focused.dataset.vol, S.sound[focused.dataset.vol] + (k === 'ArrowLeft' ? -.05 : .05)); sfx('cursor'); }
+  const ca = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, 1], ArrowDown: [0, -1] }[k];
+  if (ca && colorNudge(ca[0], ca[1])) { }   // (the colour picker's square and hue take the arrows first)
+  else if (focused && focused.dataset.vol && (k === 'ArrowLeft' || k === 'ArrowRight')) { setVol(focused.dataset.vol, S.sound[focused.dataset.vol] + (k === 'ArrowLeft' ? -.05 : .05)); sfx('cursor'); }
   else if (focused && focused.dataset.gkey && (k === 'ArrowLeft' || k === 'ArrowRight')) gNudge(k === 'ArrowLeft' ? -1 : 1);
   else if (k === 'ArrowLeft') move(-1, 0); else if (k === 'ArrowRight') move(1, 0);
   else if (k === 'ArrowUp') move(0, -1); else if (k === 'ArrowDown') move(0, 1);
@@ -539,18 +825,21 @@ function pad(t) {
   const gp = [...(navigator.getGamepads ? navigator.getGamepads() : [])].find(g => g && g.connected); if (!gp) return;
   const B = i => gp.buttons[i] && gp.buttons[i].pressed;
   const edge = (i, fn) => { const p = B(i); if (p && !held[i]) { document.body.classList.add('kb'); unlocked = true; fn(); } held[i] = p; };
-  const slide = d => { if (focused && focused.dataset.vol) { setVol(focused.dataset.vol, S.sound[focused.dataset.vol] + d * .05); sfx('cursor'); return true; } return gNudge(d); };
+  const slide = d => { if (colorNudge(d, 0)) return true; if (focused && focused.dataset.vol) { setVol(focused.dataset.vol, S.sound[focused.dataset.vol] + d * .05); sfx('cursor'); return true; } return gNudge(d); };
   edge(0, () => activate(focused)); edge(1, back); edge(4, () => tab(-1)); edge(5, () => tab(1));
   edge(3, toggleMute); edge(9, () => { if (MAIN.includes(screen)) go('settings'); });
-  edge(12, () => move(0, -1)); edge(13, () => move(0, 1)); edge(14, () => slide(-1) || move(-1, 0)); edge(15, () => slide(1) || move(1, 0));
+  edge(12, () => colorNudge(0, 1) || move(0, -1)); edge(13, () => colorNudge(0, -1) || move(0, 1)); edge(14, () => slide(-1) || move(-1, 0)); edge(15, () => slide(1) || move(1, 0));
   const x = gp.axes[0] || 0, y = gp.axes[1] || 0, dir = Math.abs(x) > .55 ? (x > 0 ? 'r' : 'l') : Math.abs(y) > .55 ? (y > 0 ? 'd' : 'u') : '';
   if (dir && (dir !== stickDir || t - stickAt > 220)) {
     document.body.classList.add('kb'); stickAt = t + (dir !== stickDir ? 160 : 0);
-    ({ l: () => slide(-1) || move(-1, 0), r: () => slide(1) || move(1, 0), u: () => move(0, -1), d: () => move(0, 1) })[dir]();
+    ({ l: () => slide(-1) || move(-1, 0), r: () => slide(1) || move(1, 0), u: () => colorNudge(0, 1) || move(0, -1), d: () => colorNudge(0, -1) || move(0, 1) })[dir]();
   }
   stickDir = dir;
 }
-function frame(t) { audioTick(t); pad(t); requestAnimationFrame(frame); }
+// ((Triforce, 11-19) #bug-tracker "launcher has no music" (menu sounds fine, an Xbox controller): the next frame is asked for
+// first, so an error in one frame's work no longer ends the loop. It did: pad threw once at the start (focusables, above), the
+// loop stopped, and audioTick, which fades the music in from 0, never ran again)
+function frame(t) { requestAnimationFrame(frame); audioTick(t); pad(t); }
 requestAnimationFrame(frame);
 
 /* ---------------- preview only: jump to a screen (the stand-in plays along) ---------------- */

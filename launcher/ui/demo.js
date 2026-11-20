@@ -84,7 +84,7 @@
     { id: 'c', name: 'Sample: Brighter nights', sub: 'Lighting · sample data', state: 'get' }, { id: 'd', name: 'Sample: Faster text', sub: 'Gameplay · sample data', state: 'get' },
     { id: 'e', name: 'Sample: Ocarina notes on screen', sub: 'Interface · sample data', state: 'get' },
   ];
-  const MINE = [{ id: 'm1', name: 'Sample: Quieter Navi', sub: 'In your mods folder', state: 'on', removable: true }, { id: 'm2', name: 'Sample: Tunic recolour', sub: 'In your mods folder', state: 'off', removable: true }];
+  const MINE = [{ id: 'm1', name: 'Sample: Quieter Navi', sub: 'In your mods folder', state: 'on', removable: true }, { id: 'm2', name: 'Sample: Tunic recolor', sub: 'In your mods folder', state: 'off', removable: true }];
   function mods(tab, q) {
     const items = (tab === 'mine' ? MINE : MODS).filter(m => !q || m.name.toLowerCase().includes(q.toLowerCase()));
     emit({ t: 'state', mods: { tab, items, loaded: true, note: tab === 'mine' ? 'Changes take effect after the game is built again: <b>about 6 minutes</b>.' : '' } });

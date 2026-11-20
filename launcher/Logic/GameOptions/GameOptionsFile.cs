@@ -267,6 +267,10 @@ public sealed class GameOptionsFile : IGameOptionValues
                 write[GameOptionsSchema.ResolutionKey] = (Atoi(dyn) != 0 ? 0 : 1).ToString(CultureInfo.InvariantCulture);
         }
         foreach (var (k, v) in set) write[k] = v.ToString(CultureInfo.InvariantCulture);
+        // ((Triforce) 11-20) the GPU device row's card by its name too: the game finds it by the name first, so the number
+        // counted in Windows' order (no triforce_gpus.txt before the game's first run) no longer picks another card. Auto: empty
+        if (set.TryGetValue(GameOptionsSchema.GpuKey, out var gpu))
+            write[GameOptionsSchema.GpuNameKey] = (GameOptionsSchema.GpuNameOf(gpu) ?? "").Replace('\r', ' ').Replace('\n', ' ');
         var bump = !exists || !hasVersion || Atoi(vs!) < GameOptionsSchema.CurrentVersion;
         if (bump) write[GameOptionsSchema.VersionKey] = GameOptionsSchema.CurrentVersion.ToString(CultureInfo.InvariantCulture);
 

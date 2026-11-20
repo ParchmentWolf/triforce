@@ -222,6 +222,11 @@ VkBufferView texel_buffer_view(const nvn_tex* t, const nvn_view* v, bool storage
 Texture* texture_for_present(const nvn_tex* t);
 /// Ages the cache by one present; images nothing used for a while go, after the work that last read them
 void texture_frame(uint64_t completed_value);
+/// ((Triforce) tex_warm.h, RX_VK_TEX_WARM: a slot registered, noted; at a submission's start after a light frame, the noted
+/// textures made and uploaded ahead)
+bool texture_warm_on();   // ((Triforce) RX_VK_TEX_WARM: tex_warm.h)
+void texture_warm_note(int slot);
+void texture_warm_step(int64_t last_frame_work);
 void texture_released(const nvn_tex* t);
 /// (diagnostics: what guest memory holds of a texture's storage now, level by level, logged)
 void texture_log_guest(const Texture* t);

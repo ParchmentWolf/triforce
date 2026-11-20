@@ -57,6 +57,7 @@ typedef struct {
     double seconds, avg, low1, low01, max_ms;
     float points[GRAPH_POINTS];
     int npoints;
+    int scene;   /* ((Triforce, 11-19) the scene it measured: a scene skipped before it shifts no name */
 } Result;
 typedef struct { uint64_t screen, vt; int stage, presses, focus_asks; int64_t press_ns, ask_ns; } Screen;
 
@@ -85,6 +86,7 @@ static struct {
     uint32_t ring_n;
     Result results[MAX_SCENES];
     int nresults;
+    int skipped[MAX_SCENES], nskipped;   /* ((Triforce, 11-19) the scenes left out: skip_scene */
     char error[160];
     int written, closing;
     int64_t end_ns;
@@ -256,6 +258,7 @@ static void scene_done(void) {   /* (under the lock) */
     if (B.nresults >= MAX_SCENES) return;
     Result *r = &B.results[B.nresults++];
     memset(r, 0, sizeof *r);
+    r->scene = B.scene;
     r->frames = B.n;
     int64_t sum = 0;
     for (int i = 0; i < B.n; i++) sum += B.iv[i];
@@ -281,7 +284,7 @@ static void scene_done(void) {   /* (under the lock) */
         }
     }
     hos_log("benchmark: scene %d of %d, %s: %.1f fps average, 1%% low %.1f, 0.1%% low %.1f, %d frames in %.2f s", B.nresults,
-            B.nscenes, B.scenes[B.nresults - 1].name, r->avg, r->low1, r->low01, r->frames, r->seconds);
+            B.nscenes, B.scenes[r->scene].name, r->avg, r->low1, r->low01, r->frames, r->seconds);
 }
 static void json_text(FILE *f, const char *s) {
     fputc('"', f);
@@ -354,12 +357,14 @@ static void write_results(int stopped) {   /* (under the lock; once) */
     for (int i = 0; i < B.nresults; i++) {
         const Result *r = &B.results[i];
         fprintf(f, "%s{\"name\":", i ? "," : "");
-        json_text(f, B.scenes[i].name);
+        json_text(f, B.scenes[r->scene].name);
         fprintf(f, ",\"avg\":%.2f,\"low1\":%.2f,\"low01\":%.2f,\"frames\":%d,\"seconds\":%.3f,\"max_ms\":%.2f,\"frametimes_ms\":[",
                 bench_finite(r->avg), bench_finite(r->low1), bench_finite(r->low01), r->frames, bench_finite(r->seconds), bench_finite(r->max_ms));
         for (int p = 0; p < r->npoints; p++) fprintf(f, "%s%.2f", p ? "," : "", bench_finite(r->points[p]));
         fprintf(f, "]}");
     }
+    fprintf(f, "],\"skipped\":[");
+    for (int i = 0; i < B.nskipped; i++) fprintf(f, "%s", i ? "," : ""), json_text(f, B.scenes[B.skipped[i]].name);
     fprintf(f, "],\"settings\":");
     json_settings(f);
     fprintf(f, "}\n");
@@ -378,6 +383,28 @@ static void fail(int64_t now, const char *why) {   /* (under the lock) */
     hos_log("benchmark: FAILED: %s", why);
     B.phase = MKWVK_BENCH_FAILED, B.end_ns = now;
     write_results(1);
+}
+/* ((Triforce, 11-19) #bug-tracker "Game kept refusing to teleport to Lake Hylia while running the benchmark" (RTX 5090): one place
+   the game would not take Link to failed the whole run. A place it refuses (an event or a fight keeps the event manager busy)
+   or never arrives at is left out now, said in the log and the results' "skipped", and the tour goes on; it fails only
+   when nothing at all was measured (under the lock) */
+static void go_scene(int64_t now);
+static void skip_scene(int64_t now, const char *why) {
+    if (B.phase >= MKWVK_BENCH_DONE) return;
+    hos_log("benchmark: %s %s: left out, the tour goes on", why, B.scenes[B.scene].name);
+    if (B.nskipped < MAX_SCENES) B.skipped[B.nskipped++] = B.scene;
+    if (++B.scene < B.nscenes) {
+        go_scene(now);
+        return;
+    }
+    if (B.nresults) {
+        B.phase = MKWVK_BENCH_DONE, B.end_ns = now;
+        write_results(0);
+    } else {
+        char msg[160];
+        snprintf(msg, sizeof msg, "%s %s", why, B.scenes[B.scene - 1].name);
+        fail(now, msg);
+    }
 }
 static void stop(int64_t now, const char *why) {   /* (under the lock) */
     if (B.phase >= MKWVK_BENCH_DONE) return;
@@ -484,9 +511,7 @@ int hos_bench_link(int64_t now, uint64_t actor, const char *map, int loading, in
                 B.phase = MKWVK_BENCH_SETTLE, B.t_phase = now;
             } else if (!B.saw_load && now - B.sent_ns > 12000000000LL) {
                 if (++B.resends > 3) {
-                    char why[160];
-                    snprintf(why, sizeof why, "The benchmark could not reach %s", B.scenes[B.scene].name);
-                    fail(now, why);
+                    skip_scene(now, "The benchmark could not reach");
                 } else {
                     hos_log("benchmark: no map change 12 s after the teleport to %s: asked again", B.scenes[B.scene].name);
                     B.want = 1, B.retry_ns = 0;
@@ -504,10 +529,8 @@ void hos_bench_teleport_sent(int index, int ok) {
     if (B.phase == MKWVK_BENCH_TRAVEL && B.want) {
         if (ok) {
             B.want = 0, B.sent_ns = now, B.saw_load = 0;
-        } else if (++B.tries > 60) {   /* (an event playing refuses it: asked again every half second, 30 s at most) */
-            char why[160];
-            snprintf(why, sizeof why, "The game kept refusing the teleport to %s", B.scenes[B.scene].name);
-            fail(now, why);
+        } else if (++B.tries > 20) {   /* (an event playing refuses it: asked again every half second, 10 s at most, then left out) */
+            skip_scene(now, "The game kept refusing the teleport to");
         } else {
             B.retry_ns = now + 500000000LL;
         }

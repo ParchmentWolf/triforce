@@ -58,6 +58,10 @@ cp -a third_party/kenney_input "$T/third_party/"
 # ((Triforce) v0.5.0: SMAA's lookup textures, which gpu/vk/vk_aa.cpp includes: left out of v0.5.0's first AppImage, and every
 # Linux build stopped at vk_aa.cpp. scripts/linux/check_player_build.sh now checks every relative include of the image's sources)
 cp -a third_party/smaa "$T/third_party/"
+# ((Triforce) 11-20, ticket "launcher error when updating on 0.5.2 from 0.3.7": AMD FSR 4's API headers, which gpu/vk/vk_fsr4.cpp
+# includes when the build has FSR 4 (--fsr, HOOKSHOT_FSR=1, or --update of a folder built with it): left out, and the update of
+# such a folder stopped at vk_fsr4.cpp ("api/include/ffx_api.h file not found"))
+cp -a third_party/fidelityfx "$T/third_party/"
 # (NVIDIA DLSS, when ticked in the builder: scripts/ngx_sdk.py and the Vulkan back end's sources, compiled with HOOKSHOT_NGX_SDK)
 mkdir -p "$T/scripts"
 cp scripts/ngx_sdk.py "$T/scripts/"
@@ -98,6 +102,8 @@ mkdir -p "$T/licenses/imgui" "$T/licenses/zstd" "$T/licenses/libertinus"
 cp third_party/imgui/LICENSE.txt third_party/imgui/PROVENANCE.md "$T/licenses/imgui/"
 cp third_party/zstd/LICENSE third_party/zstd/PROVENANCE.md "$T/licenses/zstd/"
 cp third_party/fonts/libertinus/OFL.txt third_party/fonts/PROVENANCE.md "$T/licenses/libertinus/"
+mkdir -p "$T/licenses/fidelityfx"
+cp third_party/fidelityfx/LICENSE.md "$T/licenses/fidelityfx/"
 # ---- end of the licences ----
 
 # the sysroot: this system's C library (headers, start files, the libraries to link against) and GCC's runtime pieces

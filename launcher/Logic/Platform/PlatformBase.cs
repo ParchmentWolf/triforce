@@ -27,6 +27,7 @@ public abstract class PlatformBase : IPlatform
     public abstract string LogFolder(string home);
     public abstract string NgxSdkFolder(string home);
     public abstract string SaveFolder(string game, string uid);
+    public abstract string UserFolder(string game);
     public abstract (string Roaming, string Local) EmulatorDataRoots { get; }
     public abstract IReadOnlyList<string> SteamRoots();
     public abstract string ShortcutPath(ShortcutPlace place);

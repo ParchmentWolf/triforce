@@ -80,6 +80,17 @@ class NgxRuntimeTests(unittest.TestCase):
         self.assertTrue(make_game.fsr_wanted(update, out))
         self.assertFalse(make_game.fsr_wanted(SimpleNamespace(fsr=False, no_fsr=True, update=out), out))
         self.assertFalse(make_game.fsr_wanted(plain, out))   # (a new build without --fsr: the mark is for --update only)
+        # ((Triforce) 11-20) HOOKSHOT_FSR=1 in the environment asks for it as --fsr does; --no-fsr still wins
+        saved = os.environ.get("HOOKSHOT_FSR")
+        try:
+            os.environ["HOOKSHOT_FSR"] = "1"
+            self.assertTrue(make_game.fsr_wanted(plain, out))
+            self.assertFalse(make_game.fsr_wanted(SimpleNamespace(fsr=False, no_fsr=True, update=None), out))
+        finally:
+            if saved is None:
+                os.environ.pop("HOOKSHOT_FSR", None)
+            else:
+                os.environ["HOOKSHOT_FSR"] = saved
 
     def test_linux_runtime(self):
         self.sdk_files("linux")

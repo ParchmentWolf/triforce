@@ -6,14 +6,16 @@ namespace Triforce.Launcher;
 
 /// <summary>The Settings page (DESIGN 6 Settings): a plain list in groups, Launcher, Game, Shortcuts, Help, Remove. The page
 /// draws the list the launcher sends (state "settings"); pressing a row sends cmd 'setting' {id}. The two volume sliders are the
-/// page's and the core's ('sound'); they are only listed here. The benchmark (Backend.Bench.cs) is offered once a game is built.</summary>
+/// page's and the core's ('sound'); they are only listed here. The Color scheme row under them is the page's own (ui/app.js adds
+/// it): its 'color' {hex} is kept by the core (LauncherColorChoice, Settings.Color) and comes back as state.color at start and
+/// with the list. The benchmark (Backend.Bench.cs) is offered once a game is built.</summary>
 public sealed partial class Backend
 {
     const string DiscordUrl = "https://discord.gg/triforce";
 
     partial void RegisterSettings()
     {
-        On("settings.list", _ => SendSettings());
+        On("settings.list", _ => SendSettings(color: true));
         On("setting", m => SettingPressed((string?)m["id"] ?? (string?)m["arg"]));
         On("settings.lang", m => LanguageChosen((string?)m["id"]));
         On("settings.dlss", m =>
@@ -40,10 +42,13 @@ public sealed partial class Backend
         state["gameopts"] = GameOptsState();
     }
 
-    void SendSettings()
+    /// <summary>The list again. color: the kept color too, as at start (only when the page asks for the list, which it does each time
+    /// the Settings page opens; not after a row's change, so a color still being chosen there is not set back).</summary>
+    void SendSettings(bool color = false)
     {
         var o = new JsonObject();
         AddSettingsState(o);
+        if (color) o["color"] = colorChoice.Current;
         SendState(o);
     }
 
@@ -92,7 +97,11 @@ public sealed partial class Backend
         rows.Add(SteamRow(game));
 
         rows.Add(Head("Help"));
-        rows.Add(Row("log", "Log folder", ctx.Platform.LogFolder(ctx.Home), "Open"));
+        // ((Triforce) 11-20, ticket "The log button brings me to the wrong folder": the game writes triforce_log.txt (and .1 to .4)
+        // beside its program in the game folder, which is what a bug report asks for; the launcher's own log is elsewhere)
+        var gameLogs = GameLogFolder(game);
+        rows.Add(Row("gamelog", "Game logs", gameLogs ?? "Build the game first", "Open", off: gameLogs == null));
+        rows.Add(Row("log", "Launcher log", ctx.Platform.LogFolder(ctx.Home), "Open"));
         rows.Add(Row("report", "Report", "What to paste when you ask for help", "Copy"));
         rows.Add(Row("discord", "Discord", "discord.gg/triforce", "Open"));
         rows.Add(Row("versions", "Versions", VersionsLine(game), "Copy"));
@@ -103,6 +112,11 @@ public sealed partial class Backend
     }
 
     static string Capital(string s) => s.Length > 0 ? char.ToUpperInvariant(s[0]) + s.Substring(1) : s;
+
+    /// <summary>((Triforce) 11-20) The folder the game writes triforce_log.txt in: its program's (Game.FindExe: the game folder on
+    /// Windows, bin/ under it on Linux with the launcher script). Null without a built game.</summary>
+    string? GameLogFolder(string? game) =>
+        game != null && new Game(ctx).FindExe(game) is { } exe ? Path.GetDirectoryName(exe) : null;
 
     string VersionsLine(string? game) =>
         "launcher " + BuildInfo.Version + " · tools " + (new Tools(ctx).InstalledVersion ?? "none") + " · game " + (game != null ? Game.BuiltVersion(game) ?? "unknown" : "not built");
@@ -173,6 +187,9 @@ public sealed partial class Backend
                 break;
             case "log":
                 OpenPlace(ctx.Platform.LogFolder(ctx.Home));
+                break;
+            case "gamelog":
+                if (GameLogFolder(game) is { } logs) OpenPlace(logs);
                 break;
             case "report":
                 Copy(SettingsReport(game));

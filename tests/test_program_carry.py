@@ -445,9 +445,9 @@ DENIED = [r"\bShader::", r"\busing\s+namespace\b", r"\bEnv\b",
           r"fallback_task|stages)\s*(?:=[^=]|\+=|\.push_back|\.emplace_back|\.clear|\.resize)"]
 FIRSTS = ["spirv_crc32", "DiskRecord", "disk_init", "ra_mu", "program_cache_load_some"]
 HOST_CALLS = {"gpu_read", "gpu_guest", "gpu_ptr", "guest_base", "guest_size", "depth_minus_w"}
-# (vk_bank.cpp's marked parts, by the first name each defines. None on this branch: epicmemes46's 5df76bb marks the samplers'
-# generation for its texture LOD bias (sampler_bias_changed), which this branch has not taken; with it, ["sampler_bias_changed"])
-BANK_FIRSTS = []
+# (vk_bank.cpp's marked parts, by the first name each defines: the samplers' generation moved for the texture LOD bias, which only
+# vk_draw.cpp's sampler_for reads)
+BANK_FIRSTS = ["sampler_bias_changed"]
 MARKED = {"vk_shader.cpp": FIRSTS, "vk_bank.cpp": BANK_FIRSTS}
 # (what a translation reaches in vk_bank.cpp, at the least: what vk_shader.cpp calls, and what those read)
 BANK_REACHED = {"seed_cs_control", "compute_ssbo_table", "seed_cs_buffer_word", "texture_slot_version", "registrations_generation",

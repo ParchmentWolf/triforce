@@ -1,5 +1,5 @@
 // Saves of this game (Ocarina of Time, 0400486024DEC000), wherever they are (old setup/Saves.cs, Shell.Saves.cs): Triforce keeps
-// them in <game>\user\save\<uid> (Linux: ~/.local/share/hookshot/save/<uid>, host/hos_main.c saves_dir), emulators in their NAND
+// them in <game>\user\save\<uid> (Linux: ~/.local/share/triforce/user/save/<uid>, host/hos_main.c saves_dir; older builds ~/.local/share/hookshot), emulators in their NAND
 // (Eden, yuzu, suyu, sudachi, citron, torzu, EvilOOT: nand\user\save\0000000000000000\<user>\0400486024DEC000) or Ryujinx's
 // bis\user\save\<index>\0, NX2navi in its game folder's profile (NaviSave). The files are the same everywhere (account.sav,
 // option.sav, slot_00..05\caption.sav + progress.sav), so bringing saves in or out is a copy, with what gets replaced backed up first.

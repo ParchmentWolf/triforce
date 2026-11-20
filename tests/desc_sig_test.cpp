@@ -123,7 +123,7 @@ VkImageView texture_view_of(uint32_t h, VkImageViewType vt, ViewUse use, VkForma
     *tex = &textures[slot & 15];
     return handle<VkImageView>(v | 1);
 }
-VkSampler sampler_for(int id, bool compare) {
+VkSampler sampler_for(int id, bool compare, bool) {   // ((Triforce, S8) the scene flag: a draw's own, none here)
     w.samplers++;
     if (w.sampler_fail) return VK_NULL_HANDLE;
     return handle<VkSampler>(0x7000000ull | (uint64_t)id << 8 | (uint64_t)compare << 4 | w.samp << 32 | w.bias);
@@ -240,7 +240,7 @@ Built build(const NvnState& s, const Program& p) {
                 const uint32_t h = sampled_handle(s, st, c, k);
                 Texture* tex = nullptr;
                 VkImageView view = VK_NULL_HANDLE;
-                const VkSampler smp = kept_texture(kp, jb + k, h, VK_IMAGE_VIEW_TYPE_2D, c.is_depth, false, &view, &tex);
+                const VkSampler smp = kept_texture(kp, jb + k, h, VK_IMAGE_VIEW_TYPE_2D, c.is_depth, false, false, &view, &tex);
                 if (view && tex) b.tex.push_back(tex);
                 if (view && tex && tex->gpu_written) draw_sampled().push_back(tex);
                 if (!view) view = handle<VkImageView>(0xD0);   // (the dummy)

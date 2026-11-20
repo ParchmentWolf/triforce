@@ -17,6 +17,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Logic\Triforce.Logic.csproj" />
+    <!-- (the game's media decoders, for the music loop's tests: on sounds the tests make, never a game's) -->
+    <ProjectReference Include="..\Core\Triforce.Core.csproj" />
   </ItemGroup>
 
 </Project>

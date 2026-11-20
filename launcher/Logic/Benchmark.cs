@@ -33,7 +33,11 @@ public sealed record PlaceResult(string Place, double AverageFps, double OnePerc
 }
 
 /// <summary>One benchmark run as the game wrote it.</summary>
-public sealed record BenchRun(IReadOnlyList<PlaceResult> Scenes, string? Gpu, bool Stopped, string? Error, TimeSpan Took);
+public sealed record BenchRun(IReadOnlyList<PlaceResult> Scenes, string? Gpu, bool Stopped, string? Error, TimeSpan Took)
+{
+    /// <summary>((Triforce, 11-19) the places the game would not take Link to, left out (host/hos_bench.c skip_scene)</summary>
+    public IReadOnlyList<string> Skipped { get; init; } = Array.Empty<string>();
+}
 
 /// <summary>A setting the benchmark would change: its triforce_options.ini key, the menu's row name, the value now and the
 /// recommended one (the App shows them with the menu's own labels).</summary>
@@ -72,6 +76,7 @@ public sealed class Benchmark : IBenchmarkRunner
     // 3 FSR 3.1, 4 FSR 4. resolution: 3 = 67 % (Quality), 5 = 58 % (Balanced), 4 = 50 % (Performance). quality_preset 0 Custom.
     static readonly (int value, int fps)[] Caps = { (0, 60), (2, 120), (3, 144), (5, 240) };
     public const int UpGame = 0, UpDlss = 1, UpFsr3 = 3, ResQuality = 3, ResBalanced = 5, CapUncapped = 5;
+    public const int SteadyRefreshSteps = 2;   // (fps_cap.h: 0 Off, 1 Any rate, 2 Refresh steps)
 
     public string WorkFolder => Path.Combine(ctx.WorkFolder, "benchmark");
     string Marker => Path.Combine(WorkFolder, "restore.txt");
@@ -156,7 +161,7 @@ public sealed class Benchmark : IBenchmarkRunner
         RestoreIfLeft();
         var userCopy = Path.Combine(WorkFolder, "user");
         if (Directory.Exists(userCopy)) Directory.Delete(userCopy, true);
-        CopyUser(Path.Combine(game, "user"), userCopy);
+        CopyUser(ctx.Platform.UserFolder(game), userCopy);   // ((Triforce) 11-19: on Linux it is outside the game folder)
         var backup = Path.Combine(WorkFolder, "options.backup.ini");
         var hadOptions = File.Exists(ini);
         if (hadOptions) File.Copy(ini, backup, true);
@@ -238,9 +243,12 @@ public sealed class Benchmark : IBenchmarkRunner
                 if (s.TryGetProperty("frametimes_ms", out var f)) foreach (var x in f.EnumerateArray()) if (x.TryGetDouble(out var d)) ft.Add(d);
                 scenes.Add(new PlaceResult(s.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "", D("avg"), D("low1"), false) { Low01 = D("low01"), FrameTimes = ft });
             }
+        var skipped = new List<string>();
+        if (r.TryGetProperty("skipped", out var sk) && sk.ValueKind == System.Text.Json.JsonValueKind.Array)
+            foreach (var x in sk.EnumerateArray()) if (x.GetString() is { Length: > 0 } name) skipped.Add(name);
         return new BenchRun(scenes, r.TryGetProperty("gpu", out var gpu) ? gpu.GetString() : null,
             r.TryGetProperty("stopped", out var st) && st.ValueKind == System.Text.Json.JsonValueKind.True,
-            r.TryGetProperty("error", out var er) ? er.GetString() : null, took);
+            r.TryGetProperty("error", out var er) ? er.GetString() : null, took) { Skipped = skipped };
     }
 
     /// <summary>The old interface: one run, then the rules (the App runs the upscaler pass on its own, when asked).</summary>
@@ -249,7 +257,7 @@ public sealed class Benchmark : IBenchmarkRunner
         var now = BenchIni.Read(OptionsOf(request.GameFolder));
         var run = await RunOnceAsync(request.GameFolder, null, progress, token);
         var recs = Recommend(now, run.Scenes, null, null, DisplayHz());
-        return new BenchmarkResult(run.Scenes, null, null, recs, Summary(run.Scenes, null, null), run.Took);
+        return new BenchmarkResult(run.Scenes, null, null, recs, Summary(run.Scenes, null, null) + SkippedNote(run.Skipped), run.Took);
     }
 
     static void CopyUser(string from, string to)
@@ -282,15 +290,21 @@ public sealed class Benchmark : IBenchmarkRunner
         foreach (var (value, fps) in Caps)
             if (worstLow >= fps && (displayHz <= 0 || fps <= displayHz + 1)) cap = value;
         recs.Add(new SettingChange(KCap, "Game frame rate cap", Now(KCap, 0), cap));
-        // steady frame rate: on where the lows fall under 80 % of the average anywhere
+        // steady frame rate: on where the lows fall under 80 % of the average anywhere. ((Triforce) 11-19, ticket "screen tearing":
+        // "Any rate" (1) held 36 fps on an RTX 2060 Max-Q's 60 Hz screen, frames shown for one refresh, then two: uneven, seen as
+        // tearing. "Refresh steps" (2) holds rates that divide the refresh (60, 30), even on a screen without G-Sync/FreeSync)
         var uneven = chosen.Any(r => r.OnePercentLow < r.AverageFps * 0.8);
-        recs.Add(new SettingChange(KSteady, "Steady frame rate", Now(KSteady, 0), uneven ? 1 : Now(KSteady, 0)));
+        recs.Add(new SettingChange(KSteady, "Steady frame rate", Now(KSteady, 0), uneven ? SteadyRefreshSteps : Now(KSteady, 0)));
         // frame generation: never turned on by this (DESIGN 12: only below 60 with DLSS-G / FSR 4 FG, not measured yet)
         recs.Add(new SettingChange(KFrameGen, "Frame generation", Now(KFrameGen, 0), Now(KFrameGen, 0)));
         if (recs.Any(r => r.Changes && (r.Key == KUpscaler || r.Key == KResolution)))
             recs.Add(new SettingChange(KPreset, "Quality preset", Now(KPreset, 0), 0));
         return recs;
     }
+
+    /// <summary>((Triforce, 11-19) the verdict's note for places left out ("" when none)</summary>
+    public static string SkippedNote(IReadOnlyList<string> skipped) => skipped.Count == 0 ? ""
+        : " " + string.Join(" and ", skipped) + (skipped.Count == 1 ? " was" : " were") + " left out: the game would not take Link there from your save.";
 
     public static string Summary(IReadOnlyList<PlaceResult> p1, IReadOnlyList<PlaceResult>? p2, string? second)
     {

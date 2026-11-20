@@ -845,14 +845,24 @@ bool download_unpack(const Mod& m, const File& f, const std::string& stage_dir) 
     const std::string archive = stage_dir + "\\" + name;
     logf("mods: installing %s (%d), file %s (%llu bytes) from %s", m.name.c_str(), m.id, f.name.c_str(), (unsigned long long)f.bytes, f.url.c_str());
     // (download, the progress as it comes)
+    // ((Triforce) 11-19, ticket "Mods not installing": "no answer from https://gamebanana.com/dl/... (error 12002)", WinHTTP's
+    // timeout, twice for one player while GameBanana answered here in half a second. A download that got no answer or stopped is
+    // tried again from the start, three times in all, 2 and 5 s apart; each try and the outcome go to the log)
+    std::string err;
+    bool got = false, written = true;
+    for (int attempt = 1;; attempt++) {
     HANDLE out = CreateFileW(wide(archive).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (out == INVALID_HANDLE_VALUE) { set_state(Job::Failed, "Could not write in " + root + " (error " + std::to_string(GetLastError()) + ")."); return false; }
-    std::string err;
+    {
+        std::lock_guard<std::mutex> g(mu);
+        inst.done = 0, inst.rate = 0;
+    }
+    err.clear();
     auto t0 = std::chrono::steady_clock::now();
     auto last = t0;
     uint64_t last_done = 0;
-    bool written = true;
-    const bool got = get(f.url, [&](const char* p, size_t n, uint64_t length) {
+    written = true;
+    got = get(f.url, [&](const char* p, size_t n, uint64_t length) {
         DWORD put = 0;
         if (!WriteFile(out, p, (DWORD)n, &put, nullptr) || put != n) { written = false; return false; }
         std::lock_guard<std::mutex> g(mu);
@@ -868,8 +878,15 @@ bool download_unpack(const Mod& m, const File& f, const std::string& stage_dir) 
         return !cancel_flag.load();
     }, &err);
     CloseHandle(out);
-    if (cancel_flag.load()) { remove_tree(stage_dir); set_state(Job::Cancelled, "Cancelled: nothing was installed."); return false; }
+    if (got || !written || cancel_flag.load() || attempt >= 3 ||
+        (err.rfind("no answer", 0) != 0 && err.rfind("the download stopped", 0) != 0 && err.rfind("could not reach", 0) != 0))
+        break;
+    logf("mods: %s: try %d of 3 failed (%s), trying again", m.name.c_str(), attempt, err.c_str());
+    for (int w = 0; w < (attempt == 1 ? 20 : 50) && !cancel_flag.load(); w++) Sleep(100);
+    }
+    if (cancel_flag.load()) { remove_tree(stage_dir); logf("mods: %s: cancelled", m.name.c_str()); set_state(Job::Cancelled, "Cancelled: nothing was installed."); return false; }
     if (!got || !written) {
+        logf("mods: %s: not installed: %s", m.name.c_str(), !written ? "the file could not be written" : err.c_str());
         remove_tree(stage_dir);
         set_state(Job::Failed, !written ? "The file could not be written (is the drive full?)." : "The download failed: " + err + ".");
         return false;

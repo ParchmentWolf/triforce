@@ -48,8 +48,11 @@ public interface IPlatform
     string LogFolder(string home);
     /// <summary>Where NVIDIA's DLSS SDK is fetched to: beside the tools, never inside them (an update replaces those whole).</summary>
     string NgxSdkFolder(string home);
-    /// <summary>The save folder of a game folder: Windows &lt;game&gt;\user\save\&lt;uid&gt;; Linux ${XDG_DATA_HOME}/hookshot/save/&lt;uid&gt;.</summary>
+    /// <summary>The save folder of a game folder: Windows &lt;game&gt;\user\save\&lt;uid&gt;; Linux &lt;UserFolder&gt;/save/&lt;uid&gt;.</summary>
     string SaveFolder(string game, string uid);
+    /// <summary>The game's user folder (its saves, their commits, its options): what --user names. Windows &lt;game&gt;\user;
+    /// Linux ${XDG_DATA_HOME}/triforce/user, or the folder an older build used while the game has not moved it yet.</summary>
+    string UserFolder(string game);
     /// <summary>The folders emulators keep their data in: (Roaming, Local) on Windows; (data, config) on Linux.</summary>
     (string Roaming, string Local) EmulatorDataRoots { get; }
     /// <summary>Steam folders to look in, in order (test run: &lt;root&gt;\Steam only).</summary>

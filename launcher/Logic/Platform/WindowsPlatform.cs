@@ -26,7 +26,8 @@ public sealed class WindowsPlatform : PlatformBase
     public override string DefaultGameFolder => Path.Combine(TestRoot ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Games", "Triforce");
     public override string LogFolder(string home) => home;
     public override string NgxSdkFolder(string home) => Path.Combine(home, "ngx-sdk");
-    public override string SaveFolder(string game, string uid) => Path.Combine(game, "user", "save", uid);
+    public override string SaveFolder(string game, string uid) => Path.Combine(UserFolder(game), "save", uid);
+    public override string UserFolder(string game) => Path.Combine(game, "user");
     public override (string Roaming, string Local) EmulatorDataRoots => TestRoot != null
         ? (Path.Combine(TestRoot, "Roaming"), Path.Combine(TestRoot, "Local"))
         : (Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData));

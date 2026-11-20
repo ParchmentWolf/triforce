@@ -170,11 +170,14 @@ def check_sources(menu, header, api, replay, readme):
     check("#define MOD_CHEAT_ROW(i) {TAB_SYSTEM, mod_cheats.names[i], nullptr, 0, 0, 0, nullptr, kModCheatHelp, nullptr, false, true}," in menu,
           "a cheat's row is not a row of the System tab without a value of the options file")
     at = table.index('{TAB_SYSTEM, "Bug capture (F8)", nullptr,')
-    heading = table.index('{TAB_SYSTEM, "Mod cheats", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},')
-    check(at < heading < table.index("MOD_CHEAT_ROWS8(0)") < table.index("// Controls ("), "the cheats' rows do not stand after Bug capture (F8) on the System tab")
+    # ((Triforce, options_version 7) the heading is a group's: MENU_HEADING, hidden while its group's rows are)
+    check("#define MENU_HEADING(tab, title) {tab, title, nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true}" in menu,
+          "a group's heading is not a row without a value that the selection steps over")
+    heading = table.index('MENU_HEADING(TAB_SYSTEM, "Mod cheats"),')
+    check(at < heading < table.index("MOD_CHEAT_ROWS8(0)") < table.index("// ---- Controls ("), "the cheats' rows do not stand after Bug capture (F8) on the System tab")
     check('constexpr char kModCheatHeading[] = "Mod cheats";' in menu, "the heading's name in the table is not the one row_shown tells it by")
     check(re.search(r"static_assert\(mod_cheat_rows::kSlots == %d," % slots, menu), "nothing holds the table to the list's slots")
-    check('bool ini_row(const Row& r) { return r.value && r.value != &opts.language; }' in menu, "a row without a value may be a row of the options file now")
+    check('bool ini_row(const Row& r) { return r.value && r.value != &opts.language && !is_merged(r.value); }' in menu, "a row without a value may be a row of the options file now")
     # shown only once named
     shown = block(menu, "bool row_shown(int i) {")
     check("(!rows[i].heading || strcmp(rows[i].name, kModCheatHeading) || mod_cheats.shown() > 0)" in shown

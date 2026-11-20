@@ -71,6 +71,8 @@ public sealed partial class Backend
                 case "drop": if (files.Length > 0) _ = Intake(files[0]); break;
                 case "cmd":
                     var c = (string?)m["c"] ?? "";
+                    // (a color is taken here, in the order the page sent it, so a 'settings.list' after it sends it back)
+                    if (c == "color") ColorArrived(m);
                     if (cmds.TryGetValue(c, out var h))
                         Task.Run(() => { try { h(m, files); } catch (Exception e) { Log.Write("cmd " + c + ": " + e); Toast("Something went wrong: " + H(e.Message), "error"); } });
                     else Log.Write("unhandled cmd " + c);
