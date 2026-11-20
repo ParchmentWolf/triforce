@@ -5,3 +5,5 @@ out/
 ui/audio/
 ui/img/game/
 ui/img/save*.jpg
+# (11-19) the root .gitignore's build/ also matched Logic/Build/ on Windows: the launcher's build code is source
+!Logic/Build/
