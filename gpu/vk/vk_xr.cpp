@@ -723,7 +723,7 @@ bool make_keep_pipeline() {
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, li.bindingCount = 3, li.pBindings = b;
     if (vkCreateDescriptorSetLayout(x.device, &li, nullptr, &x.keep_set) != VK_SUCCESS) return false;
-    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(int32_t) * 2};
+    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(int32_t) * 2 + sizeof(float)};   // (size, nearer)
     VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pi.setLayoutCount = 1, pi.pSetLayouts = &x.keep_set, pi.pushConstantRangeCount = 1, pi.pPushConstantRanges = &pr;
     if (vkCreatePipelineLayout(x.device, &pi, nullptr, &x.keep_layout) != VK_SUCCESS) return false;
@@ -1878,8 +1878,12 @@ extern "C" void vk_xr_keep_depth(VkCommandBuffer cb, VkImageView depth, uint32_t
         else wr[i].pImageInfo = &info[i];
     }
     x.keep_push(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.keep_layout, 0, 3, wr);
-    const int32_t pc[2] = {(int32_t)w, (int32_t)h};
-    vkCmdPushConstants(cb, x.keep_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+    // (which way is nearer in the stored depth, from the scene's projection: d = a + b / distance, so nearer is greater
+    // when b > 0; not known yet: the shader keeps the depth as it is)
+    float planes[2];
+    const float nearer = vk_xr_planes(planes) && planes[1] != 0 ? (planes[1] > 0 ? 1.0f : -1.0f) : 0.0f;
+    struct { int32_t w, h; float nearer; } pc = {(int32_t)w, (int32_t)h, nearer};
+    vkCmdPushConstants(cb, x.keep_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
     vkCmdDispatch(cb, (w + 7) / 8, (h + 7) / 8, 1);
     memory_barrier(cb);
     x.depth_kept++;
@@ -1964,6 +1968,44 @@ extern "C" int vk_xr_pointer(double dir[3]) {
     }
     dir[0] = bz * v[0] + bx * v[2], dir[1] = v[1], dir[2] = -bx * v[0] + bz * v[2];
     return 1;
+}
+
+extern "C" int vk_xr_hands(double pos[6], double point[6], double palm[6]) {
+    Xr &x = xr();
+    if (!x.ok || !x.running.load(std::memory_order_relaxed)) return 0;
+    Pose g[2];
+    bool ok[2];
+    {
+        std::lock_guard<std::mutex> lk(x.hands_mu);
+        if (!x.hands_at || plat_now_ns() - x.hands_at > 250000000ull) return 0;
+        for (int h = 0; h < 2; h++) g[h] = x.grip[h], ok[h] = x.grip_ok[h];
+    }
+    double base[3], bx, bz;
+    {   // the mapping vk_xr_camera put the head on: the camera's place before the head's offset, its level yaw
+        std::lock_guard<std::mutex> lk(x.frame_mu);
+        if (!x.frame_on || !x.drawn.tracked) return 0;
+        std::memcpy(base, x.drawn.base, sizeof base), bx = x.drawn.bx, bz = x.drawn.bz;
+    }
+    const double axes[3][3] = {{bz, 0, -bx}, {0, 1, 0}, {bx, 0, bz}};   // right, up, back in the world
+    const auto world = [&](const float v[3], double *out) {
+        for (int c = 0; c < 3; c++) out[c] = axes[0][c] * v[0] + axes[1][c] * v[1] + axes[2][c] * v[2];
+    };
+    int any = 0;
+    for (int h = 0; h < 2; h++) {
+        if (!ok[h]) {
+            for (int c = 0; c < 3; c++) pos[h * 3 + c] = point[h * 3 + c] = palm[h * 3 + c] = 0;
+            continue;
+        }
+        static const float ahead[3] = {0, 0, -1};
+        const float out_of_palm[3] = {h ? -1.0f : 1.0f, 0, 0};
+        float pt[3], pa[3];
+        rotate(g[h].q, ahead, pt), rotate(g[h].q, out_of_palm, pa);
+        world(g[h].p, pos + h * 3);
+        for (int c = 0; c < 3; c++) pos[h * 3 + c] += base[c];
+        world(pt, point + h * 3), world(pa, palm + h * 3);
+        any = 1;
+    }
+    return any;
 }
 
 extern "C" void vk_xr_hand_item(const char *model) {
@@ -2339,6 +2381,7 @@ extern "C" const MkwVkXr *vk_xr_table(void) {
     static const MkwVkXr t = {
         vk_xr_cfg, vk_xr_head_active, vk_xr_camera, vk_xr_lens, vk_xr_holds_time, vk_xr_update_step, vk_xr_pad,
         vk_xr_ocarina, vk_xr_weapon_out, vk_xr_child,
-        vk_xr_hand_item, vk_xr_in_play, vk_xr_aim_freeze, vk_xr_pointer, vk_xr_aim, vk_xr_untracked};
+        vk_xr_hand_item, vk_xr_in_play, vk_xr_aim_freeze, vk_xr_pointer, vk_xr_aim, vk_xr_untracked, vk_xr_hands,
+        vk_xr_active};
     return &t;
 }

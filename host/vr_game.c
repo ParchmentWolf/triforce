@@ -38,6 +38,9 @@ static uint64_t now_ns(void) { return (uint64_t)hos_now_ns(); }
 
 /* n bytes at a are committed read-write memory of the game's */
 static int game_rw(uint64_t a, size_t n) {
+    /* (the game's heap is committed read-write whole (host/hos_mem.c): no VirtualQuery there, which costs milliseconds a
+       call in this address space (gpu/vk/oot_game_data.h oot_data_rd); first person's poke runs every frame) */
+    if (a >= HOS_HEAP_BASE && a - HOS_HEAP_BASE < hos_heap_size && n <= hos_heap_size - (a - HOS_HEAP_BASE)) return 1;
     MEMORY_BASIC_INFORMATION mi;
     if (!a || a >= OOT_DATA_SPACE || n > OOT_DATA_SPACE - a || !VirtualQuery(GP(a), &mi, sizeof mi) || mi.State != MEM_COMMIT ||
         !(mi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) || (mi.Protect & PAGE_GUARD))
@@ -152,13 +155,31 @@ static int first_person_eye(double eye[3]) {
     double fx = m[2], fz = m[8], n = sqrt(fx * fx + fz * fz);   /* his facing: the rotation's third column, level */
     if (!(n > 1e-4)) return 0;
     fx /= n, fz /= n;
-    const double up = (oot_childhood() ? 1.27 : 1.80) + cfg_int("VR_EYE_UP") / 100.0;
-    const double ahead = 0.08 + cfg_int("VR_EYE_FORWARD") / 100.0, side = cfg_int("VR_EYE_SIDE") / 100.0;
+    /* (VR_BODY arms: the eyes at his own eyes (adult 1.45 m, 18 cm ahead of his feet, found right in a Quest 3 with his
+       arms shown; young Link scaled alike, 1.0 m), so his shoulders are under them and his arms reach where the hands
+       are: from a grown-up's height the hands' places lay out of his reach. Hidden: a grown-up's height) */
+    const int body = !strcmp(cfg_value("VR_BODY"), "arms"), child = oot_childhood();
+    const double up = (body ? (child ? 1.00 : 1.45) : (child ? 1.27 : 1.80)) + cfg_int("VR_EYE_UP") / 100.0;
+    const double ahead = (body ? 0.18 : 0.08) + cfg_int("VR_EYE_FORWARD") / 100.0, side = cfg_int("VR_EYE_SIDE") / 100.0;
     eye[0] = feet[0] + ahead * fx - side * fz;   /* his right: (-fz, 0, fx) */
     eye[1] = feet[1] + up;
     eye[2] = feet[2] + ahead * fz + side * fx;
-    hide_link(actor);
+    /* (VR_BODY arms: he stays drawn, his arms on the controllers and his head hidden by vr_body.c; hidden: all of him) */
+    if (strcmp(cfg_value("VR_BODY"), "arms")) hide_link(actor);
     return 1;
+}
+
+static volatile uint64_t fp_eye_at;   /* when first person's eyes were last put on the gameplay camera */
+static SRWLOCK anchor_lock = SRWLOCK_INIT;
+static double anchor_feet[3];       /* Link's feet at the gameplay camera's last update with the head's view (anchor_lock) */
+static uint64_t anchor_at;
+int vr_first_person_now(void) { return now_ns() - fp_eye_at < 200000000ull; }
+int vr_play_anchor(double feet[3]) {
+    AcquireSRWLockShared(&anchor_lock);
+    const int ok = anchor_at && now_ns() - anchor_at < 200000000ull;
+    if (ok) memcpy(feet, anchor_feet, sizeof anchor_feet);
+    ReleaseSRWLockShared(&anchor_lock);
+    return ok;
 }
 
 static volatile uint64_t fp_at;     /* when Link was last turned to the head in first person */
@@ -327,10 +348,17 @@ static void vr_pad(uint64_t *buttons, int32_t *lx, int32_t *ly) {
 
 void vr_pad_read(Ctx *c, uint64_t *buttons, int32_t stick[4]) {
     const MkwVkXr *x = xr();
-    if (!x) return;
+    /* (no session, VR off or no headset: nothing of VR's here, which runs on every pad read the game makes) */
+    if (!x || !x->active || !x->active()) return;
     x->pad(buttons, stick, stick + 2);   /* the hand controllers, as the pad */
     if (!rx_option(1, 0)) vr_pad(buttons, &stick[0], &stick[1]);   /* (not while the Insert menu is open) */
-    vr_tick(c, x);
+    /* (the game reads the pad several times a frame, on its workers: what vr_tick tells VR changes at most once a frame,
+       so it runs once in 4 ms, whichever reader comes first) */
+    static uint64_t tick_at;
+    const uint64_t now = now_ns();
+    uint64_t was = __atomic_load_n(&tick_at, __ATOMIC_RELAXED);
+    if (now - was >= 4000000ull && __atomic_compare_exchange_n(&tick_at, &was, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+        vr_tick(c, x);
 }
 
 static void turn_link(const double ahead[3]) {
@@ -514,8 +542,11 @@ void hos_vr_camera(Ctx *c) {
         steer_aim(x, l > 1e-6 ? d : NULL);
     }
     double eye[3];
-    if (scene == 1 && x->head_active() && first_person_eye(eye))   /* the game's camera's direction kept, from his eyes */
+    int fp_eye = 0;
+    if (scene == 1 && x->head_active() && first_person_eye(eye)) {   /* the game's camera's direction kept, from his eyes */
         for (int i = 0; i < 3; i++) at[i] += eye[i] - pos[i], pos[i] = eye[i];
+        fp_eye = 1;
+    }
     if (scene == 2) {   /* an event's camera raised by Link's height for his age, and VR_EVENT_UP cm more */
         const double lift = (oot_childhood() ? 1.27 : 1.80) + cfg_int("VR_EVENT_UP") / 100.0;
         pos[1] += lift, at[1] += lift;
@@ -526,6 +557,16 @@ void hos_vr_camera(Ctx *c) {
     memcpy(out_pos[k], pos, sizeof pos), memcpy(out_at[k], at, sizeof at), have_out[k] = 1;
     head_camera = c->x[19];
     if (scene != 1) return;   /* Link turns in play alone */
+    {   /* (vr_body.c: where Link stood for this view, the hands' anchor; and first person's eyes on him) */
+        float feet[3];
+        if (player_pos(feet)) {
+            AcquireSRWLockExclusive(&anchor_lock);
+            for (int i = 0; i < 3; i++) anchor_feet[i] = feet[i];
+            anchor_at = now_ns();
+            ReleaseSRWLockExclusive(&anchor_lock);
+        }
+        if (fp_eye) fp_eye_at = now_ns();
+    }
     const double ahead[3] = {at[0] - pos[0], at[1] - pos[1], at[2] - pos[2]};
     turn_link(ahead);
 }

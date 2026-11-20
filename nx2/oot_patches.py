@@ -138,6 +138,27 @@ VR_LENS_LOAD = "(c->x[19]+316ULL)"
 VR_LENS_BLOCK = "L_804e52d0:;"   # (the load at 0x804e52f8 is the first after this label; another path loads the angle too)
 
 
+# (Triforce VR, VR_BODY arms) after the late bone pass f_8030a320, which rewrites the bones' locals after the animation
+# (f_814f9460) and after the movement update; the model's world matrices are made from them afterwards (f_801d7ac0): Link's
+# arms and head written there (host/vr_body.c hos_oot_after_anim). Its five calls, by return address.
+ANIM_ANCHORS = tuple("c->x[30] = 0x%xULL; f_8030a320(c);\n" % r
+                     for r in (0x80192cac, 0x802cbcdc, 0x8030b78c, 0x8030d188, 0x80c9383c))
+
+
+def patch_after_anim(source):
+    """(source, the sites with the hook: made here or before)"""
+    sites = 0
+    for anchor in ANIM_ANCHORS:
+        if anchor + "    hos_oot_after_anim(c);\n" in source:
+            sites += 1
+        elif source.count(anchor) == 1:
+            source = source.replace(anchor, anchor + "    hos_oot_after_anim(c);\n", 1)
+            sites += 1
+    if sites and "extern void hos_oot_after_anim(Ctx *c);" not in source:
+        source = source.replace('#include "a64.h"\n', '#include "a64.h"\nextern void hos_oot_after_anim(Ctx *c);\n', 1)
+    return source, sites
+
+
 def patch_vr(source):
     start = source.find(VIEW_HEAD)
     if start < 0:
@@ -794,6 +815,7 @@ def apply(gen, *, protect_hearts=False, required=False):
     zstd_sites = 0   # (patch_host_zstd: its two calls, the supported build's alone)
     mod_size_sites = 0   # ((Triforce) patch_mod_sizes: its one call, the supported build's alone)
     heap_sites = [0, 0]   # (the GPU memory's sites, the CPU buffers': patch_heap_retry, the supported build only)
+    anim_sites = 0   # ((Triforce VR) patch_after_anim: the late bone pass's calls with the arms' hook, 5 in the supported build)
     for path in sorted(glob.glob(os.path.join(glob.escape(gen), "code_*.c"))):
         with open(path, encoding="utf-8", newline="") as f:
             s = f.read()
@@ -864,6 +886,11 @@ def apply(gen, *, protect_hearts=False, required=False):
             out = vr
             done["vr camera"] += 1
             print("oot_patches: VR's camera hooks in", os.path.basename(path))
+        if protect_hearts:   # ((Triforce VR) the arms' hook: host/vr_body.c)
+            out, n = patch_after_anim(out)
+            if n:
+                anim_sites += n
+                print("oot_patches: the late bone pass's VR hook at %d call(s) in %s" % (n, os.path.basename(path)))
         out, sites = patch_frame_seconds(out)
         if STEP_MARK in out:   # (made now, or by an earlier run over this file)
             step_sites += out.count(STEP_MARK)
@@ -934,6 +961,8 @@ def apply(gen, *, protect_hearts=False, required=False):
     if record_sites != sum(n for _, n in RECORD_SITES):   # (without them, above 60 fps a recorded song loses its rests)
         print("oot_patches: WARNING: the ocarina recorder's clock was found at %d of %d places"
               % (record_sites, sum(n for _, n in RECORD_SITES)))
+    if protect_hearts and anim_sites != len(ANIM_ANCHORS):   # ((Triforce VR) without them the arms do not follow the hands)
+        print("oot_patches: WARNING: the late bone pass's calls were found at %d of %d places" % (anim_sites, len(ANIM_ANCHORS)))
     if sprint_sites != 2:   # (without them the Sprint button row does nothing)
         print("oot_patches: WARNING: the sprint button's calls were found at %d of 2 places" % sprint_sites)
     if protect_hearts and mod_size_sites != 1:   # (without it a mod's bigger model can crash the game: host/mods.c)

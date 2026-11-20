@@ -24,4 +24,15 @@ int vr_motion_history(HosMotionSample *out, int max);
 int vr_holds_time(void);
 void vr_update_step(double seconds);
 
+/* (Triforce VR, VR_BODY "arms") Link's body in first person: his arms on the controllers, his head hidden (vr_body.c) */
+/* hos_main.c hos_oot_lift_player, Link's movement update (Link known): his bones found, his head's materials kept hidden */
+void vr_body_lift(Ctx *c, uint64_t actor);
+/* after the late bone pass f_8030a320 (nx2/oot_patches.py patch_after_anim): his arms and head written into the bones' locals */
+void hos_oot_after_anim(Ctx *c);
+/* vr_game.c: first person's eyes are on Link now (the gameplay camera from his eyes, a moment ago) */
+int vr_first_person_now(void);
+/* vr_game.c: 1 and Link's feet as they were at the gameplay camera's last update with the head's view (where the hands were
+   placed from), while that was a moment ago */
+int vr_play_anchor(double feet[3]);
+
 #endif

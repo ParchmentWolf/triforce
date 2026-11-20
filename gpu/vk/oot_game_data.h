@@ -35,6 +35,22 @@ static inline int oot_data_rd(const uint8_t *base, uint64_t a, void *out, size_t
     static __thread uint64_t lo, hi;
 #endif
     if (!base || !a || a >= OOT_DATA_SPACE || n > OOT_DATA_SPACE - a) return 0;
+#ifdef HOS_HEAP_BASE
+    /* (Triforce, fps) On the host's side (host/hos.h came first: host/vr_game.c through vr_game.h) a read inside the game's
+       heap or its program image is a plain copy: both are committed whole (host/hos_mem.c), as host/oot_sprint.c readable
+       and host/vr_body.c rely on; a page the lazy write-back holds faults and is paid as any touch of the CPU's is.
+       VirtualQuery is far from free in this address space: it walks the pages from the address to the end of their run,
+       1.4-17 ms a call on the heap's regions of hundreds of MB to 3 GB (VirtualQueryEx timed on the running game,
+       2026-11-19). The VR hooks read the game's data through here on every pad read the game makes (nn_hid.c npad_states
+       -> vr_pad_read -> vr_tick, VR on or off) on BaseProc executors that hold a virtual core: half of all stack samples
+       in play were in that VirtualQuery, and the game ran 4.4-4.7 fps in play, frames of ~220 ms, CPU ~0.25 of a core, 90%
+       of it in the kernel. Anything else (the address regions, a stale pointer) still goes through VirtualQuery below */
+    if ((a >= HOS_HEAP_BASE && a - HOS_HEAP_BASE < hos_heap_size && n <= hos_heap_size - (a - HOS_HEAP_BASE)) ||
+        (a >= hos_image_base && a < hos_image_end && n <= hos_image_end - a)) {
+        memcpy(out, base + a, n);
+        return 1;
+    }
+#endif
     if (!(a >= lo && a + n <= hi)) {
         MEMORY_BASIC_INFORMATION mi;
         for (uint64_t at = a; at < a + n;) {
