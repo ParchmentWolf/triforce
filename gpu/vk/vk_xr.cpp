@@ -39,6 +39,7 @@
 #include "shaders/xr_depth_keep_comp_spv.h"
 #include "shaders/xr_depth_comp_spv.h"
 #include "shaders/xr_hud_comp_spv.h"
+#include "vk_work.h"
 
 // the picture's place in a window of dw x dh, as the present puts a cw x ch picture there (vk_replay.cpp present_rect)
 static void gfx_fit_rect(int cw, int ch, int dw, int dh, int out[4]) {
@@ -395,8 +396,7 @@ bool listed(const char *const *list, uint32_t n, const char *name) {
     return false;
 }
 
-void barrier(VkCommandBuffer cb, VkImage image, VkImageLayout from, VkImageLayout to,
-             VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT) {
+VkImageMemoryBarrier2 layout_change(VkImage image, VkImageLayout from, VkImageLayout to, VkImageAspectFlags aspect) {
     VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
     b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
@@ -405,9 +405,23 @@ void barrier(VkCommandBuffer cb, VkImage image, VkImageLayout from, VkImageLayou
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = image;
     b.subresourceRange = {aspect, 0, 1, 0, 1};
+    return b;
+}
+
+void barrier(VkCommandBuffer cb, VkImage image, VkImageLayout from, VkImageLayout to,
+             VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT) {
+    const VkImageMemoryBarrier2 b = layout_change(image, from, to, aspect);
     VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     d.imageMemoryBarrierCount = 1, d.pImageMemoryBarriers = &b;
     vkCmdPipelineBarrier2(cb, &d);
+}
+
+// For the session thread's own command buffer on VR's queue: straight to the driver, not through the replay's recorder.
+void barrier_direct(VkCommandBuffer cb, VkImage image, VkImageLayout from, VkImageLayout to) {
+    const VkImageMemoryBarrier2 b = layout_change(image, from, to, VK_IMAGE_ASPECT_COLOR_BIT);
+    VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    d.imageMemoryBarrierCount = 1, d.pImageMemoryBarriers = &b;
+    (vkCmdPipelineBarrier2)(cb, &d);
 }
 
 // v rotated by the unit quaternion q (x, y, z, w)
@@ -625,7 +639,7 @@ bool make_panel(VkCommandBuffer cb, bool keep_hud, int cut) {
         w[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         w[i].pImageInfo = &info[i];
     }
-    x.push_set(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.hud_layout, 0, 4, w);
+    vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.hud_layout, 0, 4, w);
     const int32_t pc[4] = {(int32_t)x.hud_w, (int32_t)x.hud_h, keep_hud ? 1 : 0, cut};
     vkCmdPushConstants(cb, x.hud_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
     vkCmdDispatch(cb, (x.hud_w + 7) / 8, (x.hud_h + 7) / 8, 1);
@@ -787,7 +801,7 @@ void make_aim(VkCommandBuffer cb, const Drawn &d) {
         w[i].descriptorType = i ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         w[i].pImageInfo = &info[i];
     }
-    x.push_set(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.aim_layout, 0, 2, w);
+    vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.aim_layout, 0, 2, w);
     const float pc[12] = {(float)x.hud_w, (float)x.hud_h, d.aim_o[0], d.aim_o[1], d.aim_o[2], d.aim_d[0], d.aim_d[1],
                           d.aim_d[2], d.lens.r * d.scale, d.lens.u * d.scale, planes[0], planes[1]};
     vkCmdPushConstants(cb, x.aim_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
@@ -946,7 +960,7 @@ bool make_eyes(VkCommandBuffer cb, const Drawn &d) {
             if (i == 3) w[i].pBufferInfo = &rows;
             else w[i].pImageInfo = &info[i];
         }
-        x.push_set(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.depth_layout, 0, 4, w);
+        vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.depth_layout, 0, 4, w);
         const float side = (e ? 0.5f : -0.5f) * d.ipd * strength;   // the left eye to the left: the scene moves right in it
         // the largest move, at most a quarter of the picture: the shader scans no further
         const float most = std::min(0.25f, 0.5f * std::fabs(side / tan_x) * near_inv + 0.002f);
@@ -1572,17 +1586,17 @@ void run(void *) {
             if (XR_FAILED(x.xrAcquireSwapchainImage(target, &acq, &index)) || XR_FAILED(x.xrWaitSwapchainImage(target, &wait)))
                 return false;
             const VkImage dst = imgs[index].image;
-            vkResetCommandPool(x.device, pool, 0);
+            (vkResetCommandPool)(x.device, pool, 0);
             VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
             bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            vkBeginCommandBuffer(cb, &bi);
-            barrier(cb, dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            (vkBeginCommandBuffer)(cb, &bi);
+            barrier_direct(cb, dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             VkImageCopy c{};
             c.srcSubresource = c.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             c.extent = {x.width, x.height, 1};
-            vkCmdCopyImage(cb, from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
-            barrier(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-            vkEndCommandBuffer(cb);
+            (vkCmdCopyImage)(cb, from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+            barrier_direct(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+            (vkEndCommandBuffer)(cb);
             VkSemaphoreSubmitInfo w{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
             w.semaphore = x.timeline, w.value = value, w.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
             VkCommandBufferSubmitInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
@@ -1590,11 +1604,11 @@ void run(void *) {
             VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
             si.waitSemaphoreInfoCount = 1, si.pWaitSemaphoreInfos = &w;
             si.commandBufferInfoCount = 1, si.pCommandBufferInfos = &cbi;
-            vkQueueSubmit2(x.queue, 1, &si, fence);
+            (vkQueueSubmit2)(x.queue, 1, &si, fence);
             XrSwapchainImageReleaseInfo rel{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
             x.xrReleaseSwapchainImage(target, &rel);
-            vkWaitForFences(x.device, 1, &fence, VK_TRUE, UINT64_MAX);
-            vkResetFences(x.device, 1, &fence);
+            (vkWaitForFences)(x.device, 1, &fence, VK_TRUE, UINT64_MAX);
+            (vkResetFences)(x.device, 1, &fence);
             return true;
         };
         if (slot >= 0 && (drawn.hud || drawn.menu) && hud_swapchain)
@@ -1607,23 +1621,23 @@ void run(void *) {
             if (XR_SUCCEEDED(x.xrAcquireSwapchainImage(swapchain, &acq, &index)) &&
                 XR_SUCCEEDED(x.xrWaitSwapchainImage(swapchain, &wait))) {
                 const VkImage dst = images[index].image;
-                vkResetCommandPool(x.device, pool, 0);
+                (vkResetCommandPool)(x.device, pool, 0);
                 VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
                 bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-                vkBeginCommandBuffer(cb, &bi);
-                barrier(cb, dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                (vkBeginCommandBuffer)(cb, &bi);
+                barrier_direct(cb, dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
                 VkImageCopy c{};
                 c.srcSubresource = c.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
                 c.extent = {x.width, x.height, 1};
-                vkCmdCopyImage(cb, x.boxes[slot], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
-                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+                (vkCmdCopyImage)(cb, x.boxes[slot], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
+                                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
                 if (drawn.stereo) {
                     c.dstOffset.x = (int32_t)x.width;
-                    vkCmdCopyImage(cb, x.boxes_r[slot], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
-                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+                    (vkCmdCopyImage)(cb, x.boxes_r[slot], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
+                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
                 }
-                barrier(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-                vkEndCommandBuffer(cb);
+                barrier_direct(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+                (vkEndCommandBuffer)(cb);
                 VkSemaphoreSubmitInfo w{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
                 w.semaphore = x.timeline, w.value = value, w.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
                 VkCommandBufferSubmitInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
@@ -1631,11 +1645,11 @@ void run(void *) {
                 VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
                 si.waitSemaphoreInfoCount = 1, si.pWaitSemaphoreInfos = &w;
                 si.commandBufferInfoCount = 1, si.pCommandBufferInfos = &cbi;
-                vkQueueSubmit2(x.queue, 1, &si, fence);
+                (vkQueueSubmit2)(x.queue, 1, &si, fence);
                 XrSwapchainImageReleaseInfo rel{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
                 x.xrReleaseSwapchainImage(swapchain, &rel);
-                vkWaitForFences(x.device, 1, &fence, VK_TRUE, UINT64_MAX);
-                vkResetFences(x.device, 1, &fence);
+                (vkWaitForFences)(x.device, 1, &fence, VK_TRUE, UINT64_MAX);
+                (vkResetFences)(x.device, 1, &fence);
                 have_image = true;
                 shown = value;
                 shown_drawn = drawn;
@@ -1877,7 +1891,7 @@ extern "C" void vk_xr_keep_depth(VkCommandBuffer cb, VkImageView depth, uint32_t
         if (i == 2) wr[i].pBufferInfo = &rows;
         else wr[i].pImageInfo = &info[i];
     }
-    x.keep_push(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.keep_layout, 0, 3, wr);
+    vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.keep_layout, 0, 3, wr);
     // (which way is nearer in the stored depth, from the scene's projection: d = a + b / distance, so nearer is greater
     // when b > 0; not known yet: the shader keeps the depth as it is)
     float planes[2];
