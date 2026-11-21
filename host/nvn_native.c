@@ -1159,7 +1159,7 @@ static void held_init(void) {
         if (hold_on) hos_log("nvn: submits held (HOS_NVN_HOLD=%d: %s)", hold_on,
                              hold_on == 2 ? "other threads' submits, replayed by a host thread" : "all, until a flush");
         if (hold_on == 2) {
-            hold_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+            hold_event = CreateEventA(NULL, FALSE, FALSE, NULL);   /* (A, not W: host/posix has CreateEventA only; v0.6.0's Linux builds stopped at the link) */
             HANDLE h = CreateThread(NULL, 0, hold_flush_thread, NULL, 0, NULL);
             if (h) CloseHandle(h);
         }
