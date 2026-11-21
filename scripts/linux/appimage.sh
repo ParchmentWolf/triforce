@@ -22,7 +22,12 @@ PY=$DEPS/python/bin/python3
 # ---- the Vulkan back end, built here once (it needs no game) ----
 VKW=$B/vk-work
 rm -rf "$VKW/sa/build/triforce_vk.so"
-OOT_WORK=$VKW RX_MARCH=x86-64-v3 RX_VK_ONLY=1 RX_RELEASE=1 "$PY" -I nx2/build.py --standalone --jobs "${JOBS:-$(nproc)}"
+# ((Triforce) 11-20, HOOKSHOT_FSR=1: with AMD FSR 4 (gpu/vk/vk_fsr4.cpp). A player's build reuses this back end as it is
+# (AppRun's HOOKSHOT_VK_PREBUILT), so built without it no Linux player could have FSR 4, whatever they set. With it, the
+# Upscaler row offers FSR 4 where the player's own Vulkan FSR 4 library (amd_fidelityfx_upscaler_vk.so) is in the game folder
+# or RX_VK_FSR_DIR and runs on their GPU; without the library it is not offered, as before. AMD ships no Linux library and
+# none is packed here)
+OOT_WORK=$VKW RX_MARCH=x86-64-v3 RX_VK_ONLY=1 RX_RELEASE=1 HOOKSHOT_FSR=1 "$PY" -I nx2/build.py --standalone --jobs "${JOBS:-$(nproc)}"
 VK=$VKW/sa/build/triforce_vk.so
 [ -f "$VK" ] || { echo "triforce_vk.so was not built"; exit 1; }
 
