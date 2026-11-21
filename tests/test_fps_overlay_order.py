@@ -61,7 +61,10 @@ bool can_draw = true;
 float ease_step = 0;
 bool ease_live = false;   // (menu_record's frames step the easing; a still, menu_record_image, is drawn settled)
 int64_t prof_now() { return 1000; }
-int radial_menu_open(int* slot) { *slot = -1; return 0; }   // ((Triforce) the radial menus: never open here)
+// ((Triforce) the radial menus: never open here
+int radial_menu_open(int* slot) { *slot = -1; return 0; }
+int radial_menu_dpad_hud() { return 0; }   // ((Triforce) the D-pad's items: never shown here
+int radial_menu_menu_page_now() { return -1; }
 namespace ui {
 struct Ctx {};
 bool begin(uint32_t, uint32_t) { calls += "b"; return can_draw; }
@@ -91,6 +94,7 @@ constexpr int kModsRowPage = 9;
 void draw_mods_row_shut(ui::Ctx&) { calls += "M"; }
 void draw_notice(ui::Ctx&) { calls += "n"; }
 void draw_radial_menu(ui::Ctx&, int, int) { calls += "w"; }   // ((Triforce) never here: radial_menu_open answers none)
+void draw_radial_dpad(ui::Ctx&, bool, bool = false) { calls += "d"; }   // ((Triforce) never here: radial_menu_dpad_hud answers no)
 ''' + fn + r'''
 int main() {
     for (bool startup : {false, true}) for (int fps : {0, 1, 2}) for (bool menu : {false, true}) for (bool can : {true, false}) {

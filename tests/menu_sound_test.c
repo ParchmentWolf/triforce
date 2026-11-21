@@ -63,6 +63,8 @@ static void (*between)(int at);
 #define MENU_SOUND_BETWEEN(at) do { if (between) between(at); } while (0)
 
 #define MENU_SOUND_TEST
+/* (a sound in one of the game's banks, rom_bank.c: the test's files by the same name) */
+static uint8_t *hos_rom_bank_sound(const char *rel, uint64_t most, uint64_t *size) { return hos_fs_rom_file(rel, most, size); }
 #include "../host/menu_sound.c"
 
 /* ---- memory that ends where nothing can be read: a read past a file's or a sound's end stops the run ---- */
@@ -421,7 +423,7 @@ static void decode_refusals(void) {
 /* ---- the voices and the mix, on sounds put there as they would be after the files are read ---- */
 enum { OPEN = HOS_MENU_SOUND_OPEN, CLOSE = HOS_MENU_SOUND_CLOSE, CURSOR = HOS_MENU_SOUND_CURSOR, DECIDE = HOS_MENU_SOUND_DECIDE,
        CANCEL = HOS_MENU_SOUND_CANCEL, TAB_LEFT = HOS_MENU_SOUND_TAB_LEFT, TAB_RIGHT = HOS_MENU_SOUND_TAB_RIGHT, FANFARE = HOS_MENU_SOUND_FANFARE,
-       SYS_CURSOR = HOS_MENU_SOUND_SYS_CURSOR, SYS_DECIDE = HOS_MENU_SOUND_SYS_DECIDE };
+       SYS_CURSOR = HOS_MENU_SOUND_SYS_CURSOR, SYS_DECIDE = HOS_MENU_SOUND_SYS_DECIDE, ITEM_EQUIP = HOS_MENU_SOUND_ITEM_EQUIP, ITEM_ERROR = HOS_MENU_SOUND_ITEM_ERROR };
 #define BLOCK 240
 static float bl[BLOCK], br[BLOCK];
 static void install(int id, uint32_t frames, float l, float r) {   /* (its samples end where nothing can be read) */
@@ -560,6 +562,24 @@ static void voices_and_mix(void) {
         CHECK(active() == 2 && voice_with(CURSOR) == 0 && voice_with(DECIDE) == 1);
         quiet();
     }
+    {   /* ((Triforce, 11-19) the system menu's: the mouse onto Mods or Quit and its click in one tick, or a stick's flick and
+           A, is their decide alone, as the options' tick and decision; 50 ms on they both play. Its ticks are not thinned
+           out by the 180 ms gap, as the game's System list does not thin out its own) */
+        install(SYS_CURSOR, 30000, 0.5f, 0.5f), install(SYS_DECIDE, 100, 1.0f, -1.0f);
+        t0 += 10000 * kMs;
+        hos_menu_sound_play(SYS_CURSOR, t0);
+        hos_menu_sound_play(SYS_DECIDE, t0);
+        CHECK(active() == 1 && voice_with(SYS_DECIDE) == 0 && voice_with(SYS_CURSOR) < 0 && voice_pos(0) == 0);
+        quiet();
+        hos_menu_sound_play(SYS_CURSOR, t0 + 1000 * kMs);
+        hos_menu_sound_play(SYS_CURSOR, t0 + 1100 * kMs);   /* (100 ms on: heard, restarted) */
+        CHECK(active() == 1 && voice_with(SYS_CURSOR) == 0 && voice_pos(0) == 0);
+        for (int k = 0; k < 10; k++) block(1.0f, 0.0f, 0.0f);
+        hos_menu_sound_play(SYS_DECIDE, t0 + 1150 * kMs);
+        CHECK(active() == 2 && voice_with(SYS_CURSOR) == 0 && voice_with(SYS_DECIDE) == 1);
+        quiet();
+        sounds[SYS_CURSOR] = sounds[SYS_DECIDE] = (Sound){0};
+    }
     {   /* a restart inside the mix, between its read of the voice's place and of its sound: the tick is 240 samples in when
            the decision, 100 samples long, takes its voice. The place is the tick's, the sound the decision's: nothing of
            it is mixed in this block (240 is past the decision's end, and its samples end where nothing can be read),
@@ -623,7 +643,7 @@ static void voices_and_mix(void) {
 
 /* ---- the game's files, as the test wrote them: all seven two channels of PCM16 that never change, so a block's sum
    says which sounds are in it ---- */
-static int16_t held[HOS_MENU_SOUND_N - 1][2][4000];   /* (a sound's samples each: the seven and the Mods screen's fanfare) */
+static int16_t held[HOS_MENU_SOUND_N - 1][2][4000];   /* (a sound's samples each: the seven, the Mods screen's, the D-pad put's) */
 static void rom_put(const char *rel, const uint8_t *data, uint64_t size) { rom[nrom].rel = rel, rom[nrom].data = data, rom[nrom].size = size, nrom++; }
 static void rom_sound(int id, uint32_t frames, int l, int r) {
     for (uint32_t i = 0; i < frames; i++) held[id - 1][0][i] = (int16_t)l, held[id - 1][1][i] = (int16_t)r;
@@ -637,6 +657,8 @@ static void rom_seven(void) {
     rom_sound(DECIDE, 1000, 8192, -8192), rom_sound(CANCEL, 500, 2048, 2048), rom_sound(TAB_LEFT, 500, 4096, 0);
     rom_sound(TAB_RIGHT, 500, 0, 4096), rom_sound(FANFARE, 1500, 8192, 8192);   /* ((Triforce) the Mods screen's install done) */
     rom_sound(SYS_CURSOR, 600, 2048, 4096), rom_sound(SYS_DECIDE, 700, 4096, 2048);   /* ((Triforce, 11-17) the Mods entry's */
+    rom_sound(ITEM_EQUIP, 800, 4096, 4096);   /* ((Triforce) the radial menus: a D-pad put's */
+    rom_sound(ITEM_ERROR, 900, 4096, 4096);   /* ((Triforce) the radial menus: a D-pad put refused */
 }
 static void frame(float l, float r) {
     for (int i = 0; i < BLOCK; i++) bl[i] = l, br[i] = r;
@@ -658,8 +680,8 @@ static void loading(void) {
     rom_put(files[TAB_RIGHT], huge, sizeof huge);   /* (more than a sound's file ever has: not taken) */
     CHECK(atomic_load(&loaded) == 0);
     load_all();
-    CHECK(atomic_load(&loaded) == 2 && rom_reads == 10);
-    CHECK(strstr(logged, "menu sounds: 5 of 10 interface sounds from the game's files"));
+    CHECK(atomic_load(&loaded) == 2 && rom_reads == 12);
+    CHECK(strstr(logged, "menu sounds: 5 of 12 interface sounds from the game's files"));
     CHECK(strstr(logged, "SE_Sys_Cancel00.bwav is not a BWAV file the options play") && strstr(logged, "left out"));
     CHECK(sounds[OPEN].pcm && sounds[OPEN].frames == 2000 && sounds[OPEN].pcm[0] == 0.25f && sounds[OPEN].pcm[3999] == 0.25f);
     CHECK(sounds[DECIDE].pcm && sounds[DECIDE].pcm[1] == -0.25f && sounds[TAB_LEFT].pcm && sounds[TAB_LEFT].pcm[1] == 0.0f);
@@ -695,7 +717,7 @@ static void frames_and_events(void) {
     frame(0.0f, 0.0f), frame(0.0f, 0.0f);
     CHECK(load_requests == 1);
     load_all();
-    CHECK(strstr(logged, "menu sounds: 10 of 10 interface sounds from the game's files") && rom_reads == 10);
+    CHECK(strstr(logged, "menu sounds: 12 of 12 interface sounds from the game's files") && rom_reads == 12);
     frame(0.0f, 0.0f);
     CHECK(load_requests == 1 && block_is(0, BLOCK, 0.0f, 0.0f) && active() == 0);
     /* a sound asked for is in the very next block, at the row's level, over what the block holds */
@@ -745,7 +767,7 @@ static void frames_and_events(void) {
     CHECK(asked_at == 8);
     frame(0.0f, 0.0f);
     CHECK(asked_at == 10);
-    CHECK(volume_reads > 200 && rom_reads == 10);   /* (the files were read once) */
+    CHECK(volume_reads > 200 && rom_reads == 12);   /* (the files were read once) */
 }
 
 /* ---- the end of nn_audio.c's render_frame, cut out as it is: the options' sounds, the Master volume, the 16 bits ---- */

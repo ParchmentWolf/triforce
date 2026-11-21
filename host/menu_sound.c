@@ -42,6 +42,7 @@
 #include <windows.h>
 int rx_option(int id, int otherwise);                                              /* rx_backend.c */
 uint8_t *hos_fs_rom_file(const char *rel, uint64_t most, uint64_t *size);   /* nn_fs.c */
+uint8_t *hos_rom_bank_sound(const char *rel, uint64_t most, uint64_t *size);   /* rom_bank.c: "<bank>#<entry>" */
 static void load_all(void);
 static DWORD WINAPI load_main(void *arg) {
     (void)arg;
@@ -79,6 +80,10 @@ static const char *const files[SOUNDS] = {
        file opens: the title's cursor, its Continue and the Load list's choice) */
     [HOS_MENU_SOUND_SYS_CURSOR] = "Sound/Resource/Stream/SE_Sys_SysMenu_Cursor00.bwav",
     [HOS_MENU_SOUND_SYS_DECIDE] = "Sound/Resource/Stream/SE_Sys_SysMenu_DecideL00.bwav",
+    /* ((Triforce) the radial menus: an item or a gear put on the D-pad, as the pause menu sounds an item equipped) */
+    [HOS_MENU_SOUND_ITEM_EQUIP] = "Sound/Resource/Stream/SE_Sys_PlusMenu_ItemEquip00.bwav",
+    /* ((Triforce) the pause menu's own refusal, kept in its sound bank alone) */
+    [HOS_MENU_SOUND_ITEM_ERROR] = "Sound/Resource/UI_Static.Product.111.bars.zs#SE_Sys_PlusMenu_ItemInvalid00",
 };
 
 static Sound sounds[SOUNDS];
@@ -180,7 +185,7 @@ static void load_all(void) {   /* (once: hos_menu_sound_frame's store of 1 into 
     int n = 0;
     for (int id = 1; id < SOUNDS; id++) {
         uint64_t size = 0;
-        uint8_t *b = hos_fs_rom_file(files[id], FILE_MOST, &size);
+        uint8_t *b = strchr(files[id], '#') ? hos_rom_bank_sound(files[id], FILE_MOST, &size) : hos_fs_rom_file(files[id], FILE_MOST, &size);
         if (!b) continue;
         uint32_t frames = 0;
         float *pcm = hos_menu_sound_decode(b, size, &frames);
@@ -219,10 +224,12 @@ void hos_menu_sound_play(int id, int64_t now_ns) {
         if (voices[i].started < oldest) oldest = voices[i].started, pick = i;
     }
     /* A sound that replaces itself restarts instead of stacking up, and a decision replaces the tick of the same press
-       (a row changes its value in the tick the press is seen). */
+       (a row changes its value in the tick the press is seen). ((Triforce, 11-19) the system menu's tick too: the mouse
+       onto Mods or Quit and its click in one tick is their decide alone) */
     for (int i = 0; i < VOICES; i++) {
         const int64_t at = atomic_load_explicit(&voices[i].at, memory_order_acquire);
-        if (at >= 0 && (atomic_load(&voices[i].sound) == id || atomic_load(&voices[i].sound) == HOS_MENU_SOUND_CURSOR) &&
+        const int was = atomic_load(&voices[i].sound);
+        if (at >= 0 && (was == id || was == HOS_MENU_SOUND_CURSOR || was == HOS_MENU_SOUND_SYS_CURSOR) &&
             AT_FRAME(at) < 2400) {   /* started under 50 ms ago */
             pick = i;
             break;

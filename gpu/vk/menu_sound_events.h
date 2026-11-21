@@ -25,6 +25,12 @@
 namespace menu_sound {
 // (vk_api.h HOS_MENU_SOUND_*: vk_menu.cpp holds them against these)
 constexpr int kNone = 0, kOpen = 1, kClose = 2, kCursor = 3, kDecide = 4, kCancel = 5, kTabLeft = 6, kTabRight = 7;
+// ((Triforce) and the Mods screen's and entry's own, which sound_of never names: the fanfare of a mod installed, and the
+// system menu's cursor and "decide" of the game's lists the Mods entry is under. (11-19) The queue took the seven above
+// only and dropped these without a word: moving onto Mods, A on it, Quit's dialog and the fanfare were silent)
+constexpr int kFanfare = 8, kSysCursor = 9, kSysDecide = 10;
+// ((Triforce) an item or a gear put on the D-pad, and a put refused: the radial menus' own, radial_menu_take_put_sound)
+constexpr int kItemEquip = 11, kItemError = 12, kLast = kItemError;
 
 // (State::page: the tabs' rows, a page over them, and the restart question, whose two buttons L and R choose between)
 constexpr int kPageRows = 0, kPageAsk = 5;
@@ -104,9 +110,9 @@ struct Queue {
     Entry entries[kQueue] = {};
     std::atomic<unsigned> head{0}, tail{0};   // (taken up to head, put up to tail)
 
-    /// The menu's thread: a sound asked for at now_ns. false when it is none of the seven, or the queue is full
+    /// The menu's thread: a sound asked for at now_ns. false when it is none of the sounds (1 to kLast), or the queue is full
     bool put(int sound, int64_t now_ns) {
-        if (sound <= kNone || sound > kTabRight) return false;
+        if (sound <= kNone || sound > kLast) return false;
         const unsigned t = tail.load(std::memory_order_relaxed);
         if (t - head.load(std::memory_order_acquire) >= kQueue) return false;
         entries[t % kQueue] = {sound, now_ns};
