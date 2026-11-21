@@ -974,7 +974,7 @@ bool make_eyes(VkCommandBuffer cb, const Drawn &d) {
 }
 
 // The hand controllers through OpenXR's actions, bound for the Touch controllers (Quest), read each headset frame onto
-// the pad's buttons (input_map.h bits): A and B their own, X and Y A and B again; either stick's click X (jump); the left grip ZL (the Z lock), the right grip ZR; the left Menu tapped Plus (the inventory), held a second
+// the pad's buttons (input_map.h bits): A and B their own, X and Y A and B again; either stick's click alone X (jump); the left grip ZL (the Z lock), the right grip ZR; both sticks' clicks together (L3+R3, as the PSVR2's Options cannot reach OpenXR) or the Touch left Menu tapped Plus (the inventory), held a second
 // Minus; the sword hand (VR_HANDEDNESS, the left by default) swung fast Y tapped, or held while the swing went
 // outward and left the hand out to the side (the charge), until the hand comes back in. The shield hand's shield turned to face ahead before its own side's eye holds ZL (the Z lock), as Link
 // holds his shield. Both arms shaken upward press the D-pad's down (the boots), both hands together before the face
@@ -998,6 +998,9 @@ struct Controls {
     bool trigger_on[2]{}, squeeze_on[2]{};
     uint64_t menu_down = 0, plus_until = 0, minus_until = 0;   // plat_now_ns
     bool minus_sent = false;
+    static constexpr uint64_t click_wait_ns = 80000000ull;
+    bool combo_latch = false;   // both sticks clicked together, until both are let go
+    uint64_t click_since = 0;   // one stick clicked alone since (plat_now_ns)
     // the swing: the sword hand's grip positions over the last frames (plat_now_ns). A swing starts once the speed is past
     // swing_on (VR_SWING_SPEED), at least refractory_ns after the last one started (a swing's follow-through is
     // not another), and ends under swing_off. Each is a tap of Y (tap_ns down, at least gap_ns up
@@ -1097,6 +1100,8 @@ struct Controls {
             rt_log("vr: the Touch controllers' bindings were refused (%d): no hand controllers", (int)r);
             return;
         }
+        // (SteamVR presents the PSVR2 Sense controllers as Touch ones, but its remapping of the Touch left Menu to the
+        // Sense's right Options does not reach OpenXR, whose input is "menu", not "application_menu": hence L3+R3)
         XrSessionActionSetsAttachInfo at{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
         at.countActionSets = 1, at.actionSets = &set;
         r = x.xrAttachSessionActionSets(session, &at);
@@ -1141,7 +1146,16 @@ struct Controls {
         const auto set_bit = [&](int bit, bool down) { bits |= down ? 1ull << bit : 0; };
         set_bit(A, on(session, a, XR_NULL_PATH) || on(session, xb, XR_NULL_PATH));
         set_bit(B, on(session, b, XR_NULL_PATH) || on(session, yb, XR_NULL_PATH));
-        set_bit(X, on(session, click, hand[0]) || on(session, click, hand[1]));
+        // both sticks clicked together (L3+R3) are the Menu, below: one click alone is X (jump) once it has been held
+        // click_wait_ns, so the first of two clicks pressed nearly together is not a jump; held both, no jump until both are up
+        const bool click_l = on(session, click, hand[0]), click_r = on(session, click, hand[1]);
+        const bool combo = click_l && click_r;
+        if (combo) combo_latch = true;
+        else if (!click_l && !click_r) combo_latch = false;
+        if ((click_l != click_r) && !combo_latch) {
+            if (!click_since) click_since = now;
+        } else click_since = 0;
+        set_bit(X, click_since && now - click_since >= click_wait_ns);
         bool squeezed_before[2] = {squeeze_on[0], squeeze_on[1]};
         for (int h = 0; h < 2; h++) {   // pressed past 0.6, released under 0.4
             const float t = value(session, trigger, hand[h]), s = value(session, squeeze, hand[h]);
@@ -1151,11 +1165,11 @@ struct Controls {
         const bool in_play = x.in_play.load();
         if (!in_play) set_bit(ZL, squeeze_on[0]), set_bit(ZR, squeeze_on[1]);   // menus and events: the grips as ever
         // the Menu: a tap is Plus for a moment at its release, a second's hold Minus for a moment then
-        if (on(session, menu, XR_NULL_PATH)) {
+        if (combo_latch || on(session, menu, XR_NULL_PATH)) {
             if (!menu_down) menu_down = now, minus_sent = false;
-            if (!minus_sent && now - menu_down >= hold_ns) minus_until = now + press_ns, minus_sent = true;
+            if (!minus_sent && now - menu_down >= hold_ns) minus_until = now + press_ns, minus_sent = true, rt_log("vr: Menu held: Minus");
         } else if (menu_down) {
-            if (!minus_sent) plus_until = now + press_ns;
+            if (!minus_sent) plus_until = now + press_ns, rt_log("vr: Menu tapped: Plus");
             menu_down = 0;
         }
         set_bit(PLUS, now < plus_until), set_bit(MINUS, now < minus_until);
