@@ -30,6 +30,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <cctype>
 #include <string>
 #include <vector>
 
@@ -92,6 +93,7 @@ struct Drawn {
 
 struct Xr {
     bool tried = false, ok = false;
+    bool psvr2 = false;   // the headset is a PSVR2 (its system name): its Options cannot reach OpenXR, so L3+R3 are the Menu
     PFN_xrGetInstanceProcAddr gipa = nullptr;
 #define XR_DECLARE(f) PFN_##f f = nullptr;
     XR_FUNCS(XR_DECLARE)
@@ -369,6 +371,11 @@ bool init() {
     }
     XrSystemProperties sp{XR_TYPE_SYSTEM_PROPERTIES};
     x.xrGetSystemProperties(x.instance, x.system, &sp);
+    {
+        std::string name = sp.systemName;
+        for (char &ch : name) ch = (char)std::tolower((unsigned char)ch);
+        x.psvr2 = name.find("playstation_vr2") != std::string::npos || name.find("psvr2") != std::string::npos;
+    }
     XrGraphicsRequirementsVulkanKHR req{XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR};   // asked before a session, as the spec says
     x.xrGetVulkanGraphicsRequirementsKHR(x.instance, x.system, &req);
     for (int pass = 0; pass < 2; pass++) {
@@ -974,7 +981,7 @@ bool make_eyes(VkCommandBuffer cb, const Drawn &d) {
 }
 
 // The hand controllers through OpenXR's actions, bound for the Touch controllers (Quest), read each headset frame onto
-// the pad's buttons (input_map.h bits): A and B their own, X and Y A and B again; either stick's click alone X (jump); the left grip ZL (the Z lock), the right grip ZR; both sticks' clicks together (L3+R3, as the PSVR2's Options cannot reach OpenXR) or the Touch left Menu tapped Plus (the inventory), held a second
+// the pad's buttons (input_map.h bits): A and B their own, X and Y A and B again; either stick's click alone X (jump); the left grip ZL (the Z lock), the right grip ZR; on the PSVR2 both sticks' clicks together (L3+R3, as its Options cannot reach OpenXR) or the Touch left Menu tapped Plus (the inventory), held a second
 // Minus; the sword hand (VR_HANDEDNESS, the left by default) swung fast Y tapped, or held while the swing went
 // outward and left the hand out to the side (the charge), until the hand comes back in. The shield hand's shield turned to face ahead before its own side's eye holds ZL (the Z lock), as Link
 // holds his shield. Both arms shaken upward press the D-pad's down (the boots), both hands together before the face
@@ -1146,16 +1153,20 @@ struct Controls {
         const auto set_bit = [&](int bit, bool down) { bits |= down ? 1ull << bit : 0; };
         set_bit(A, on(session, a, XR_NULL_PATH) || on(session, xb, XR_NULL_PATH));
         set_bit(B, on(session, b, XR_NULL_PATH) || on(session, yb, XR_NULL_PATH));
-        // both sticks clicked together (L3+R3) are the Menu, below: one click alone is X (jump) once it has been held
+        // on the PSVR2 both sticks clicked together (L3+R3) are the Menu, below: one click alone is X (jump) once it has been held
         // click_wait_ns, so the first of two clicks pressed nearly together is not a jump; held both, no jump until both are up
         const bool click_l = on(session, click, hand[0]), click_r = on(session, click, hand[1]);
-        const bool combo = click_l && click_r;
-        if (combo) combo_latch = true;
-        else if (!click_l && !click_r) combo_latch = false;
-        if ((click_l != click_r) && !combo_latch) {
-            if (!click_since) click_since = now;
-        } else click_since = 0;
-        set_bit(X, click_since && now - click_since >= click_wait_ns);
+        if (!x.psvr2) {   // (other headsets have their own Menu button: either click is X at once)
+            set_bit(X, click_l || click_r);
+        } else {
+            const bool combo = click_l && click_r;
+            if (combo) combo_latch = true;
+            else if (!click_l && !click_r) combo_latch = false;
+            if ((click_l != click_r) && !combo_latch) {
+                if (!click_since) click_since = now;
+            } else click_since = 0;
+            set_bit(X, click_since && now - click_since >= click_wait_ns);
+        }
         bool squeezed_before[2] = {squeeze_on[0], squeeze_on[1]};
         for (int h = 0; h < 2; h++) {   // pressed past 0.6, released under 0.4
             const float t = value(session, trigger, hand[h]), s = value(session, squeeze, hand[h]);
