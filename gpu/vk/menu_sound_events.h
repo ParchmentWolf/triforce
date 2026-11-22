@@ -30,7 +30,7 @@ constexpr int kNone = 0, kOpen = 1, kClose = 2, kCursor = 3, kDecide = 4, kCance
 // only and dropped these without a word: moving onto Mods, A on it, Quit's dialog and the fanfare were silent)
 constexpr int kFanfare = 8, kSysCursor = 9, kSysDecide = 10;
 // ((Triforce) an item or a gear put on the D-pad, and a put refused: the radial menus' own, radial_menu_take_put_sound)
-constexpr int kItemEquip = 11, kItemError = 12, kLast = kItemError;
+constexpr int kItemEquip = 11, kItemError = 12, kRadialCursor = 13, kRadialSwap = 14, kLast = kRadialSwap;
 
 // (State::page: the tabs' rows, a page over them, and the restart question, whose two buttons L and R choose between)
 constexpr int kPageRows = 0, kPageAsk = 5;

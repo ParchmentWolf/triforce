@@ -84,6 +84,9 @@ static const char *const files[SOUNDS] = {
     [HOS_MENU_SOUND_ITEM_EQUIP] = "Sound/Resource/Stream/SE_Sys_PlusMenu_ItemEquip00.bwav",
     /* ((Triforce) the pause menu's own refusal, kept in its sound bank alone) */
     [HOS_MENU_SOUND_ITEM_ERROR] = "Sound/Resource/UI_Static.Product.111.bars.zs#SE_Sys_PlusMenu_ItemInvalid00",
+    /* ((Triforce) the radial menus: a slot picked, as the game's own item bar; ZR stepping a slot's variants, a page turned */
+    [HOS_MENU_SOUND_RADIAL_CURSOR] = "Sound/Resource/UI_Static.Product.111.bars.zs#SE_Sys_ShortCut_ItemSelect00",
+    [HOS_MENU_SOUND_RADIAL_SWAP] = "Sound/Resource/Stream/SE_Sys_ItemMenu_WinScroll_Right.bwav",
 };
 
 static Sound sounds[SOUNDS];

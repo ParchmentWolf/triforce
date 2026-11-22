@@ -216,7 +216,7 @@ def main():
     check("else if (!after.open && !quit_ended) mods_sound(HOS_MENU_SOUND_SYS_CURSOR);" in tick and "quit_ended = true" in rows,
           "Quit Game's decide is followed by the cursor's sound")
     # (the sounds reach the host: the queue takes the system menu's)
-    check("constexpr int kFanfare = 8, kSysCursor = 9, kSysDecide = 10;" in events and "kLast = kItemError;" in events and
+    check("constexpr int kFanfare = 8, kSysCursor = 9, kSysDecide = 10;" in events and "kLast = kRadialSwap;" in events and
           "sound > kLast" in events,
           "the sounds' queue drops the system menu's cursor and decide")
 

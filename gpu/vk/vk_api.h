@@ -130,6 +130,7 @@ enum { HOS_MENU_SOUND_OPEN = 1, HOS_MENU_SOUND_CLOSE, HOS_MENU_SOUND_CURSOR, HOS
        HOS_MENU_SOUND_SYS_CURSOR, HOS_MENU_SOUND_SYS_DECIDE,
        HOS_MENU_SOUND_ITEM_EQUIP,   /* ((Triforce) an item or a gear put on the D-pad: the pause menu's equip sound) */
        HOS_MENU_SOUND_ITEM_ERROR,   /* ((Triforce) a put on the D-pad refused: the pause menu's own */
+       HOS_MENU_SOUND_RADIAL_CURSOR, HOS_MENU_SOUND_RADIAL_SWAP,   /* ((Triforce) a radial slot picked; ZR's variant step */
        HOS_MENU_SOUND_N };
 /* (Triforce) The Mods entry under a game list's last button (host/oot_menu.c tells, gpu/vk/vk_menu.cpp draws it): the pause
    menu's System page and the title's list. Each frame such a list runs, option_set: HOS_OPT_MODS_X0 .. HOS_OPT_MODS_Y1 its

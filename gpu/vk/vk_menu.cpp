@@ -5157,26 +5157,98 @@ void draw_radial_menu(ui::Ctx& c, int kind, int picked) {
             float st;
             if (radial_menu_shake(kind, i, &st))   // (a refused put: shaken side to side, dying out, as the pause menu does)
                 spot.x += std::sin(st * 6 * 2 * 3.14159265f) * (1 - st) * icon * 0.12f;
-            wheel_slot_icon(c, s, spot, icon);
-            wheel_count(c, s.count, s.max, at(ai, 0.5f * (r + ring - icon * 0.5f)), icon * 0.28f, false);
-            if (s.minis && s.mini_selected < 0) {
-                const float m = icon * 0.42f, out = 0.5f * (ring + icon * 0.5f + R), spread = m * 1.1f / out;
-                for (int k = 0; k < s.minis; k++) {
-                    const ImVec2 p = at(ai + (k - 0.5f * (s.minis - 1)) * spread, out);
-                    if (ImTextureData* t = wheel_icon(s.mini[k]))
-                        c.d->AddImage(t->GetTexRef(), ImVec2(p.x - m * 0.5f, p.y - m * 0.5f), ImVec2(p.x + m * 0.5f, p.y + m * 0.5f));
-                    wheel_count(c, s.mini_count[k], s.mini_max[k], ImVec2(p.x + m * 0.5f, p.y + m * 0.5f), m * 0.36f, true);
+            // ((Triforce) the picked slot's icons kept from frame to frame: a ZL/ZR swap turns each from where it was to its new
+            // place, half a circle about their midpoint (clockwise to a later variant, counter-clockwise to an earlier), growing or shrinking on the way)
+            struct Placed { RadialMenuTex tex; ImVec2 p; float size; };
+            static Placed last[4], from[4];
+            static int last_n = 0, last_kind = 0, last_slot = -1, from_n = 0;
+            static uint64_t from_id = 0;
+            Placed now_at[4];
+            int now_n = 0;
+            const bool minis_out = s.minis && s.mini_selected < 0;
+            const float m = icon * 0.42f, out = 0.5f * (ring + icon * 0.5f + R), spread = m * 1.1f / out;
+            if (i == picked && minis_out) {
+                now_at[now_n++] = {s.main, spot, icon};
+                for (int k = 0; k < s.minis && now_n < 4; k++) now_at[now_n++] = {s.mini[k], at(ai + (k - 0.5f * (s.minis - 1)) * spread, out), m};
+            }
+            float sw_t;
+            uint64_t sw_id;
+            int sw_cw = 0;
+            bool turning = false;
+            if (i == picked && now_n && radial_menu_swap_anim(kind, i, &sw_t, &sw_id, &sw_cw)) {
+                if (sw_id != from_id) {
+                    from_id = sw_id, from_n = last_kind == kind && last_slot == i ? last_n : 0;
+                    for (int k = 0; k < from_n; k++) from[k] = last[k];
                 }
+                turning = from_n > 0;
+            }
+            if (turning) {
+                const float e = sw_t * sw_t * (3 - 2 * sw_t), th = (sw_cw ? -e : e) * pi;
+                for (int k = 0; k < now_n; k++) {
+                    const Placed& b = now_at[k];
+                    ImVec2 p = b.p;
+                    float size = b.size;
+                    for (int j = 0; j < from_n; j++) {
+                        if (strcmp(from[j].tex.file, b.tex.file) || strcmp(from[j].tex.tex, b.tex.tex)) continue;
+                        const ImVec2 o((from[j].p.x + b.p.x) * 0.5f, (from[j].p.y + b.p.y) * 0.5f);
+                        const float vx = from[j].p.x - o.x, vy = from[j].p.y - o.y;
+                        p = ImVec2(o.x + vx * std::cos(th) + vy * std::sin(th), o.y - vx * std::sin(th) + vy * std::cos(th));
+                        size = from[j].size + (b.size - from[j].size) * e;
+                        break;
+                    }
+                    if (ImTextureData* t = wheel_icon(b.tex))
+                        c.d->AddImage(t->GetTexRef(), ImVec2(p.x - size * 0.5f, p.y - size * 0.5f), ImVec2(p.x + size * 0.5f, p.y + size * 0.5f));
+                }
+            } else {
+                wheel_slot_icon(c, s, spot, icon);
+                wheel_count(c, s.count, s.max, at(ai, 0.5f * (r + ring - icon * 0.5f)), icon * 0.28f, false);
+                if (minis_out)
+                    for (int k = 0; k < s.minis; k++) {
+                        const ImVec2 p = at(ai + (k - 0.5f * (s.minis - 1)) * spread, out);
+                        if (ImTextureData* t = wheel_icon(s.mini[k]))
+                            c.d->AddImage(t->GetTexRef(), ImVec2(p.x - m * 0.5f, p.y - m * 0.5f), ImVec2(p.x + m * 0.5f, p.y + m * 0.5f));
+                        wheel_count(c, s.mini_count[k], s.mini_max[k], ImVec2(p.x + m * 0.5f, p.y + m * 0.5f), m * 0.36f, true);
+                    }
+            }
+            if (i == picked) {
+                last_kind = kind, last_slot = i, last_n = now_n;
+                for (int k = 0; k < now_n; k++) last[k] = now_at[k];
             }
         }
     }
     c.d->AddCircle(mid, R - 1, ui::kGold, 96, 3.0f);
     c.d->AddCircle(mid, r, ui::kGold, 64, 2.0f);
     if (picked < 0 || !radial_menu_slot(kind, picked, &s)) return;
-    {   // (the middle: only what the release equips)
+    const bool swap = radial_menu_can_swap(kind, picked);
+    {   // (the middle: only what the release equips; raised and smaller while ZR can swap, for its prompt under it)
         RadialMenuSlot only{};
         only.main = s.now, only.count = -1;
-        wheel_slot_icon(c, only, mid, 1.35f * r);
+        wheel_slot_icon(c, only, swap ? ImVec2(mid.x, mid.y - 0.22f * r) : mid, swap ? 1.05f * r : 1.35f * r);
+    }
+    if (swap) {   // (ZL/ZR's icons, the swap arrows under them, then "Swap")
+        const float k = 0.7f;   // (the prompt's size; its parts keep their proportions, "Swap" stays at the bottom)
+        float y = mid.y + (0.8f - k * 0.42f) * r;
+        ImFont* slash_font = c.f.strong ? c.f.strong : c.f.body;
+        if (c.f.glyph && slash_font) {
+            const float px = k * 0.42f * r, spx = k * 0.3f * r;
+            const ImVec2 zl = ui::size_of(c.f.glyph, px, ui::kIconZL), zr = ui::size_of(c.f.glyph, px, ui::kIconZR),
+                         sl = ui::size_of(slash_font, spx, "/");
+            float x = mid.x - (zl.x + sl.x + zr.x) * 0.5f;
+            c.d->AddText(c.f.glyph, px, ImVec2(x, y - zl.y * 0.5f), ui::kInk, ui::kIconZL), x += zl.x;
+            ui::text_mid(c, slash_font, spx, x, y, ui::kInk, "/"), x += sl.x;
+            c.d->AddText(c.f.glyph, px, ImVec2(x, y - zr.y * 0.5f), ui::kInk, ui::kIconZR);
+        } else if (slash_font) {
+            ui::text_mid_centre(c, slash_font, k * 0.24f * r, mid.x, y, ui::kInk, "ZL/ZR");
+        }
+        y = mid.y + (0.8f - k * 0.18f) * r;
+        const float hw = k * 0.17f * r, gap = k * 0.05f * r, head = k * 0.07f * r, th = std::max(1.5f, k * 0.03f * r);
+        c.d->AddLine(ImVec2(mid.x - hw, y - gap), ImVec2(mid.x + hw - head, y - gap), ui::kInk, th);
+        c.d->AddTriangleFilled(ImVec2(mid.x + hw, y - gap), ImVec2(mid.x + hw - head, y - gap - head * 0.6f),
+                               ImVec2(mid.x + hw - head, y - gap + head * 0.6f), ui::kInk);
+        c.d->AddLine(ImVec2(mid.x + hw, y + gap), ImVec2(mid.x - hw + head, y + gap), ui::kInk, th);
+        c.d->AddTriangleFilled(ImVec2(mid.x - hw, y + gap), ImVec2(mid.x - hw + head, y + gap + head * 0.6f),
+                               ImVec2(mid.x - hw + head, y + gap - head * 0.6f), ui::kInk);
+        if (ImFont* f = c.f.body ? c.f.body : c.f.strong) ui::text_mid_centre(c, f, k * 0.15f * r, mid.x, mid.y + 0.8f * r, ui::kInk, "Swap");
     }
     ImFont* font = c.f.body ? c.f.body : c.f.strong;
     if (!s.label || !font) return;
@@ -5569,6 +5641,7 @@ static_assert(menu_sound::kOpen == HOS_MENU_SOUND_OPEN && menu_sound::kClose == 
               menu_sound::kTabRight == HOS_MENU_SOUND_TAB_RIGHT && menu_sound::kFanfare == HOS_MENU_SOUND_FANFARE &&
               menu_sound::kSysCursor == HOS_MENU_SOUND_SYS_CURSOR && menu_sound::kSysDecide == HOS_MENU_SOUND_SYS_DECIDE &&
               menu_sound::kItemEquip == HOS_MENU_SOUND_ITEM_EQUIP && menu_sound::kItemError == HOS_MENU_SOUND_ITEM_ERROR &&
+              menu_sound::kRadialCursor == HOS_MENU_SOUND_RADIAL_CURSOR && menu_sound::kRadialSwap == HOS_MENU_SOUND_RADIAL_SWAP &&
               menu_sound::kLast + 1 == HOS_MENU_SOUND_N,
               // ((Triforce) the fanfare and the system menu's two: the Mods screen's and entry's own, not the options')
               "menu_sound_events.h's sounds are vk_api.h's HOS_MENU_SOUND_*");
@@ -5628,7 +5701,8 @@ static menu_sound::State sound_state() {
 // (the options' next sound, for the host's sound thread; (Triforce) first a D-pad put's, the pause menu's equip sound)
 int menu_take_sound() {
     if (const int put = radial_menu_take_put_sound(); put && opts.menu_sounds > 0)
-        return put == 2 ? HOS_MENU_SOUND_ITEM_ERROR : HOS_MENU_SOUND_ITEM_EQUIP;
+        return put == 2 ? HOS_MENU_SOUND_ITEM_ERROR : put == 3 ? HOS_MENU_SOUND_RADIAL_CURSOR : put == 4 ? HOS_MENU_SOUND_RADIAL_SWAP
+                                                                                    : HOS_MENU_SOUND_ITEM_EQUIP;
     return sound_queue.take(prof_now());
 }
 void mods_sound(int id) { if (opts.menu_sounds > 0) sound_queue.put(id, prof_now()); }   // ((Triforce) the Mods entry's and screen's own sounds

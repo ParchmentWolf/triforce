@@ -33,7 +33,8 @@ typedef struct {
 int radial_menu_slots(int kind);                        // the radial menu's slots
 int radial_menu_slot(int kind, int slot, RadialMenuSlot *out);  // 1 when the slot holds something owned, and what it shows
 int radial_menu_usable(int kind, int slot);             // owned and usable now (a gray gear is not)
-void radial_menu_tap(int kind, int slot);               // a tap on the slot: its next owned variant (kept)
+int radial_menu_can_swap(int kind, int slot);           // 1 when ZL/ZR would step the slot to another owned variant
+int radial_menu_tap(int kind, int slot, int dir);       // the slot's next (dir 1) or previous (-1) owned variant (kept): 1 to a later one, 2 an earlier, 0 none
 // The item slot's value now, NULL when empty: an AssignableItem value, an ocarina ("Item_Ocarina_Time": played as the game's
 // D-pad plays it) or a gear's name (worn: radial_menu_gear_member)
 const char *radial_menu_equip(int slot);
@@ -86,9 +87,12 @@ int radial_menu_dpad_put_item(int dir, const char *item, int from_layout, float 
 int radial_menu_dpad_fly(int *dir, int *radial_kind, int *radial_slot, int *from_layout, float *x, float *y, float *t);
 // A put's sound due since the last call (vk_menu.cpp menu_take_sound): 1 put (HOS_MENU_SOUND_ITEM_EQUIP), 2 refused (not
 // owned, the other age's, nothing there: HOS_MENU_SOUND_ITEM_ERROR), 0 none
-int radial_menu_take_put_sound(void);
+int radial_menu_take_put_sound(void);   // 1 put, 2 refused, 3 a slot picked, 4 a slot's variants stepped
 // A refused put's shake of the radial menu's slot it was put from: 1 while it lasts, *t how far along (0..1)
 int radial_menu_shake(int kind, int slot, float *t);
+// A ZL/ZR swap's turn of the slot's icons: 1 while it lasts, *t how far along (0..1), *id the swap's own (a new one each),
+// *cw clockwise (to a later variant; to an earlier one: counter-clockwise)
+int radial_menu_swap_anim(int kind, int slot, float *t, uint64_t *id, int *cw);
 // A gear on the direction (from the Equipment page: a sword, a shield, a tunic, boots): its name and its PlayerStatus member
 // ("EquipWeapon"), NULL when none or not wearable now (not owned, or not at Link's age)
 const char *radial_menu_dpad_gear(int dir, const char **member);
@@ -101,18 +105,15 @@ const char *radial_menu_dpad_gear(int dir, const char **member);
 // A radial menu's controller, the same for every input that opens the radial menus (a gamepad's L and R: radial_menu_pad): held = the buttons
 // that open the radial menus (bit 0 the gear's, bit 1 the items'), sticks = each radial menu's stick (-1..1, x right, y up). A radial menu
 // opens while its button is held (the first held wins) and allowed; the stick pushed past half picks the slot it points at;
-// the stick toward a slot and back within flick_ns steps its variants (radial_menu_tap); the button's release uses the slot
+// swap steps the picked slot's variants (radial_menu_tap): 1 on (ZR), -1 back (ZL); the button's release uses the slot
 // the stick is held toward (an empty slot, or none, does nothing).
 struct RadialMenuCtl {
-    static constexpr uint64_t flick_ns = 300000000ull;
     int open = 0, slot = -1;
-    int tap_slot = -1;
-    uint64_t tap_since = 0;
     struct Out {
         bool closed = false;
         int used_kind = 0, used_slot = -1;
     };
-    Out step(int held, bool allowed, const float sticks[2][2], uint64_t now);
-    void reset() { open = 0, slot = -1, tap_slot = -1; }
+    Out step(int held, bool allowed, const float sticks[2][2], uint64_t now, int swap = 0);
+    void reset() { open = 0, slot = -1; }
 };
 #endif

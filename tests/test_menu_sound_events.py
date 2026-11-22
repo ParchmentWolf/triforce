@@ -160,7 +160,7 @@ int main() {
     CHECK(q.take(2000) == kNone);
     /* ((Triforce) 11-19) the Mods entry's and screen's own: the system menu's cursor and decide, and the fanfare, are queued
        and taken as the others are (they were dropped: the entry under the title's list made no sound) */
-    CHECK(kFanfare == kTabRight + 1 && kSysCursor == kFanfare + 1 && kSysDecide == kSysCursor + 1 && kItemEquip == kSysDecide + 1 && kItemError == kItemEquip + 1 && kLast == kItemError);
+    CHECK(kFanfare == kTabRight + 1 && kSysCursor == kFanfare + 1 && kSysDecide == kSysCursor + 1 && kItemEquip == kSysDecide + 1 && kItemError == kItemEquip + 1 && kRadialCursor == kItemError + 1 && kRadialSwap == kRadialCursor + 1 && kLast == kRadialSwap);
     CHECK(q.put(kSysCursor, 1000) && q.put(kSysDecide, 1000) && q.put(kFanfare, 1000));
     CHECK(q.take(1000) == kSysCursor && q.take(1000) == kSysDecide && q.take(1000) == kFanfare);
     CHECK(q.take(2000) == kNone);

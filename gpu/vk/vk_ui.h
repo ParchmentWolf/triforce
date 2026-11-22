@@ -285,7 +285,7 @@ struct Prompt {
 };
 // (the game's icon font: the Switch's buttons' code points, StaticMsg/GuideKeyIcon.msbt; the host's font points each at the
 // icon of the pad input bound to it, host/prompts.c)
-constexpr const char *kIconA = "\xEE\x81\x80", *kIconB = "\xEE\x81\x81", *kIconL = "\xEE\x81\x84", *kIconR = "\xEE\x81\x85",
+constexpr const char *kIconA = "\xEE\x81\x80", *kIconB = "\xEE\x81\x81", *kIconL = "\xEE\x81\x84", *kIconR = "\xEE\x81\x85", *kIconZL = "\xEE\x81\x86", *kIconZR = "\xEE\x81\x87",
                      *kIconUpDown = "\xEE\x81\xA4", *kIconLeftRight = "\xEE\x81\xA5";
 /// One prompt's icon at p (its left; the line's middle my); its width. draw false: measured only
 inline float glyph(Ctx& c, float my, float x, const Prompt& pr, bool draw) {

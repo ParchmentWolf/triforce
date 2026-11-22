@@ -368,13 +368,22 @@ int radial_menu_usable(int kind, int slot) {
     return radial_menu_slot(kind, slot, &s) && !s.now.gray;
 }
 
-void radial_menu_tap(int kind, int slot) {
-    if (kind != RADIAL_MENU_ITEMS || slot < 0 || slot >= RADIAL_MENU_ITEM_SLOTS) return;
+int radial_menu_can_swap(int kind, int slot) {
+    if (kind != RADIAL_MENU_ITEMS || slot < 0 || slot >= RADIAL_MENU_ITEM_SLOTS) return 0;
+    int count, owned_idx[4], n_owned;
+    const Var *vars = slot_vars(slot, &count);
+    return slot_current(slot, vars, count, owned_idx, &n_owned) >= 0 && n_owned >= 2;
+}
+
+int radial_menu_tap(int kind, int slot, int dir) {
+    if (kind != RADIAL_MENU_ITEMS || slot < 0 || slot >= RADIAL_MENU_ITEM_SLOTS) return 0;
     int count, owned_idx[4], n_owned;
     const Var *vars = slot_vars(slot, &count);
     const int cur = slot_current(slot, vars, count, owned_idx, &n_owned);
-    if (cur < 0 || n_owned < 2) return;
-    g_mem[slot].store(owned_idx[(cur + 1) % n_owned]);
+    if (cur < 0 || n_owned < 2) return 0;
+    const int next = (cur + (dir < 0 ? n_owned - 1 : 1)) % n_owned;
+    g_mem[slot].store(owned_idx[next]);
+    return next > cur ? 1 : 2;
 }
 
 const char *radial_menu_equip(int slot) {
@@ -386,13 +395,16 @@ const char *radial_menu_equip(int slot) {
     return cur < 0 ? NULL : variant(&vars[owned_idx[cur]], &icon, &label);
 }
 
-RadialMenuCtl::Out RadialMenuCtl::step(int held, bool allowed, const float sticks[2][2], uint64_t now) {
+void radial_menu_nav_sound(int sound);
+void radial_menu_swapped(int kind, int slot, int cw);
+
+RadialMenuCtl::Out RadialMenuCtl::step(int held, bool allowed, const float sticks[2][2], uint64_t, int swap) {
     Out o;
     if (open && !(held & (1 << (open - 1)))) {   // its button let go: the slot held toward used
         if (slot >= 0 && radial_menu_usable(open, slot)) o.used_kind = open, o.used_slot = slot;
         o.closed = true, open = 0;
     }
-    if (!open && held && allowed) open = held & 1 ? RADIAL_MENU_GEAR : RADIAL_MENU_ITEMS, tap_slot = -1;
+    if (!open && held && allowed) open = held & 1 ? RADIAL_MENU_GEAR : RADIAL_MENU_ITEMS;
     const int was = slot;
     slot = -1;
     if (!open) return o;
@@ -404,11 +416,8 @@ RadialMenuCtl::Out RadialMenuCtl::step(int held, bool allowed, const float stick
         // (the item radial menu's first slot centred at the top; the gear's first starts there: a third's edge at the top)
         slot = (int)std::floor(a / (2.0f * 3.14159265f / n) + (open == RADIAL_MENU_GEAR ? 0.0f : 0.5f)) % n;
     }
-    if (slot >= 0 && slot != was) tap_slot = slot, tap_since = now;
-    if (slot < 0 && tap_slot >= 0) {
-        if (now - tap_since < flick_ns) radial_menu_tap(open, tap_slot);
-        tap_slot = -1;
-    }
+    if (const int step = swap && slot >= 0 ? radial_menu_tap(open, slot, swap) : 0) radial_menu_nav_sound(4), radial_menu_swapped(open, slot, step == 1);
+    else if (slot >= 0 && slot != was) radial_menu_nav_sound(3);
     return o;
 }
 
@@ -598,13 +607,14 @@ struct Menus {
     bool allowed = false;
     uint64_t closed_at = 0;
     uint64_t dpad_was = 0;   // (the D-pad held at the last read while a radial menu was open)
+    bool zl_was = false, zr_was = false;
 };
 Menus &menus() {
     static Menus w;
     return w;
 }
 // the game's pad: L 6, R 7 (kept the game's while a radial menu is open: its sequence's item bar stays open, paused)
-constexpr int kL = 6, kR = 7;
+constexpr int kL = 6, kR = 7, kZL = 8, kZR = 9;
 
 // the last put's flight to its direction (radial_menu_dpad_fly): from the item radial menu's slot, or from a point of the
 // pause menu's layout
@@ -617,11 +627,15 @@ struct Fly {
 std::mutex g_fly_mu;
 Fly g_fly;
 std::atomic<int> g_put_sound{0};   // (a put not sounded yet, 1, or a refused one, 2: radial_menu_take_put_sound)
+std::atomic<int> g_nav_sound{0};   // (a slot picked, 3, or its variants stepped, 4)
 constexpr uint64_t kFlyNs = 350000000ull;
 // (a refused put's shake of its radial menu slot, as the pause menu shakes an item it cannot equip)
 std::atomic<int> g_shake_kind{0}, g_shake_slot{-1};
 std::atomic<uint64_t> g_shake_at{0};
 constexpr uint64_t kShakeNs = 300000000ull;
+std::atomic<int> g_swap_kind{0}, g_swap_slot{-1}, g_swap_cw{0};
+std::atomic<uint64_t> g_swap_at{0};
+constexpr uint64_t kSwapNs = 260000000ull;
 void put_refused(int radial_kind, int radial_slot) {
     g_put_sound.store(2, std::memory_order_release);
     if (radial_kind && radial_slot >= 0)
@@ -636,7 +650,21 @@ void fly_start(int dir, int radial_kind, int radial_slot, bool from_layout, floa
 }
 }   // namespace
 
-int radial_menu_take_put_sound(void) { return g_put_sound.exchange(0, std::memory_order_acq_rel); }
+void radial_menu_swapped(int kind, int slot, int cw) {
+    g_swap_cw.store(cw), g_swap_slot.store(slot), g_swap_kind.store(kind), g_swap_at.store(radial_now_ns());
+}
+int radial_menu_swap_anim(int kind, int slot, float *t, uint64_t *id, int *cw) {
+    if (g_swap_kind.load() != kind || g_swap_slot.load() != slot) return 0;
+    const uint64_t at = g_swap_at.load(), now = radial_now_ns();
+    if (!at || now - at >= kSwapNs) return 0;
+    *t = (float)(now - at) / (float)kSwapNs, *id = at, *cw = g_swap_cw.load();
+    return 1;
+}
+int radial_menu_take_put_sound(void) {
+    const int put = g_put_sound.exchange(0, std::memory_order_acq_rel);
+    return put ? put : g_nav_sound.exchange(0, std::memory_order_acq_rel);
+}
+void radial_menu_nav_sound(int sound) { g_nav_sound.store(sound, std::memory_order_release); }
 
 int radial_menu_shake(int kind, int slot, float *t) {
     if (g_shake_kind.load() != kind || g_shake_slot.load() != slot) return 0;
@@ -669,7 +697,11 @@ int radial_menu_pad(uint64_t *buttons, int32_t left[2], int32_t right[2], int wa
     const int held = want == RADIAL_MENU_GEAR ? 1 : want == RADIAL_MENU_ITEMS ? 2 : 0;
     // (the right stick picks for both: the left thumb stays on the D-pad, to put what it points at there)
     const float rx = right[0] / 32767.0f, ry = right[1] / 32767.0f, sticks[2][2] = {{rx, ry}, {rx, ry}};
-    const RadialMenuCtl::Out o = w.pad.step(held, w.allowed, sticks, now);
+    // (ZR steps the picked slot's variants on, ZL back)
+    const bool zl = *buttons >> kZL & 1, zr = *buttons >> kZR & 1;
+    const int swap = !w.pad.open ? 0 : zr && !w.zr_was ? 1 : zl && !w.zl_was ? -1 : 0;
+    w.zl_was = zl, w.zr_was = zr;
+    const RadialMenuCtl::Out o = w.pad.step(held, w.allowed, sticks, now, swap);
     if (o.closed) w.closed_at = now;
     if (o.used_kind) w.used_kind = o.used_kind, w.used_slot = o.used_slot;
     if (!w.pad.open) {
