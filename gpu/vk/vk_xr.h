@@ -87,6 +87,11 @@ int vk_xr_hands(double pos[6], double point[6], double palm[6]);
 // be drawn over it: the image VR keeps it in (the caller copies it there in its stream), VK_NULL_HANDLE when the HUD's
 // panel is not made now. *init 1: the image is new (UNDEFINED; the caller makes it GENERAL first)
 VkImage vk_xr_scene_image(VkImage target, uint32_t w, uint32_t h, VkFormat format, int *init);
+// (diagnostics) a gameplay upscale's dispatch seen while VR is on; taken: its output found and kept for VR
+void vk_xr_note_upscale(int taken);
+// the hand controllers' buttons (HOS_SW_* bits, as labelled) and sticks while they are a menu's (not in play): 1, for this
+// menu's own input (vk_menu.cpp); 0 none
+int vk_xr_menu_buttons(uint64_t *buttons, float sticks[2][2]);
 
 // vk_replay.cpp present_image: 1 when VR takes this present's window image (then in TRANSFER_SRC_OPTIMAL for
 // vk_xr_capture); 0 records nothing
