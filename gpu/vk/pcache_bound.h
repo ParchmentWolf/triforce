@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <new>
 #include <stdexcept>
 #include <vector>
@@ -87,6 +88,7 @@ enum class Read {
     OverBound,   // (longer than the bound: not a byte of it read)
     NoMemory,    // (no block of its size)
     Cut,         // (the read ended early: nothing of it is used)
+    Foreign,     // ((Triforce) its header is another GPU's or driver's: not read past it)
 };
 
 inline const char* why(Read r) {
@@ -96,13 +98,19 @@ inline const char* why(Read r) {
     case Read::OverBound: return "it is over the bound";
     case Read::NoMemory: return "there is no memory for a block of its size";
     case Read::Cut: return "reading it ended early";
+    case Read::Foreign: return "it is another GPU's or driver's";
     default: return "";
     }
 }
 
 /// The whole file into out, or nothing: out is empty unless the answer is Ok. *len: the file's length whenever it could be
-/// asked, read or not. least: a file of at most this many bytes is refused; bound: one longer than this too (0: none)
-inline Read read(const char* path, uint64_t least, uint64_t bound, std::vector<uint8_t>& out, uint64_t* len) {
+/// asked, read or not. least: a file of at most this many bytes is refused; bound: one longer than this too (0: none).
+/// ((Triforce) head_ok: when given, the file's first kHead bytes (a pipeline cache's header) are read alone and handed to it
+/// with the file's length; refused, the rest is not read (Foreign). The file's stamp names only the translated shaders, so
+/// after a driver update a file of 0.65-1.6 GB was read whole only for its header to be refused)
+constexpr size_t kHead = 32;
+inline Read read(const char* path, uint64_t least, uint64_t bound, std::vector<uint8_t>& out, uint64_t* len,
+                 bool (*head_ok)(const uint8_t* head, uint64_t size) = nullptr) {
     out.clear();
     *len = 0;
     FILE* f = fopen(path, "rb");
@@ -120,7 +128,14 @@ inline Read read(const char* path, uint64_t least, uint64_t bound, std::vector<u
     else if ((uint64_t)n <= least) r = Read::Short;
     else if (!within((uint64_t)n, bound)) r = Read::OverBound;
     else if ((uint64_t)n > SIZE_MAX) r = Read::NoMemory;
-    else {
+    uint8_t head[kHead];
+    size_t got = 0;
+    if (r == Read::Ok && head_ok && (uint64_t)n >= kHead) {
+        got = fread(head, 1, kHead, f);
+        if (got != kHead) r = Read::Cut;
+        else if (!head_ok(head, (uint64_t)n)) r = Read::Foreign;
+    }
+    if (r == Read::Ok) {
         try {
             out.resize((size_t)n);
         } catch (const std::bad_alloc&) {
@@ -128,7 +143,7 @@ inline Read read(const char* path, uint64_t least, uint64_t bound, std::vector<u
         } catch (const std::length_error&) {
             r = Read::NoMemory;
         }
-        size_t got = 0;
+        if (r == Read::Ok && got) std::memcpy(out.data(), head, got);
         while (r == Read::Ok && got < out.size()) {
             const size_t piece = std::min(out.size() - got, kPiece);
             const size_t had = fread(out.data() + got, 1, piece, f);

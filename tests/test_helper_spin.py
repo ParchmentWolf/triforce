@@ -1,7 +1,7 @@
 """The parallel replay's spins (the third performance audit's P6, after NX2navi's replay workers): a helper thread with no
 segment to record spins for the next before it sleeps on the pool's condition variable (gpu/vk/vk_replay.cpp
 par_worker_main), and the replay thread spins for a segment a helper records before it sleeps for it (replay_handle), both
-bounded by RX_VK_HELPER_SPIN_US (100 us; 0: off, as before; gpu/vk/helper_spin.h). The spins only make a wait shorter: the
+bounded by RX_VK_HELPER_SPIN_US (20 us since 11-21, 100 before; 0: off, as before; gpu/vk/helper_spin.h). The spins only make a wait shorter: the
 condition variable's wait with its predicate follows each as before.
 
 gpu/vk/helper_spin.h and vk_replay.cpp's ParPool and par_worker_main (cut out unchanged) run in tests/helper_spin_test.cpp:

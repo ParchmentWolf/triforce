@@ -58,4 +58,14 @@ inline unsigned translate(unsigned all, bool amd_older, bool asked) {
     return amd_older && !asked ? std::min(all, kAmdOlderMost) : all;
 }
 
+/// (Triforce) Which heap the process is on (Windows), by the signature word at byte 16 of GetProcessHeap()'s header: the
+/// segment heap's (an exe built with HOOKSHOT_SEGMENT_HEAP=1, nx2/win_manifest.py) or the NT heap's; said in the log's line
+/// on the preparation's threads, so that a run says which of the two exes it was
+inline constexpr uint32_t kSegmentHeapSignature = 0xDDEEDDEEu;
+inline constexpr uint32_t kNtHeapSignature = 0xFFEEFFEEu;
+inline const char* heap_name(uint32_t signature) {
+    return signature == kSegmentHeapSignature ? "segment" : signature == kNtHeapSignature ? "NT" : "not known";
+}
+inline bool segment_heap(uint32_t signature) { return signature == kSegmentHeapSignature; }
+
 }   // namespace prepare_threads

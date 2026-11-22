@@ -33,6 +33,34 @@ def check_sources():
     # (NGX's Linux library converts its wide paths back in the "C" locale, ASCII only: a folder named otherwise goes to it
     # as /proc/self/fd/<n>)
     assert "dlss_checks::ascii(s)" in dlss and '"/proc/self/fd/"' in dlss, "wide(): non-ASCII folders by descriptor"
+    # ((Triforce, 11-21, the performance audit's PRESENT-37) prepare reads the DLSS model row's preset only through the settle
+    # rule, before it asks whether the feature there is can be used: a preset stepped past makes no feature
+    prepare = dlss[dlss.index("int prepare(VkCommandBuffer cmd"):]
+    prepare = prepare[:prepare.index("\n}\n")]
+    assert prepare.count("wanted_preset()") == 1, "prepare: the row's preset read past the settle rule"
+    settle = ("const unsigned preset = s.settle.pick(wanted_preset(), s.feature_preset, s.feature != nullptr, texture_frame_no(), "
+              "settle_frames);")
+    assert settle in prepare and prepare.index(settle) < prepare.index("const bool same_feature ="), \
+        "prepare: the preset is not the settle rule's, or is picked after the feature's reuse test"
+    assert 'dlss_checks::settle_frames(getenv("RX_VK_DLSS_MODEL_SETTLE"))' in prepare, "prepare: no RX_VK_DLSS_MODEL_SETTLE"
+    assert "dlss_checks::PresetSettle settle;" in dlss, "vk_dlss.cpp: the settle rule's state is not kept with the feature"
+    # ((Triforce, 11-22, the performance audit's PRESENT-38) the mode is found by mode_for, with its slack unless the switch
+    # says strict, and the feature there is is let go only after a mode took the size: a refused size keeps it
+    order = [prepare.find(n) for n in (
+        'static const bool slack_env = !(getenv("RX_VK_DLSS_MODE_SLACK") && atoi(getenv("RX_VK_DLSS_MODE_SLACK")) == 0);',
+        'dlss_checks::mode_for(ranges, nmodes, rw, rh, ow, oh, slack_env && !lab_ab::on("dlssstrict"), &widened);',
+        'if (!found) return *fail = "no DLSS mode takes this render size", 0;',
+        "temporal_later([old] { NVSDK_NGX_VULKAN_ReleaseFeature(old); });",
+        "NGX_VULKAN_CREATE_DLSS_EXT(cmd, 1, 1, &s.feature, s.params, &cp);")]
+    assert min(order) >= 0 and order == sorted(order), \
+        "prepare: the mode is not found by mode_for before the old feature is let go (%s)" % order
+    assert prepare.count("NVSDK_NGX_VULKAN_ReleaseFeature(old)") == 1, "prepare: the old feature is let go in a second place"
+    assert "max_w = std::max<unsigned>(r.max_w, rw), max_h = std::max<unsigned>(r.max_h, rh);" in prepare, \
+        "prepare: a size taken by the slack is not kept in the feature's range (it would be made again every frame)"
+    assert "`RX_VK_DLSS_MODE_SLACK=0`" in (ROOT / "docs" / "development.md").read_text(encoding="utf-8"), \
+        "docs/development.md: RX_VK_DLSS_MODE_SLACK is not in the switches table"
+    assert "`RX_VK_DLSS_MODEL_SETTLE=<frames>`" in (ROOT / "docs" / "development.md").read_text(encoding="utf-8"), \
+        "docs/development.md: RX_VK_DLSS_MODEL_SETTLE is not in the switches table"
 
 
 def main():

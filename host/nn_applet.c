@@ -152,6 +152,11 @@ uint32_t hos_output_size(int height) {
    much as the pool (nx2/oot_patches.py): a null pointer (a player's log, v0.3.7). With the 900 MB, 11-15 on an RTX 4070 SUPER: that
    output with RenoDX HDR boots and played in the world, 17,160 presents at about 50 fps, RenoDX's four shaders in place, no
    error from the pool (one short session, not every area; its scene target and each copy are 118 MB there). */
+/* ((Triforce, 11-21, the performance audit's TEX-85) Whether the render targets' heap is held to a size, with no room to
+   give: HOS_RT_POOL_MB set, or the 5120-wide outputs' 900 MB. -1 until hos_rt_pool_size has run. host/shadow_slot.h reserves
+   no stepped storage there unless asked to) */
+static int rt_pool_pinned = -1;
+int hos_rt_pool_pinned(void) { return __atomic_load_n(&rt_pool_pinned, __ATOMIC_RELAXED); }
 uint64_t hos_rt_pool_size(uint64_t game) {
     const char *e = getenv("HOS_RT_POOL_MB");
     extern volatile uint64_t hos_wide_out;
@@ -169,6 +174,7 @@ uint64_t hos_rt_pool_size(uint64_t game) {
     const uint64_t asked = (e ? strtoull(e, NULL, 0) << 20 : scaled < minimum ? minimum : is_five_k && scaled > five_k ? five_k : scaled) + (e ? 0 : rgba16f);
     /* (the 5120 x 2880 output: 900 MB for the whole pool, see above; an explicit HOS_RT_POOL_MB still wins) */
     const uint64_t v = !e && is_five_k && asked > five_k ? five_k : asked;
+    __atomic_store_n(&rt_pool_pinned, e != NULL || v != asked || (is_five_k && scaled > five_k), __ATOMIC_RELAXED);   /* ((Triforce, 11-21, TEX-85)) */
     static int logged;
     if (!logged++) {
         hos_log("applet: render target pool %llu MB (the game's %llu MB)", (unsigned long long)(v >> 20), (unsigned long long)(game >> 20));

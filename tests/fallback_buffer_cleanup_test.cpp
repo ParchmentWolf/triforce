@@ -2,8 +2,10 @@
 // initialization/BDA functions are included verbatim from current vk_draw.cpp.
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -70,6 +72,8 @@ static uint64_t vkGetBufferDeviceAddress(int device, const VkBufferDeviceAddress
     require(live.contains(info->buffer), "queried an unconfirmed allocation");
     return ++address_calls == zero_address ? 0 : info->buffer * 4096;
 }
+
+static void logf(const char*, ...) {}   // ((11-21, MEM-154) the new pairs' line)
 
 #include "fallback_actual.inc"
 
@@ -155,6 +159,44 @@ static void run(const std::string& name) {
         Program next;
         require(fallback_buffers_of(next, out) && out && out->records_address, "another program inherited failure");
         require(live.size() == 2 && destroy_calls == 1, "another program's buffers were freed or leaked");
+    } else if (name == "payload_growth_keeps_records") {
+        // ((11-21, the performance audit's MEM-154) the records are the same size for every program: a program whose
+        // payloads need more takes a bigger payload buffer, and the records the thread has already)
+        require(fallback_buffers_of(p, out) && out && out->payload_bytes == 44 && create_calls == 2, "first program's pair");
+        const VkBuffer records = out->records;
+        const uint64_t records_address = out->records_address;
+        Program bigger;
+        bigger.fallback_payload_words = 8;
+        require(fallback_buffers_of(bigger, out) && out && out->payload_bytes == 116, "a bigger payload was not made");
+        require(out->records == records && out->records_address == records_address && create_calls == 3 && live.size() == 3,
+                "a bigger payload made another records buffer");
+        const auto calls = create_calls;
+        require(fallback_buffers_of(p, out) && out->payload_bytes == 116 && create_calls == calls, "the smaller program made more");
+        require(destroy_calls == 0, "a growth destroyed a buffer");
+    } else if (name == "shared_records_payload_failure") {
+        // ((11-21, MEM-154) a growth that shares the records and then cannot make its payload: its create fails, and on
+        // the next try its address comes back 0. The shared records must stay, and the pair before must still serve)
+        require(fallback_buffers_of(p, out) && out && create_calls == 2 && address_calls == 2, "first program's pair");
+        const VkBuffer records = out->records;
+        const uint64_t payload_bytes = out->payload_bytes;
+        const auto still_usable = [&](const char* why) {
+            const auto calls = create_calls;
+            require(live.contains(records), why);
+            require(fallback_buffers_of(p, out) && out->records == records && out->payload_bytes == payload_bytes &&
+                    create_calls == calls, why);
+        };
+        Program bigger;
+        bigger.fallback_payload_words = 8;
+        fail_create = 3;
+        require(!fallback_buffers_of(bigger, out), "a failed grown payload was accepted");
+        require(destroy_calls == 0 && live.size() == 2, "a failed grown payload destroyed something");
+        still_usable("the shared records went with a payload that could not be made");
+        zero_address = address_calls + 1;
+        require(!fallback_buffers_of(bigger, out), "a grown payload with no address was accepted");
+        require(destroy_calls == 1 && live.size() == 2, "a grown payload with no address was not the one buffer destroyed");
+        still_usable("the shared records went with a payload that had no address");
+        require(fallback_buffers_of(bigger, out) && out->records == records && out->payload_bytes == 116 && live.size() == 3,
+                "the growth did not succeed once it could");
     } else throw std::runtime_error("unknown authored case");
 }
 int main(int argc, char** argv) {

@@ -34,11 +34,11 @@ class OutOfSpace(unittest.TestCase):
     def test_full_drive_names_the_member_and_the_drive(self):
         with tempfile.TemporaryDirectory() as out:
             member = Path(os.path.realpath(out)) / "romfs" / "Model" / "authored.zs"
-            partial = member.with_name("authored.zs.part")
             seen = []
 
             def usage(path):
-                seen.append((path, partial.exists()))
+                # (the member itself: it is written straight to its name since the performance audit's IO-51)
+                seen.append((path, member.exists()))
                 return SimpleNamespace(free=196 * 10 ** 9)
 
             original = OSError(errno.ENOSPC, "authored disk-full failure")
@@ -51,8 +51,9 @@ class OutOfSpace(unittest.TestCase):
                              "No space left on device writing romfs/Model/authored.zs (12345 bytes): 196.0 GB free there, NTFS")
             self.assertIs(error.exception.__cause__, original)
             # (measured while the failed member still holds its space)
-            self.assertEqual(seen, [(str(member.parent), True)])
-            self.assertFalse(partial.exists())
+            self.assertEqual(seen, [(nup.long_path(str(member.parent)), True)])
+            self.assertFalse(member.exists())
+            self.assertFalse(member.with_name("authored.zs.part").exists())
 
     def test_other_errors_pass_through(self):
         with tempfile.TemporaryDirectory() as out:

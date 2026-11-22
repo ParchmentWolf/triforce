@@ -1,5 +1,6 @@
 // nx2/make_game.py as a child process (old Setup.cs Runner, Shell.cs Run/Line/Ended; hookshot_builder.py start_make/on_exit):
-//   <python> -I <tools>\nx2\make_game.py <args>      cwd <tools>, stdout+stderr UTF-8, below-normal priority (Windows)
+//   <python> -I <tools>\nx2\make_game.py <args>      cwd <tools>, stdout+stderr UTF-8, normal priority (below normal on
+//                                                    Windows only with HOOKSHOT_LOW_PRIORITY=1)
 //   env: PYTHONIOENCODING=utf-8, HOOKSHOT_BUILDER_EXE (written into the game folder's builder= line), HOOKSHOT_NGX_SDK when
 //        DLSS is on, EMSDK / RX_CPM / WGPU_NATIVE / HOOKSHOT_MINGW for tool folders that exist (Windows); Linux: DLSS on drops
 //        HOOKSHOT_VK_PREBUILT (the Vulkan back end is compiled with NGX), DLSS off drops HOOKSHOT_NGX_SDK
@@ -195,7 +196,12 @@ public sealed class BuildRunner
             var si = StartInfo(ctx, tools, args, ctx.NgxSdkFolder, dlss);
             using var p = ctx.Platform.StartTree(si);
             process = p;
-            try { if (ctx.IsWindows) p.PriorityClass = ProcessPriorityClass.BelowNormal; } catch (Exception) { }
+            // (Triforce, 11-22, the performance audit's OS-57, after Source A's) The build tools run at normal priority;
+            // below normal, as every build was before, only with HOOKSHOT_LOW_PRIORITY=1. Source A's reason, a report it
+            // did not measure: below normal, Windows kept the steps that are one process (the read, the lift) on a hybrid
+            // Intel CPU's efficiency cores while the performance cores idled.
+            if (Environment.GetEnvironmentVariable("HOOKSHOT_LOW_PRIORITY") == "1")
+                try { if (ctx.IsWindows) p.PriorityClass = ProcessPriorityClass.BelowNormal; } catch (Exception) { }
             try { p.StandardInput.Close(); } catch (Exception) { }
             p.ErrorDataReceived += (_, e) => { if (e.Data != null) Take(e.Data); };
             p.BeginErrorReadLine();

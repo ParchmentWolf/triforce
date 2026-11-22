@@ -24,6 +24,7 @@ struct Fonts {
 struct Art {
     ImTextureData* tex = nullptr;
     float w = 0, h = 0;
+    bool mask = false;   // ((Triforce) one channel, white with its shape in alpha: the game's layout gives it its colour, as the drawing must)
 };
 const Art* art(const char* name);
 /// (Triforce) The button icons' font asked for: read at the next begin, the one the game was served this run

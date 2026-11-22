@@ -52,8 +52,10 @@ FIXTURE = r'''#define _CRT_SECURE_NO_WARNINGS
 #include <stdlib.h>
 #include <string.h>
 #include "step_steady.h"
+#include "movie_pace.h"   /* ((Triforce, 11-22, PRESENT-30) realtime_step goes by pace_fps: the cap here, no movie plays) */
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); exit(1); } } while (0)
 static int64_t pace_period_ns;   /* (the period the presents are paced by: hos_vi_native_presented) */
+static int movie_raise;          /* (nn_vi.c's, set once a present by movie_pace_decide: tests/test_movie_pace.py) */
 static uint8_t guest[0x4000];
 #define GP(a) ((void *)(guest + (a)))
 #define MOD 0x1000u
@@ -181,8 +183,8 @@ def main():
               "a second run left one divide's hook from the first")
 
     vi = (ROOT / "host" / "nn_vi.c").read_text(encoding="utf-8")
-    host = "\n".join(block(vi, m) for m in ("static float text_scale(", "static int fps_cap_of(", "static int fps_max(void) {", "static int realtime_rate(",
-                                                "static void realtime_step("))
+    host = "\n".join(block(vi, m) for m in ("static float text_scale(", "static int fps_cap_of(", "static int fps_max(void) {", "static int pace_fps(void) {",
+                                                "static int realtime_rate(", "static void realtime_step("))
     fixture = FIXTURE.replace("@HOST@", host).replace("@HOOK@", "\n".join(oot_patches.STEP_HOOK.split("\n")[:2]))
     with tempfile.TemporaryDirectory(prefix="cap-step-") as tmp:
         c = Path(tmp) / "fixture.c"

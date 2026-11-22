@@ -56,7 +56,7 @@ foreach ($d in 'python', 'cpm', 'wgpu-native', 'llvm-mingw', 'third_party') {
 # 3. the speed profile (hot functions, link order, play profile, chunk list) and the Triforce icon for the game's exe
 $work = Join-Path $tools 'work'
 New-Item -ItemType Directory -Force $work | Out-Null
-foreach ($n in 'hot_funcs.txt', 'hot_order.txt', 'hookshot_pieces.prof') {
+foreach ($n in 'hot_funcs.txt', 'hot_order.txt', 'hookshot_pieces.prof', 'triforce_vk.profdata') {
     if (Test-Path (Join-Path $repo "work\$n")) { Copy-Item (Join-Path $repo "work\$n") $work }
 }
 # 3b. the pipeline state list (nx2/pipeline_states.py --out work\pipeline_states.bin <lists from play>): nx2/make_game.py puts it

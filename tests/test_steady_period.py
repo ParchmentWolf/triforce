@@ -126,6 +126,9 @@ static void renderer_present(void) {
 static int mode_asked = 1;
 int hos_ini_option(const char *key, int otherwise) { return strcmp(key, "steady_frame_rate") ? otherwise : mode_asked; }
 static int fps_max(void) { return 240; }
+static void movie_pace_decide(void) {}             /* ((Triforce, 11-22, PRESENT-30) no movie plays here: paced by the cap) */
+static int pace_fps(void) { return fps_max(); }
+void hos_bench_present(int64_t now) { (void)now; }   /* (benchmark mode's note of each present: not on here) */
 /* ---- host/nn_vi.c's state these functions use, and the rest of hos_vi_native_presented's stand-ins ---- */
 static volatile LONG64 presents;
 static int64_t next_frame_at, window_start, frames_in_window;
@@ -399,7 +402,8 @@ def main():
     steady = steady[:steady.index("static int64_t steady_period(int64_t base, int64_t now) {")] + block(steady, "static int64_t steady_period(")
     presented = vi[vi.index("void hos_vi_native_presented(void) {"):]
     presented = presented[:re.search(r"^}", presented, re.M).end()]
-    code = "\n".join((region, block(vi, "void hos_vi_native_acquire(int active) {"), steady, presented))
+    # (with the 1% low's sort, which the cut-out present calls)
+    code = "\n".join((region, block(vi, "void hos_vi_native_acquire(int active) {"), steady, block(vi, "static int cmp_i64_desc("), presented))
     source = PREFIX.replace("@IDS@", ids.group(0) + "\n" + cap.group(0)) + code + SUFFIX
     env = {k: v for k, v in os.environ.items() if not k.startswith(("HOS_", "RX_"))}
     with tempfile.TemporaryDirectory(prefix="steady-period-") as tmp:

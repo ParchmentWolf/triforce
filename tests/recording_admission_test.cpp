@@ -20,6 +20,9 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include "flat_map.h"         // ((Triforce) RecordingRes's c1_at)
+#include "desc_pool_grow.h"   // ((Triforce, 11-22, DESC-33) a slot's pool at half, whole once a recording ran out)
+namespace desc_pool_grow = mkwvk::desc_pool_grow;
 
 void require(bool ok, const char* why) {
     if (!ok) { std::fprintf(stderr, "FAIL: %s\n", why); std::exit(1); }
@@ -44,6 +47,7 @@ using VmaAllocation = Allocation*;
 struct { VkDevice device{}; VkPhysicalDeviceProperties props{}; } dev;
 std::map<VkBuffer, Allocation> buffers;
 std::set<VkDescriptorPool> pools;
+std::map<VkDescriptorPool, uint32_t> pool_sets;   // ((Triforce, 11-22, DESC-33) each pool's maxSets as it was made)
 std::map<VkDescriptorSet, VkDescriptorPool> sets;
 uintptr_t serial = 100;
 template<class T> T handle() { return reinterpret_cast<T>(++serial); }
@@ -63,10 +67,10 @@ void destroy_buffer(VkBuffer buffer, VmaAllocation allocation) {
     require(buffer && buffers.count(buffer) && &buffers.at(buffer) == allocation, "buffer ownership/double free");
     buffers.erase(buffer); ++destroys;
 }
-VKAPI_ATTR VkResult VKAPI_CALL vkCreateDescriptorPool(VkDevice, const VkDescriptorPoolCreateInfo*, const VkAllocationCallbacks*, VkDescriptorPool* pool) {
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateDescriptorPool(VkDevice, const VkDescriptorPoolCreateInfo* ci, const VkAllocationCallbacks*, VkDescriptorPool* pool) {
     // Vulkan output handles must not be trusted after a failing creation result.
     if (fail_pool) { *pool = reinterpret_cast<VkDescriptorPool>(uintptr_t(0xdead)); return VK_ERROR_OUT_OF_HOST_MEMORY; }
-    *pool = handle<VkDescriptorPool>(); pools.insert(*pool); return VK_SUCCESS;
+    *pool = handle<VkDescriptorPool>(); pools.insert(*pool); pool_sets[*pool] = ci->maxSets; return VK_SUCCESS;
 }
 void drop_sets(VkDescriptorPool pool) {
     for (auto it = sets.begin(); it != sets.end();) {
@@ -149,6 +153,7 @@ int64_t descs_of(const VkWriteDescriptorSet* w, size_t n) { int64_t k = 0; for (
 bool bind_tail() {
     VkCommandBuffer cmd{}; VkPipelineBindPoint bp = VK_PIPELINE_BIND_POINT_GRAPHICS;
     struct { VkDescriptorSetLayout set_layout{}; VkPipelineLayout layout{}; } p;
+    auto& dwr = dw();   // ((Triforce, 11-22, DESC-20) as bind_descriptors takes it at its top)
     /* DESCRIPTORS */
 }
 void begin(int slot = 0, uint64_t value = 1) { draw_begin_recording(slot, VkCommandBuffer{}, value); }
@@ -256,6 +261,37 @@ int main(int argc, char** argv) {
             require(cur->extra.empty() && pools.size() == pool_count, "failed descriptor pool ownership retained/leaked");
             fail_pool = fail_pool_commit = false; fail_sets = 1;
             require(bind_tail() && cur->extra.size() == 1 && updates == 1 && binds == 1, "descriptor retry did not recover");
+        } else if (mode == "pool-grow" || mode == "pool-grow-off") {
+            // ((Triforce, 11-22, the performance audit's DESC-33) a slot's pool at half, whole from the reset after a recording
+            // ran out of it; with RX_VK_DESC_POOL_GROW=0 (the test's driver sets it for pool-grow-off) whole from the start
+            const bool on = mode == "pool-grow";
+            const auto first = res[0].pool;
+            writes.writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, writes.writes[0].descriptorCount = 3;
+            require(pool_sets.at(first) == (on ? 4096u : 8192u) && res[0].shift == (on ? 1u : 0u), "a slot's first pool: half with the rule, whole without");
+            require(bind_tail() && cur->extra.empty(), "a set from the slot's own pool");
+            begin(0, 2);
+            require(res[0].pool == first && pools.count(first) && pools_whole == 0 && pools_added == 0, "a slot that did not run out keeps its pool");
+            require(pool_most.sets == 1 && pool_most.n[desc_pool_grow::kSampled] == 3, "what the first recording took is not counted");
+            fail_sets = 1; require(bind_tail() && cur->extra.size() == 1 && pool_sets.at(cur->extra[0]) == 8192u, "the extra pool is not a whole one");
+            require(bind_tail() && cur->extra.size() == 1, "a second set from the extra pool");
+            const auto extra = cur->extra[0];
+            begin(0, 3);
+            require(cur->extra.empty() && !pools.count(extra) && pools_added == 1, "the extra pool is not destroyed and counted at the slot's reset");
+            require(pool_most.sets == 2 && pool_most.n[desc_pool_grow::kSampled] == 6 && res[0].took.sets == 0, "the peaks do not follow the recordings");
+            if (on) require(res[0].pool != first && !pools.count(first) && pool_sets.at(res[0].pool) == 8192u && res[0].shift == 0 && pools_whole == 1,
+                            "a slot that ran out does not have a whole pool from its next reset");
+            else require(res[0].pool == first && pools.count(first) && pools_whole == 0, "without the rule the slot's pool is replaced");
+            const auto whole = res[0].pool;
+            fail_sets = 1; require(bind_tail() && cur->extra.size() == 1, "a whole slot that runs out gets an extra pool as before");
+            begin(0, 4);
+            require(res[0].pool == whole && pools.count(whole) && pools_whole == (on ? 1u : 0u) && pools_added == 2, "a whole slot's pool is made again");
+            // (the whole pool cannot be made: the half one is reset and kept, the slot never without a pool)
+            begin(1, 5); const auto other = res[1].pool;
+            fail_sets = 1; require(bind_tail() && cur->extra.size() == 1, "the second slot's extra pool");
+            fail_pool = true; begin(1, 6); fail_pool = false;
+            require(res[1].pool == other && pools.count(other) && res[1].extra.empty() && res[1].shift == (on ? 1u : 0u) &&
+                    pools_whole == (on ? 1u : 0u), "a whole pool that could not be made cost the slot its pool");
+            require(bind_tail(), "the kept pool does not serve");
         } else if (mode == "healthy") {
             require(bind_tail() && cur->extra.empty() && updates == 1 && binds == 1, "healthy primary descriptor binding");
             copied(17, 51); require(cur->stream == old && cur->used == 273, "alignment/prefix preservation");

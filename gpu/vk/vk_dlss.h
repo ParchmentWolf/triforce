@@ -26,5 +26,10 @@ void dlss_instance_extensions(std::vector<const char*>& want, const std::vector<
 void dlss_device_extensions(std::vector<const char*>& want, const std::vector<VkExtensionProperties>& all);
 /// DLSS as the temporal upscaler's engine (DLSS and DLAA on the Upscaler row); nullptr in a build without it
 const TemporalEngine* dlss_engine();
+/// (Triforce, 11-22, the performance audit's PRESENT-36, after Source A's and Source B's) The card's video memory for the
+/// DLSS model row's CNN rule (upscaler_rows.h cnn_for_vram: the K row draws with preset E under 7 GB), in bytes; 0 unless
+/// RX_VK_DLSS_CNN_VRAM=1 (off by default: the picture is the owner's call). DLSS's preset and the menu's row both ask
+/// this, so they agree. In every build
+uint64_t dlss_cnn_vram();
 
 } // namespace mkwvk

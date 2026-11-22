@@ -39,6 +39,13 @@
 //    libraries after it, so the draws of such a pipeline waited for the whole build. The same objects are made either way.
 //    A draw that waits runs the first job itself (vk_jobs.cpp jobs_wait): the libraries and the link, not the whole build.
 //    RX_VK_PIPE_FAST_WORKERS=0: the whole build first, as before.
+//  - choose(), depth_new ((Triforce, 11-22, the performance audit's PIPE-29, after Source B's): a depth-tested draw into a
+//    pass drawn once whose shaders write no memory, outside a samples-passed count and the item icon capture's kept targets):
+//    from the frame's wait pool, then left out, and a pipeline that ran out of time is left out at once until it is built
+//    (vk_draw.cpp). Source B froze 11-13 s twice on an Arc B580 compiling some fifty new pipelines for such passes, and made
+//    them wait at most 50 ms a frame. RX_VK_PIPE_DEPTH_BUDGET=1; off by default on every driver, Intel's too, where the
+//    entry would have it on: a render into a new depth target that is left out can stay missing until it is drawn again,
+//    and that trade is the owner's to make (depth_budget).
 // A wait from a budget is vk_jobs.cpp jobs_wait_for: the pipeline's job goes to the front of the queue, and is not run on the
 // draw's thread (a compile there would outlast the bound).
 #pragma once
@@ -46,6 +53,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 
 namespace pipe_wait {
 
@@ -139,7 +147,12 @@ private:
 // ---- the draw's choice
 
 enum class Act { Skip, Wait, WaitAll };
-enum Kind { K_NONE, K_ONESHOT, K_FULL, K_LAST };
+enum Kind { K_NONE, K_ONESHOT, K_FULL, K_LAST, K_DEPTH };
+
+/// ((Triforce, 11-22, PIPE-29) RX_VK_PIPE_DEPTH_BUDGET: on when set to anything but 0; unset, off on every driver)
+inline bool depth_budget(const char* env) {
+    return env && *env && std::atoi(env) != 0;
+}
 
 struct Rules {
     bool always_wait = false;      // (RX_VK_PIPE_SKIP=0: every pipeline waited for)
@@ -155,9 +168,16 @@ struct Choice {
 
 /// A draw whose pipeline is not ready. kept: its pass (kept()); writes: its shaders write memory; full: full_screen(); held:
 /// the hold of the last picture would take this frame if it lacks a draw (present_hold.h DEFERS, the pipelines counted);
-/// pool_ns, last_ns: what the frame's wait pool and its last wait have left
-inline Choice choose(const Rules& r, bool kept, bool writes, bool full, bool held, int64_t pool_ns, int64_t last_ns) {
+/// pool_ns, last_ns: what the frame's wait pool and its last wait have left. depth_new ((Triforce, 11-22, PIPE-29)
+/// RX_VK_PIPE_DEPTH_BUDGET, the caller's: a depth-tested draw into a pass drawn once whose shaders write no memory): from the
+/// pool, then left out
+inline Choice choose(const Rules& r, bool kept, bool writes, bool full, bool held, int64_t pool_ns, int64_t last_ns,
+                     bool depth_new = false) {
     if (r.always_wait) return {Act::WaitAll, 0, K_NONE};
+    if (!kept && !writes && depth_new) {
+        if (pool_ns >= kMinWaitNs) return {Act::Wait, pool_ns, K_DEPTH};
+        return {Act::Skip, 0, K_NONE};
+    }
     if (!kept || writes) {
         if (!r.oneshot_budget) return {Act::WaitAll, 0, K_NONE};
         if (pool_ns >= kMinWaitNs) return {Act::Wait, pool_ns, K_ONESHOT};

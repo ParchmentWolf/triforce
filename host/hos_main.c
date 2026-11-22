@@ -15,6 +15,7 @@
 #include "../gpu/vk/vk_api.h"
 #include "../gpu/vk/oot_cheat_items.h"
 #include "../gpu/vk/oot_debug_link.h"   /* ((Triforce) the Game flags and Cutscenes pages' lines) */
+#include "achievements.h"               /* ((Triforce) what an achievement asks of the save data: host/achievements.c) */
 #include "../gpu/vk/ultrawide_rows.h"   /* ((Triforce) the Ultrawide row's shapes: ultrawide_ratio) */
 #include <math.h>
 #include <stdio.h>
@@ -34,6 +35,7 @@ const char *hos_version(void) { return HOOKSHOT_VERSION; }   /* (discord_rpc.c's
 #ifdef __linux__
 #include <sys/prctl.h>
 #include <sys/sysinfo.h>
+#include <sys/stat.h>   /* ((Triforce) driver_env_choose) */
 #endif
 #include <errno.h>
 #include <fcntl.h>
@@ -183,24 +185,30 @@ static int reserve_guest(void) {
         /* (only where /dev/udmabuf can be opened: a shared mapping's pages cannot be host-pointer imports (RADV:
            VK_ERROR_INVALID_EXTERNAL_HANDLE), so a pool udmabuf refused would be no import at all. A pool larger than udmabuf's
            size_limit_mb (64 MB unless raised) is imported as several dma-bufs bound into one sparse buffer, so no setting is
-           needed. HOS_GUEST_MEMFD=1: the memfd all the same) */
+           needed. HOS_GUEST_MEMFD=1: the memfd all the same; =0: anonymous memory.
+           (Triforce, 11-21) A size_limit_mb that cannot be read counts as udmabuf's default, 64 MB, as the renderer takes it
+           (gpu/vk/vk_memory.cpp import_dma_buf): Flatpak and other sandboxes hide /sys/module while /dev/udmabuf opens, and the
+           window stayed anonymous there, 15-45 ms a submission on AMD. Only a limit that reads 0 (udmabuf then refuses every
+           dma-buf) keeps it anonymous) */
         const char *e = getenv("HOS_GUEST_MEMFD");
         int usable = 0;
-        unsigned long long limit_mb = 0;
         {
             const int u = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
             if (u >= 0) {
                 close(u);
+                usable = 1;
                 FILE *f = fopen("/sys/module/udmabuf/parameters/size_limit_mb", "r");
                 if (f) {
-                    if (fscanf(f, "%llu", &limit_mb) != 1) limit_mb = 0;
+                    unsigned long long limit_mb = 0;
+                    if (fscanf(f, "%llu", &limit_mb) == 1 && limit_mb == 0) usable = 0;
                     fclose(f);
+                } else {
+                    hos_log("mem: udmabuf's size_limit_mb cannot be read (in a container?): its default, 64 MB, assumed");
                 }
-                usable = limit_mb > 0;
             }
             if (!usable && !e)
                 hos_log("mem: guest memory stays host-pointer imports for the GPU (slow submissions on AMD): %s",
-                        u < 0 ? "/dev/udmabuf cannot be opened" : "udmabuf's size_limit_mb cannot be read");
+                        u < 0 ? "/dev/udmabuf cannot be opened" : "udmabuf's size_limit_mb is 0");
         }
         if (e ? atoi(e) != 0 : usable) {
             const int fd = (int)syscall(SYS_memfd_create, "hookshot-guest", 1u /* MFD_CLOEXEC */ | 2u /* MFD_ALLOW_SEALING */);
@@ -466,6 +474,96 @@ static void load_hookshot_env(void) {
     }
     fclose(f);
 }
+
+#ifdef __linux__
+/* (Triforce, 11-21, Linux) Steam's Game Mode gives every game RADV_FORCE_VRS_CONFIG_FILE (its Half Rate Shading). While that
+   file exists, RADV on RDNA 2 and newer puts a forced shading rate into every pipeline's key, whatever the file holds, 1x1 too:
+   the pipelines prepared in Desktop Mode, or by the builder, missed the driver's caches and were all compiled again (on a Deck,
+   over 25 minutes to the title, against under one). The variable goes before Vulkan is loaded, when it names a file that
+   exists, unless HOS_HALF_RATE_SHADING=1 (triforce_env.txt can set it) keeps it; RADV_FORCE_VRS is left alone. What was done is
+   said on stderr now and in the log with the boot: lines (driver_env_note). The slider is worth little here: RADV keeps fragment
+   programs that read their position at full rate, and nearly all of this game's do */
+static char driver_env_note[640];
+static void driver_env_choose(void) {
+    const char *v = getenv("RADV_FORCE_VRS_CONFIG_FILE");
+    struct stat st;
+    if (!v || !*v || stat(v, &st) != 0) return;
+    const char *keep = getenv("HOS_HALF_RATE_SHADING");
+    if (keep && !strcmp(keep, "1")) {
+        snprintf(driver_env_note, sizeof driver_env_note,
+                 "boot: RADV_FORCE_VRS_CONFIG_FILE=%s kept (HOS_HALF_RATE_SHADING=1: Steam's Half Rate Shading changes every "
+                 "pipeline's key, so the driver's caches prepared without it miss)", v);
+    } else {
+        snprintf(driver_env_note, sizeof driver_env_note,
+                 "boot: RADV_FORCE_VRS_CONFIG_FILE=%s dropped (Steam's Half Rate Shading changes every pipeline's key; "
+                 "HOS_HALF_RATE_SHADING=1 keeps it)", v);
+        unsetenv("RADV_FORCE_VRS_CONFIG_FILE");
+    }
+    fprintf(stderr, "%s\n", driver_env_note);
+}
+
+/* (Triforce, 11-22, the performance audit's PIPE-97, after Source A's and Source B's) Room in the driver's own shader
+   cache for the pipelines the game prepares. The ~41,400 predicted pipelines are built into the driver's disk cache
+   alone, and NVIDIA's and Mesa's caches hold 1 GiB unless told otherwise and trim themselves to it: Source A saw a
+   full preparation stop at 1,026 MB with about 45% of it dropped, to be compiled again in play. Both drivers read
+   their size from the environment when they load, so the Linux main sets 10 GiB for each before Vulkan loads, in the
+   game's run and the builder's preparation alike, without overwriting: a size the player set stays. The cache only
+   grows by what is built. The env file cannot set these two names (env_line_allowed). Not set here:
+   __GL_SHADER_DISK_CACHE_SKIP_CLEANUP (the cache would then grow with every update's preparation).
+   HOS_DRIVER_CACHE_ROOM=0, in the environment or triforce_env.txt: neither is set, as before. Windows' NVIDIA driver
+   takes its size from its control panel: nothing is done there. One line for the log, as driver_env_choose's */
+static char driver_room_line[320];
+static void driver_cache_room(void) {
+    const char *off = getenv("HOS_DRIVER_CACHE_ROOM");
+    if (off && !strcmp(off, "0")) {
+        snprintf(driver_room_line, sizeof driver_room_line,
+                 "boot: the drivers' shader cache sizes left as they are (HOS_DRIVER_CACHE_ROOM=0)");
+    } else {
+        setenv("__GL_SHADER_DISK_CACHE_SIZE", "10737418240", 0);   /* (NVIDIA's, in bytes: 10 GiB) */
+        setenv("MESA_SHADER_CACHE_MAX_SIZE", "10G", 0);            /* (Mesa's: RADV, the Steam Deck) */
+        const char *nv = getenv("__GL_SHADER_DISK_CACHE_SIZE"), *mesa = getenv("MESA_SHADER_CACHE_MAX_SIZE");
+        snprintf(driver_room_line, sizeof driver_room_line,
+                 "boot: room in the drivers' shader caches: __GL_SHADER_DISK_CACHE_SIZE=%.64s, MESA_SHADER_CACHE_MAX_SIZE=%.64s "
+                 "(a size set before the game stays; HOS_DRIVER_CACHE_ROOM=0 sets neither)", nv ? nv : "", mesa ? mesa : "");
+    }
+    fprintf(stderr, "%s\n", driver_room_line);
+}
+
+/* (Triforce, 11-22, the performance audit's PIPE-98, after Source A's) NVIDIA's Linux driver keeps no shader cache at
+   all when __GL_SHADER_DISK_CACHE_PATH names a folder that is not there: it neither makes it nor falls back to
+   ~/.cache/nvidia, and every one of the game's prepared pipelines is compiled again at each start (Source A: a
+   preparation of 830.7 s against 51.0 s from a filled cache). So before Vulkan loads the Linux main makes the folder
+   the variable names, with its parents, for the user alone (0700). The value is never changed, and nothing is made
+   when the variable is not set: only a folder the player or a launcher named. One line when it cannot be made (a
+   file in the way, no permission), on stderr and kept for the log. HOS_DRIVER_CACHE_FOLDER=0, in the environment or
+   triforce_env.txt: nothing is made, as before. The driver files its cache by the program's file name, so the Linux
+   binary's name stays "triforce" (nx2/build.py EXE; tests/test_driver_cache_folder.py pins it), and
+   __GL_SHADER_DISK_CACHE_APP_NAME is never set: every player's cache would start over */
+static char driver_folder_line[1200];
+static void driver_cache_folder(void) {
+    const char *off = getenv("HOS_DRIVER_CACHE_FOLDER");
+    const char *path = getenv("__GL_SHADER_DISK_CACHE_PATH");
+    char dir[1024];
+    struct stat st;
+    if ((off && !strcmp(off, "0")) || !path || !*path) return;
+    const size_t len = strlen(path);
+    if (len < sizeof dir) {
+        memcpy(dir, path, len + 1);
+        for (size_t i = 1; i < len; i++) {   /* (each parent in turn; one that is there already is no failure) */
+            if (dir[i] != '/') continue;
+            dir[i] = 0;
+            mkdir(dir, 0700);
+            dir[i] = '/';
+        }
+        mkdir(dir, 0700);
+    }
+    if (len < sizeof dir && stat(path, &st) == 0 && S_ISDIR(st.st_mode)) return;   /* (made, or there already) */
+    snprintf(driver_folder_line, sizeof driver_folder_line,
+             "boot: __GL_SHADER_DISK_CACHE_PATH=%.900s is not a folder and cannot be made one: NVIDIA's driver keeps no "
+             "shader cache without it", path);
+    fprintf(stderr, "%s\n", driver_folder_line);
+}
+#endif
 
 int hos_oot_protect_hearts;
 volatile int hos_oot_live_action;   /* (test runs) the live input file's "!cheat <action>": host/nn_hid.c */
@@ -1237,6 +1335,24 @@ static void oot_link_tick(Ctx *c, uint64_t actor, int64_t now) {
     oot_link_say(OOT_SAID_FLAGS, states);
 }
 
+/* ---- (Triforce) Achievements (host/achievements.c, on unless HOS_ACHIEVEMENTS=0): what the save data has of a
+   condition's name, read as the pages above and the Inventory page read it, and nothing written. Asked once a second at
+   Link's update, and only while a save is loaded: before that GameData holds a new game's values */
+static int oot_achievement_probe(void *ctx, int kind, const char *what) {
+    Ctx *c = (Ctx *)ctx;
+    if (kind == ACH_ITEM) return oot_item_get(c, what);
+    const char state = oot_flag_state(c, 1, oot_name_hash(what, strlen(what)));
+    return state == '1' ? 1 : state == '0' ? 0 : -1;
+}
+
+static void oot_achievements_tick(Ctx *c, int64_t now) {
+    static int64_t next;
+    if (!hos_achievements_on() || now < next) return;
+    next = now + 1000000000LL;
+    if (oot_pouch_count(c, oot_item_names[0]) < 0) return;
+    hos_achievements_check(oot_achievement_probe, c, now);
+}
+
 static uint64_t oot_gameplay_view(Ctx *c) {
     const uint64_t singleton = recomp_load64(c, 0x84ca6bc0ULL);
     const uint64_t manager = singleton ? recomp_load64(c, singleton) : 0;
@@ -1292,6 +1408,7 @@ static void oot_update_player_cheats(Ctx *c, uint64_t actor, uint64_t components
     oot_bench_tick(c, actor, now);   /* ((Triforce, 11-19) benchmark mode: its tour, host/hos_bench.c */
     oot_inventory_refresh(c, now);
     oot_link_tick(c, actor, now);   /* ((Triforce) the Game flags and Cutscenes pages) */
+    oot_achievements_tick(c, now);   /* ((Triforce) host/achievements.c) */
     if (action >= OOT_CHEAT_ITEM_ACTION && action < OOT_CHEAT_ITEM_ACTION + 256 * (int)OOT_ITEM_COUNT) {
         oot_inventory_edit(c, action);
     } else if (action == OOT_AGE_ACTION) {
@@ -1843,7 +1960,13 @@ static int game_main(int argc, char **argv) {
         }
 #endif
         HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
-        if (!err || err == INVALID_HANDLE_VALUE || GetFileType(err) == FILE_TYPE_UNKNOWN) {
+        /* ((Triforce, 11-21, ticket "Linux: games started with the launcher's Play write no triforce_log.txt") HOS_LOG_FILE=1:
+           the log file whatever stderr is. The launcher's Play on Linux gives the game pipes it reads and drops (so a full pipe
+           never blocks it), and a pipe is a known stderr: the whole log went into it and no triforce_log.txt was written, so a
+           session started from the launcher left nothing to send with a report, nor with an F8 capture) */
+        const char *lf = getenv("HOS_LOG_FILE");
+        const int log_file = lf && *lf && *lf != '0';
+        if (log_file || !err || err == INVALID_HANDLE_VALUE || GetFileType(err) == FILE_TYPE_UNKNOWN) {
             char path[MAX_PATH + 32];
             DWORD n = hos_game_path_a(path, MAX_PATH);
             while (n && path[n - 1] != 92 && path[n - 1] != 47) n--;
@@ -1861,6 +1984,10 @@ static int game_main(int argc, char **argv) {
         }
     }
     hos_log("triforce %s", HOOKSHOT_VERSION);   /* (the log's first line: which build a report comes from) */
+#ifdef __linux__
+    if (driver_room_line[0]) hos_log("%s", driver_room_line);   /* ((Triforce, 11-22) the performance audit's PIPE-97: decided in main, before this log was open */
+    if (driver_folder_line[0]) hos_log("%s", driver_folder_line);   /* ((Triforce, 11-22) the performance audit's PIPE-98: likewise */
+#endif
 #ifdef _WIN32
     if (instance_held >= 0)
         hos_log("instance: %s", instance_held ? "this game folder is this run's (a second copy started on it says so and ends)"
@@ -1876,6 +2003,7 @@ static int game_main(int argc, char **argv) {
                                         : "Windows' throttling of a window not in front left as it is (HOS_POWER_THROTTLING=1)");
     }
 #endif
+    hos_sim_cpu_apply();   /* ((Triforce, 11-22, the performance audit's OS-49) HOS_SIM_CPU, a lab switch: before any thread */
     const char *image = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--romfs") && i + 1 < argc) hos_romfs_dir = argv[++i];
@@ -2040,6 +2168,9 @@ static int game_main(int argc, char **argv) {
 #ifndef A64_MEM_ZERO
     memory_notice();
 #endif
+#ifdef __linux__
+    if (driver_env_note[0]) hos_log("%s", driver_env_note);   /* ((Triforce) driver_env_choose's line) */
+#endif
     void hos_mods_init(const char *image_path);
     hos_mods_init(image);   /* mods.c: <exe folder>\mods (RomFS files) */
 
@@ -2090,6 +2221,11 @@ int main(int argc, char **argv) {
     int hos_display_init(void);
     void hos_display_loop(void);
     load_hookshot_env();
+#ifdef __linux__
+    driver_env_choose();   /* ((Triforce) after the env file, which may set HOS_HALF_RATE_SHADING; before Vulkan, the builder's run too) */
+    driver_cache_room();   /* ((Triforce, 11-22) the performance audit's PIPE-97: 10 GiB for the driver's shader cache, likewise */
+    driver_cache_folder();   /* ((Triforce, 11-22) the performance audit's PIPE-98: the folder __GL_SHADER_DISK_CACHE_PATH names, made */
+#endif
     game_argc = argc, game_argv = argv;
     int prepare_shaders = 0;
     for (int i = 1; i < argc; i++) {

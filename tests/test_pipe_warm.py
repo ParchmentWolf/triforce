@@ -56,6 +56,7 @@ FIXTURE = r"""
 #include <vector>
 #include "pipe_warm.h"
 #include "pipe_order.h"
+#include "pipe_ahead.h"   // ((Triforce, 11-22, PIPE-81) order_met counts where first-drawn pipelines stand)
 namespace pipe_order = mkwvk::pipe_order;   // (vk_draw.cpp's code is inside mkwvk)
 #define CHECK(x) do { if (!(x)) { std::printf("line %d: %s\n", __LINE__, #x); return 1; } } while (0)
 using VkPipeline = uint64_t;
@@ -625,7 +626,8 @@ def check_source(draw, shader):
             or "readahead_wait_stats(&raw_n, &raw_ns);" not in replay:
         raise SystemExit("the stall line does not split the dispatches' time, or lacks the waits for the read-ahead")
     disp_pick = disp.index("const Program* cp = program_for(s, ProgramKind::Compute, types);")
-    if not disp.index("const auto t_pick = std::chrono::steady_clock::now();") < disp_pick < disp.index("st_disp_pick_ns +=") or \
+    # ((11-22, DESC-30) the pick's time is the change of prof_t.exact across it: a clock pair only under prof_full)
+    if not disp.index("const int64_t x_pick = prof_t.exact;") < disp_pick < disp.index("st_disp_pick_ns +=") < disp.index("prof_t.exact - x_pick") or \
             not disp.index("pipe_clock{") < disp.index("ensure_layout(p);") < disp.index("pipe_clock.stop();") < disp.index("end_pass(cmd);"):
         raise SystemExit("vk_draw.cpp dispatch: the program pick or the first layout and pipeline are not what is timed")
     for need in ("`RX_VK_PIPELINE_WARM=0` or `1`", "`RX_VK_PIPELINE_WARM_FOLLOW=1`", "`RX_VK_COMPUTE_WARM=1`"):

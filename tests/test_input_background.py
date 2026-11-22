@@ -107,6 +107,9 @@ static void host_drag_read(int32_t stick[4]) { (void)stick; }
 static void player_used(void) {}
 void hos_amiibo_poll(void) {}
 int hos_oot_mods_down(void) { return 0; }   /* ((Triforce) host/oot_menu.c: no game list's last button has the cursor here) */
+static void device_used(int device) { (void)device; }   /* ((Triforce) the device used last, for the button prompts: not looked at */
+static void mods_input(uint64_t *buttons, int32_t stick[4]) { (void)buttons, (void)stick; }   /* (and no Mods entry's input) */
+int hos_bench_input_only(void) { return 0; }   /* ((Triforce) host/hos_bench.c: benchmark mode off */
 """
     actual = "\n".join((cheat_state, cheat_spies, host_spies, block(hid, "static int key("), block(hid, "static int kmap_down("),
         block(hid, "static int game_in_front("), hid[start:end], block(hid, "static void stick_max("),

@@ -833,7 +833,13 @@ int hos_prompts_romfs(const char *key, char *out, size_t cap);
    finds that one first) */
 int hos_prompts_font_file(const char *key, char *out, size_t cap) {
     if (strcmp(key, FONT_PATH)) return 0;
-    return hos_prompts_romfs(FONT_PATH, out, cap);
+    /* ((Triforce, 11-21, the performance audit's IO-24) from the lifted code's size hook (host/mods.c), a game thread: the
+       core given up around the builder, which builds the font at its first call and holds its lock meanwhile; never inside
+       hos_prompts_romfs, where that lock is held) */
+    const int away = hos_vcore_away();
+    const int found = hos_prompts_romfs(FONT_PATH, out, cap);
+    if (away) hos_vcore_back();
+    return found;
 }
 
 /* (Triforce) The title screen's third entry, "Options / ZELDA NOTES Setting" in US English, reads "Options / Triforce":

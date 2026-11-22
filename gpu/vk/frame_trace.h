@@ -28,6 +28,7 @@ struct Split {
     double wb_wait = 0;    // (the waits for write-backs still on the GPU, wherever they were: memory sync's capture, a read)
     double wb_held = 0;    // (of them, the part after the writer's recording was done: the timeline held, not the GPU)
     double qs_bg = 0;      // (the queue submits made while a background import ran)
+    double gpu_waits = 0;  // ((Triforce, 11-22, SYNC-27) every thread's time in calls that block on the GPU: gpu_wait_kinds.h)
 };
 
 /// Outside the replay and the present: the game's own update, its waits for the replay and the GPU among it. As the stall line's
@@ -35,12 +36,13 @@ inline double outside(const Split& s) { return s.interval - s.replay - s.present
 
 /// The columns, after the trace's first ones (their names; the line's values in this order: line)
 constexpr const char* kColumns =
-    "replay_ms,present_ms,dispatch_ms,qsubmit_ms,par_wait_ms,outside_ms,game_wait_ms,captures_ms,wb_wait_ms,wb_held_ms,qs_bg_ms";
+    "replay_ms,present_ms,dispatch_ms,qsubmit_ms,par_wait_ms,outside_ms,game_wait_ms,captures_ms,wb_wait_ms,wb_held_ms,qs_bg_ms,"
+    "gpu_waits_ms";
 
 /// The values for kColumns, comma-separated, no line end: snprintf's count
 inline int line(const Split& s, char* out, size_t cap) {
-    return std::snprintf(out, cap, "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f", s.replay, s.present, s.dispatch,
-                         s.qsubmit, s.par_wait, outside(s), s.game_wait, s.captures, s.wb_wait, s.wb_held, s.qs_bg);
+    return std::snprintf(out, cap, "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f", s.replay, s.present, s.dispatch,
+                         s.qsubmit, s.par_wait, outside(s), s.game_wait, s.captures, s.wb_wait, s.wb_held, s.qs_bg, s.gpu_waits);
 }
 
 } // namespace mkwvk::frame_trace

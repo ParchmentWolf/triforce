@@ -12,6 +12,12 @@
    free registered buffer (host memory: the pool's guest memory is not used). The video service itself (nn::gsv) is
    not emulated: nn::codec::video::Initialize does nothing. */
 #include "hos.h"
+#include "host_alloc.h"   /* ((Triforce, 11-22, OS-04) allocations that wait at Windows' commit limit before they answer NULL) */
+#include "video_av1.h"    /* ((Triforce, 11-22, IO-32) which AV1 decoder goes first on Windows) */
+#include "video_movie.h"  /* ((Triforce, 11-22, IO-32) what a movie cost to decode, and its line) */
+#include "video_nv12.h"   /* ((Triforce, 11-22, IO-36) a decoded picture kept as NV12 alone) */
+#include "video_catchup.h" /* ((Triforce, 11-22, THREAD-82) how far dec_acquire decodes ahead to catch up) */
+#include "video_input.h"  /* ((Triforce, 11-22, IO-34) how many submissions the decoder holds before it refuses one) */
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,6 +44,8 @@ static int video_log(void) {   /* HOS_VIDEO_LOG=1: submissions and acquisitions 
 
 void hos_system_event_init(uint64_t key, int autoclear);   /* nn_os_sync.c */
 void hos_system_event_signal(uint64_t key);
+void hos_system_event_clear(uint64_t key);          /* ((Triforce, 11-22, IO-34) these two under a host lock: no checkpoint) */
+void hos_system_event_signal_held(uint64_t key);
 
 /* an image pool: its pictures, w x h, as RGBA and as NV12 (both kept: the reader asks for either) */
 typedef struct {
@@ -71,7 +79,12 @@ static DWORD WINAPI av1_notice(LPVOID unused) {
    (Triforce) It needs Microsoft's AV1 Video Extension, which not every PC has: without it the movies are decoded here, by
    dav1d, when the FFmpeg the build links has it (the Tools' FFmpeg with AV1; nx2/build.py takes whichever is there), as
    NX2navi decodes them always. No notice and no black movies then. HOS_AV1=dav1d: dav1d first, for tests;
-   HOS_AV1_MISSING=1: as if the extension were missing. */
+   HOS_AV1_MISSING=1: as if the extension were missing.
+   (Triforce, 11-22, the performance audit's IO-32, after Source A's) The order is the other way round now: dav1d first
+   where that FFmpeg has it, Media Foundation when it has not or when libdav1d does not open (video_av1.h). Media
+   Foundation's path here decodes in software on every GPU (mf_av1.c takes the synchronous decoder, with no D3D
+   manager), and its decode time was never seen: each movie now says in the log what it took (video_movie.h).
+   HOS_AV1=mf: Media Foundation first, as before. */
 typedef void (*mf_av1_picture_fn)(void *user, const uint8_t *y, const uint8_t *uv, int w, int h, int stride, int64_t pts);
 void *mf_av1_open(int w, int h, int tell);
 void mf_av1_decode(void *m, const uint8_t *data, size_t n, int64_t pts, mf_av1_picture_fn fn, void *user);
@@ -92,12 +105,21 @@ typedef struct {
     Picture queue[MAX_QUEUE];
     int qhead, qn;
     int eos;                         /* the last submission is in and decoded: an empty queue is the end */
+    int stopped;                     /* a Stop or Flush with nothing submitted since: no picture will come (dec_acquire) */
     Pending *phead, *ptail;          /* submissions not decoded yet, oldest first */
     int64_t submits, acquires;
     int clock_set;                   /* (hookshot) the movie's clock: the picture at clock_pts was due at clock_ns */
     int64_t clock_ns, clock_pts;
     int64_t last_pts;                /* the pts of the last picture handed out */
     int64_t log_submits;             /* (HOS_VIDEO_LOG) submissions still to log, after a flush or the end */
+    VideoMovie movie;                /* ((Triforce, 11-22, IO-32) this movie's pictures and decode time, for its line) */
+    VideoPace pace;                  /* ((Triforce, 11-22, THREAD-82) the gap between its pictures and what a decode takes
+                                        lately: the catch-up's bound (dec_acquire, video_catchup.h)) */
+    int npending;                    /* ((Triforce, 11-22, IO-34) submissions in phead's list: with qn, what the input limit
+                                        counts (video_input.h)) */
+    uint64_t ready;                  /* ((Triforce, 11-22, IO-34) its "ready for a submission" event, a guest address: set,
+                                        and clear from a refused submission until there is room again) */
+    int ready_clear;                 /* (... whether it is clear now; changed only under the lock, with the event) */
     SRWLOCK lock;
 } Dec;
 
@@ -127,7 +149,7 @@ static void set_host(uint64_t obj, uint32_t magic, void *p) {
         if (i == nhost_objs) {
             if (nhost_objs == cap_host_objs) {
                 cap_host_objs = cap_host_objs ? cap_host_objs * 2 : 16;
-                host_objs = (HostObj *)realloc(host_objs, cap_host_objs * sizeof *host_objs);
+                host_objs = (HostObj *)hos_xrealloc(host_objs, cap_host_objs * sizeof *host_objs);   /* ((Triforce, OS-04) host_alloc.h) */
                 if (!host_objs) hos_fatal(NULL, "video: out of memory");
             }
             nhost_objs++;
@@ -164,7 +186,7 @@ HLE(_ZN2nn5codec31CalculateDecoderImagePoolBufferEPmS1_RKNS0_27VideoDecoderImage
 /* InitializeDecoderImagePool(pool, void* memory, size, Preference const&, u32 count) */
 HLE(_ZN2nn5codec26InitializeDecoderImagePoolEPNS0_25VideoDecoderImagePoolTypeEPvmRKNS0_27VideoDecoderImagePreferenceEj) {
     const Pref *p = (const Pref *)GP(ARG(3));
-    Pool *o = (Pool *)calloc(1, sizeof *o);
+    Pool *o = (Pool *)hos_xcalloc(1, sizeof *o);   /* ((Triforce, OS-04) host_alloc.h) */
     if (!o) hos_fatal(NULL, "video: out of memory for an image pool");
     o->w = p->magic == PREF_MAGIC && p->w ? p->w : 1280, o->h = p->magic == PREF_MAGIC && p->h ? p->h : 720;
     o->format = p->magic == PREF_MAGIC ? (int)p->format : 2;
@@ -280,6 +302,40 @@ HLE(_ZN2nn5codec26ReadDecoderOutputImageNv12EPKNS0_25VideoDecoderImagePoolTypeEj
 /* ---- decoders ---- */
 static void dec_init_sized(Ctx *c, enum AVCodecID id, const char *what, int w, int h);
 static void dec_init(Ctx *c, enum AVCodecID id, const char *what) { dec_init_sized(c, id, what, 0, 0); }
+#ifdef _WIN32
+static const char *av1_first(void) {   /* ((Triforce, 11-22, IO-32) HOS_AV1, read once: "mf" puts Media Foundation first) */
+    static const char *value;
+    static int read;
+    if (!read) value = getenv("HOS_AV1"), read = 1;
+    return value;
+}
+#endif
+/* ((Triforce, 11-22, the performance audit's IO-34, after Source A's) The input limit (video_input.h): the decoder
+   refuses a submission while this many wait, not decoded yet or decoded and not taken. Every submission was taken
+   before, and the game submits a whole movie at once on the thread that also takes the pictures: the pictures that
+   came due while it submitted were skipped by the catch-up, a stutter at each movie's start.
+   HOS_VIDEO_INPUT_LIMIT=<n>, read once: that many instead of 16; 0: none, as before) */
+static int input_limit(void) {
+    static int limit = -1;
+    if (limit < 0) limit = video_input_limit(getenv("HOS_VIDEO_INPUT_LIMIT"));
+    return limit;
+}
+static int input_full(const Dec *d) { return video_input_full(input_limit(), d->npending, d->qn); }
+/* (under d->lock, wherever the count went down) room again: the event a refused submission cleared is set */
+static void input_room(Dec *d) {
+    if (d->ready_clear && !input_full(d)) {
+        d->ready_clear = 0;
+        hos_system_event_signal_held(d->ready);
+    }
+}
+/* a decoder's own ready event, set: one for all decoders could not be clear for the full one alone. Never freed, as
+   the one event before it (64 bytes of the system region a decoder) */
+static uint64_t ready_new(void) {
+    const uint64_t event = hos_sys_alloc(0x40, 16);
+    hos_system_event_init(event, 0);
+    hos_system_event_signal(event);
+    return event;
+}
 static void dec_init_sized(Ctx *c, enum AVCodecID id, const char *what, int w, int h) {
     const AVCodec *codec = NULL;
 #ifndef _WIN32   /* (linux) FFmpeg's own AV1 decoder needs a hardware context, and there is no Media Foundation to fall
@@ -289,11 +345,12 @@ static void dec_init_sized(Ctx *c, enum AVCodecID id, const char *what, int w, i
 #endif
     Dec *d = (Dec *)calloc(1, sizeof *d);
     InitializeSRWLock(&d->lock);
-#ifdef _WIN32   /* (Triforce) AV1: Windows' decoder, else dav1d; never FFmpeg's own, which needs a hardware context */
+#ifdef _WIN32   /* (Triforce) AV1: dav1d, else Windows' decoder; never FFmpeg's own, which needs a hardware context.
+                   ((Triforce, 11-22, IO-32) It was Windows' decoder first: video_av1.h has the rule and HOS_AV1=mf the old
+                   order. Media Foundation is still opened below when libdav1d is there and does not open) */
     if (id == AV_CODEC_ID_AV1) {
-        const char *first = getenv("HOS_AV1");
         codec = avcodec_find_decoder_by_name("libdav1d");
-        if (!(codec && first && !strcmp(first, "dav1d"))) d->mf = mf_av1_open(w, h, 0);
+        if (video_av1_mf_first(av1_first(), codec != NULL)) d->mf = mf_av1_open(w, h, 0);
         if (d->mf) codec = NULL;
     } else
 #endif
@@ -316,6 +373,7 @@ static void dec_init_sized(Ctx *c, enum AVCodecID id, const char *what, int w, i
 #endif
     d->pkt = av_packet_alloc();
     d->frame = av_frame_alloc();
+    d->ready = ready_new();   /* ((Triforce, 11-22, IO-34) before the game can ask for it or submit) */
     set_host(ARG(0), DEC_MAGIC, d);
     static int logged;
     if (logged++ < 4)
@@ -335,10 +393,25 @@ static void pending_free(Dec *d) {
         free(n);
     }
     d->ptail = NULL;
+    d->npending = 0;
+}
+/* ((Triforce, 11-22, the performance audit's IO-32, after Source A's) The movie's line, once, and its counts from zero
+   for the next movie: at a Stop, a Flush and the decoder's end (video_movie.h) */
+static void movie_end(Dec *d) {
+    char line[280];
+    if (video_movie_line(&d->movie, d->ctx ? d->ctx->codec->name : "Media Foundation", video_pace_spacing(&d->pace), line,
+                         sizeof line))
+        hos_log("video: %s", line);
+    memset(&d->movie, 0, sizeof d->movie);
+    memset(&d->pace, 0, sizeof d->pace);   /* ((Triforce, 11-22, THREAD-82) the next movie's gap and decode time are its own) */
 }
 static void dec_finalize(Ctx *c) {
     Dec *d = (Dec *)host_of(ARG(0), DEC_MAGIC);
     if (!d) return;
+    movie_end(d);
+    /* ((Triforce, 11-22, IO-34) its ready event is left set: a thread that still waits for it is not left waiting. No
+       lock: nothing else has this decoder any more) */
+    if (d->ready_clear) hos_system_event_signal(d->ready);
     pending_free(d);
     for (int i = 0; i < d->qn; i++) picture_free(&d->queue[(d->qhead + i) % MAX_QUEUE]);
     if (d->sws) sws_freeContext(d->sws);
@@ -349,11 +422,24 @@ static void dec_finalize(Ctx *c) {
     free(d);
     set_host(ARG(0), DEC_MAGIC, NULL);
 }
-/* a decoded frame into the queue, as RGBA and NV12 (the oldest dropped when the reader falls behind) */
+static int rgba_eager(void) {   /* ((Triforce, 11-22, IO-36) HOS_VIDEO_RGBA=1, read once: planar pictures made RGBA at once) */
+    static int on = -1;
+    if (on < 0) on = getenv("HOS_VIDEO_RGBA") != NULL && atoi(getenv("HOS_VIDEO_RGBA")) != 0;
+    return on;
+}
+/* a decoded frame into the queue, as RGBA and NV12 (the oldest dropped when the reader falls behind).
+   ((Triforce, 11-22, the performance audit's IO-36, after Source A's) As NV12 alone for libdav1d's planar 4:2:0 too, as
+   Media Foundation's NV12 already was: no swscale context, no RGBA buffer and no conversion, the pool making the RGBA
+   only if it is read (pool_rgba; dec_acquire copies no RGBA rows for such a picture). Each 1080p picture was converted
+   on the movie thread for a game that reads only the NV12. The NV12 buffer is zeroed only where a copy leaves bytes
+   out, and U and V are interleaved 16 pairs a step (video_nv12.h). HOS_VIDEO_RGBA=1: the RGBA of every planar picture,
+   as before) */
 static void queue_frame(Dec *d, const AVFrame *f) {
     const int w = f->width, h = f->height;
     if (w <= 0 || h <= 0) return;
-    if (f->format != AV_PIX_FMT_NV12 && (!d->sws || d->sws_w != w || d->sws_h != h || d->sws_fmt != f->format)) {
+    const int planar = f->format == AV_PIX_FMT_YUV420P || f->format == AV_PIX_FMT_YUVA420P;
+    const int lazy = video_rgba_lazy(rgba_eager(), f->format == AV_PIX_FMT_NV12, f->format == AV_PIX_FMT_YUV420P);
+    if (!lazy && (!d->sws || d->sws_w != w || d->sws_h != h || d->sws_fmt != f->format)) {
         if (d->sws) sws_freeContext(d->sws);
         d->sws = sws_getContext(w, h, (enum AVPixelFormat)f->format, w, h, AV_PIX_FMT_RGBA, SWS_BILINEAR, NULL, NULL, NULL);
         d->sws_w = w, d->sws_h = h, d->sws_fmt = f->format;
@@ -361,14 +447,15 @@ static void queue_frame(Dec *d, const AVFrame *f) {
     Picture p = {0};
     p.w = w, p.h = h, p.pts = f->pts;
     const int nv12 = f->format == AV_PIX_FMT_NV12;   /* (hookshot: Media Foundation's pictures, kept as NV12 alone) */
-    p.rgba = nv12 ? NULL : (uint8_t *)malloc((size_t)w * h * 4);
-    p.nv12 = nv12 ? (uint8_t *)malloc((size_t)w * h * 3 / 2) : (uint8_t *)calloc(1, (size_t)w * h * 3 / 2);
-    if (!p.nv12 || (!nv12 && !p.rgba)) {   /* (out of memory: this frame is dropped, not written through NULL; issue 342) */
+    p.rgba = lazy ? NULL : (uint8_t *)malloc((size_t)w * h * 4);
+    p.nv12 = (uint8_t *)malloc((size_t)w * h * 3 / 2);
+    if (!p.nv12 || (!lazy && !p.rgba)) {   /* (out of memory: this frame is dropped, not written through NULL; issue 342) */
         static volatile LONG told;
         if (InterlockedIncrement(&told) <= 4) hos_log("video: no memory for a %dx%d frame: dropped", w, h);
         free(p.rgba), free(p.nv12);
         return;
     }
+    if (video_nv12_zero(w, h, nv12 || planar)) memset(p.nv12, 0, (size_t)w * h * 3 / 2);
     uint8_t *dst[4] = {p.rgba, NULL, NULL, NULL};
     int dst_stride[4] = {w * 4, 0, 0, 0};
     if (d->sws && p.rgba) sws_scale(d->sws, (const uint8_t *const *)f->data, f->linesize, 0, h, dst, dst_stride);
@@ -376,14 +463,12 @@ static void queue_frame(Dec *d, const AVFrame *f) {
         for (int y = 0; y < h; y++) memcpy(p.nv12 + (size_t)y * w, f->data[0] + (size_t)y * f->linesize[0], (size_t)w);
         for (int y = 0; y < h / 2; y++)
             memcpy(p.nv12 + (size_t)w * h + (size_t)y * w, f->data[1] + (size_t)y * f->linesize[1], (size_t)w);
-    } else if (f->format == AV_PIX_FMT_YUV420P || f->format == AV_PIX_FMT_YUVA420P) {   /* (planar 4:2:0 -> NV12) */
+    } else if (planar) {   /* (planar 4:2:0 -> NV12) */
         for (int y = 0; y < h; y++) memcpy(p.nv12 + (size_t)y * w, f->data[0] + (size_t)y * f->linesize[0], (size_t)w);
         uint8_t *uv = p.nv12 + (size_t)w * h;
         for (int y = 0; y < h / 2; y++)
-            for (int x = 0; x < w / 2; x++) {
-                uv[(size_t)y * w + 2 * x] = f->data[1][(size_t)y * f->linesize[1] + x];
-                uv[(size_t)y * w + 2 * x + 1] = f->data[2][(size_t)y * f->linesize[2] + x];
-            }
+            video_uv_interleave(uv + (size_t)y * w, f->data[1] + (size_t)y * f->linesize[1],
+                                f->data[2] + (size_t)y * f->linesize[2], w / 2);
     }
     if (d->qn == MAX_QUEUE) {
         picture_free(&d->queue[d->qhead]);
@@ -391,6 +476,8 @@ static void queue_frame(Dec *d, const AVFrame *f) {
     }
     d->queue[(d->qhead + d->qn) % MAX_QUEUE] = p;
     d->qn++;
+    d->movie.pictures++;
+    video_pace_picture(&d->pace, f->pts);   /* ((Triforce, 11-22, THREAD-82) the gap between pictures, from their own times) */
 }
 static void mf_picture(void *user, const uint8_t *y, const uint8_t *uv, int w, int h, int stride, int64_t pts) {
     AVFrame f;
@@ -417,9 +504,12 @@ static void decode_pending(Dec *d) {
 /* one submission decoded (its pictures into the queue, if any) */
 static void decode_next(Dec *d) {
     if (d->phead) {
+        const int64_t began = hos_now_ns();   /* ((Triforce, 11-22, IO-32) each submission timed, for the movie's line) */
+        const int64_t pictures = d->movie.pictures;
         Pending *n = d->phead;
         d->phead = n->next;
         if (!d->phead) d->ptail = NULL;
+        d->npending--;
         if (d->mf) {   /* (hookshot) */
             if (n->pkt) {
                 d->eos = 0;
@@ -448,6 +538,10 @@ static void decode_next(Dec *d) {
             avcodec_flush_buffers(d->ctx);   /* (a stream after it starts again) */
         }
         free(n);
+        const int64_t took = hos_now_ns() - began;
+        video_movie_decoded(&d->movie, took);
+        /* ((Triforce, 11-22, THREAD-82) and what a decode that gives a picture takes lately, for the catch-up's bound) */
+        if (d->movie.pictures != pictures) video_pace_decoded(&d->pace, took);
     }
 }
 static void pending_push(Dec *d, AVPacket *pkt) {
@@ -456,6 +550,7 @@ static void pending_push(Dec *d, AVPacket *pkt) {
     if (d->ptail) d->ptail->next = n;
     else d->phead = n;
     d->ptail = n;
+    d->npending++;
 }
 /* SubmitXDecoderInputBuffer(u64* id, decoder, data, size, TimeSpan pts, bool last): kept, decoded when a picture is
    acquired (the library submits a whole movie at once: its pictures decoded then would not fit any queue) */
@@ -526,6 +621,24 @@ static uint64_t submitted(void) {   /* a submission: every handle given out befo
 
 static void dec_submit(Ctx *c) {
     Dec *d = (Dec *)host_of(ARG(1), DEC_MAGIC);
+    /* ((Triforce, 11-22, the performance audit's IO-34, after Source A's) Refused at once, with the console's result for
+       it, while the limit's worth of submissions wait (video_input.h): the game submits it again later. Never the
+       stream's last, and only by a decoder that decodes: one without would never make room. Before submitted(): a
+       refusal is no submission, and must not move the count the idle buffers' sync handles are compared with. The
+       event is cleared under the lock, with the flag input_room reads, so no room made on another thread is missed) */
+    if (d && (d->ctx || d->mf) && input_limit()) {
+        AcquireSRWLockExclusive(&d->lock);
+        const int refuse = video_input_refuse(input_limit(), d->npending, d->qn, (int)(ARG(5) & 1));
+        if (refuse) {
+            if (!d->ready_clear) d->ready_clear = 1, hos_system_event_clear(d->ready);
+            if (video_log() && d->movie.refused < 4)
+                hos_log("video: a submission refused (pts %lld): %d wait to be decoded and %d to be taken", (long long)ARG(4),
+                        d->npending, d->qn);
+            d->movie.refused++;
+        }
+        ReleaseSRWLockExclusive(&d->lock);
+        if (refuse) { RET(VIDEO_RESULT_INPUT_FULL); return; }
+    }
     const uint64_t id = submitted();
     if (ARG(0)) G64(ARG(0)) = id;
     if (!d || (!d->ctx && !d->mf)) { RET(0); return; }
@@ -546,12 +659,14 @@ static void dec_submit(Ctx *c) {
         }
     }
     d->submits++;
+    d->stopped = 0;
     if (ARG(5) & 1) pending_push(d, NULL);
     const int logged_one = d->log_submits > 0;
     if (logged_one) d->log_submits--;
     if (video_log() && (d->submits <= 8 || (ARG(5) & 1) || logged_one))
         hos_log("video: submit %lld (%llu bytes, pts %lld%s)", (long long)d->submits, (unsigned long long)ARG(3),
                 (long long)ARG(4), (ARG(5) & 1) ? ", last" : "");
+    input_room(d);   /* ((Triforce, 11-22, IO-34) as at every unlock that ends a call: the event never stays clear with room) */
     ReleaseSRWLockExclusive(&d->lock);
     RET(0);
 }
@@ -564,14 +679,17 @@ static void dec_flush(Ctx *c, const char *what) {
                     (long long)d->acquires, d->qn, d->eos ? "at the end" : d->phead ? "submissions left" : "none left",
                     (unsigned long long)c->x[30]);
         d->log_submits = 8;
+        movie_end(d);   /* ((Triforce, 11-22, IO-32) what the movie cost to decode, once) */
         if (d->ctx) avcodec_flush_buffers(d->ctx);
         else mf_av1_flush(d->mf);
         pending_free(d);
         for (int i = 0; i < d->qn; i++) picture_free(&d->queue[(d->qhead + i) % MAX_QUEUE]);
         d->qhead = d->qn = 0;
         d->eos = 0;
+        d->stopped = 1;
         d->clock_set = 0;
         for (int i = 0; i < MAX_SLOTS; i++) d->slot_last[i] = 0;
+        input_room(d);   /* ((Triforce, 11-22, IO-34) nothing waits any more: ready for submissions) */
         ReleaseSRWLockExclusive(&d->lock);
     }
     RET(0);
@@ -592,11 +710,22 @@ static void dec_acquire(Ctx *c) {
     Dec *d = (Dec *)host_of(ARG(2), DEC_MAGIC);
     if (ARG(1)) G64(ARG(1)) = 0;
     if (!d) { RET(RESULT_NO_OUTPUT); return; }
-    /* (the library aborts on any failure here: the hardware call waits for a picture. Up to ~100 ms for one decoded
-       by another thread's submission; then a free buffer as it was, so the caller is never refused) */
+    /* (the library aborts on any failure here: the hardware call waits for a picture. Up to 100 ms by the clock for one
+       decoded by another thread's submission, none after a Stop or Flush with nothing submitted since; then a free
+       buffer as it was, so the caller is never refused. The wait was 50 sleeps of 2 ms, each 4-5 ms long on Windows:
+       ~250 ms after a movie's Stop, while the game's main thread joined the movie thread, a frame that long at every
+       load from the title. HOS_VIDEO_ACQUIRE_TRIES=1: the 50 sleeps as before.
+       The decode runs without the thread's virtual core: other game threads run on it meanwhile. It is taken back only
+       after the lock is let go, never under it (dec_submit holds a core while it waits for the lock).
+       HOS_VIDEO_KEEP_CORE=1: the core held throughout, as before) */
+    static int by_tries = -1, keep_core = -1;
+    if (by_tries < 0) by_tries = getenv("HOS_VIDEO_ACQUIRE_TRIES") && atoi(getenv("HOS_VIDEO_ACQUIRE_TRIES")) == 1;
+    if (keep_core < 0) keep_core = getenv("HOS_VIDEO_KEEP_CORE") && atoi(getenv("HOS_VIDEO_KEEP_CORE")) == 1;
+    const int away = keep_core ? 0 : hos_vcore_away();
     AcquireSRWLockExclusive(&d->lock);
     decode_pending(d);
-    for (int tries = 0; !d->qn && !d->eos && tries < 50; tries++) {
+    const int64_t wait_until = hos_now_ns() + 100000000;
+    for (int tries = 0; !d->qn && !d->eos && (by_tries ? tries < 50 : !d->stopped && hos_now_ns() < wait_until); tries++) {
         ReleaseSRWLockExclusive(&d->lock);
         hos_sleep_ns(2000000);
         AcquireSRWLockExclusive(&d->lock);
@@ -606,7 +735,9 @@ static void dec_acquire(Ctx *c) {
     for (int i = 0; i < MAX_SLOTS && slot < 0; i++)
         if (d->slots[i] && !d->busy[i] && host_of(d->slots[i], POOL_MAGIC)) slot = i;
     if (slot < 0) {
+        input_room(d);   /* ((Triforce, 11-22, IO-34) here and at the two exits below: what was decoded or taken made room) */
         ReleaseSRWLockExclusive(&d->lock);
+        if (away) hos_vcore_back();
         RET(RESULT_NO_OUTPUT);
         return;
     }
@@ -621,7 +752,9 @@ static void dec_acquire(Ctx *c) {
                                  d->eos ? " (the end)" : idle ? " (idle: its sync not reached)" : "", slot);
         else if (d->acquires == 1 && !d->eos)   /* (the start: the frame shows the buffer as it was, black since the pool's fill) */
             hos_log("video: the first buffer went out before the first picture was decoded (shown black)");
+        input_room(d);
         ReleaseSRWLockExclusive(&d->lock);
+        if (away) hos_vcore_back();
         if (ARG(0)) G32(ARG(0)) = (uint32_t)slot;
         RET(0);
         return;
@@ -629,8 +762,16 @@ static void dec_acquire(Ctx *c) {
     {   /* (hookshot) The game takes one picture a frame, and the sound plays on: under 60 fps the movie fell behind its
            sound (the intro "slow motion, audio ahead", issues 146 and 179). Pictures behind the movie's clock are skipped:
            the next ones decoded, as the whole movie is submitted at once. HOS_VIDEO_NO_CATCHUP=1: as before */
-        static int off = -1;
+        /* ((Triforce, 11-22, the performance audit's THREAD-82, after Source A's) Decoding ahead to skip had no bound but
+           the guard below. With a decoder slower than the movie every picture decoded to catch up puts the clock
+           further ahead, so an acquire decoded hundreds of pictures with the lock held, threw them away, and the next
+           one started further behind. It now stops when a decode takes longer than the gap between two pictures, or
+           once this acquire has decoded for one gap, and shows the late picture it has (video_catchup.h): such a movie
+           falls behind its sound instead, and its line says so. HOS_VIDEO_UNBOUNDED_CATCHUP=1: no bound, as before) */
+        static int off = -1, unbounded = -1;
         if (off < 0) off = getenv("HOS_VIDEO_NO_CATCHUP") != NULL;
+        if (unbounded < 0)
+            unbounded = getenv("HOS_VIDEO_UNBOUNDED_CATCHUP") != NULL && atoi(getenv("HOS_VIDEO_UNBOUNDED_CATCHUP")) != 0;
         const int64_t now = hos_now_ns(), late = 25000000;   /* (a frame and a half at 60 fps) */
         Picture *h = &d->queue[d->qhead];
         if (!d->clock_set || h->pts < d->clock_pts) d->clock_set = 1, d->clock_ns = now, d->clock_pts = h->pts;   /* (a start, a loop) */
@@ -640,6 +781,14 @@ static void dec_acquire(Ctx *c) {
             if (d->queue[d->qhead].pts + late >= due) break;
             if (d->qn < 2) {
                 if (!d->phead) break;
+                if (video_catchup_stop(unbounded, video_pace_spacing(&d->pace), d->pace.recent_ns, hos_now_ns() - now)) {
+                    if (video_log())
+                        hos_log("video: the catch-up stops %.2f s behind: a decode takes %.1f ms lately, a picture is due "
+                                "every %.1f ms, and this acquire has decoded for %.1f ms", (double)(due - d->queue[d->qhead].pts) / 1e9,
+                                (double)d->pace.recent_ns / 1e6, (double)video_pace_spacing(&d->pace) / 1e6,
+                                (double)(hos_now_ns() - now) / 1e6);
+                    break;
+                }
                 decode_next(d);
                 continue;
             }
@@ -648,6 +797,7 @@ static void dec_acquire(Ctx *c) {
             skipped++;
         }
         if (skipped && video_log()) hos_log("video: %d pictures skipped to catch up with the movie's clock", skipped);
+        d->movie.skipped += skipped;   /* ((Triforce, 11-22, IO-32) and in the movie's line) */
     }
     Picture *p = &d->queue[d->qhead];
     Pool *o = (Pool *)host_of(d->slots[slot], POOL_MAGIC);
@@ -703,7 +853,9 @@ static void dec_acquire(Ctx *c) {
     }
     picture_free(p);
     d->qhead = (d->qhead + 1) % MAX_QUEUE, d->qn--;
+    input_room(d);
     ReleaseSRWLockExclusive(&d->lock);
+    if (away) hos_vcore_back();
     if (ARG(0)) G32(ARG(0)) = (uint32_t)slot;
     RET(0);
 }
@@ -734,13 +886,13 @@ static void dec_properties(Ctx *c) {
     }
     RET(0);
 }
-static uint64_t ready_event(void) {
+/* GetXDecoderSubmissionReadyEvent(decoder). ((Triforce, 11-22, IO-34) The decoder's own event, clear while its input
+   is full: it was one event for every decoder, always set. That one is still what an unknown decoder gets) */
+static uint64_t ready_event(Ctx *c) {
     static uint64_t event;
-    if (!event) {
-        event = hos_sys_alloc(0x40, 16);
-        hos_system_event_init(event, 0);
-        hos_system_event_signal(event);
-    }
+    const Dec *d = (const Dec *)host_of(ARG(0), DEC_MAGIC);
+    if (d && d->ready) return d->ready;
+    if (!event) event = ready_new();
     return event;
 }
 
@@ -753,7 +905,7 @@ HLE(_ZN2nn5codec26UnregisterVp9DecoderBufferEPNS0_14Vp9DecoderTypeEj) { dec_unre
 HLE(_ZN2nn5codec15StartVp9DecoderEPNS0_14Vp9DecoderTypeE) { RET(0); }
 HLE(_ZN2nn5codec14StopVp9DecoderEPNS0_14Vp9DecoderTypeE) { dec_flush(c, "Stop"); }
 HLE(_ZN2nn5codec15FlushVp9DecoderEPNS0_14Vp9DecoderTypeE) { dec_flush(c, "Flush"); }
-HLE(_ZN2nn5codec33GetVp9DecoderSubmissionReadyEventEPNS0_14Vp9DecoderTypeE) { RET(ready_event()); }
+HLE(_ZN2nn5codec33GetVp9DecoderSubmissionReadyEventEPNS0_14Vp9DecoderTypeE) { RET(ready_event(c)); }
 HLE(_ZN2nn5codec27SubmitVp9DecoderInputBufferEPmPNS0_14Vp9DecoderTypeEPKvmNS_8TimeSpanEb) { dec_submit(c); }
 HLE(_ZN2nn5codec36SubmitEncryptedVp9DecoderInputBufferEPmPNS0_14Vp9DecoderTypeEPKNS0_18EncryptionPropertyEPKvmNS_8TimeSpanEb) {
     const uint64_t id = submitted();
@@ -778,7 +930,7 @@ HLE(_ZN2nn5codec24RegisterAv1DecoderBufferEPNS0_14Av1DecoderTypeEjPNS0_25VideoDe
 HLE(_ZN2nn5codec15StartAv1DecoderEPNS0_14Av1DecoderTypeE) { RET(0); }
 HLE(_ZN2nn5codec14StopAv1DecoderEPNS0_14Av1DecoderTypeE) { dec_flush(c, "Stop"); }
 HLE(_ZN2nn5codec15FlushAv1DecoderEPNS0_14Av1DecoderTypeE) { dec_flush(c, "Flush"); }
-HLE(_ZN2nn5codec33GetAv1DecoderSubmissionReadyEventEPNS0_14Av1DecoderTypeE) { RET(ready_event()); }
+HLE(_ZN2nn5codec33GetAv1DecoderSubmissionReadyEventEPNS0_14Av1DecoderTypeE) { RET(ready_event(c)); }
 HLE(_ZN2nn5codec27SubmitAv1DecoderInputBufferEPmPNS0_14Av1DecoderTypeEPKvmNS_8TimeSpanEb) { dec_submit(c); }
 HLE(_ZN2nn5codec29AcquireAv1DecoderOutputBufferEPjPNS_2gs16NativeSyncHandleEPNS0_14Av1DecoderTypeE) { dec_acquire(c); }
 HLE(_ZN2nn5codec29ReleaseAv1DecoderOutputBufferEPNS0_14Av1DecoderTypeEjNS_2gs16NativeSyncHandleE) { dec_release(c); }
@@ -793,7 +945,7 @@ HLE(_ZN2nn5codec26UnregisterVp8DecoderBufferEPNS0_14Vp8DecoderTypeEj) { dec_unre
 HLE(_ZN2nn5codec15StartVp8DecoderEPNS0_14Vp8DecoderTypeE) { RET(0); }
 HLE(_ZN2nn5codec14StopVp8DecoderEPNS0_14Vp8DecoderTypeE) { dec_flush(c, "Stop"); }
 HLE(_ZN2nn5codec15FlushVp8DecoderEPNS0_14Vp8DecoderTypeE) { dec_flush(c, "Flush"); }
-HLE(_ZN2nn5codec33GetVp8DecoderSubmissionReadyEventEPNS0_14Vp8DecoderTypeE) { RET(ready_event()); }
+HLE(_ZN2nn5codec33GetVp8DecoderSubmissionReadyEventEPNS0_14Vp8DecoderTypeE) { RET(ready_event(c)); }
 HLE(_ZN2nn5codec27SubmitVp8DecoderInputBufferEPmPNS0_14Vp8DecoderTypeEPKvmNS_8TimeSpanEb) { dec_submit(c); }
 HLE(_ZN2nn5codec29AcquireVp8DecoderOutputBufferEPjPNS_2gs16NativeSyncHandleEPNS0_14Vp8DecoderTypeE) { dec_acquire(c); }
 HLE(_ZN2nn5codec29ReleaseVp8DecoderOutputBufferEPNS0_14Vp8DecoderTypeEjNS_2gs16NativeSyncHandleE) { dec_release(c); }

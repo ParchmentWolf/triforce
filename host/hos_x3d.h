@@ -5,6 +5,11 @@
    none of them crosses dies. Windows' own placement of games on that die (Game Mode with AMD's chipset driver) depends
    on its taking the program for a game.
 
+   (Triforce, 11-22, the performance audit's THREAD-49, after Source A's) The replay's core is kept on the die only where
+   the die's cores have more than one logical processor each (SMT on). With SMT off a kept core left the game 7 of the
+   die's 8 cores: the replay ran faster and the frame slower (hos_x3d_keep_replay_core below). HOS_RESERVE_CORE=1 keeps
+   one there too, as before.
+
    Nothing is done:
    - with every L3 cache the same size: one die (a 7800X3D), two dies alike (a 7950X, a part with the cache on both), an
      Intel processor of two kinds of core, whose cores differ in their L2 caches and share one L3;
@@ -95,5 +100,25 @@ static inline uint64_t hos_x3d_thread_mask(uint64_t process, uint64_t die, uint6
     const uint64_t on = die && (process & die) ? process & die : process;
     if (on & ~reserved) return reserved || on != process ? on & ~reserved : 0;
     return on != process ? on : 0;
+}
+
+/* (Triforce, 11-22, the performance audit's THREAD-49, after Source A's) Whether a core of the die is kept for the replay.
+   die: hos_x3d_pick's die, 0 for none; cores: the cores in it; asked: HOS_RESERVE_CORE, -1 when it is not set, else 0 or
+   1; own_thread: the replay has a thread of its own (RX_VK_ASYNC=1), which is pinned to the kept core.
+   Source A measured a 9950X3D with SMT off: with one of the die's 8 cores kept the replay took 9.8-10.0 ms a frame and
+   the game ran at 56.9-57.4 fps; with none kept, 10.1-10.5 ms and 59.8-59.9 fps. The game runs six cores' worth of
+   threads beside the replay's, and the eighth core was worth more to them than to the replay alone. With SMT on (16
+   logical processors on the die's 8 cores) it was never measured, so the core stays kept there, as before; so it does
+   with no such die, where this rule changes nothing. The switch, when set, wins either way */
+static inline int hos_x3d_keep_replay_core(uint64_t die, int cores, int asked, int own_thread) {
+    if (asked >= 0) return asked != 0;
+    if (!die || cores <= 0 || own_thread) return 1;
+    return __builtin_popcountll(die) > cores;
+}
+
+/* The core kept for the replay (hos_reserved_cpus): fast, the last core of the fastest kind among the die's cores when
+   there is a die and among all otherwise (pick_reserved_core's, 0 for none), unless the rule above keeps none */
+static inline uint64_t hos_x3d_reserved(uint64_t fast, uint64_t die, int cores, int asked, int own_thread) {
+    return hos_x3d_keep_replay_core(die, cores, asked, own_thread) ? fast : 0;
 }
 #endif

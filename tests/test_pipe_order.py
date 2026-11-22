@@ -42,11 +42,11 @@ def check_source():
     if "!found->looked.exchange(true)) st_pipe_looked++, order_met(key);" not in found:
         raise SystemExit("vk_draw.cpp graphics_pipeline: a draw's first need of a pipeline the precompile made is not in the order")
     take = gp.index("VkPipeline linked = warm_link_take(key);")
-    met = gp.index("order_met(key);   // ((Triforce, wp18)")
+    met = gp.index("order_met(key, warm_linked);   // ((Triforce, wp18)")   # ((Triforce, 11-22, PIPE-81) and whether the warm linked it)
     if not take < met < gp.index("auto job = std::make_shared<Job>();"):
         raise SystemExit("vk_draw.cpp graphics_pipeline: a new pipeline goes into the order before the warm's link for it is "
                          "taken (the draws' move could let it go), or not at all")
-    om = function(draw, "void order_met(uint64_t key) {")
+    om = function(draw, "void order_met(uint64_t key, bool warm_linked = false) {")
     for need in ("if (!pipe_order_on()) return;", "pipe_order_rec.add(key);",
                  "!pipe_order_front.met(pipe_order_index.at(key))", "pipe_order_links.behind(from, gone);",
                  "order_gone_locked(gone, true);"):

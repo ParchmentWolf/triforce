@@ -11,7 +11,9 @@ RUN_ALL_ARGS = ["--cxx", "{cxx}"]
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("initial_allocation_failure", "payload_allocation_failure", "records_address_zero",
          "records_only_address_zero", "payload_address_zero", "records_only_success", "task_success",
-         "invalid_program", "program_isolation")
+         "invalid_program", "program_isolation",
+         # ((11-21, the performance audit's MEM-154) a payload growth keeps the thread's records buffer)
+         "payload_growth_keeps_records", "shared_records_payload_failure")
 
 
 def block(source, signature, semicolon=False):

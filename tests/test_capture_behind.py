@@ -190,6 +190,7 @@ def production_fixture(mem):
 #include <thread>
 #include <vector>
 #include "capture_behind.h"
+#include "cpu_count.h"   // ((Triforce, 11-22, OS-49) copy_helper_main counts by cpu_count()
 namespace capture_behind = mkwvk::capture_behind;
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); std::fflush(stderr); std::_Exit(1); } } while (0)
 typedef size_t SIZE_T;
@@ -391,7 +392,7 @@ def check_source(mem, replay, texture, dev):
     check("if (behind && behind_on())" in make, "capture_make: the copies go behind without the caller's leave or the switch")
     for a, b in (("behind_now.store(b.get()", "behind_start(b);"), ("c->behind = b;", "behind_start(b);"),
                  ("behind_start(b);", "copy_part(w);"), ("for (uint32_t i : c->late) na += !ahead[i], ahead[i] = 1;", "b->plan(ahead.data(), n);"),
-                 ("g < std::prev(it)->second) ahead[(size_t)i] = 1", "b->plan(ahead.data(), n);")):
+                 ("if (!ahead[(size_t)i] && in_texr.in(g)) ahead[(size_t)i] = 1", "b->plan(ahead.data(), n);")):   # ((Triforce, 11-22, MEM-42) the loop's walk)
         before(make, a, b, "capture_make: %s before %s" % (a, b))
     check("if (!ahead[(size_t)i] || b->ok[(size_t)i]) c->copied.push_back(pages[i])" in make,
           "capture_make: the pages copied ahead that failed are counted as copied, or those behind are not")

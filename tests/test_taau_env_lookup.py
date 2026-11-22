@@ -19,8 +19,10 @@ def block(source, marker):
     return source[start:start + re.search(r'^}', source[start:], re.M).end()]
 
 
-def fixture(source):
-    return (PREFIX + block(source, 'bool taau_key(uint64_t key) {') + '\n' +
+def fixture(source, rule):
+    # ((Triforce, 11-22, GPUWORK-20) taau_stand_in asks upscale_off.h which dispatches it stands in for: the header itself)
+    return (PREFIX.replace('/*UPSCALE_OFF_H*/', rule.replace('#pragma once', '')) +
+            block(source, 'bool taau_key(uint64_t key) {') + '\n' +
             block(source, 'bool taau_stand_in(VkCommandBuffer cmd,') + '\n' + SUFFIX)
 
 
@@ -42,15 +44,24 @@ static const char* fixture_getenv(const char* name) {
 namespace Shader { namespace Backend { namespace SPIRV { static bool mma_software = true; } } }
 using VkCommandBuffer = int;
 using VkImageView = int;
-constexpr int VK_IMAGE_VIEW_TYPE_2D=2, VK_FORMAT_B10G11R11_UFLOAT_PACK32=7;
-enum class ViewUse { Storage };
+constexpr int VK_IMAGE_VIEW_TYPE_2D=2, VK_FORMAT_B10G11R11_UFLOAT_PACK32=7, VK_FORMAT_UNDEFINED=0, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32=9;
+enum class ViewUse { Storage, Sample };
 struct Desc { unsigned count=1; int format=23; };
-struct Info { std::vector<Desc> texture_descriptors, image_descriptors; };
+struct Info { std::vector<Desc> texture_descriptors, image_descriptors; bool uses_cooperative_matrix=false; };
+/*UPSCALE_OFF_H*/
+/* ((Triforce, 11-22, GPUWORK-20) the upscaler Off, and the two gameplay networks by key, as vk_draw.cpp has them) */
+static bool off_now;
+static bool upscale_off_on(){return off_now;}
+/* ((Triforce, 11-22, DESC-30) the lab's "diagold" phases, vk_draw.cpp: never here, so taau_key answers from its parsed list) */
+static bool dispatch_diag_old(){return false;}
+static bool gameplay_network(uint64_t key){return key==0xfd029a317a9a4b94ull || key==0x9dc98871eb7fc101ull;}
 struct Stage { Info info; };
 struct NvnState {};
 struct Program { uint64_t key; std::vector<Stage> stages; };
 struct Texture { int format=VK_FORMAT_B10G11R11_UFLOAT_PACK32; };
 static Texture texture;
+static Texture scene_texture{VK_FORMAT_E5B9G9R9_UFLOAT_PACK32};   /* (the network's input, asked for only for a network taken by its shape) */
+static int sample_view_calls;
 static struct { bool push_descriptor=false; } dev;
 static bool vkCmdPushDescriptorSetKHR=true;
 struct ImageInfo { VkImageView imageView; };
@@ -70,7 +81,8 @@ static uint32_t handle_of(const NvnState&,const Stage&,const Desc&,uint32_t inde
     ++handle_calls;return index==0?handle_value:0;
 }
 static int image_format(int f){return f+100;}
-static VkImageView texture_view_of(uint32_t handle,int type,ViewUse use,int format,Texture** out,uint32_t* level){
+static VkImageView texture_view_of(uint32_t handle,int type,ViewUse use,int format,Texture** out,uint32_t* level=nullptr){
+    if(use==ViewUse::Sample){ ++sample_view_calls; if(handle==5 && type==VK_IMAGE_VIEW_TYPE_2D && format==VK_FORMAT_UNDEFINED) *out=&scene_texture; (void)level; return 98; }
     ++view_calls;
     if(handle!=5 || type!=VK_IMAGE_VIEW_TYPE_2D || use!=ViewUse::Storage || format!=123) return 0;
     *out=resolve_image?&texture:nullptr;*level=7;return 99;
@@ -102,6 +114,50 @@ int main(int argc,char** argv){
     else if(!strcmp(argv[1],"disabled"))configured_keys="-",expected=false;
     else if(!strcmp(argv[1],"custom"))configured_keys="0123456789abcdef",target=0x0123456789abcdefull;
     else if(!strcmp(argv[1],"prefixes"))configured_keys="abcd,fd029a";
+    else if(!strcmp(argv[1],"off")){
+        /* ((Triforce, 11-22, GPUWORK-20) the upscaler Off on a card that runs the networks: none is listed, every gameplay
+           network is stood in for with the plain stretch, anything else is left alone */
+        Shader::Backend::SPIRV::mma_software=false;
+        dev.push_descriptor=true;dw().imgs={{11},{44}};
+        NvnState state{};Stage stage;stage.info.texture_descriptors={{1,23}};stage.info.image_descriptors={{1,23}};
+        auto run=[&](uint64_t key,bool matrix){Program q{key,{}};stage.info.uses_cooperative_matrix=matrix;q.stages.push_back(stage);
+            forwarded_temporal=true;forwarded_text.clear();return taau_stand_in(19,state,q);};
+        const uint64_t networks[]={0xfd029a317a9a4b94ull,0x9dc98871eb7fc101ull};
+        const uint64_t shares[]={0x6676619641320ba7ull,0xf10782f9e58b6a7cull,0x72ba090c70fe2614ull,0x0775215f8da720e6ull};
+        for(uint64_t k:networks)check(!run(k,true) && !upscale_calls,"with the upscaler not Off, a card that runs the networks stands in for none");
+        for(uint64_t k:shares)check(!run(k,true) && !upscale_calls,"with the upscaler not Off, a share's network runs");
+        check(sample_view_calls==0,"with the upscaler not Off, no network's input is looked up");
+        off_now=true;
+        int calls=0;
+        for(uint64_t k:networks){
+            check(run(k,true) && upscale_calls==++calls,"Off: a gameplay network by key is stood in for");
+            check(!forwarded_temporal && forwarded_text=="the upscaler Off" && forwarded_key==k,"Off: the stretch is the plain one, no FXAA and no history bound");
+            check(hudless_key==k,"Off: the picture is still taken for frame generation");
+        }
+        check(sample_view_calls==0,"Off: a network known by key needs no look at its input");
+        for(uint64_t k:shares)check(run(k,true) && upscale_calls==++calls && !forwarded_temporal,"Off: a share's network (by its shape) is stood in for");
+        check(sample_view_calls==4,"Off: a network taken by its shape has its input's format looked at");
+        check(!run(0x1111111111111111ull,false) && upscale_calls==calls,"Off: a program that is no network is left alone");
+        scene_texture.format=VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+        check(!run(shares[0],true) && upscale_calls==calls,"Off: a network of that shape whose input is not the scene's format is left alone");
+        scene_texture.format=VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
+        stage.info.texture_descriptors={{1,23},{1,23}};dw().imgs={{11},{12},{44}};
+        check(!run(shares[0],true) && upscale_calls==calls,"Off: a network sampling two textures is left alone");
+        check(run(networks[1],true) && upscale_calls==calls+1,"Off: a network known by key is taken whatever its shape");
+        printf("%s failures=%u eligible=%d\n",argv[1],failures,upscale_calls);
+        return failures?1:0;
+    }
+    else if(!strcmp(argv[1],"off-software")){
+        /* (Off where the first network is already stood in for: Off's plain stretch, not the stand-in's FXAA) */
+        dev.push_descriptor=true;dw().imgs={{11},{44}};off_now=true;
+        NvnState state{};Stage stage;stage.info.texture_descriptors={{1,23}};stage.info.image_descriptors={{1,23}};
+        Program q{0xfd029a317a9a4b94ull,{}};q.stages.push_back(stage);
+        check(taau_stand_in(19,state,q) && !forwarded_temporal && forwarded_text=="the upscaler Off","Off wins over the listed stand-in's FXAA");
+        off_now=false;
+        check(taau_stand_in(19,state,q) && forwarded_temporal && forwarded_text=="fd029a317a9a4b94","not Off: the listed stand-in as before");
+        printf("%s failures=%u eligible=%d\n",argv[1],failures,upscale_calls);
+        return failures?1:0;
+    }
     else if(strcmp(argv[1],"software"))return 91;
     check(taau_key(target)==expected && !taau_key(0),"existing key matcher unchanged");
     NvnState state{};Program program{target,{}};Stage stage;
@@ -154,7 +210,8 @@ def main():
     p.add_argument('--emit-only', type=Path)
     p.add_argument('--cxx-arg', action='append', default=[], help='extra compiler/linker flag (repeatable)')
     args = p.parse_args()
-    cpp = fixture((args.source / 'gpu/vk/vk_draw.cpp').read_text(encoding='utf-8'))
+    cpp = fixture((args.source / 'gpu/vk/vk_draw.cpp').read_text(encoding='utf-8'),
+                  (args.source / 'gpu/vk/upscale_off.h').read_text(encoding='utf-8'))
     if args.emit_only:
         with args.emit_only.open('x', encoding='utf-8') as f:
             f.write(cpp)
@@ -171,13 +228,13 @@ def main():
             command = [args.cxx, '-std=c++17', '-Wall', '-Wextra', '-Werror', *args.cxx_arg, str(source), '-o', str(exe)]
         subprocess.run(command, cwd=folder, check=True)
         failed = False
-        for case in ('software', 'hardware', 'no-f16', 'empty', 'disabled', 'custom', 'prefixes'):
+        for case in ('software', 'hardware', 'no-f16', 'empty', 'disabled', 'custom', 'prefixes', 'off', 'off-software'):
             result = subprocess.run([str(exe), case], cwd=folder)
             print(case, 'exit', result.returncode, flush=True)
             failed |= result.returncode != 0
         if failed:
             raise SystemExit(1)
-    print('PASS: seven key configurations; rejected lookups removed, eligible per-call forwarding preserved')
+    print('PASS: seven key configurations; rejected lookups removed, eligible per-call forwarding preserved; the upscaler Off')
 
 
 if __name__ == '__main__':

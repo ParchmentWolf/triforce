@@ -114,12 +114,87 @@ class PromptsInTheBackground(unittest.TestCase):
         keys = (ROOT / "nx2/prompt_keys.py").read_text(encoding="utf-8")
         self.assertIn('"third_party", "fonts", "libertinus", "LibertinusSans-Bold.ttf"', keys)
 
-    def test_the_players_own_folders_are_drawn_at_every_build(self):
-        (self.out / ".triforce_romfs").unlink()   # (romfs and exefs folders linked in: no stamp to tell them by)
-        self.assertIsNone(make_game.prompts_key(str(self.out)))
-        self.assertEqual(self.build()[1:], (True, "drawn in run 1"))
-        self.assertEqual(self.build()[1:], (True, "drawn in run 2"))
-        self.assertFalse((self.out / "prompts" / make_game.PROMPT_KEY).exists())
+    def game_files(self):
+        """a romfs with every file the tool reads, as stand-ins; their names under the romfs"""
+        import prompt_assets
+        romfs = self.out / "romfs"
+        names = ["Pack/ZsDic.pack.zs", prompt_assets.FONT, prompt_assets.TEXTURES, prompt_assets.LAYOUTS, prompt_assets.CAMERA,
+                 "System/Resource/ResourceSizeTable.Product.110.rsizetable.zs",
+                 prompt_assets.MALS + "/EUen.Product.110.sarc.zs", prompt_assets.MALS + "/JPja.Product.110.sarc.zs"]
+        for n in names:
+            (romfs / n).parent.mkdir(parents=True, exist_ok=True)
+            (romfs / n).write_bytes(("the game's " + n).encode())
+        return names
+
+    def test_the_players_own_folders_are_kept_by_their_files_content(self):
+        # ((11-21, the performance audit's IO-43) romfs and exefs folders linked in have no stamp to tell them by: the
+        # prompts were drawn at every build. Their key is the content of the game's files the tool reads)
+        (self.out / ".triforce_romfs").unlink()
+        self.assertIsNone(make_game.prompts_key(str(self.out)))            # (no romfs given: no key, as before)
+        names = self.game_files()
+        self.assertEqual(make_game.prompt_game_files(str(self.out / "romfs")), names)
+        root = Path(self.temp.name)
+        (root / "host").mkdir()
+        (root / "host" / "prompts.c").write_text("/* reads the prompts */\n")
+        with patch.object(make_game, "ROOT", self.temp.name):
+            self.assertEqual(self.build()[1:], (True, "drawn in run 1"))
+            self.assertEqual(self.build()[1:], (False, "drawn in run 1"))   # (the same folders again: kept)
+            self.assertTrue((self.out / "prompts" / make_game.PROMPT_KEY).exists())
+            run = 1
+            for n in names:   # (each file the tool reads, changed: drawn again, then kept)
+                (self.out / "romfs" / n).write_bytes(b"another dump's")
+                run += 1
+                self.assertEqual(self.build()[1:], (True, "drawn in run %d" % run), n)
+                self.assertEqual(self.build()[1:], (False, "drawn in run %d" % run), n)
+            (self.out / "romfs" / "Model").mkdir()
+            (self.out / "romfs" / "Model" / "Link.bfres.zs").write_bytes(b"a file the tool does not read")
+            self.assertEqual(self.build()[1:], (False, "drawn in run %d" % run))
+            (self.out / "romfs" / names[-1]).unlink()                       # (a language gone)
+            run += 1
+            self.assertEqual(self.build()[1:], (True, "drawn in run %d" % run))
+            (root / "host" / "prompts.c").write_text("/* reads the prompts, changed */\n")
+            run += 1
+            self.assertEqual(self.build()[1:], (True, "drawn in run %d" % run))
+            (root / "version.txt").write_text("v9.9.9\n")                  # (another release of the tools)
+            run += 1
+            self.assertEqual(self.build()[1:], (True, "drawn in run %d" % run))
+            self.assertEqual(self.build()[1:], (False, "drawn in run %d" % run))
+            with patch.dict(os.environ, {"HOOKSHOT_PROMPTS_FOLDER_KEY": "0"}):   # (the switch: at every build, as before)
+                self.assertIsNone(make_game.prompts_key(str(self.out), str(self.out / "romfs")))
+                self.assertEqual(self.build()[1:], (True, "drawn in run %d" % (run + 1)))
+                self.assertEqual(self.build()[1:], (True, "drawn in run %d" % (run + 2)))
+
+    def test_an_unpacked_games_key_holds_the_reader_and_the_release_too(self):
+        # ((11-21, IO-43) for every game: host/prompts.c, which reads what is drawn, and the release these tools are)
+        root = Path(self.temp.name)
+        (root / "host").mkdir()
+        (root / "host" / "prompts.c").write_text("/* reads the prompts */\n")
+        with patch.object(make_game, "ROOT", self.temp.name):
+            self.assertEqual(self.build()[1:], (True, "drawn in run 1"))
+            self.assertEqual(self.build()[1:], (False, "drawn in run 1"))
+            (root / "host" / "prompts.c").write_text("/* reads the prompts, changed */\n")
+            self.assertEqual(self.build()[1:], (True, "drawn in run 2"))
+            (root / "VERSION").write_text("v9.9.9\n")
+            self.assertEqual(self.build()[1:], (True, "drawn in run 3"))
+            self.assertEqual(self.build()[1:], (False, "drawn in run 3"))
+
+    def test_every_game_file_the_tool_opens_is_in_the_key(self):
+        # ((11-21, IO-43) nx2/prompt_assets.py's own source: each place it opens a file under the romfs names it by one of
+        # the names prompt_game_files gives. A new read there has to join the key, or a changed dump keeps old prompts)
+        import re
+        src = (ROOT / "nx2/prompt_assets.py").read_text(encoding="utf-8")
+        opened = set(re.findall(r"read_zs\((?:a\.)?romfs, ([^,]+),", src))
+        # ("rel" is read_zs's own definition)
+        self.assertEqual(opened, {"rel", "FONT", "TEXTURES", "LAYOUTS", "CAMERA", 'f"System/Resource/{name}"', 'f"{MALS}/{name}"'},
+                         "prompt_assets.py reads a game file this test does not know: add it to make_game.prompt_game_files")
+        joined = set(re.findall(r"os\.path\.join\(romfs, ([^)]+)\)", src))
+        self.assertEqual(joined, {'"Pack", "ZsDic.pack.zs"', "rel", '"System", "Resource"', "MALS"},
+                         "prompt_assets.py opens a path under the romfs this test does not know")
+        key = (ROOT / "nx2/make_game.py").read_text(encoding="utf-8")
+        body = key[key.index("def prompt_game_files(romfs):"):key.index("def prompts_key(")]
+        for part in ('"Pack/ZsDic.pack.zs"', "prompt_assets.FONT", "prompt_assets.TEXTURES", "prompt_assets.LAYOUTS",
+                     "prompt_assets.CAMERA", '"ResourceSizeTable."', "prompt_assets.MALS", '".sarc.zs"'):
+            self.assertIn(part, body)
 
     def test_a_drawing_that_fails_leaves_no_prompts(self):
         self.build()

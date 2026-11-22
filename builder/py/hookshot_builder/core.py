@@ -17,6 +17,15 @@ CREATE_NO_WINDOW = 0x08000000
 BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
 
 
+def build_priority(env=None):
+    """(Triforce, 11-22, the performance audit's OS-57, after Source A's) The priority class the build tools are started
+    with, as a creation flag: none (normal priority), and below normal, as every build was before, only with
+    HOOKSHOT_LOW_PRIORITY=1. Source A's reason, a report it did not measure: below normal, Windows kept the steps that are
+    one process (the read, the lift) on a hybrid Intel CPU's efficiency cores while the performance cores idled."""
+    env = os.environ if env is None else env
+    return BELOW_NORMAL_PRIORITY_CLASS if env.get("HOOKSHOT_LOW_PRIORITY") == "1" else 0
+
+
 # ---------------- the build tools (Runner.cs: Tools) ----------------
 
 class Tools:
@@ -96,7 +105,7 @@ class Runner:
             p = subprocess.Popen(build_command(self.tools, self.args), cwd=self.tools.root,
                                  env=build_env(self.tools, self.workers, self.ngx_sdk), stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
-                                 creationflags=CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS)
+                                 creationflags=CREATE_NO_WINDOW | build_priority())
         except OSError as e:
             self.on_finished("The build tools could not start: %s" % e)
             return

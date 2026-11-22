@@ -80,6 +80,9 @@ struct Frame {
     double wb_unsent_ms = 0;
     int64_t wb_held = 0;            // ((Triforce, wp20) how many went on after the writer's recording was done on the GPU, and
     double wb_held_ms = 0;          //  that part of them: the submissions' timeline held by work stopped at a wait, wb_rec_wait.h)
+    // ((Triforce, 11-22, the performance audit's SYNC-122) that part by caller, ms: a capture's take, a read of a page put off,
+    // a binding of one, a readback's fallback (wb_rec_wait.h Caller; the readbacks' is in none of the counts above)
+    double wb_held_by[4] = {0, 0, 0, 0};
     double pipe_wait = 0;          // (waits for shaders and pipelines)
     int64_t pipe_waits = 0, left_out = 0;   // (how many; draws left out while theirs were built)
     int64_t pipes_first = 0, pipes_ahead = 0, pipes_order = 0;   // ((Triforce, wp18) vk_draw.cpp graphics_pipeline: the pipelines the
@@ -186,6 +189,10 @@ inline int stall_line(const Frame& f, char* out, size_t cap) {
                 (long long)f.wb_held, f.wb_held_ms);
         put("%s", ")");
     }
+    // ((Triforce, 11-22, SYNC-122) the held part by caller, when there is any: the reads' side of RX_VK_WB_WAIT_REC)
+    if (f.wb_held_by[0] + f.wb_held_by[1] + f.wb_held_by[2] + f.wb_held_by[3] > 0)
+        put("; the timeline held after a writer's recording was done, by caller: takes %.1f, reads %.1f, binds %.1f, readbacks %.1f ms",
+            f.wb_held_by[0], f.wb_held_by[1], f.wb_held_by[2], f.wb_held_by[3]);
     if (f.pipe_waits || f.left_out)
         put("; %lld waits for shaders or pipelines (%.1f ms), %lld draws left out", (long long)f.pipe_waits, f.pipe_wait,
             (long long)f.left_out);

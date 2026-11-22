@@ -95,7 +95,7 @@ def check_source():
     draw = (ROOT / "gpu/vk/vk_draw.cpp").read_text(encoding="utf-8")
     init = between(draw, "void pcache_init() {", "\n}\n")
     setb = 'pcache_bound_bytes = pcache_bound::bytes(getenv("RX_VK_PCACHE_MAX_MB"), ram);'
-    readb = "pcache_bound::read(pcache_path.c_str(), 32, pcache_bound_bytes, data, &len)"
+    readb = "pcache_bound::read(pcache_path.c_str(), 32, pcache_bound_bytes, data, &len,"   # ((Triforce) and the header check: test_pcache_head_read.py)
     if setb not in init or readb not in init or init.index(setb) > init.index(readb):
         raise SystemExit("pcache_init does not read the file through the bound, or reads before the bound is set")
     if "fread(" in init[init.index(setb):]:

@@ -150,6 +150,27 @@ enum { HOS_MODS_PRESS_UP = 1, HOS_MODS_PRESS_DOWN = 2, HOS_MODS_PRESS_LEFT = 4, 
    text. HOS_OPT_TEXT_CHAR, option_set (the window's thread, host/display.c): a code point typed, or 8 Backspace, 127
    Ctrl+Backspace (a pasted text comes as its characters) */
 enum { HOS_OPT_TEXT_CHAR = 159, HOS_OPT_TEXT_WANTED };
+/* ((Triforce) 11-20) The Mods screen's music (host/mods_music.c). HOS_OPT_MODS_MUSIC, option: 0 none; 1 the title's list
+   is there with its Mods entry (the tune is read from the game's files ahead of its use); 2 the Mods screen is open from
+   the title's list: the game's shop theme plays quietly and the game's own sound, the title's music, is faded out
+   under it, and back when the screen shuts */
+enum { HOS_OPT_MODS_MUSIC = 161 };
+/* ((Triforce) 11-20) The Mods entry with the game's own buttons, not by a clock of its own. HOS_OPT_MODS_ALPHA,
+   option_set: how much of the list's last button the game shows this frame, in thousandths (0 to 1000: the button's own
+   alpha as the game animates it, host/oot_menu.c), told before that frame's HOS_OPT_MODS_LIST. A HOS_OPT_MODS_LIST without
+   HOS_MODS_LIST_SHOWN says that the list is there no longer for the entry (another screen has the game's cursor): the
+   entry goes at once, as the game's buttons did */
+enum { HOS_OPT_MODS_ALPHA = 162 };
+/* (Triforce) Achievements (host/achievements.c keeps them, on unless HOS_ACHIEVEMENTS=0; gpu/vk/vk_menu.cpp and
+   gpu/vk/achievement_rows.h show them: the System tab's Achievements page, and a notice when one is earned; 165 to 169 are
+   theirs). HOS_OPT_ACH_ASK, option: 1 from a renderer that shows them. Once it answers the host names its list, in the list's
+   order: HOS_OPT_ACH_TEXT, option_set: the next byte of an achievement's name, UTF-8, then a line feed and the line about it,
+   then a line feed and the day it was earned when it was; HOS_OPT_ACH_ADD, option_set: the bytes sent so far are the next
+   achievement's, the value its icon (0 to 255, host/achievements.h ach_icon) and HOS_ACH_EARNED when it is earned;
+   HOS_OPT_ACH_COUNT, option_set: the list is whole (0: none). HOS_OPT_ACH_EARNED, option_set: the achievement at that place
+   in the list was earned now, the bytes sent so far the day: the notice shows it. One at a time, the host waits between two */
+enum { HOS_OPT_ACH_TEXT = 165, HOS_OPT_ACH_ADD, HOS_OPT_ACH_COUNT, HOS_OPT_ACH_EARNED, HOS_OPT_ACH_ASK };
+enum { HOS_ACH_EARNED = 256 };
 
 /* (hookshot) the mouse over the window while it is free (not captured): the Insert menu's (host/display.c,
    host/posix/display_sdl.c). x and y: the cursor in the window's pixels, of a window width x height pixels (the

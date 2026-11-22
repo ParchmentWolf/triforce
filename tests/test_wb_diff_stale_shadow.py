@@ -85,6 +85,7 @@ Host the_host;
 Host* host = &the_host;
 bool diff_on = true;
 bool wb_diff_on() { return diff_on; }
+bool wb_notes_off() { return false; }   // ((Triforce, 11-22, MEM-51) the mirrors are on here: tests/test_mirror_bookkeeping.py has the case without
 std::mutex shadow_written_mu;
 std::vector<uint32_t> shadow_written_pages, shadow_written_collected_list, shadow_written_by_replay;
 bool shadow_written_all = false;

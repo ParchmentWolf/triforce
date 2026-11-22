@@ -321,6 +321,8 @@ bool make_pipeline(Pipeline& p, const PassInfo& info) {
     ci.layout = p.layout;
     // (hookshot, a stutter: through the pipeline cache kept across runs. Made with none, FSR 3.1's dozen passes were compiled
     // again at every start, inside the first upscaled frame: a 2.7 s first frame of play against 1.0 s without FSR, 2026-11-10)
+    // ((Triforce, 11-22, the performance audit's PIPE-95) and through the play cache, so that a pass the main cache lacks is
+    // in the small file a save in play writes, not left to the exit's save of the whole main file: shared_cache_compute)
     const VkResult made = shared_cache_compute(&ci, &p.pipeline);
     vkDestroyShaderModule(dev.device, m, nullptr);
     if (made != VK_SUCCESS) {

@@ -395,13 +395,82 @@ def long_path(p):
     return "\\\\?\\" + p
 
 
-def extraction_path(out, part, rel, temporary_suffix=".part"):
-    """A package path stays under its part, without following existing output links."""
+def package_parts(rel):
+    """A package path's parts ("/" between them), or the build stops: no empty part, no "." or "..", no backslash, drive
+    or stream, nothing Windows would rename or open as a device. No file is touched"""
     parts = rel.split("/")
     if (not rel or "\\" in rel or any(not p or p in (".", "..") or p[-1] in " ." or
             any(c in '<>:"|?*' or ord(c) < 32 for c in p) or p.split(".")[0].rstrip(" ").upper() in WINDOWS_DEVICES
             for p in parts)):
         raise SystemExit("unsafe path in the package: %r" % rel)
+    return parts
+
+
+def is_link(info):
+    """Whether what os.lstat found is a symbolic link or, on Windows, any reparse point (a junction, a mount)"""
+    return bool(stat.S_ISLNK(info.st_mode) or
+                getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+
+
+# (Triforce, 11-22, the performance audit's IO-51, after Source A's) HOOKSHOT_NUP_IN_PLACE=0: extract writes each member
+# to <member>.part and renames it, and resolves the output folder and looks at every folder above a member for every
+# member, as before. Read once.
+IN_PLACE = os.environ.get("HOOKSHOT_NUP_IN_PLACE", "1") != "0"
+
+
+class Destination:
+    """(Triforce, 11-22, the performance audit's IO-51, after Source A's) Where one extraction writes: the output folder
+    resolved once, and each folder under it looked at once (one os.lstat: there and no link, or made). extraction_path
+    did both again for every member, 186,583 times over the game's package, and under a virus scanner on NTFS each look
+    costs. A member's own name is still looked at by extract, once.
+
+    made: the folders this run made itself, which can hold nothing an older run left behind."""
+    def __init__(self, out):
+        self.root = long_path(os.path.realpath(os.path.abspath(out)))
+        self.checked = set()
+        self.made = set()
+
+    def folder(self, path, base):
+        """path (the root, or a folder under it) is a real folder from here on: its parent first, then itself"""
+        if path in self.checked:
+            return
+        if path != self.root:
+            if os.path.commonpath((os.path.normcase(base), os.path.normcase(os.path.abspath(path)))) != os.path.normcase(base):
+                raise SystemExit("path leaves the extraction folder: %r" % path)
+            self.folder(os.path.dirname(path), base)
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            info = None
+        if info is None:
+            try:
+                if path == self.root:
+                    os.makedirs(path)
+                else:
+                    os.mkdir(path)
+                self.made.add(path)
+            except FileExistsError:   # (made meanwhile by another unpack of the same package: looked at like any other)
+                info = os.lstat(path)
+        if info is not None:
+            if is_link(info):
+                raise SystemExit("extraction path is a link or reparse point: %s" % path)
+            if not stat.S_ISDIR(info.st_mode):
+                raise SystemExit("extraction path is not a folder: %s" % path)
+        self.checked.add(path)
+
+    def member(self, part, rel):
+        """Where the package's rel of part goes, its folder there: (the path, whether this run made that folder)"""
+        parts = package_parts(rel)
+        base = os.path.join(self.root, part)
+        folder = os.path.join(base, *parts[:-1])
+        if folder not in self.checked:
+            self.folder(folder, base)
+        return os.path.join(folder, parts[-1]), folder in self.made
+
+
+def extraction_path(out, part, rel, temporary_suffix=".part"):
+    """A package path stays under its part, without following existing output links."""
+    parts = package_parts(rel)
     root = long_path(os.path.realpath(os.path.abspath(out)))
     base = os.path.join(root, part)
     dst = os.path.join(base, *parts)
@@ -419,7 +488,7 @@ def extraction_path(out, part, rel, temporary_suffix=".part"):
             info = os.lstat(path)
         except FileNotFoundError:
             continue
-        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0):
+        if is_link(info):
             raise SystemExit("extraction path is a link or reparse point: %s" % path)
         if path == temporary and info.st_nlink > 1:
             raise SystemExit("extraction temporary file has other hard links: %s" % path)
@@ -502,8 +571,58 @@ def extract(nup, t, out, only=None, quiet=False, zs=None):
             print("  %.1f MiB written (%d files completed)" % (written / (1 << 20), n), flush=True)
             next_report = now + interval
 
+    # (Triforce, 11-22, the performance audit's IO-51, after Source A's) Each member is written straight to its name:
+    # one os.lstat, then a create that fails if anything is there (O_EXCL), no <member>.part and no rename. Under a
+    # virus scanner on NTFS the temporary's create and rename and extraction_path's looks at every folder were most of
+    # a small member's cost. A member that is there whole is kept (a re-run picks up where it stopped); one of another
+    # size is unlinked, never truncated (another hard link to it keeps its data); one whose write fails is deleted, so
+    # the next run writes it again. HOOKSHOT_NUP_IN_PLACE=0: the loop below this one, as before.
+    where = Destination(out) if IN_PLACE else None
     for part in ("exefs", "romfs"):
-        if only and part != only:
+        if where is None or (only and part != only):
+            continue
+        for rel, r in nup.walk(t[part]):
+            dst, fresh = where.member(part, rel)
+            looked = zs is not None and part == "romfs" and rel.endswith(".zs")
+            try:
+                info = os.lstat(dst)
+            except FileNotFoundError:
+                info = None
+            if info is not None:
+                if is_link(info):
+                    raise SystemExit("extraction path is a link or reparse point: %s" % dst)
+                if stat.S_ISREG(info.st_mode) and info.st_size == r[2]:
+                    if looked:
+                        with open(dst, "rb") as f:
+                            zs["files"] += 1
+                            if not zstd_start(f.read(4)):
+                                zs["damaged"].append(rel)
+                    continue          # (re-runs pick up where they stopped)
+                os.unlink(dst)
+            if not fresh:   # (a <member>.part an interrupted older run left: a folder this run made has none)
+                with suppress(FileNotFoundError):
+                    os.unlink(dst + ".part")
+            g = os.fdopen(os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o666), "wb")
+            try:
+                with g:
+                    sink = HeadSink(g) if looked else g
+                    nup.copy_to(r, sink if quiet else ProgressSink(sink, progress), rel)
+                if looked:
+                    zs["files"] += 1
+                    if not zstd_start(sink.head):
+                        zs["damaged"].append(rel)
+            except BaseException as error:
+                full = out_of_space(error, dst, part, rel, r[2])   # (measured before the member's space is freed)
+                # Free the failed member's space without hiding the extraction error.
+                with suppress(OSError):
+                    os.unlink(dst)
+                if full:
+                    raise full from error
+                raise
+            total += r[2]
+            n += 1
+    for part in ("exefs", "romfs"):
+        if where is not None or (only and part != only):
             continue
         for rel, r in nup.walk(t[part]):
             dst = extraction_path(out, part, rel)

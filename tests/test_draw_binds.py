@@ -35,6 +35,11 @@ def main():
         raise SystemExit("a vertex set remembers an empty size as empty")
     if "gpu_bind_stamp() == vstamp" not in draw:
         raise SystemExit("a vertex set is remembered across a mirror")
+    # (a mesh pipeline's bind leaves the vertex strides undefined: the next vertex draw binds all 16 streams again)
+    bind = draw.index("vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl)")
+    rebind = draw.find("if (p.mesh && mesh_vb_rebind) last_vb_valid = false, vertex_set.on = false;", bind)
+    if rebind < 0 or rebind > draw.index("vertex_set_same(", bind):
+        raise SystemExit("a mesh pipeline's bind keeps the vertex streams and strides of the draws before it")
     if draw.count("bind_index(") != 3:
         raise SystemExit("an indexed draw binds its index buffer on its own")
     bound = block(source, "void bind_index(")

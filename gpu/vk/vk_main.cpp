@@ -3,6 +3,7 @@
 // swapchain, and the rx_* table (vk_api.h). The NVN replay itself is vk_replay.cpp.
 #include "vk_dlssg.h"
 #include "vk_paths.h"
+#include "cpu_count.h"   // ((Triforce, 11-22, OS-49) the threads to size by: HOS_SIM_CPU
 #include "vk_loader.h"
 
 #include <atomic>
@@ -21,6 +22,7 @@
 #include "vk_internal.h"
 #include "gpu_choice.h"
 #include "present_mode.h"   // (the swapchain's present mode: the VSync row and the switches)
+#include "surface_lost.h"   // ((Triforce, 11-22, PRESENT-45) the window's surface lost: create_swapchain, invalidate_lost_surface)
 #include "vk_menu.h"
 #include "vk_dlss.h"
 #include "vk_fsr4.h"
@@ -29,6 +31,11 @@
 #include "vk_progress.h"
 #include "vk_dump.h"   // (write_png: RX_VK_STARTUP_SHOTS)
 #include "foliage_shadow.h"   // ((Triforce) RX_VK_FOLIAGE_SHADOW_VRS: whether the fragment shading rate is asked for)
+#include "recorder_auto.h"   // ((Triforce) the recorder thread's default by the GPU and the cores)
+#include "vk_gpu_clock.h"   // ((Triforce, Linux) the GPU's stable power state: gpu_clock_device_created)
+#include "mesa_spilling.h"    // ((Triforce, 11-22, PIPE-55) shader_spilling_rate=2 for Mesa's Intel compiler, Linux build)
+#include "new_wait.h"   // ((Triforce, 11-22, OS-04) a `new` refused at Windows' commit limit waits before it throws: new_refused)
+#include <new>
 
 namespace vkx {
 #define VKX_DEFINE(f) PFN_##f f;
@@ -129,6 +136,13 @@ bool create_instance() {
             if (has_extension(all, want)) exts[n_exts++] = want;
     }
 #endif
+#ifndef _WIN32
+    // ((Triforce, 11-22, the performance audit's PIPE-55, after Source A's) Mesa's Intel compiler spills registers at rate 2
+    // (mesa_spilling.h): on an Iris Xe one compute program was not built after 20 minutes and 13 GB at the driver's own rate
+    // and took 32 s and 1.7 GB at 2. Set before the instance is made, when the driver reads its options, and without
+    // overwriting, so a value the player set wins. No other driver reads it. RX_VK_NO_SPILLING_RATE=1: the driver's own rate)
+    if (mesa_spilling::wanted(false, getenv("RX_VK_NO_SPILLING_RATE"))) setenv("shader_spilling_rate", "2", 0);
+#endif
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "mkw-recomp";
     app.apiVersion = VK_API_VERSION_1_3;
@@ -159,6 +173,24 @@ bool create_instance() {
     return true;
 }
 
+// (Triforce) The physical cores the process may run on (recorder_auto.h; 0: not known): the RelationProcessorCore entries with a
+// logical processor in the process's affinity. The core kept for the replay thread (host->reserved_cpus) counts too: on Linux
+// the process's mask is the one the loading thread had (host/posix/win32_posix.c), which may already be kept off that core
+static unsigned process_physical_cores() {
+    DWORD len = 0;
+    GetLogicalProcessorInformation(nullptr, &len);
+    std::vector<SYSTEM_LOGICAL_PROCESSOR_INFORMATION> info(len / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION) + 1);
+    len = (DWORD)(info.size() * sizeof info[0]);
+    if (!GetLogicalProcessorInformation(info.data(), &len)) return 0;
+    DWORD_PTR proc = 0, sys = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) || !proc) return 0;
+    std::vector<uint64_t> masks;
+    for (DWORD i = 0; i < len / sizeof info[0]; i++)
+        if (info[i].Relationship == RelationProcessorCore) masks.push_back((uint64_t)info[i].ProcessorMask);
+    const uint64_t affinity = (uint64_t)proc | (host && host->reserved_cpus ? host->reserved_cpus() : 0);
+    return recorder_default::physical_cores(masks.data(), (int)masks.size(), affinity);
+}
+
 bool pick_device() {
     menu_init();
     uint32_t n = 0;
@@ -167,6 +199,7 @@ bool pick_device() {
     vkEnumeratePhysicalDevices(dev.instance, &n, all.data());
 
     std::vector<uint32_t> valid_gpus;
+    std::vector<int> valid_types;   // ((Triforce) 11-22: their VkPhysicalDeviceType, for gpu_choice::unnamed_integrated)
     gpu_device_names.clear();
     for (uint32_t i = 0; i < n; i++) {
         VkPhysicalDeviceProperties p;
@@ -176,6 +209,7 @@ bool pick_device() {
         if (p.apiVersion >= VK_API_VERSION_1_3) {
             valid_gpus.push_back(i);
             gpu_device_names.push_back(p.deviceName);
+            valid_types.push_back((int)p.deviceType);
         }
     }
     menu_set_gpu_count((int)valid_gpus.size());
@@ -213,8 +247,11 @@ bool pick_device() {
     int best = -1, best_score = -1;
     uint32_t best_driver = 0;
     int target_raw_idx = -1;
+    bool unnamed_integrated = false;   // ((Triforce) 11-22: the row's number alone on the processor graphics: Auto, the row follows)
     if (const char* want = getenv("RX_VK_DEVICE")) {
         if (*want) target_raw_idx = atoi(want);
+    } else if (gpu_choice::unnamed_integrated(menu_gpu_name(), gpu_device_names, valid_types, opts.gpu_device)) {
+        unnamed_integrated = true;
     } else if (const int k = gpu_choice::pick(menu_gpu_name(), gpu_device_names, opts.gpu_device); k >= 0) {
         target_raw_idx = (int)valid_gpus[k];
         if (opts.gpu_device != k + 1) {   // ((Triforce) 11-20: the saved name found the card under another number: the row follows it)
@@ -267,10 +304,36 @@ bool pick_device() {
         logf("vk: no Vulkan 1.3 GPU");
         return false;
     }
+    if (unnamed_integrated) {   // ((Triforce) 11-22) the row says the card Auto took: the menu's next save keeps it with its name
+        for (size_t k = 0; k < valid_gpus.size(); k++) {
+            if (valid_gpus[k] != (uint32_t)best) continue;
+            logf("vk: GPU device: the row's %d is the processor graphics (%s) and no name was saved with it (a choice counted in "
+                 "Windows' order before 11-20): %s, as Auto takes it; the row now says %d",
+                 opts.gpu_device, gpu_device_names[(size_t)opts.gpu_device - 1].c_str(), gpu_device_names[k].c_str(), (int)k + 1);
+            opts.gpu_device = (int)k + 1;
+        }
+    }
     dev.physical = all[best];
     vkGetPhysicalDeviceProperties(dev.physical, &dev.props);
-    // (Triforce, 11-16) the recorder thread by default on NVIDIA with 12 logical processors or more (vk_recorder.h mode_from_env)
-    recorder_auto(dev.props.vendorID == 0x10DE && std::thread::hardware_concurrency() >= 12);
+    // (Triforce, 11-16) the recorder thread's default (vk_recorder.h mode_from_env): NVIDIA with 12 logical processors or more;
+    // (Triforce, 11-21) AMD with 6 physical cores or more, but for its older Windows driver (recorder_auto.h)
+    {
+        VkPhysicalDeviceDriverProperties drv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p2.pNext = &drv;
+        vkGetPhysicalDeviceProperties2(dev.physical, &p2);
+        VendorFacts facts;
+        facts.vendor_id = p2.properties.vendorID;
+        facts.driver_id = drv.driverID;
+        facts.device_type = p2.properties.deviceType;
+        facts.driver_info = drv.driverInfo;
+        const unsigned logical = cpu_count(), physical = process_physical_cores();
+        const recorder_default::Why why = recorder_default::why(facts.vendor_id, logical, physical, amd_older_compiler(facts));
+        recorder_auto(recorder_default::on(why));
+        if (!getenv("RX_VK_RECORDER"))
+            logf("vk: recorder thread %s by default (%s: %u logical processors, %u physical cores; RX_VK_RECORDER=thread or =off "
+                 "decides)", recorder_default::on(why) ? "on" : "off", recorder_default::text(why), logical, physical);
+    }
     vkGetPhysicalDeviceMemoryProperties(dev.physical, &dev.memory);
     return true;
 }
@@ -305,6 +368,11 @@ bool create_device() {
     optional(VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME, dev.vertex_divisor);
     optional(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME, dev.stencil_export);
     optional(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME, dev.memory_budget);
+    // ((Triforce, 11-22, the performance audit's TEX-47, after Source A's) VK_EXT_memory_priority: which device memory the
+    // system keeps in video memory when the card is short, the render targets before the sampled textures. Asked for only
+    // with RX_VK_MEMORY_PRIORITY (1, or <targets>,<textures>: memory_priority.h); unset, nothing of it is on)
+    const bool prio_asked = memory_priority::parse(getenv("RX_VK_MEMORY_PRIORITY")).on;
+    if (prio_asked) optional(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME, dev.memory_priority);
     optional(VK_EXT_IMAGE_2D_VIEW_OF_3D_EXTENSION_NAME, dev.view_2d_of_3d);
     // ((Triforce) the far cascades' foliage at one fragment per 2 x 2 pixels, foliage_shadow.h: asked for only where mesh programs
     // can draw natively and RX_VK_FOLIAGE_SHADOW_VRS is not off; enabled below only with pipelineFragmentShadingRate)
@@ -412,6 +480,8 @@ bool create_device() {
     if (dev.device_fault) *tail = &fault, tail = &fault.pNext;
     VkPhysicalDeviceImage2DViewOf3DFeaturesEXT v2d3d{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_2D_VIEW_OF_3D_FEATURES_EXT};
     if (dev.view_2d_of_3d) *tail = &v2d3d, tail = &v2d3d.pNext;
+    VkPhysicalDeviceMemoryPriorityFeaturesEXT mem_prio{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT};
+    if (dev.memory_priority) *tail = &mem_prio, tail = &mem_prio.pNext;   // ((Triforce, 11-22, TEX-47) only with the switch)
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
     if (dev.coop_matrix) *tail = &coop, tail = &coop.pNext;
     VkPhysicalDeviceDescriptorBufferFeaturesEXT descriptor_buffer{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT};
@@ -424,6 +494,9 @@ bool create_device() {
     vkGetPhysicalDeviceFeatures2(dev.physical, &f);
     descriptor_buffer.descriptorBufferCaptureReplay = VK_FALSE;
     dev.view_2d_of_3d = dev.view_2d_of_3d && v2d3d.sampler2DViewOf3D;
+    dev.memory_priority = dev.memory_priority && mem_prio.memoryPriority;   // ((Triforce, 11-22, TEX-47) the allocator's bit: vma_init)
+    if (prio_asked && !dev.memory_priority)
+        logf("vk: RX_VK_MEMORY_PRIORITY: this driver has no VK_EXT_memory_priority: nothing changes");
     coop.cooperativeMatrixRobustBufferAccess = VK_FALSE;
     dev.coop_matrix = dev.coop_matrix && coop.cooperativeMatrix &&
                       f12.vulkanMemoryModel && f12.vulkanMemoryModelDeviceScope;
@@ -483,6 +556,12 @@ bool create_device() {
         facts.driver_id = drv.driverID;
         facts.device_type = p2.properties.deviceType;
         facts.driver_info = drv.driverInfo;
+        // ((Triforce, 11-22, the performance audit's MEM-23, after Source A's) RADV on a GCN 1 to 4 GPU, by its missing 16-bit
+        // storage input and output: a fact for the rules that need those cards told apart (the mesh fallback's stage sizes).
+        // No line and nothing else on any other device
+        facts.storage_io16 = f11.storageInputOutput16 != VK_FALSE;
+        dev.radv_gcn = radv_gcn(facts);
+        if (dev.radv_gcn) logf("vk: RADV on a GCN 1 to 4 GPU (no 16-bit storage input and output)");
         dev.fixes = vendor_fixes(facts);
         amd_older = amd_older_compiler(facts);
         vendor_fixes_env(dev.fixes, [](const char* name) -> const char* { return getenv(name); });
@@ -525,6 +604,12 @@ bool create_device() {
         dev.driver_id = drv.driverID;
         logf("vk: subgroups: default %u lanes, %u-%u, pinned to 32 on stages %#x", sg.subgroupSize, sc.minSubgroupSize, sc.maxSubgroupSize,
              (unsigned)dev.sg32_stages);
+        // ((Triforce, 11-22, PIPE-55) the rate create_instance asked Mesa's Intel compiler for, as this process sees it)
+        if (mesa_spilling::told(drv.driverID == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA)) {
+            const char* rate = getenv(mesa_spilling::kName);
+            logf("vk: Mesa's Intel compiler spills at rate %s (driconf shader_spilling_rate: 2 unless set)",
+                 rate && *rate ? rate : "of its own");
+        }
     }
     if (!f13.dynamicRendering || !f13.synchronization2 || !f12.timelineSemaphore) {
         logf("vk: the GPU lacks dynamic rendering, synchronization2 or timeline semaphores");
@@ -630,6 +715,10 @@ bool create_device() {
     coopmat_init();
     reflex_device_created();
     antilag_device_created();
+#ifdef __linux__
+    // ((Triforce) the Steam Deck's GPU held at amdgpu's peak stable power state while the game runs: vk_gpu_clock.cpp, RX_VK_GPU_CLOCK)
+    gpu_clock_device_created(has_extension(exts, VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME));
+#endif
     if (dev.push_descriptor) {
         VkPhysicalDevicePushDescriptorPropertiesKHR pp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR};
         VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
@@ -692,10 +781,51 @@ bool gpu_device_luid(uint8_t out[8]) {
     return true;
 }
 
+// ---- (Triforce, 11-22, the performance audit's PRESENT-45, after Source A's) The window's surface lost (surface_lost.h),
+// RX_VK_SURFACE_RECOVER (on unless =0)
+namespace { bool open_window_surface(bool log_failure); }   // (below, with the window's own code: start)
+bool surface_recover(VkResult result) {
+    static const bool on = surface_lost::on(getenv("RX_VK_SURFACE_RECOVER"));
+    return surface_lost::recovers(result == VK_ERROR_SURFACE_LOST_KHR, on, dlssg::active());
+}
+/// What hangs on the lost surface let go, in Vulkan's order: the device idle first (frames in flight name the swapchain's
+/// images), then the swapchain as create_swapchain lets an old one go (Reflex off it, the overlays' views, the images'
+/// semaphores, the swapchain), then the surface. The first 8 losses are said. dev.present_mu held
+void invalidate_lost_surface() {
+    static int said;
+    if (said++ < 8)
+        logf("vk: the window's surface is lost: its swapchain and the surface are let go, and made again at the next present "
+             "(RX_VK_SURFACE_RECOVER=0: not handled, as before)");
+    device_wait_idle_locked();
+    if (dev.swapchain) {
+        reflex_swapchain_destroyed();
+        swap_views_drop();
+        for (auto semaphore : dev.swap_rendered) vkDestroySemaphore(dev.device, semaphore, nullptr);
+        vkDestroySwapchainKHR(dev.device, dev.swapchain, nullptr);
+        dev.swapchain = VK_NULL_HANDLE;
+        dev.swap_rendered.clear();
+        dev.swap_images.clear();
+    }
+    if (dev.surface) vkDestroySurfaceKHR(dev.instance, dev.surface, nullptr);
+    dev.surface = VK_NULL_HANDLE;
+}
+
 bool create_swapchain(uint32_t width, uint32_t height) {
+    // ((Triforce, 11-22, PRESENT-45) no surface: it was lost and let go (invalidate_lost_surface; start makes the first one
+    // before it comes here). Made again with the startup's calls while the window has a size, one try each 250 ms at most)
+    if (!dev.surface) {
+        static int64_t tried_ms;
+        const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (!surface_lost::retry_due(now_ms, tried_ms)) return false;
+        tried_ms = now_ms;
+        if (!open_window_surface(true)) return false;
+        logf("vk: the window's surface is made again");
+    }
     VkSurfaceCapabilitiesKHR caps;
     VkResult result = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(dev.physical, dev.surface, &caps);
     if (result != VK_SUCCESS) {
+        if (surface_recover(result)) return invalidate_lost_surface(), false;   // ((Triforce, PRESENT-45) lost at the query)
         logf("vk: querying surface capabilities failed (VkResult %d)", (int)result);
         return false;
     }
@@ -712,6 +842,7 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     uint32_t n = 0;
     result = vkGetPhysicalDeviceSurfaceFormatsKHR(dev.physical, dev.surface, &n, nullptr);
     if (result != VK_SUCCESS || !n) {
+        if (surface_recover(result)) return invalidate_lost_surface(), false;   // ((Triforce, PRESENT-45) lost at the query)
         logf("vk: querying surface formats failed (VkResult %d, count %u)", (int)result, n);
         return false;
     }
@@ -831,6 +962,9 @@ bool create_swapchain(uint32_t width, uint32_t height) {
         dev.swap_images.clear();
     }
     if (result != VK_SUCCESS) {
+        // ((Triforce, 11-22, PRESENT-45) the surface lost at the creation: it goes too (the old swapchain went just above),
+        // and the next present's creation makes one for the window again)
+        if (surface_recover(result)) return invalidate_lost_surface(), false;
         logf("vk: vkCreateSwapchainKHR failed (VkResult %d, extent %ux%u, format %d, usage %#x, mode %d, images %u)",
              (int)result, width, height, (int)fmt.format, ci.imageUsage, (int)mode, ci.minImageCount);
         return false;
@@ -862,6 +996,7 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     dev.swap_images = std::move(images);
     logf("vk: swapchain %ux%u, %u images, %s%s", width, height, n, present_mode::name(chosen),
          force_fifo ? " (RX_VK_FIFO)" : want_immediate ? " (RX_VK_IMMEDIATE)" : opts.vsync ? "" : " (VSync off)");
+    dev.swap_generation++;   // ((Triforce) an image held from the one before is let go: present_image, RX_VK_ACQUIRE_FENCE)
     present_mode_now.store((int)chosen, std::memory_order_relaxed);
     swap_views_make(ci.imageUsage, mutable_view ? view_formats[1] : fmt.format);
     reflex_swapchain_created(sc);   // (NVIDIA Reflex: its sleep mode on the new swapchain)
@@ -1317,6 +1452,7 @@ bool started_up() {
     if (FILE* f = fopen(skipped_path().c_str(), "rb")) {
         fclose(f);
         logf("vk: the shaders' preparation was skipped at the build: left to when each is first drawn");
+        texture_pipelines_unprepared();   // ((Triforce) no precompile: the texture converters' pipelines made here all the same)
         return true;
     }
     if (precompile_wanted()) {   // (a release build, before the game: nothing to build during play)
@@ -1389,6 +1525,50 @@ static void choose_present_queue() {
         return;
     }
     logf("vk: presents on a queue of their own, of compute family %u (RX_VK_PRESENT_QUEUE=0: off)", dev.present_family);
+}
+
+/// (Triforce, 11-22, the performance audit's PRESENT-45, after Source A's) A surface for the window again, after the one
+/// before was lost and let go (invalidate_lost_surface): the calls start() makes below, for the window it was given.
+/// False, with no surface, while the window has no size (minimized: it waits), or when the surface cannot be made or the
+/// replay's queue cannot present to it (said when log_failure, the first 8 times). The presents' own queue is chosen
+/// again for the new surface. From create_swapchain, dev.present_mu held
+bool open_window_surface(bool log_failure) {
+    static int said;
+#ifdef _WIN32
+    if (!main_window) return false;
+    RECT r{};
+    GetClientRect(main_window, &r);
+    if (r.right - r.left <= 0 || r.bottom - r.top <= 0) return false;
+    VkWin32SurfaceCreateInfoKHR si{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
+    si.hinstance = GetModuleHandleA(nullptr);
+    si.hwnd = main_window;
+    if (vkCreateWin32SurfaceKHR(dev.instance, &si, nullptr, &dev.surface) != VK_SUCCESS) {
+        dev.surface = VK_NULL_HANDLE;
+        if (log_failure && said++ < 8) logf("vk: the window's surface could not be made again: tried again every 250 ms");
+        return false;
+    }
+#else
+    const MkwVkWindow* w = prep_window;
+    if (!w) return false;
+    int width = 0, height = 0;
+    w->drawable_size(w->window, &width, &height);
+    if (width <= 0 || height <= 0) return false;
+    if (!w->create_surface(w->window, (void*)dev.instance, (void*)&dev.surface)) {
+        dev.surface = VK_NULL_HANDLE;
+        if (log_failure && said++ < 8) logf("vk: the window's surface could not be made again: tried again every 250 ms");
+        return false;
+    }
+#endif
+    VkBool32 ok = VK_FALSE;
+    if (vkGetPhysicalDeviceSurfaceSupportKHR(dev.physical, dev.queue_family, dev.surface, &ok) != VK_SUCCESS || !ok) {
+        if (log_failure && said++ < 8)
+            logf("vk: the replay's queue cannot present to the window's new surface: tried again every 250 ms");
+        vkDestroySurfaceKHR(dev.instance, dev.surface, nullptr);
+        dev.surface = VK_NULL_HANDLE;
+        return false;
+    }
+    choose_present_queue();
+    return true;
 }
 
 int start(void* hwnd) {
@@ -1464,6 +1644,8 @@ const char* describe() {
 MkwVkRenderer table;
 
 } // namespace
+/// ((Triforce, 11-22, PIPE-23) prepare_only, above, for vk_draw.cpp's precompile_end_save (vk_internal.h))
+bool prepare_only_start() { return prepare_only(); }
 } // namespace mkwvk
 
 // (hookshot) The window is being closed (host/display.c, host/posix/display_sdl.c, before they end the process): while the
@@ -1483,6 +1665,37 @@ void mkwvk_close_asked(void) {
     if (WaitForSingleObject(prep_ended, 10000) != WAIT_OBJECT_0) logf("vk: the preparation did not stop within 10 s: closing anyway");
 }
 
+// ---- (Triforce, 11-22, the performance audit's OS-04, after Source A's and Source B's: new_wait.h) a refused `new` ----
+namespace mkwvk {
+/// The system's commit left (false: not known: elsewhere a card's memory is not charged to it)
+bool new_commit_left(uint64_t* avail) {
+#ifdef _WIN32
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    if (!GlobalMemoryStatusEx(&ms)) return false;
+    *avail = ms.ullAvailPageFile;
+    return true;
+#else
+    (void)avail;
+    return false;
+#endif
+}
+/// The renderer's new handler: at Windows' commit limit a refused allocation sleeps 50 ms and is tried again, up to
+/// HOS_COMMIT_WAIT_MS (5 s) a thread; then, or with 4 GiB of commit or more left, or in a NoWait scope, it throws as before
+void new_refused() {
+    static const int max_ms = new_wait::wait_ms(getenv("HOS_COMMIT_WAIT_MS"));
+    uint64_t avail = 0;
+    const bool known = new_commit_left(&avail);
+    if (!new_wait::waits(known, avail, new_wait::t_waited_ms, max_ms, new_wait::t_no_wait)) throw std::bad_alloc();
+    static std::atomic<int> told{0};
+    if (told.fetch_add(1) < 8)
+        logf("vk: an allocation refused with %llu MB of the system's commit left: tried again for up to %d ms (HOS_COMMIT_WAIT_MS)",
+             (unsigned long long)(avail >> 20), max_ms);
+    Sleep(new_wait::kStepMs);
+    new_wait::t_waited_ms += new_wait::kStepMs;
+}
+} // namespace mkwvk
+
 extern "C"
 #ifdef _WIN32
 __declspec(dllexport)
@@ -1493,6 +1706,7 @@ const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
     using namespace mkwvk;
     if (!h || h->version != MKWVK_API_VERSION) return nullptr;
     host = h;
+    std::set_new_handler(new_refused);   // ((Triforce, OS-04) a `new` refused at the commit limit waits before it throws)
     if (!load_global()) {
         logf("vk: vulkan-1.dll not found");
         return nullptr;
@@ -1505,6 +1719,9 @@ const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
          dev.props.deviceName, VK_VERSION_MAJOR(dev.props.apiVersion), VK_VERSION_MINOR(dev.props.apiVersion),
          dev.props.driverVersion, dev.mesh_shader ? "yes" : "no", dev.external_memory_host ? "yes" : "no",
          dev.graphics_pipeline_library ? "yes" : "no");
+    // ((Triforce, 11-22, the performance audit's PRESENT-46, after Source A's) the card is known now, which menu_init (inside
+    // pick_device) was not given: a first start on a weak card takes its Render resolution, with RX_VK_FIRST_START_AUTO
+    menu_first_start();
     if (!dev.mesh_shader && !dev.mesh_fallback && !getenv("RX_VK_NO_MESH_WARNING")) {
         // (the game draws its foliage, grass and many effects with mesh shaders: without them those draws are left out and the
         // picture is broken (an RX 580's "static"-like scenes, 2026-11-08). Said once, on its own thread, and the game goes on.)

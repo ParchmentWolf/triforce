@@ -90,6 +90,116 @@ int main() {
           std::strstr(b, "; 1 waits for write-backs still on the GPU 39.4 ms (up to 4 submissions ahead of it, 1 of them 37.9 ms after "
                          "their writer's recording was done (the timeline held by work stopped at a wait))") != nullptr);
 
+    // ---- (Triforce, 11-22, the performance audit's SYNC-122) the reads' side ----
+    // the mode: 1 on, 2 the check, anything else off
+    CHECK("mode unset", wr::mode(nullptr) == wr::kOff);
+    CHECK("mode empty", wr::mode("") == wr::kOff);
+    CHECK("mode 0", wr::mode("0") == wr::kOff);
+    CHECK("mode 1", wr::mode("1") == wr::kOn);
+    CHECK("mode 2", wr::mode("2") == wr::kCheck);
+    CHECK("mode 3", wr::mode("3") == wr::kOff);
+    CHECK("mode 12", wr::mode("12") == wr::kOff);
+    CHECK("mode a word", wr::mode("yes") == wr::kOff);
+    CHECK("mode 1 with a tail", wr::mode("1x") == wr::kOff);
+    // RX_VK_TL_REC: 2 the old lookup; on otherwise it ends the wait as mode 1 does
+    CHECK("tl unset", !wr::tl_rec_first_part(nullptr));
+    CHECK("tl 1", !wr::tl_rec_first_part("1"));
+    CHECK("tl 2", wr::tl_rec_first_part("2"));
+    CHECK("ends: all off", !wr::ends_by_switch(wr::kOff, false, false));
+    CHECK("ends: the check never ends a wait", !wr::ends_by_switch(wr::kCheck, false, false));
+    CHECK("ends: mode 1", wr::ends_by_switch(wr::kOn, false, false));
+    CHECK("ends: RX_VK_TL_REC", wr::ends_by_switch(wr::kOff, true, false));
+    CHECK("ends: RX_VK_TL_REC=2 has its own wait", !wr::ends_by_switch(wr::kOff, true, true));
+    CHECK("ends: the check with RX_VK_TL_REC", wr::ends_by_switch(wr::kCheck, true, false));
+    CHECK("callers", !std::strcmp(wr::caller_name(wr::kTake), "takes") && !std::strcmp(wr::caller_name(wr::kRead), "reads") &&
+                         !std::strcmp(wr::caller_name(wr::kBind), "binds") && !std::strcmp(wr::caller_name(wr::kReadback), "readbacks") &&
+                         wr::kCallers == 4);
+    CHECK("sliced only with a mode and a recordings' timeline",
+          !wr::fallback_sliced(wr::kOff, true) && !wr::fallback_sliced(wr::kOn, false) && !wr::fallback_sliced(wr::kCheck, false) &&
+              wr::fallback_sliced(wr::kOn, true) && wr::fallback_sliced(wr::kCheck, true));
+
+    // the fallback wait against a made-up GPU: the writer's recording is known at K, done at R, and the submissions' timeline
+    // reaches the value at T (K <= R <= T: known at its submit, and the timeline cannot pass the recording that finished it)
+    struct Gpu {
+        int64_t K, R, T, t = 0;
+        int plains = 0, flushes = 0, lookups = 0, rec_waits = 0, slices = 0;
+        bool fail_slice = false;
+        void plain() { plains++, t = t > T ? t : T; }
+        void flush() { flushes++; }
+        uint64_t lookup() { lookups++; return t >= K ? 77 : 0; }
+        int rec_wait(uint64_t seq) {
+            if (seq != 77) return 2;
+            rec_waits++, t = t > R ? t : R;
+            return 0;
+        }
+        bool rec_done(uint64_t seq) { return seq == 77 && t >= R; }
+        int slice() {
+            slices++;
+            if (fail_slice) return 2;
+            if (T <= t + (int64_t)wr::kSliceNs) {
+                t = t > T ? t : T;
+                return 0;
+            }
+            t += (int64_t)wr::kSliceNs;
+            return 1;
+        }
+        int64_t now() { return t; }
+    };
+    uint64_t rng = 0x9E3779B97F4A7C15ull;
+    const auto rnd = [&](uint64_t n) {
+        rng ^= rng << 13, rng ^= rng >> 7, rng ^= rng << 17;
+        return (int64_t)(rng % n);
+    };
+    for (int i = 0; i < 20000; i++) {
+        const int64_t K = rnd(40000000), R = K + rnd(20000000), T = R + rnd(i % 3 ? 60000000 : 50000);
+        Gpu off{K, R, T};
+        const wr::FallbackResult a = wr::fallback_wait(wr::kOff, true, off);
+        CHECK("off: the one old wait and nothing else",
+              off.plains == 1 && !off.flushes && !off.lookups && !off.rec_waits && !off.slices && !a.sliced && a.total_ns == T &&
+                  wr::fallback_held_ns(a) == 0);
+        Gpu none{K, R, T};
+        const wr::FallbackResult n1 = wr::fallback_wait(wr::kOn, false, none);
+        CHECK("no recordings' timeline: the old wait in any mode", none.plains == 1 && !none.slices && !n1.sliced && n1.total_ns == T);
+        Gpu chk{K, R, T};
+        const wr::FallbackResult c = wr::fallback_wait(wr::kCheck, true, chk);
+        CHECK("the check ends where the old wait ends", c.total_ns == a.total_ns && chk.t == off.t);
+        CHECK("the check makes neither the old wait nor the recording's", !chk.plains && !chk.rec_waits && c.sliced && !c.at_recording && !c.error);
+        CHECK("the check flushes before each look", chk.flushes == chk.slices);
+        const int64_t h = wr::fallback_held_ns(c);
+        CHECK("the check's held part is never more than the part after the recording", h <= T - R);
+        // (seen done at the first look at or after R: a slice late at most; under the latency's floor it is not named)
+        if (T - R >= (int64_t)wr::kSliceNs + wr::kHeldMinNs) CHECK("the check's held part, to a slice", h >= T - R - (int64_t)wr::kSliceNs);
+        if (T - R < wr::kHeldMinNs) CHECK("no held part under the latency", h == 0);
+        Gpu on{K, R, T};
+        const wr::FallbackResult o = wr::fallback_wait(wr::kOn, true, on);
+        CHECK("on: never the old wait", !on.plains && o.sliced && !o.error);
+        CHECK("on: never past where the old wait ends", o.total_ns <= T);
+        if (o.at_recording) {
+            CHECK("on: not before the writer's recording is done", o.total_ns >= R && on.rec_waits == 1);
+            CHECK("on: at the recording, or a slice after it was known", o.total_ns <= (R > K + (int64_t)wr::kSliceNs ? R : K + (int64_t)wr::kSliceNs));
+            CHECK("on: nothing held", wr::fallback_held_ns(o) == 0);
+        } else {
+            CHECK("on: ended by the timeline only when it got there first", o.total_ns == T && !on.rec_waits);
+        }
+    }
+    {
+        Gpu bad{1000000, 2000000, 900000000};
+        bad.fail_slice = true;
+        const wr::FallbackResult e = wr::fallback_wait(wr::kCheck, true, bad);
+        CHECK("an error ends the wait", e.error && bad.slices == 1 && wr::fallback_held_ns(e) == 0);
+    }
+
+    // the stall line names the held part by caller, only when there is one
+    sw::Frame g;
+    g.no = 1, g.interval = 60, g.replay = 50;
+    sw::stall_line(g, b, sizeof b);
+    CHECK("no held part by caller: not named", !std::strstr(b, "by caller"));
+    g.wb_held_by[wr::kRead] = 12.5, g.wb_held_by[wr::kReadback] = 3.5;
+    sw::stall_line(g, b, sizeof b);
+    CHECK("held part by caller named",
+          std::strstr(b, "; the timeline held after a writer's recording was done, by caller: takes 0.0, reads 12.5, binds 0.0, "
+                         "readbacks 3.5 ms") != nullptr);
+
     std::puts("PASS: write-back waits by the writer's recording, and the held part");
     return 0;
 }

@@ -19,6 +19,8 @@
 #include <utility>
 #include <vector>
 #include "barrier_rules.h"
+#include "desc_pool_grow.h"   // ((Triforce, 11-22, DESC-33) a slot's pool at half, whole once a recording ran out)
+namespace desc_pool_grow = mkwvk::desc_pool_grow;
 static void require(bool ok,const char* why) { if(!ok) { std::fprintf(stderr,"FAIL: %s\n",why); std::exit(1); } }
 struct Allocation { std::vector<uint8_t> cpu,visible; };
 using VmaAllocation=Allocation*;
@@ -55,7 +57,10 @@ void draw_flush_recording(int slot);
 VkCommandBuffer rec_cmd{};
 uint64_t rec_value=0,targets_serial=0;
 VkBuffer zero_buffer{}; VmaAllocation zero_alloc{};
-VkDescriptorPool make_pool() { return handle<VkDescriptorPool>(); }
+VkDescriptorPool make_pool(uint32_t = 0) { return handle<VkDescriptorPool>(); }
+bool pool_grow_on() { return true; }   // ((Triforce, 11-22, DESC-33) vk_draw.cpp: RX_VK_DESC_POOL_GROW and its counts)
+desc_pool_grow::Took pool_most;
+uint64_t pools_added = 0, pools_whole = 0;
 VKAPI_ATTR VkResult VKAPI_CALL vkResetDescriptorPool(VkDevice,VkDescriptorPool,VkDescriptorPoolResetFlags) { return VK_SUCCESS; }
 VKAPI_ATTR void VKAPI_CALL vkDestroyDescriptorPool(VkDevice,VkDescriptorPool,const VkAllocationCallbacks*) {}
 struct Pass {}; Pass& pass() { static Pass p;return p; }
@@ -90,7 +95,9 @@ bool batch=false;bool batch_on() { return batch; }
 namespace barrier_rules = mkwvk::barrier_rules;   // (the held submits' rule, gpu/vk/barrier_rules.h: RX_VK_BATCH=1 here)
 barrier_rules::Batch batch_way() { return batch ? barrier_rules::Batch::Hold : barrier_rules::Batch::Off; }
 int submit_depth=0;
-int flush_reason=0;constexpr int FR_OTHER=0,FR_CAP=1;
+int flush_reason=0;constexpr int FR_OTHER=0,FR_CAP=1,FR_IDLE=2;
+bool batch_idle_on() { return false; }   // ((Triforce, 11-22, SYNC-09) RX_VK_BATCH_IDLE: off, as unset; not this test's)
+bool batch_gpu_idle() { return false; }
 bool event_writes_held(VkCommandBuffer) { return false; }   // (no event's write held: RX_VK_EVENT_BARRIER's, not this test's)
 void split_part_submitted(VkCommandBuffer,bool) {}   // (RX_VK_SPLIT_BARRIER's count)
 void end_pass(VkCommandBuffer) { require(false,"a pass ended at a submit"); }

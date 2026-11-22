@@ -66,7 +66,23 @@
 #include "../third_party/zstd/lib/zstd.h"
 #include "../third_party/zstd/lib/zstd_errors.h"
 
-#define HZ_AWAY_BYTES (64u << 10)   /* inputs from this size give the virtual core up while they decode */
+#define HZ_AWAY_BYTES (64u << 10)   /* inputs from this size give the virtual core up while they decode (hz_away_mode 2) */
+/* ((Triforce, 11-21, the performance audit's IO-01, after Source A's) Who gives the game's virtual core up for a decode:
+   HOS_HOST_ZSTD_AWAY, set by the includer before the first call.
+     1 (the default)  a whole buffer whose input or output (the content's size where the frame says it, else the
+                      caller's room) is HZ_AWAY_WHOLE or more; a stream's feed never. A feed is a
+                      chunk the loading thread just read, a millisecond or two of decoding, and taking a core again
+                      after each one cost more than it gave: Source A's loads froze in 7 of 10 runs on a 22-thread
+                      laptop with the core given up there, in none of 3 with it kept;
+     0                never;
+     2                as before this: whole buffers and feeds alike from HZ_AWAY_BYTES of input */
+#define HZ_AWAY_WHOLE (128u << 10)
+static int hz_away_mode = 1;
+static inline int hz_away_whole(uint64_t size, uint64_t cap) {
+    return hz_away_mode == 2 ? size >= HZ_AWAY_BYTES : hz_away_mode == 1 ? size >= HZ_AWAY_WHOLE || cap >= HZ_AWAY_WHOLE : 0;
+}
+static inline int hz_away_feed(uint64_t size) { return hz_away_mode == 2 && size >= HZ_AWAY_BYTES; }
+#define HZ_CANARY 64   /* (check mode: bytes after the host's own output that must stay as they were set) */
 #define HZ_MAX_DICT (64u << 20)
 #define HZ_NDICT 32
 #define HZ_NSTREAM 16
@@ -90,6 +106,7 @@ static _Thread_local uint64_t hz_caller;
 static struct {
     uint64_t calls, in, out, ns, game, inplace, away, checked, differ;   /* one-shot */
     uint64_t streams, feeds, s_in, s_out, s_ns, s_game, s_checked, s_differ;
+    uint64_t tail;   /* ((Triforce, IO-01) check mode: decodes that wrote past their content's end) */
 } hz_stats;
 
 static inline uint32_t hz_ld32(uint64_t a) { uint32_t v; memcpy(&v, HZ_PTR(a), 4); return v; }
@@ -210,7 +227,7 @@ static size_t hz_decode(void *out, uint64_t cap, uint64_t src, uint64_t size, ui
     int slot;
     ZSTD_DCtx *d = hz_dctx_take(&slot);
     if (!d) return 0;
-    const int away = size >= HZ_AWAY_BYTES ? HZ_AWAY() : 0;
+    const int away = hz_away_whole(size, cap) ? HZ_AWAY() : 0;
     if (away) hz_add(&hz_stats.away, 1);
     *ok = 1;
     const size_t r = dd ? ZSTD_decompress_usingDDict(d, out, (size_t)cap, HZ_PTR(src), (size_t)size, dd)
@@ -223,12 +240,12 @@ static size_t hz_decode(void *out, uint64_t cap, uint64_t src, uint64_t size, ui
 static void hz_count(uint64_t in, uint64_t out, uint64_t ns) {
     const uint64_t n = __atomic_add_fetch(&hz_stats.calls, 1, __ATOMIC_RELAXED);
     hz_add(&hz_stats.in, in), hz_add(&hz_stats.out, out), hz_add(&hz_stats.ns, ns);
-    if (n == 1 || !(n & 0x3fff))
+    if (!(n & (n - 1)) || !(n & 0x3fff))   /* ((Triforce, IO-01) the 1st, 2nd, 4th, ... and every 16384th) */
         HZ_LOG("zstd: %llu calls decoded on the host, %.1f MB in, %.1f MB out, %.0f ms; %llu left to the game's decoder (%llu of "
-               "them in place), %llu with the core given up; check: %llu compared, %llu differ", (unsigned long long)n,
-               hz_stats.in / 1048576.0, hz_stats.out / 1048576.0, hz_stats.ns / 1e6, (unsigned long long)hz_stats.game,
-               (unsigned long long)hz_stats.inplace, (unsigned long long)hz_stats.away, (unsigned long long)hz_stats.checked,
-               (unsigned long long)hz_stats.differ);
+               "them in place), %llu with the core given up; check: %llu compared, %llu differ, %llu wrote past the end",
+               (unsigned long long)n, hz_stats.in / 1048576.0, hz_stats.out / 1048576.0, hz_stats.ns / 1e6,
+               (unsigned long long)hz_stats.game, (unsigned long long)hz_stats.inplace, (unsigned long long)hz_stats.away,
+               (unsigned long long)hz_stats.checked, (unsigned long long)hz_stats.differ, (unsigned long long)hz_stats.tail);
 }
 
 /* (the input inside the output: the result depends on how the decoder's writes overtake its reads, which libzstd does
@@ -236,6 +253,21 @@ static void hz_count(uint64_t in, uint64_t out, uint64_t ns) {
    a damaged input) */
 static int hz_in_place(uint64_t dst, uint64_t cap, uint64_t src, uint64_t size) {
     return cap && src < dst + cap && dst < src + size;
+}
+
+/* ((Triforce, 11-21, the performance audit's IO-01, after Source A's) The room libzstd is given for a whole buffer: the
+   content's size when the frames say it and it fits, not the caller's whole room. libzstd may park a block's literals in
+   spare room past where the block ends (zstd_decompress_block.c, the "split literals" buffer); the game's decoder, zstd
+   1.4, never writes past the content, and what lies in the game's memory after it is not the decoder's to touch. *exact:
+   the room is the content's. Else (a frame without its content size, or a size that does not fit: libzstd then refuses
+   and the game's decoder decides) the caller's room, all of which may have been written */
+static uint64_t hz_room(uint64_t cap, uint64_t src, uint64_t size, int *exact) {
+    *exact = 0;
+    if (size < 5 || !src || !HZ_OK(src, size)) return cap;
+    const unsigned long long n = ZSTD_findDecompressedSize(HZ_PTR(src), (size_t)size);
+    if (n == ZSTD_CONTENTSIZE_UNKNOWN || n == ZSTD_CONTENTSIZE_ERROR || n > cap) return cap;
+    *exact = 1;
+    return (uint64_t)n;
 }
 
 /* A call of the game's ZSTD_decompressMultiFrame. 1: decoded here, *ret its result (the decoded size). 0: the game's
@@ -246,9 +278,10 @@ static int hz_oneshot(uint64_t dst, uint64_t cap, uint64_t src, uint64_t size, u
         hz_add(&hz_stats.inplace, 1), hz_add(&hz_stats.game, 1);
         return 0;
     }
-    int ok = 0;
+    int ok = 0, exact = 0;
     const uint64_t t0 = (uint64_t)HZ_NOW_NS();
-    const size_t r = (cap && !dst) || !HZ_OK(dst, cap) ? 0 : hz_decode(HZ_PTR(dst), cap, src, size, dict, dict_size, ddict, &ok);
+    const uint64_t room = hz_room(cap, src, size, &exact);   /* ((Triforce, IO-01) the content's size, when known) */
+    const size_t r = (cap && !dst) || !HZ_OK(dst, cap) ? 0 : hz_decode(HZ_PTR(dst), room, src, size, dict, dict_size, ddict, &ok);
     if (!ok || ZSTD_isError(r)) {   /* (the game's decoder decides, and gives its own error code) */
         static int logged;
         if (__atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED) < 8)
@@ -257,7 +290,8 @@ static int hz_oneshot(uint64_t dst, uint64_t cap, uint64_t src, uint64_t size, u
         hz_add(&hz_stats.game, 1);
         return 0;
     }
-    if (r) HZ_WRITTEN(dst, r);
+    /* ((Triforce, IO-01) a room that was not the content's own: all of it may have been written, and is told so) */
+    if (exact ? r != 0 : cap != 0) HZ_WRITTEN(dst, exact ? r : cap);
     *ret = r;
     hz_count(size, r, (uint64_t)HZ_NOW_NS() - t0);
     return 1;
@@ -271,10 +305,14 @@ static uint64_t hz_oneshot_check(uint64_t dst, uint64_t cap, uint64_t src, uint6
         hz_add(&hz_stats.inplace, 1), hz_add(&hz_stats.game, 1);
         return game(user);
     }
-    uint8_t *mine = cap ? (uint8_t *)malloc((size_t)cap) : NULL;
-    int ok = 0;
+    /* ((Triforce, IO-01) the host's output with the room hz_oneshot would give it, every byte set first: what is not the
+       content must come back as it was, or the decode wrote past its content's end (counted, "wrote past the end") */
+    uint8_t *mine = cap ? (uint8_t *)malloc((size_t)cap + HZ_CANARY) : NULL;
+    int ok = 0, exact = 0;
+    const uint64_t room = hz_room(cap, src, size, &exact);
+    if (mine) memset(mine, 0xA5, (size_t)cap + HZ_CANARY);
     const uint64_t t0 = (uint64_t)HZ_NOW_NS();
-    const size_t r = cap && !mine ? 0 : hz_decode(mine, cap, src, size, dict, dict_size, ddict, &ok);
+    const size_t r = cap && !mine ? 0 : hz_decode(mine, room, src, size, dict, dict_size, ddict, &ok);
     const uint64_t ns = (uint64_t)HZ_NOW_NS() - t0;
     const uint64_t g = game(user);
     const int host_ok = ok && !ZSTD_isError(r);
@@ -287,6 +325,17 @@ static uint64_t hz_oneshot_check(uint64_t dst, uint64_t cap, uint64_t src, uint6
                    !ok ? "inputs not taken" : ZSTD_getErrorName(r));
     } else {
         hz_add(&hz_stats.checked, 1);
+        for (uint64_t i = r; mine && i < cap + HZ_CANARY; i++)
+            if (mine[i] != 0xA5) {
+                hz_add(&hz_stats.tail, 1);
+                static int told;
+                if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 8)
+                    HZ_LOG("zstd check: the host wrote past the end: %llu bytes of content, byte %llu of a room of %llu changed "
+                           "(%s; called from %#llx)", (unsigned long long)r, (unsigned long long)i, (unsigned long long)cap,
+                           exact ? "the room was the content's: libzstd wrote past its capacity" : "no content size in the frame",
+                           (unsigned long long)hz_caller);
+                break;
+            }
         if (g != r || (r && (!HZ_OK(dst, r) || memcmp(mine, HZ_PTR(dst), r)))) {
             hz_add(&hz_stats.differ, 1);
             static int logged;
@@ -394,7 +443,7 @@ static ZSTD_DCtx *hz_stream_dctx(void) {
 /* Feeds in to the stream's context until the input is used up, the frame ends (0), an error, or nothing moves. With
    the virtual core given up for large chunks, as hz_decode */
 static size_t hz_stream_run(HzStream *st, ZSTD_outBuffer *out, ZSTD_inBuffer *in) {
-    const int away = in->size >= HZ_AWAY_BYTES ? HZ_AWAY() : 0;
+    const int away = hz_away_feed(in->size) ? HZ_AWAY() : 0;   /* ((Triforce, IO-01) a feed keeps its core: hz_away_mode) */
     if (away) hz_add(&hz_stats.away, 1);
     size_t r = 1;
     while (in->pos < in->size) {
@@ -409,11 +458,12 @@ static size_t hz_stream_run(HzStream *st, ZSTD_outBuffer *out, ZSTD_inBuffer *in
 static void hz_stream_count(const HzStream *st, uint64_t out) {
     const uint64_t n = __atomic_add_fetch(&hz_stats.streams, 1, __ATOMIC_RELAXED);
     hz_add(&hz_stats.s_in, st->in), hz_add(&hz_stats.s_out, out);
-    if (n == 1 || !(n & 0x3ff))
+    if (!(n & (n - 1)) || !(n & 0x3ff))   /* ((Triforce, IO-01) the 1st, 2nd, 4th, ... and every 1024th) */
         HZ_LOG("zstd: %llu streams decoded on the host in %llu feeds, %.1f MB in, %.1f MB out, %.0f ms; %llu streams left to the "
-               "game's decoder; check: %llu compared, %llu differ", (unsigned long long)n, (unsigned long long)hz_stats.feeds,
-               hz_stats.s_in / 1048576.0, hz_stats.s_out / 1048576.0, hz_stats.s_ns / 1e6, (unsigned long long)hz_stats.s_game,
-               (unsigned long long)hz_stats.s_checked, (unsigned long long)hz_stats.s_differ);
+               "game's decoder; check: %llu compared, %llu differ, %llu wrote past the end", (unsigned long long)n,
+               (unsigned long long)hz_stats.feeds, hz_stats.s_in / 1048576.0, hz_stats.s_out / 1048576.0, hz_stats.s_ns / 1e6,
+               (unsigned long long)hz_stats.s_game, (unsigned long long)hz_stats.s_checked, (unsigned long long)hz_stats.s_differ,
+               (unsigned long long)hz_stats.tail);
 }
 
 /* A stream at its begin (phase 1): its slot, the host context ready for the frame, or NULL when the game's feed is to
@@ -441,10 +491,11 @@ static HzStream *hz_stream_begin(uint64_t s, uint64_t src, int32_t size, uint64_
     if ((!st->dctx && !(st->dctx = hz_stream_dctx())) ||
         ZSTD_isError(ZSTD_DCtx_reset(st->dctx, ZSTD_reset_session_only)) ||
         ZSTD_isError(ZSTD_DCtx_refDDict(st->dctx, dd)) ||
-        (check && !(st->shadow = (uint8_t *)malloc((size_t)st->content)))) {
+        (check && !(st->shadow = (uint8_t *)malloc((size_t)st->content + HZ_CANARY)))) {
         hz_stream_drop(st);
         return NULL;
     }
+    if (check) memset(st->shadow + st->content, 0xA5, HZ_CANARY);   /* ((Triforce, IO-01) what must stay: hz_stream_check) */
     if (!check) {   /* what the game's begin leaves in its state */
         hz_st32(s + 0x14, (uint32_t)st->content);
         hz_st64(s + 0x30, ws);
@@ -474,7 +525,9 @@ static uint64_t hz_stream_feed(HzStream *st, uint64_t s, uint64_t src, int32_t s
         return 0xffffffffu;
     }
     ZSTD_inBuffer in = {HZ_PTR(src), (size_t)size, 0};
-    ZSTD_outBuffer out = {HZ_PTR(st->dst0), (size_t)st->cap0, (size_t)st->pos};
+    /* ((Triforce, IO-01) the content's own size, not the game's whole room: libzstd may park literals in room past a
+       block's end, where the game's decoder never writes. The begin took the stream only with room for the content) */
+    ZSTD_outBuffer out = {HZ_PTR(st->dst0), (size_t)st->content, (size_t)st->pos};
     const size_t r = hz_stream_run(st, &out, &in);
     const uint32_t wrote = (uint32_t)(out.pos - st->pos);
     st->pos = out.pos, st->in += in.pos;
@@ -545,6 +598,15 @@ static uint64_t hz_stream_check(HzStream *st, uint64_t s, uint64_t src, int32_t 
     const int out_all = ph == 2 && !g;   /* the job feeds no more, with or without the frame's last bytes */
     if (ph != 3 && ph != 4 && !out_all) return g;
     hz_add(&hz_stats.s_checked, 1);
+    for (int i = 0; i < HZ_CANARY; i++)   /* ((Triforce, IO-01) the bytes after the host's own output: as they were set) */
+        if (st->shadow[st->content + i] != 0xA5) {
+            hz_add(&hz_stats.tail, 1);
+            static int told;
+            if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 8)
+                HZ_LOG("zstd check: a host stream wrote past the end of its %llu bytes of content (called from %#llx)",
+                       (unsigned long long)st->content, (unsigned long long)hz_caller);
+            break;
+        }
     const int same = ph == 3 ? st->bad || st->done != 1   /* the game failed: the host must not have a clean frame */
                              : !st->bad && !st->moved && st->done != 2 && (ph != 4 || st->done == 1) &&
                                    st->pos == st->content && HZ_OK(st->dst0, st->content) &&

@@ -557,16 +557,28 @@ void frame(VkCommandBuffer cmd, uint32_t out_width, uint32_t out_height) {
         if ((t = token(n))) p_tag(*t, vp, none, 2, (sl::CommandBuffer*)cmd);
     }
     if (generate && have) {
+        // ((Triforce, 11-20) the matrices in the clip space of the depth Streamline is given (FSR's copy, 1 at the near
+        // plane), not the game's own, whose clip z runs -1 to 1 the other way: dlss_math.h depth_clip_projection says what
+        // that did while the camera moved. RX_VK_DLSSG_CLIP=0: the game's own matrices, as before, for comparing)
+        static const bool game_clip = getenv("RX_VK_DLSSG_CLIP") && atoi(getenv("RX_VK_DLSSG_CLIP")) == 0;
+        float projection[16], clip_to_prev[16];
+        if (game_clip) {
+            std::memcpy(projection, in.projection, sizeof projection);
+            std::memcpy(clip_to_prev, in.clip_to_prev, sizeof clip_to_prev);
+        } else {
+            dlss_math::depth_clip_projection(in.projection, in.camera.flip_depth, projection);
+            dlss_math::depth_clip_reprojection(in.clip_to_prev, in.camera.flip_depth, clip_to_prev);
+        }
         float clip_to_view[16], prev_to_clip[16];
-        if (!inverse(in.projection, clip_to_view) || !inverse(in.clip_to_prev, prev_to_clip)) {
+        if (!inverse(projection, clip_to_view) || !inverse(clip_to_prev, prev_to_clip)) {
             static int told;
             if (!told++) logf("vk: dlssg: a frame whose projection has no inverse: no generated frame after it");
             return;
         }
         sl::Constants c{};
-        matrix(c.cameraViewToClip, in.projection);
+        matrix(c.cameraViewToClip, projection);
         matrix(c.clipToCameraView, clip_to_view);
-        matrix(c.clipToPrevClip, in.clip_to_prev);
+        matrix(c.clipToPrevClip, clip_to_prev);
         matrix(c.prevClipToClip, prev_to_clip);
         c.jitterOffset = sl::float2(in.jitter[0], in.jitter[1]);
         // (the motion is in render pixels: this makes it fractions of the picture)

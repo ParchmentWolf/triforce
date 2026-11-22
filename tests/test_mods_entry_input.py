@@ -410,7 +410,8 @@ def main():
           "the key's Down that came onto Mods is taken again as the entry's own")
     check('logf("menu: the host\'s word %d for the Mods entry not taken: %s", enter,' in tick,
           "an enter word the menu does not take leaves no line")
-    check("title_anim.step(now, sel, std::min<int64_t>(age, mods_entry::kListShownNs));" in
+    # ((11-20) and the game's own amount of its buttons with it: tests/test_mods_entry_sync.py)
+    check("title_anim.step(now, sel, std::min<int64_t>(age, mods_entry::kListShownNs), mods_list_shown());" in
           block(menu, "void draw_title_mods(ui::Ctx& c, bool sel, float cx, float cy, float k, float pitch) {"),
           "the title's entry does not take the list's age by the game's frames (a slow frame blinks it)")
     print("PASS: the Mods entry's input: no Down taken twice, held ones repeated, slow frames keep the list")

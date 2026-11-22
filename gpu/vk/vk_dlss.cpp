@@ -29,6 +29,8 @@
 #endif
 
 #include "dlss_checks.h"
+#include "dlss_feature.h"   // ((Triforce, the upscaler audit's UPS-01) the render size the feature is made for)
+#include "lab_ab.h"         // ((Triforce, 11-22, PRESENT-38) the lab's "dlssstrict" phases)
 #include "upscaler_rows.h"
 #include "vk_menu.h"
 #include "vk_paths.h"
@@ -76,7 +78,13 @@ struct State {
     NVSDK_NGX_Handle* feature = nullptr;
     uint32_t feature_rw = 0, feature_rh = 0, feature_ow = 0, feature_oh = 0;   // (its largest render size, its output)
     uint32_t min_rw = 0, min_rh = 0;
+    // ((Triforce, 11-21, the upscaler audit's UPS-01) made for the one render size it is given (dlss_feature.h: a fixed share),
+    // not for the largest of its mode's range; and whether the render size was seen changing under one output in this run
+    // (the game's dynamic resolution), after which every feature is made for the range, as all were before)
+    bool feature_exact = false;
+    bool range_seen = false;
     unsigned feature_preset = ~0u;   // (the preset it was made with: another one from the menu makes it again)
+    dlss_checks::PresetSettle settle;   // ((Triforce, 11-21, PRESENT-37) the row's preset, taken once it has held: dlss_checks.h)
     bool feature_hdr = false;        // (made for linear HDR colour, NGX's IsHDR: the other kind of colour makes it again)
     uint64_t features_made = 0;      // (how many times: a feature made again in play costs a stall, so each says why)
     // (a feature not made for want of video memory: tried again from retry_frame on, kMemoryRetries times before it is given
@@ -287,7 +295,17 @@ bool ngx_init() {
 /// DLSS's preset: the DLSS model row's, RX_VK_DLSS_PRESET over it (upscaler_rows.h dlss_preset)
 unsigned wanted_preset() {
     static const char* const env = getenv("RX_VK_DLSS_PRESET");
-    return upscaler_rows::dlss_preset(opts.dlss_model, env && *env ? env : nullptr);
+    // ((Triforce, 11-22, the performance audit's PRESENT-36, after Source A's and Source B's) with RX_VK_DLSS_CNN_VRAM=1 the
+    // K row on a card under 7 GB asks for preset E, NVIDIA's CNN model (upscaler_rows.h cnn_for_vram); said once)
+    const uint64_t vram = dlss_cnn_vram();
+    const unsigned preset = upscaler_rows::dlss_preset(opts.dlss_model, env && *env ? env : nullptr, vram);
+    static bool told;
+    if (!told && vram && preset != upscaler_rows::dlss_preset(opts.dlss_model, env && *env ? env : nullptr)) {
+        told = true;
+        logf("vk: NVIDIA DLSS: %llu MB of video memory: the K row draws with preset E (RX_VK_DLSS_CNN_VRAM=1)",
+             (unsigned long long)(vram >> 20));
+    }
+    return preset;
 }
 
 /// DLSS's feature for this output size and preset, made when either changes (cmd: its creation's work): the engine's
@@ -295,10 +313,17 @@ unsigned wanted_preset() {
 int prepare(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, bool hdr, uint32_t* in_w,
             uint32_t* in_h, const char** fail) {
     State& s = st();
-    const unsigned preset = wanted_preset();
-    if (s.feature && s.feature_ow == ow && s.feature_oh == oh && rw <= s.feature_rw && rh <= s.feature_rh &&
-        rw >= s.min_rw && rh >= s.min_rh && s.feature_preset == preset && s.feature_hdr == hdr)
+    // ((Triforce, 11-21, the performance audit's PRESENT-37, after Source A's) the DLSS model row's preset once the row has
+    // held it for RX_VK_DLSS_MODEL_SETTLE frames (30; 0: at once, as before): no feature for a preset stepped past)
+    static const uint64_t settle_frames = dlss_checks::settle_frames(getenv("RX_VK_DLSS_MODEL_SETTLE"));
+    const unsigned preset = s.settle.pick(wanted_preset(), s.feature_preset, s.feature != nullptr, texture_frame_no(), settle_frames);
+    // ((Triforce, UPS-01) the feature there is takes this frame: its one render size, or any of its range (dlss_feature.h takes)
+    const bool same_feature = s.feature && s.feature_ow == ow && s.feature_oh == oh && s.feature_preset == preset && s.feature_hdr == hdr;
+    if (same_feature && dlss_feature::takes(s.feature_exact, s.feature_rw, s.feature_rh, s.min_rw, s.min_rh, rw, rh))
         return *in_w = s.feature_rw, *in_h = s.feature_rh, 1;
+    // (a feature of one render size, and a frame of another under the same output: the game changes the render size, so
+    // from here on the features of this run are made for their mode's whole range)
+    const bool found_range = dlss_feature::found_range(same_feature, s.feature_exact, s.feature_rw, s.feature_rh, rw, rh);
     static const char* const kNoMemory = "no video memory for its feature: tried again in a while";
     if (s.retry_frame && texture_frame_no() < s.retry_frame) return *fail = kNoMemory, 0;
     // (why it is made: in the log with its time, so a stall in play can be matched with one)
@@ -311,50 +336,90 @@ int prepare(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t
         snprintf(why, sizeof why, "preset %c, was %c (the DLSS model row)", upscaler_rows::preset_letter(preset),
                  upscaler_rows::preset_letter(s.feature_preset));
     else if (s.feature_hdr != hdr) snprintf(why, sizeof why, "the colour is %s now", hdr ? "HDR" : "LDR");
+    else if (found_range)
+        snprintf(why, sizeof why, "the render size went from %ux%u to %ux%u: for its mode's whole range from now on", s.feature_rw,
+                 s.feature_rh, rw, rh);
     else
         snprintf(why, sizeof why, "the render size %ux%u left its range, %ux%u to %ux%u", rw, rh, s.min_rw, s.min_rh,
                  s.feature_rw, s.feature_rh);
     const uint64_t key = (uint64_t)ow << 44 ^ (uint64_t)oh << 24 ^ (uint64_t)preset << 1 ^ (hdr ? 1 : 0) ^ 1ull << 63;
     if (s.refused == key) return *fail = "its feature was not made", 0;   // (until a DLSS setting changes: upstream #2550)
-    if (s.feature) {
-        NVSDK_NGX_Handle* old = s.feature;
-        temporal_later([old] { NVSDK_NGX_VULKAN_ReleaseFeature(old); });
-        s.feature = nullptr;
-    }
+    if (found_range) s.range_seen = true;
     // (the quality mode whose range of render sizes holds this one: the network's 3/4 is DLSS's MaxQuality range)
     // (DLAA's when the render size is the output's)
     static const NVSDK_NGX_PerfQuality_Value scaled[] = {NVSDK_NGX_PerfQuality_Value_MaxQuality, NVSDK_NGX_PerfQuality_Value_DLAA,
                                                         NVSDK_NGX_PerfQuality_Value_Balanced, NVSDK_NGX_PerfQuality_Value_MaxPerf,
                                                         NVSDK_NGX_PerfQuality_Value_UltraPerformance};
     static const NVSDK_NGX_PerfQuality_Value same[] = {NVSDK_NGX_PerfQuality_Value_DLAA, NVSDK_NGX_PerfQuality_Value_MaxQuality};
-    const bool aa = rw == ow && rh == oh;
+    // ((Triforce, 11-22, the performance audit's PRESENT-32, after Source A's) with RX_VK_DLSS_PREWARM=1 the one-size modes
+    // only for NVIDIA DLAA: DLSS at the output's size (the Render resolution row's Auto, before the game lowers it) takes
+    // the scaled mode whose range holds it, and the smaller sizes after it draw with the same feature instead of making a
+    // second one in play (dlss_checks.h dlaa_feature). Off by default: as before, one size whenever the two are equal
+    static const bool dlaa_rule = dlss_checks::prewarm_rule(getenv("RX_VK_DLSS_PREWARM"));
+    const bool aa = dlss_checks::dlaa_feature(dlaa_rule, temporal_mode() == upscaler_rows::DLAA, rw, rh, ow, oh);
     const NVSDK_NGX_PerfQuality_Value* modes = aa ? same : scaled;
     const size_t nmodes = aa ? 2 : 5;
     NVSDK_NGX_PerfQuality_Value mode = modes[0];
     unsigned max_w = 0, max_h = 0, min_w = 0, min_h = 0;
     bool found = aa;
     if (aa) max_w = min_w = ow, max_h = min_h = oh;   // (DLAA: the render size is the output's, one size)
-    for (size_t i = 0; i < nmodes && !found; i++) {
-        const NVSDK_NGX_PerfQuality_Value m = modes[i];
-        unsigned w = 0, h = 0, xw = 0, xh = 0, nw = 0, nh = 0;
-        float sharp = 0;
-        if (NVSDK_NGX_FAILED(NGX_DLSS_GET_OPTIMAL_SETTINGS(s.caps, ow, oh, m, &w, &h, &xw, &xh, &nw, &nh, &sharp)) || !w) continue;
-        if (rw >= nw && rh >= nh && rw <= xw && rh <= xh) {
-            mode = m, max_w = xw, max_h = xh, min_w = nw, min_h = nh, found = true;
-            break;
+    // ((Triforce, 11-22, the performance audit's PRESENT-38, after Source A's) every mode's range first, then the one that
+    // takes this size (dlss_checks.h mode_for): the first that holds it, else the first it is outside of by a rounding. The
+    // Render resolution row's shares are rounded up and NGX's sizes down, so at 2560x1440 the row's 33% (854x480) was in
+    // no range (Ultra Performance is 853x480), DLSS was refused every frame and the game's own upscale ran with DLSS
+    // chosen. RX_VK_DLSS_MODE_SLACK=0, or the lab's "dlssstrict" phases: only a range that holds the size, as before
+    if (!found) {
+        dlss_checks::ModeRange ranges[5];
+        for (size_t i = 0; i < nmodes; i++) {
+            unsigned w = 0, h = 0, xw = 0, xh = 0, nw = 0, nh = 0;
+            float sharp = 0;
+            if (NVSDK_NGX_FAILED(NGX_DLSS_GET_OPTIMAL_SETTINGS(s.caps, ow, oh, modes[i], &w, &h, &xw, &xh, &nw, &nh, &sharp)) || !w) continue;
+            ranges[i] = {nw, nh, xw, xh, true};
+        }
+        static const bool slack_env = !(getenv("RX_VK_DLSS_MODE_SLACK") && atoi(getenv("RX_VK_DLSS_MODE_SLACK")) == 0);
+        bool widened = false;
+        const int at = dlss_checks::mode_for(ranges, nmodes, rw, rh, ow, oh, slack_env && !lab_ab::on("dlssstrict"), &widened);
+        if (at >= 0) {
+            const dlss_checks::ModeRange& r = ranges[at];
+            // (a size taken by the slack is in the range from here on: the feature's reuse test takes it next frame)
+            mode = modes[at], found = true;
+            min_w = std::min<unsigned>(r.min_w, rw), min_h = std::min<unsigned>(r.min_h, rh);
+            max_w = std::max<unsigned>(r.max_w, rw), max_h = std::max<unsigned>(r.max_h, rh);
+            static bool told;
+            if (widened && !told) {
+                told = true;
+                logf("vk: NVIDIA DLSS: %ux%u is a rounding outside mode %d's sizes for %ux%u (%ux%u to %ux%u): taken as that "
+                     "mode's (RX_VK_DLSS_MODE_SLACK=0: refused, the game's upscale runs)", rw, rh, (int)mode, ow, oh, r.min_w,
+                     r.min_h, r.max_w, r.max_h);
+            }
         }
     }
+    // (a size no mode takes: the feature there is stays, so the next size one takes does not make it again)
     if (!found) return *fail = "no DLSS mode takes this render size", 0;
+    if (s.feature) {   // (only now is the old one let go: a mode takes this size, and a feature is made for it)
+        NVSDK_NGX_Handle* old = s.feature;
+        temporal_later([old] { NVSDK_NGX_VULKAN_ReleaseFeature(old); });
+        s.feature = nullptr;
+    }
     // (the DLSS model row's preset for every mode, K by default: NVIDIA's transformer model. 0: NVIDIA's own per mode)
     static_assert(NVSDK_NGX_DLSS_Hint_Render_Preset_K == 11 && NVSDK_NGX_DLSS_Hint_Render_Preset_L == 12 &&
-                  NVSDK_NGX_DLSS_Hint_Render_Preset_M == 13 && NVSDK_NGX_DLSS_Hint_Render_Preset_Default == 0);
+                  NVSDK_NGX_DLSS_Hint_Render_Preset_M == 13 && NVSDK_NGX_DLSS_Hint_Render_Preset_Default == 0 &&
+                  NVSDK_NGX_DLSS_Hint_Render_Preset_E == 5);   // ((Triforce, PRESENT-36) E: upscaler_rows.h kPresetE)
     for (const char* k : {NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality,
                           NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance,
                           NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance,
                           NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality})
         NVSDK_NGX_Parameter_SetUI(s.params, k, preset);
     NVSDK_NGX_DLSS_Create_Params cp{};
-    cp.Feature.InWidth = max_w, cp.Feature.InHeight = max_h, cp.Feature.InTargetWidth = ow, cp.Feature.InTargetHeight = oh;
+    // ((Triforce, 11-21, the upscaler audit's UPS-01) a fixed share's feature for its own render size, not the largest its
+    // mode allows (NGX answers the output's own size for that: 2.25 times the pixels at Quality, 9 at Ultra Performance, for
+    // a feature whose cost and memory follow the size it is made for; NVIDIA's guide has the render size passed to the
+    // creation). For the mode's whole range where the game changes the render size: the Render resolution row's Auto, or a
+    // size seen changing under one output in this run. RX_VK_DLSS_FEATURE_MAX=1: always the largest, as before
+    static const bool whole_range = dlss_feature::whole_range(getenv("RX_VK_DLSS_FEATURE_MAX"));
+    const dlss_feature::Size made =
+        dlss_feature::size(aa, whole_range || s.range_seen || opts.resolution == 0, rw, rh, max_w, max_h);
+    cp.Feature.InWidth = made.w, cp.Feature.InHeight = made.h, cp.Feature.InTargetWidth = ow, cp.Feature.InTargetHeight = oh;
     cp.Feature.InPerfQualityValue = mode;
     // (LDR colour, already tonemapped: no exposure; motion at the render size, not jittered; depth not reversed)
     cp.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
@@ -367,7 +432,7 @@ int prepare(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t
     const double made_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     note_work(cmd);   // (NGX's own commands, which vk_work.h does not see: the next full_barrier is not left out)
     if (NVSDK_NGX_FAILED(r) || !s.feature) {
-        logf("vk: NVIDIA DLSS: its feature was not made (%#x) for %ux%u -> %ux%u", (unsigned)r, max_w, max_h, ow, oh);
+        logf("vk: NVIDIA DLSS: its feature was not made (%#x) for %ux%u -> %ux%u", (unsigned)r, made.w, made.h, ow, oh);
         s.feature = nullptr;
         // (out of video memory passes, when the game lets an area's textures go: not the end of DLSS for the run, as any
         // failure was before. Anything else is)
@@ -387,13 +452,15 @@ int prepare(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t
         return *fail = "its feature was not made", 0;
     }
     s.retries = 0, s.retry_frame = 0, s.refused = 0;
-    s.feature_rw = max_w, s.feature_rh = max_h, s.feature_ow = ow, s.feature_oh = oh, s.min_rw = min_w, s.min_rh = min_h;
+    s.feature_rw = made.w, s.feature_rh = made.h, s.feature_ow = ow, s.feature_oh = oh, s.min_rw = min_w, s.min_rh = min_h;
+    s.feature_exact = made.exact;
     s.feature_preset = preset, s.feature_hdr = hdr;
     s.features_made++;
     logf("vk: NVIDIA DLSS: feature %llu made (%s; frame %llu, %.1f ms of CPU): %ux%u (%ux%u to %ux%u) -> %ux%u, mode %d, "
-         "preset %c%s", (unsigned long long)s.features_made, why, (unsigned long long)texture_frame_no(), made_ms, rw, rh,
-         min_w, min_h, max_w, max_h, ow, oh, (int)mode, upscaler_rows::preset_letter(preset),
-         preset ? "" : " (NVIDIA's default)");
+         "preset %c%s; made for %ux%u%s", (unsigned long long)s.features_made, why, (unsigned long long)texture_frame_no(),
+         made_ms, rw, rh, min_w, min_h, max_w, max_h, ow, oh, (int)mode, upscaler_rows::preset_letter(preset),
+         preset ? "" : " (NVIDIA's default)", made.w, made.h,
+         made.exact ? ", this render size alone (RX_VK_DLSS_FEATURE_MAX=1: its mode's largest)" : ", the largest of its range");
     *in_w = s.feature_rw, *in_h = s.feature_rh;
     return 2;   // (a new history)
 }
@@ -428,6 +495,7 @@ void release() {
     temporal_later([old] { NVSDK_NGX_VULKAN_ReleaseFeature(old); });
     s.feature = nullptr;
     s.feature_rw = s.feature_rh = s.feature_ow = s.feature_oh = s.min_rw = s.min_rh = 0;
+    s.feature_exact = false;
 }
 
 uint64_t memory() {
@@ -484,5 +552,14 @@ void dlss_instance_extensions(std::vector<const char*>&, const std::vector<VkExt
 void dlss_device_extensions(std::vector<const char*>&, const std::vector<VkExtensionProperties>&) {}
 
 #endif
+
+// (Triforce, 11-22, the performance audit's PRESENT-36, after Source A's and Source B's) The card's video memory for the
+// DLSS model row's CNN rule, 0 while the rule is off: RX_VK_DLSS_CNN_VRAM=1 turns it on (Source A has it on for every card
+// under 7 GB; Source B has the same rule behind a switch that is off, for preset E's ghosting and because NVIDIA marks it
+// deprecated: here off, as there, until the owner has looked at the picture). RX_VK_TEST_CARD_MB plays a smaller card
+uint64_t dlss_cnn_vram() {
+    static const bool on = env_switch("RX_VK_DLSS_CNN_VRAM") == 1;
+    return on ? device_vram_bytes() : 0;
+}
 
 } // namespace mkwvk

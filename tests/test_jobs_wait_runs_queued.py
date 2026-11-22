@@ -57,7 +57,7 @@ def main():
     check_source()
     with tempfile.TemporaryDirectory(prefix="jobs-wait-") as tmp:
         tmp = Path(tmp)
-        for name in ("vk_jobs.cpp", "vk_jobs.h"):
+        for name in ("vk_jobs.cpp", "vk_jobs.h", "cpu_count.h"):   # ((Triforce, 11-22, OS-49) vk_jobs.cpp counts by cpu_count.h
             shutil.copy(ROOT / "gpu/vk" / name, tmp / name)
         (tmp / "vk_internal.h").write_text(STUB_INTERNAL, encoding="utf-8")
         (tmp / "vk_draw.h").write_text(STUB_DRAW, encoding="utf-8")

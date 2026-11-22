@@ -781,6 +781,47 @@ void exact_note(VkShaderModule m, const std::vector<uint32_t>& code) {
     else if (!exact_of.erase(m)) return;   // (a handle used again; nothing kept and nothing there: no thread's answer changes)
     exact_gen.fetch_add(1, std::memory_order_release);
 }
+// ((Triforce, 11-22, the performance audit's PIPE-52, after Source A's) The modules looked at and found without a barrier of
+// Subgroup scope (compute_pin.h subgroup_barrier): the lowering's barrier between a warp's shared-memory store and load takes
+// the subgroup to be the warp, and no flag of Shader::Info records it. Only where RX_VK_COMPUTE_PIN is not "all" (Mesa's
+// Intel driver by default): with "all" no module is looked at and nothing is kept. A handle the driver uses again is noted
+// again by make_module, and forgotten by stage_module_destroy
+// ((Triforce, 11-22, the performance audit's PIPE-56, after Source A's) A compute module's OpPhi and OpFunctionCall counts,
+// taken here while the SPIR-V is in hand (program_pack may drop the module) and only on the two drivers that have a limit
+// (fallback_size_policy.h: RADV on GCN 1 to 4, Mesa's Intel driver): on every other one nothing is counted or kept. Moved
+// with the stage's key by program_pack as exact_of's entry is, forgotten by stage_module_destroy
+std::mutex size_mu;
+std::unordered_map<VkShaderModule, fallback_size::Size> size_of;
+void size_note(VkShaderModule m, const std::vector<uint32_t>& code) {
+    if (!m || fallback_size_driver() == fallback_size::Driver::Other) return;
+    const bool compute = compute_pin::compute_entry(code.data(), code.size());
+    const fallback_size::Size s = compute ? fallback_size::count(code.data(), code.size()) : fallback_size::Size{};
+    std::lock_guard lk(size_mu);
+    if (compute) size_of[m] = s;
+    else size_of.erase(m);   // (a handle used again by a graphics stage's module)
+}
+void size_move(VkShaderModule from, VkShaderModule to) {
+    if (fallback_size_driver() == fallback_size::Driver::Other) return;
+    std::lock_guard lk(size_mu);
+    const auto it = size_of.find(from);
+    if (it == size_of.end()) {
+        size_of.erase(to);
+        return;
+    }
+    const fallback_size::Size s = it->second;
+    size_of.erase(it);
+    size_of[to] = s;
+}
+std::mutex lanes_mu;
+std::unordered_set<VkShaderModule> lanes_free;
+void lanes_note(VkShaderModule m, const std::vector<uint32_t>& code) {
+    if (!m || compute_pin_mode() == compute_pin::Mode::All) return;
+    // (a graphics stage's module is never asked about: nothing kept for it, and a handle of an earlier compute module's forgotten)
+    const bool barrier = !compute_pin::compute_entry(code.data(), code.size()) || compute_pin::subgroup_barrier(code.data(), code.size());
+    std::lock_guard lk(lanes_mu);
+    if (barrier) lanes_free.erase(m);
+    else lanes_free.insert(m);
+}
 // ---- (Triforce) RX_VK_SPV_PACK: a ready program's stages keep their SPIR-V packed and no module (spv_store.h, where the
 // reasons and the measurements are). make_module packs the words it hands to the driver and keeps the store beside the
 // module's handle (pack_note); program_pack, called where a program becomes ready, gives each stage its store and destroys
@@ -870,6 +911,7 @@ void program_pack(Program& p) {
         }
         if (p.failed || p.compute) continue;   // (its store is let go, its module stays)
         exact_move(st.module, (VkShaderModule)(uintptr_t)code.get());
+        size_move(st.module, (VkShaderModule)(uintptr_t)code.get());   // ((Triforce, 11-22, PIPE-56) nothing off the two drivers)
         module_forget(st.module);
         vkDestroyShaderModule(dev.device, st.module, nullptr);
         st.module = VK_NULL_HANDLE;
@@ -1109,12 +1151,16 @@ VkShaderModule make_module(const std::vector<uint32_t>& spirv, uint32_t* renodx 
         vkCreateShaderModule(dev.device, &ci, nullptr, &m);
         module_note(m, salted.size());
         exact_note(m, code);
+        lanes_note(m, code);
+        size_note(m, code);
         pack_note(m, salted.data(), salted.size());
         return m;
     }
     vkCreateShaderModule(dev.device, &ci, nullptr, &m);
     module_note(m, code.size());
     exact_note(m, code);
+    lanes_note(m, code);   // ((Triforce, 11-22, PIPE-52) nothing with RX_VK_COMPUTE_PIN "all", the default off Mesa's Intel driver)
+    size_note(m, code);    // ((Triforce, 11-22, PIPE-56) nothing but on RADV for GCN 1 to 4 and Mesa's Intel driver)
     pack_note(m, code.data(), code.size());
     return m;
 }
@@ -1134,9 +1180,45 @@ bool spv_pack_on() {
     static const bool on = !(getenv("RX_VK_SPV_PACK") && atoi(getenv("RX_VK_SPV_PACK")) == 0);
     return on;
 }
+compute_pin::Mode compute_pin_mode() {
+    static const compute_pin::Mode mode = [] {
+        const char* env = getenv("RX_VK_COMPUTE_PIN");
+        const compute_pin::Mode m = compute_pin::mode_for(env, dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA);
+        // (no line where it is "all" by default: every driver but Mesa's Intel one, whose log is what it was)
+        if (m != compute_pin::Mode::All || env)
+            logf("vk: compute programs held to 32 lanes: %s (RX_VK_COMPUTE_PIN=all, lanes or shared; lanes: only the programs that "
+                 "can tell, the default on Mesa's Intel driver)", compute_pin::name(m));
+        return m;
+    }();
+    return mode;
+}
+bool compute_lanes_free(VkShaderModule m) {
+    if (!m || compute_pin_mode() == compute_pin::Mode::All) return false;
+    std::lock_guard lk(lanes_mu);
+    return lanes_free.count(m) != 0;
+}
+fallback_size::Driver fallback_size_driver() {
+    static const fallback_size::Driver d =
+        fallback_size::driver_of(dev.radv_gcn, dev.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA);
+    return d;
+}
+fallback_size::Size stage_size(const Stage& st) {
+    if (fallback_size_driver() == fallback_size::Driver::Other) return fallback_size::Size{};
+    std::lock_guard lk(size_mu);
+    const auto it = size_of.find(stage_exact_key(st));
+    return it == size_of.end() ? fallback_size::Size{} : it->second;
+}
 void stage_module_destroy(VkShaderModule m) {
     if (!m) return;
     module_forget(m);
+    if (fallback_size_driver() != fallback_size::Driver::Other) {   // ((Triforce, 11-22, PIPE-56) its counts go with it)
+        std::lock_guard lk(size_mu);
+        size_of.erase(m);
+    }
+    if (compute_pin_mode() != compute_pin::Mode::All) {   // ((Triforce, 11-22, PIPE-52) its note goes with it: lanes_note)
+        std::lock_guard lk(lanes_mu);
+        lanes_free.erase(m);
+    }
     if (spv_pack_on()) {   // (a store made for it that no program took: let go with it)
         std::lock_guard lk(pack_mu);
         pack_made.erase(m);
@@ -3818,7 +3900,9 @@ size_t program_cache_load_some(const std::unordered_set<uint64_t>& wanted, const
         for (auto it = disk_records.begin(); it != disk_records.end();) {
             // (fallbacks: and every program translated for the mesh fallback (kind 4), not only those play has drawn, whatever the
             // compute list says: their compute pipelines, made in play, took AMD up to 12 s each on first sight, the foliage and the
-            // door white until then. Only a GPU without mesh shaders has such programs)
+            // door white until then. (Triforce, 11-22, PIPE-62) Such programs are those of a GPU on the task and mesh fallback: one
+            // without mesh shaders, an RX 6000 or an RDNA2 integrated GPU on Windows, the menu's Compute row,
+            // RX_VK_TASK_MESH_FALLBACK=1. Only the records still on the disk are found here: the walk at the end takes the rest)
             if (wanted.count(it->first) ||
                 (!it->second.empty() && ((computes && (it->second[0].kind & 1)) || (fallbacks && (it->second[0].kind & 4))))) {
                 work.push_back({it->first, std::move(it->second)});
@@ -3853,6 +3937,28 @@ size_t program_cache_load_some(const std::unordered_set<uint64_t>& wanted, const
         auto& variants = programs[work[i].first];
         for (auto& p : made[i]) variants.push_back(std::move(p));
         for (auto& p : variants) n++, fn(*p);
+    }
+    // ((Triforce, 11-22, the performance audit's PIPE-62, after Source A's) And the mesh fallback's programs that are in memory
+    // already, ready and not failed. The loop above hands over only what was still on the disk, and in a start that prepares,
+    // state_list_prepare has taken the state lists' records before the precompile asks (with fallbacks off): most of the
+    // fallback programs play draws were then never handed to the precompile, got no compute pipelines before the title, and
+    // each one's first draw waited up to 50 ms on the recording thread and was left out until its pipelines were built
+    // (Source A, a preparing start on the fallback: 850 programs ready where a later start had about 2,096). The precompile's
+    // worker takes a program's compute_state before it builds, as a draw does, so none is built twice. Under shader_mu, as the
+    // loop above. RX_VK_FALLBACK_LOADED=0: not, as before (read once)
+    if (fallbacks) {
+        static const bool loaded = !(getenv("RX_VK_FALLBACK_LOADED") && atoi(getenv("RX_VK_FALLBACK_LOADED")) == 0);
+        if (loaded) {
+            std::unordered_set<uint64_t> taken;
+            for (const auto& w : work) taken.insert(w.first);
+            size_t found = 0;
+            for (auto& kv : programs) {
+                if (taken.count(kv.first)) continue;
+                for (auto& p : kv.second)
+                    if (p->fallback && !p->failed && p->ready.load(std::memory_order_acquire)) found++, n++, fn(*p);
+            }
+            if (found) logf("vk: %zu mesh fallback programs read in earlier in this start are made ready with the rest", found);
+        }
     }
     return n;
 }

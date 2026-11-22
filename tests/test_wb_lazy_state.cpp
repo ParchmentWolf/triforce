@@ -547,9 +547,56 @@ void choice() {
 
 } // namespace
 
+// ((Triforce, 11-21, a player's report on 0.6.0) The fault handler's question, on_fault: (1) a fault that arrives after another
+// thread's payment gave the page back (untracked by now, readable and writable) runs again, where tracked() alone sent it to the
+// crash handler; untracked and without access is still not ours. (2) start_watch counts pages before it protects them: the model
+// fails any protection of a page tracked() does not know yet
+struct OrderModel : Model {
+    Table<OrderModel>* t = nullptr;
+    bool set(uint64_t lo, uint64_t hi, Access a) {
+        if (a != RW && t)
+            for (uint64_t p = lo; p < hi; p++)
+                if (!t->tracked(p)) { fail("a page protected before the table tracks it", p - kBase, a); break; }
+        return Model::set(lo, hi, a);
+    }
+};
+void late_fault() {
+    Model m;
+    Table<Model> t(m);
+    Epoch e;
+    Skip skip;
+    std::vector<Job> jobs;
+    const uint64_t now = 100000, a = kBase + 32, b = kBase + 96;
+    e.collects_begun = 1;
+    t.advance(a, b, kSrc, 1, e, now, true, skip);
+    e.collects = 2, e.collects_begun = 2;
+    t.advance(a, b, kSrc, 2, e, now, true, skip);
+    expect(t.state_of(a) == OWED && !m.accessible(a, false), "late fault: the run is owed, its pages without access");
+    // a fault there now: this thread pays (as fault() did)
+    expect(t.on_fault(a + 5, true, 255, now, jobs) == PAY && !jobs.empty(), "late fault: a fault on an owed page pays (the whole run: grow 255)");
+    t.end_pay(jobs, BY_FAULT, now);
+    jobs.clear();
+    // another thread faulted on a page of that payment before end_pay gave the access back; its handler runs only now
+    expect(!t.tracked(a + 6), "late fault: the paid page is untracked by now");
+    expect(t.on_fault(a + 6, true, 7, now, jobs) == RETRY && jobs.empty(), "late fault: untracked but writable again: run the access again");
+    expect(t.late_retries.load() == 1, "late fault: counted");
+    // an untracked page that still has no access is not this table's (the crash handler's, as before)
+    m.set(kBase + 200, kBase + 201, NONE);
+    expect(t.on_fault(kBase + 200, false, 7, now, jobs) == NOT_OURS, "late fault: untracked and without access: not ours");
+    m.set(kBase + 200, kBase + 201, RW);
+    // (2) the order in start_watch
+    OrderModel om;
+    Table<OrderModel> ot(om);
+    om.t = &ot;
+    Epoch e2;
+    e2.collects_begun = 1;
+    ot.advance(a, b, kSrc, 1, e2, now, true, skip);
+    expect(ot.state_of(a) == WATCH && ot.tracked(a), "late fault: watched, tracked");
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && !std::strcmp(argv[1], "stress")) stress(argc > 2 ? std::atof(argv[2]) : 2.0, argc > 3 ? std::atoi(argv[3]) : kMaxPayers);
-    else rules(), choice(), payer_slots();
+    else rules(), choice(), payer_slots(), late_fault();
     if (failures) return std::printf("%d check(s) failed\n", failures), 1;
     std::printf("PASS: %s\n", argc > 1 ? argv[1] : "rules");
     return 0;

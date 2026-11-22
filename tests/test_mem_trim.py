@@ -39,7 +39,11 @@ def main():
     need("r.streams[r.si].buffer" in nxt and "r.before += r.used" in nxt, "a stream move does not switch the buffer")
     begin = block(draw, "void draw_begin_recording(")
     need("r.si = 0" in begin and "r.used = 0, r.before = 0" in begin, "a recording begins in a stream that is not its first")
-    need(begin.index("r.streams.resize(1)") < begin.index("r.si = 0"), "the streams given back are used after")
+    # ((11-21, REPLAY-04) the slot's reset, the streams' give-back in it, is a function of its own, made before the stream
+    # in use is chosen)
+    reset = block(draw, "void slot_reset_locked(")
+    need("r.streams.resize(1)" in reset and begin.index("slot_reset_locked(r);") < begin.index("r.si = 0"),
+         "the streams given back are used after")
 
     tex = (ROOT / "gpu/vk/vk_texture.cpp").read_text(encoding="utf-8")
     astc = block(tex, "bool upload_astc_gpu(")

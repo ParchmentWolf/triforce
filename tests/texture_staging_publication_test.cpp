@@ -25,6 +25,7 @@ bool fail_large = false, unmap_large = false, unmap_all = false;
 std::vector<uint64_t> attempts;
 unsigned destroys = 0;
 uint64_t rec_value = 1, completed_value = 0;
+std::atomic<int64_t> st_arena_makes{0}, st_arena_make_ns{0};   // ((Triforce, 11-22, TEX-28) staging() counts the arenas it makes)
 struct { VkPhysicalDeviceProperties props{}; } dev;
 int flushes = 0;
 bool create_buffer(uint64_t n, VkBufferUsageFlags, bool, VkBuffer& b, VmaAllocation& a, void** map) {

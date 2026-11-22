@@ -115,6 +115,10 @@ public static class BuildEstimator
     {
         GpuVendor.Nvidia => (TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(20)),
         GpuVendor.Amd => (TimeSpan.FromMinutes(30), TimeSpan.FromMinutes(120)),
+        // ((Triforce, 11-22) Intel's Arc cards: an A750's preparation took 4.3 h on v0.6.0 (#bug-tracker "Intel Arc A750 current
+        // state", 12 threads), an A770's 11 h; with the compute warm cut to the listed programs (RX_VK_WARM_COMPUTES) a
+        // re-preparation is over an hour shorter. The 10 to 40 minutes before had the time left show minutes for hours)
+        GpuVendor.Intel => (TimeSpan.FromMinutes(60), TimeSpan.FromMinutes(240)),
         _ => (TimeSpan.FromMinutes(10), TimeSpan.FromMinutes(40)),
     };
 
@@ -136,6 +140,13 @@ public static class BuildEstimator
             {
                 if (!shaders) continue;
                 if (stages != null && stages.Seconds.TryGetValue("shaders", out var ss) && ss > 0) { list.Add(Exact(st.Id, ss)); continue; }
+                // ((Triforce, 11-22) an update with no update of its own on record: the shader step this PC measured in its
+                // last build of any kind, before the stated range (an update after a full build prepares the same shaders)
+                if (history.Stages.LastOrDefault(r => r.Seconds.TryGetValue("shaders", out var any) && any > 0) is { } anyRec)
+                {
+                    list.Add(Exact(st.Id, anyRec.Seconds["shaders"]));
+                    continue;
+                }
                 var (sl, sh) = ShaderRange(gpu);
                 list.Add(new StageEstimate(st.Id, sl, sh, false));
                 continue;
@@ -171,9 +182,34 @@ public static class BuildClock
         return Unit(low) == Unit(high) ? M(low) + " to " + M(high) + " " + Unit(high) : M(low) + " " + Unit(low) + " to " + M(high) + " " + Unit(high);
     }
 
-    /// <summary>The time left: the stages after this one by the estimate, and this one by @@eta (compile), else by its progress so
-    /// far (from 5 %), else its estimate less what it has run. Never below zero; "Almost done" is the App's words under a minute.</summary>
+    /// <summary>The time left as shown: Estimated, smoothed. Each call counts the shown time down by the time since the last one and
+    /// moves it toward the new estimate: down within seconds (FallSeconds), up slowly (RiseSeconds) and never faster than half a
+    /// second a second, so one odd moment never makes it jump. The first call of a build shows the estimate itself. Never below
+    /// zero; "Almost done" is the App's words under a minute.</summary>
     public static TimeSpan Remaining(BuildEstimate estimate, BuildTracker tracker)
+    {
+        var raw = Estimated(estimate, tracker).TotalSeconds;
+        lock (tracker.Gate)
+        {
+            var now = tracker.Now;
+            var shown = raw;
+            if (tracker.Shown is { } was)
+            {
+                var dt = Math.Max(0, (now - was.At).TotalSeconds);
+                var counted = Math.Max(0, was.Seconds - dt);
+                shown = raw < counted ? counted + (raw - counted) * (1 - Math.Exp(-dt / FallSeconds))
+                    : Math.Min(counted + (raw - counted) * (1 - Math.Exp(-dt / RiseSeconds)), was.Seconds + MaxRise * dt);
+            }
+            tracker.Shown = (shown, now);
+            return TimeSpan.FromSeconds(Math.Max(0, shown));
+        }
+    }
+
+    const double FallSeconds = 15, RiseSeconds = 30, MaxRise = 0.5;
+
+    /// <summary>The time left now, unsmoothed: the stages after this one by the estimate, and this one by @@eta (compile), else by
+    /// StageLeft. Never below zero.</summary>
+    public static TimeSpan Estimated(BuildEstimate estimate, BuildTracker tracker)
     {
         var at = tracker.Stage is { } s ? BuildStages.IndexOf(s) : -1;
         var left = TimeSpan.Zero;
@@ -181,13 +217,61 @@ public static class BuildClock
             if (BuildStages.IndexOf(st.Stage) > at) left += st.Mid;
         if (at >= 0 && estimate.Of(tracker.Stage!) is { } cur)
         {
-            TimeSpan here;
-            if (tracker.Stage == "compile" && tracker.EtaSeconds is { } eta) here = TimeSpan.FromSeconds(eta);
-            else if (tracker.StageProgress >= 0.05) here = tracker.InStage * ((1 - tracker.StageProgress) / tracker.StageProgress);
-            else here = cur.Mid - tracker.InStage;
+            var here = tracker.Stage == "compile" && tracker.EtaSeconds is { } eta ? TimeSpan.FromSeconds(eta)
+                : StageLeft(cur.Mid, tracker.Recent, tracker.StageStarted, tracker.Now);
             left += here < TimeSpan.Zero ? TimeSpan.Zero : here;
         }
         return left;
+    }
+
+    /// <summary>A stage's time left by its progress. The work per step is uneven (the shader step: on AMD and Intel cards the first
+    /// part, the compute pipelines, can be most of its time, an Arc A750 spent 5175 s of 5858 s on them; one slow shader holds it
+    /// for minutes), so the rate since the stage began says hours where there is an hour. Instead:
+    ///   the rate of the last WindowSeconds of progress, each wait between two steps counted as at most 4 times the usual one (and
+    ///   at least half a minute), so one slow item is one step late, not a new pace;
+    ///   blended with the estimate's own pace (what it leaves of the stage, at least a tenth of it, and past it a quarter of the
+    ///   time over too), trusting the measured rate more as the stage goes (all of it from TrustFrom of the way);
+    ///   reckoned at the last step: between steps it counts down for one usual wait, then holds, and after a long stall (2
+    ///   minutes, or 4 waits) rises by a quarter of the time.
+    /// No progress yet: the estimate less the time run (the same floor).</summary>
+    public static TimeSpan StageLeft(TimeSpan expected, IReadOnlyList<(DateTime At, double Progress)> samples, DateTime began, DateTime now)
+    {
+        var e = expected.TotalSeconds;
+        static double Prior(double e, double run) => Math.Max(e - run, 0.1 * e + 0.25 * Math.Max(0, run - e));
+        if (samples.Count < 2 || samples[^1].Progress <= 0) return TimeSpan.FromSeconds(Prior(e, Math.Max(0, (now - began).TotalSeconds)));
+        var (last, p) = samples[^1];
+        if (p >= 1) return TimeSpan.Zero;
+        var run = Math.Max(0, (last - began).TotalSeconds);
+        var rateHere = (1 - p) / Math.Max(1, Prior(e, run));
+        var recent = RecentRate(samples);
+        var w = recent == null ? 0 : Math.Clamp(p / TrustFrom, 0, 1);
+        var rate = w * (recent?.Rate ?? 0) + (1 - w) * rateHere;
+        var atStep = (1 - p) / rate;
+        var wait = recent?.Wait ?? 0;
+        var stall = Math.Max(0, (now - last).TotalSeconds);
+        var left = atStep - Math.Min(stall, wait) + 0.25 * Math.Max(0, stall - Math.Max(120, 4 * wait));
+        return TimeSpan.FromSeconds(Math.Max(0, left));
+    }
+
+    const double WindowSeconds = 180, TrustFrom = 0.3;
+
+    /// <summary>Progress a second over the last WindowSeconds (each wait capped), and the usual wait between steps (the median of
+    /// the last 64); null with no step yet.</summary>
+    static (double Rate, double Wait)? RecentRate(IReadOnlyList<(DateTime At, double Progress)> s)
+    {
+        if (s.Count < 2) return null;
+        var waits = new List<double>();
+        for (var i = s.Count - 1; i >= 1 && waits.Count < 64; i--) waits.Add((s[i].At - s[i - 1].At).TotalSeconds);
+        waits.Sort();
+        var usual = waits[waits.Count / 2];
+        var cap = Math.Max(30, 4 * usual);
+        double span = 0, moved = 0;
+        for (var i = s.Count - 1; i >= 1 && span < WindowSeconds; i--)
+        {
+            span += Math.Min(cap, (s[i].At - s[i - 1].At).TotalSeconds);
+            moved += s[i].Progress - s[i - 1].Progress;
+        }
+        return span <= 0 || moved <= 0 ? null : (moved / span, usual);
     }
 
     /// <summary>"About 31 minutes left"; "Almost done" under a minute (DESIGN 6 Build).</summary>

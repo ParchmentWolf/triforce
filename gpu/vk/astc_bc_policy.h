@@ -13,4 +13,12 @@ inline bool all_by_vram(uint64_t allowed) {
     return allowed && allowed < (8704ull << 20);
 }
 
+// (Triforce, 11-22, the performance audit's TEX-12, after Source A's) And every integrated GPU, whatever it is allowed. Its
+// allowance is a share of the system's RAM (a 16 GB handheld reported 10,361 MB), so by the allowance alone it kept the
+// fine-block textures of 2 to 64 MB as RGBA8, in RAM the game needs too, inside a texture budget capped at 2,560 MB.
+// Source A measured the difference on a discrete card (RX_VK_ASTC_BC_ALL 0 against 1, Kokiri Forest: decoded ASTC
+// 2,496-2,532 MB against 1,579-1,587, the GPU's frame the same); it was not run on an integrated GPU there either.
+// The shape of tex_detail::by_vram(allowed, integrated). RX_VK_ASTC_BC_ALL=0: the finer ones as RGBA8, as before
+inline bool all(uint64_t allowed, bool integrated) { return integrated || all_by_vram(allowed); }
+
 } // namespace astc_bc_policy

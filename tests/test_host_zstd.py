@@ -554,6 +554,85 @@ int main(int argc, char **argv) {
     CHECK(r == 0xffffffffu && hz_stats.s_checked == sc0, "check: a stream left to the game was compared (%#llx)", (unsigned long long)r);
     ZSTD_freeDCtx(f2.d);
 
+    /* ====== ((Triforce, 11-21, the performance audit's IO-01) the content's own room, the canary, who gives the core up ====== */
+    {
+        size_t LITN, LZN, LNN;
+        uint8_t *lit = load(argv[1], "lit.bin", &LITN), *LZ = load(argv[1], "lit.zst", &LZN), *LN = load(argv[1], "litnosize.zst", &LNN);
+        const uint64_t spare = 256u << 10;   /* (room past the content, as the game's buffers have) */
+        const uint64_t past = OUTA + ((LITN + 4095) & ~4095ull) + 4096;   /* (a page wholly after the content) */
+        const uint8_t *out = (const uint8_t *)HZ_PTR(OUTA);
+        size_t i;
+        /* one call: a frame of many literals into a room 256 KiB over its content. libzstd keeps a block's literals in
+           spare room after the block when it has any; given the content's own size it has none */
+        put(COMPA, LZ, LZN);
+        memset(HZ_PTR(OUTA), 0xA5, LITN + spare);
+        clear_marks();
+        r = once(OUTA, LITN + spare, COMPA, LZN, 0, 0, 0);
+        CHECK(r == LITN && !memcmp(out, lit, LITN), "literals, one call: %#llx or other bytes", (unsigned long long)r);
+        for (i = LITN; i < LITN + spare && out[i] == 0xA5; i++) {}
+        CHECK(i == LITN + spare, "literals, one call: byte %zu after the content was written (room %llu over it)", i - LITN,
+              (unsigned long long)spare);
+        CHECK(marked(OUTA, LITN) && !marked(past, 1), "literals, one call: the pages told to the write tracking are not the content's alone");
+        /* the same frame without its content size: the caller's room is all libzstd can be given, and all of it is told */
+        put(COMPA, LN, LNN);
+        memset(HZ_PTR(OUTA), 0xA5, LITN + spare);
+        clear_marks();
+        r = once(OUTA, LITN + spare, COMPA, LNN, 0, 0, 0);
+        CHECK(r == LITN && !memcmp(out, lit, LITN), "literals without a content size: %#llx or other bytes", (unsigned long long)r);
+        CHECK(marked(OUTA, LITN + spare), "literals without a content size: the whole room was not told to the write tracking");
+        /* a stream: the same frame, its state's room 256 KiB over the content */
+        put(COMPA, LZ, LZN);
+        state(SA, OUTA, (uint32_t)(LITN + spare), WSA);
+        memset(HZ_PTR(OUTA), 0xA5, LITN + spare);
+        clear_marks();
+        r = feed(SA, COMPA, (int32_t)LZN, 0);
+        CHECK(r == 0 && phase(SA) == 4 && !memcmp(out, lit, LITN), "literals, a stream: %#llx in phase %d or other bytes",
+              (unsigned long long)r, phase(SA));
+        for (i = LITN; i < LITN + spare && out[i] == 0xA5; i++) {}
+        CHECK(i == LITN + spare, "literals, a stream: byte %zu after the content was written", i - LITN);
+        CHECK(marked(OUTA, LITN) && !marked(past, 1), "literals, a stream: the pages told to the write tracking are not the content's alone");
+        /* check mode: the host's own output with the same room, and what it writes past the content counted */
+        Fake1 l1 = {OUTA, LITN + spare, COMPA, LZN, NULL, 0, 0, 0, 0};
+        uint64_t t0 = hz_stats.tail, e0 = hz_stats.differ;
+        r = hz_oneshot_check(OUTA, LITN + spare, COMPA, LZN, 0, 0, 0, fake_once, &l1);
+        CHECK(r == LITN && hz_stats.tail == t0 && hz_stats.differ == e0, "check: literals with a content size: %llu past the end, "
+              "%llu different", (unsigned long long)(hz_stats.tail - t0), (unsigned long long)(hz_stats.differ - e0));
+        put(COMPA, LN, LNN);
+        Fake1 l2 = {OUTA, LITN + spare, COMPA, LNN, NULL, 0, 0, 0, 0};
+        t0 = hz_stats.tail, e0 = hz_stats.differ;
+        r = hz_oneshot_check(OUTA, LITN + spare, COMPA, LNN, 0, 0, 0, fake_once, &l2);
+        CHECK(r == LITN && hz_stats.tail == t0 + 1 && hz_stats.differ == e0, "check: literals without a content size, room to spare: "
+              "%llu counted as past the end (want 1: what the exact room is for), %llu different",
+              (unsigned long long)(hz_stats.tail - t0), (unsigned long long)(hz_stats.differ - e0));
+
+        /* who gives the core up (HOS_HOST_ZSTD_AWAY): a whole buffer of 3 MB, then the same frame fed 64 KiB at a time */
+        static const struct { int mode, whole, feeds; } want[] = {{1, 1, 0}, {0, 0, 0}, {2, 1, 1}};
+        for (int k = 0; k < 3; k++) {
+            hz_away_mode = want[k].mode;
+            put(COMPA, A, AN);
+            aways = backs = 0;
+            r = once(OUTA, RAWN, COMPA, AN, 0, 0, 0);
+            CHECK(r == RAWN && aways == want[k].whole && backs == aways, "away %d: a whole buffer gave the core up %d times (%d back)",
+                  want[k].mode, aways, backs);
+            aways = backs = 0;
+            state(SA, OUTA, (uint32_t)RAWN, WSA);
+            for (size_t off = 0; off < AN; off += 65536) r = feed(SA, COMPA + off, (int32_t)(AN - off < 65536 ? AN - off : 65536), 0);
+            CHECK(r == 0 && phase(SA) == 4 && (aways != 0) == want[k].feeds && backs == aways,
+                  "away %d: a stream's feeds of 64 KiB gave the core up %d times (%d back; %#llx in phase %d)", want[k].mode, aways,
+                  backs, (unsigned long long)r, phase(SA));
+        }
+        hz_away_mode = 1;
+        /* (mode 1's line is the content's size where the frame says it, not the caller's room: 100 KB of content keeps the
+           core in a room of 1 MB as in one of its own size) */
+        put(COMPA, S, SN);
+        aways = 0;
+        r = once(OUTA, 1 * MB, COMPA, SN, 0, 0, 0);
+        CHECK(r == SMALLN && aways == (SN >= HZ_AWAY_WHOLE), "away 1: 100 KB of content in a room of 1 MB gave the core up (%d)", aways);
+        aways = 0;
+        r = once(OUTA, SMALLN, COMPA, SN, 0, 0, 0);
+        CHECK(r == SMALLN && aways == (SN >= HZ_AWAY_WHOLE), "away 1: an input and a room under 128 KiB gave the core up (%d)", aways);
+    }
+
     CHECK(logs > 0, "nothing was logged");
     if (fails) printf("host zstd: FAILED (%d of %d checks)\n", fails, checks);
     else printf("host zstd: all %d checks passed\n", checks);
@@ -691,11 +770,22 @@ def zstd_sources():
 
 def check_source():
     glue = (ROOT / "host/hos_zstd.c").read_text(encoding="utf-8")
+    header = (ROOT / "host/host_zstd.h").read_text(encoding="utf-8")
     build = (ROOT / "nx2/build.py").read_text(encoding="utf-8")
     docs = (ROOT / "docs/development.md").read_text(encoding="utf-8")
     for text, needle, why in (
             (glue, 'getenv("HOS_HOST_ZSTD")', "host/hos_zstd.c does not read HOS_HOST_ZSTD"),
-            (glue, "v = e && *e ? atoi(e) : 0;\n        v = v == 1 || v == 2 ? v : 0;", "the decoder is not off unless HOS_HOST_ZSTD is 1 or 2"),
+            # ((Triforce, 11-21, the performance audit's IO-01) on when not set; 2 the check; anything else off
+            (glue, "v = e && *e ? atoi(e) : 1;", "HOS_HOST_ZSTD not set does not mean the host's decoder"),
+            (glue, "v = v == 1 || v == 2 ? v : 0;", "the decoder is not off for a HOS_HOST_ZSTD that is neither 1 nor 2"),
+            (glue, 'const char *a = getenv("HOS_HOST_ZSTD_AWAY");', "host/hos_zstd.c does not read HOS_HOST_ZSTD_AWAY"),
+            (glue, "const int away = a && *a ? atoi(a) : 1;", "HOS_HOST_ZSTD_AWAY not set does not mean 1"),
+            (glue, "hz_away_mode = away == 0 || away == 2 ? away : 1;", "a HOS_HOST_ZSTD_AWAY that is neither 0 nor 2 does not mean 1"),
+            (header, "const uint64_t room = hz_room(cap, src, size, &exact);", "a whole buffer is not decoded into the content's own room"),
+            (header, "ZSTD_outBuffer out = {HZ_PTR(st->dst0), (size_t)st->content, (size_t)st->pos};",
+             "a stream is not decoded into the content's own room"),
+            (header, "const int away = hz_away_feed(in->size) ? HZ_AWAY() : 0;", "a stream's feed does not go by HOS_HOST_ZSTD_AWAY"),
+            (header, "const int away = hz_away_whole(size, cap) ? HZ_AWAY() : 0;", "a whole buffer does not go by HOS_HOST_ZSTD_AWAY"),
             (glue, 'strncmp(hos_main_build_id, "e0f3ccfa", 8)', "the game build the addresses are for is not checked"),
             (glue, "const int m = in_game ? 0 : mode();\n    if (!m) return 0;", "a call does not answer 0 with the switch off, or inside the game's own function"),
             (glue, "#define GAME_MULTIFRAME 0x8010b380ULL", "the one-call function's address changed"),
@@ -704,7 +794,7 @@ def check_source():
             (glue, "#define HZ_OK(a, n) (hos_guest_range((a), (n)) != NULL)", "guest ranges are not checked against the game's memory"),
             (build, 'for f in HOST_ZSTD_SOURCES:\n            jobs.append((cc, os.path.join(hzstd, *f.split("/")), os.path.join(obj_dir, "hostzstd_"',
              "nx2/build.py does not compile zstd's decoder for the runtime"),
-            (docs, "`HOS_HOST_ZSTD=1` or `2`", "docs/development.md does not name HOS_HOST_ZSTD")):
+            (docs, "`HOS_HOST_ZSTD=0` or `2`, `HOS_HOST_ZSTD_AWAY=0/1/2`", "docs/development.md does not name HOS_HOST_ZSTD and its core switch")):
         if needle not in text:
             raise SystemExit(why)
     for f in zstd_sources():
@@ -754,6 +844,13 @@ def frames(tmp):
         "tdicted.zst": zstandard.ZstdCompressor(level=3, dict_data=trained, write_dict_id=True).compress(traw),
         "traw.bin": traw,
     }
+    # ((Triforce, 11-21, IO-01) many literals and few matches: 16 symbols at random, which zstd packs as Huffman literals
+    # block after block. What libzstd does with spare room after such a block is what the content's own room is for)
+    lit = bytes(rng.choices(b"0123456789abcdef", k=700000))
+    files["lit.bin"] = lit
+    files["lit.zst"] = plain.compress(lit)
+    files["litnosize.zst"] = zstandard.ZstdCompressor(level=3, write_content_size=False).compress(lit)
+    assert zstandard.get_frame_parameters(files["lit.zst"]).content_size == len(lit)
     assert zstandard.get_frame_parameters(files["tdicted.zst"]).dict_id == trained.dict_id() != 0
     assert zstandard.get_frame_parameters(files["a.zst"]).content_size == len(raw)
     assert zstandard.get_frame_parameters(files["small.zst"]).has_checksum

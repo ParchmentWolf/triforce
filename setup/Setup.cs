@@ -352,7 +352,6 @@ static class Install
     /// Removes Setup, its tools and the shortcuts. Game folders and saves are the player's and stay.
     public static bool Uninstall(bool quiet)
     {
-        var dir = InstalledDir ?? SelfDir;
         if (!quiet && MessageBox.Show("Remove Triforce Setup and its tools from this PC?\n\nYour game folders and saves are not touched.",
                 "Uninstall Triforce", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return false;
         foreach (var f in new[] { DesktopLink })
@@ -363,10 +362,22 @@ static class Install
         try { if (Directory.Exists(work)) Directory.Delete(work, true); } catch (Exception) { }
         Remove(UninstallKey);
         Remove(SettingsKey);
-        // (this exe is running from the folder: a short-lived cmd removes it once we are gone)
-        if (File.Exists(Path.Combine(dir, Program.SetupAsset)))
-            Process.Start(new ProcessStartInfo("cmd.exe", "/c timeout /t 2 /nobreak >nul & rmdir /s /q \"" + dir + "\"")
+        // (this exe is running from the folder: a short-lived cmd removes it once we are gone. (Triforce, 11-21, ticket
+        // "Downloads folder got deleted while uninstalling the Triforce launcher") Only the installed Setup's folder, never the
+        // folder a Setup that is not installed runs from (Downloads), and only Setup's own entries there, the folder itself
+        // only when nothing else is left (rmdir without /s): the whole folder went before, with whatever the player kept there)
+        if (InstalledDir is { } inst && File.Exists(Path.Combine(inst, Program.SetupAsset)))
+        {
+            var d = Path.GetFullPath(inst).TrimEnd('\\', '/');
+            var own = string.Equals(Path.GetFileName(d), "Triforce", StringComparison.OrdinalIgnoreCase);
+            var line = "/c timeout /t 2 /nobreak >nul";
+            foreach (var f in new[] { "TriforceSetup*.exe", "TriforceSetup*.exe.*", "setup.log", "setup.log.*" })
+                line += " & del /f /q \"" + Path.Combine(d, f) + "\" 2>nul";
+            if (own)
+                foreach (var f in new[] { "tools", "downloads", "ngx-sdk" }) line += " & rmdir /s /q \"" + Path.Combine(d, f) + "\" 2>nul";
+            Process.Start(new ProcessStartInfo("cmd.exe", line + " & rmdir \"" + d + "\" 2>nul")
             { CreateNoWindow = true, UseShellExecute = false, WorkingDirectory = Path.GetTempPath() });
+        }
         if (!quiet) MessageBox.Show("Triforce has been removed.", "Uninstall Triforce", MessageBoxButton.OK, MessageBoxImage.Information);
         return true;
     }
@@ -774,7 +785,12 @@ sealed class Runner
                 process = p;
                 p.ErrorDataReceived += (_, e) => { if (e.Data != null) Line?.Invoke(e.Data); };
                 p.BeginErrorReadLine();
-                try { p.PriorityClass = ProcessPriorityClass.BelowNormal; } catch (Exception) { }
+                // (Triforce, 11-22, the performance audit's OS-57, after Source A's) The build tools run at normal priority;
+                // below normal, as every build and update was before, only with HOOKSHOT_LOW_PRIORITY=1. Source A's reason,
+                // a report it did not measure: below normal, Windows kept the steps that are one process (the read, the
+                // lift) on a hybrid Intel CPU's efficiency cores while the performance cores idled.
+                if (Environment.GetEnvironmentVariable("HOOKSHOT_LOW_PRIORITY") == "1")
+                    try { p.PriorityClass = ProcessPriorityClass.BelowNormal; } catch (Exception) { }
                 for (string? line; (line = p.StandardOutput.ReadLine()) != null;)
                 {
                     if (line.StartsWith("@@error ")) error = line.Substring(8);

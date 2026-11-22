@@ -39,6 +39,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # (python -I leaves the script folder off)
 import kit
+import cold_parts
 import lifted_c
 import rtgen
 import logo_rgba
@@ -58,6 +59,26 @@ HOST_ZSTD_SOURCES = ("common/debug.c", "common/entropy_common.c", "common/error_
 OBJ_CACHE = os.path.join(kit.WORK, "objcache")
 # (hookshot) work/hot_order.txt: the functions that run, hottest first (sampled), packed together by the linker; RX_NO_ORDER=1: off
 PGO = os.environ.get("RX_PGO", "")
+# ((Triforce, 11-21, the performance audit's LIFT-10, after Source A's) RX_VK_PGO: the renderer's own code (gpu/vk/*.cpp, not
+# the vendored recompiler, ImGui or zstd) with a play profile. The back end runs the replay on the game's render thread, and
+# was built at plain -O2 whatever it does most. "gen": it counts its branches (host/pgo_rt.c in the DLL, RX_VK_PGO_FILE=<path>
+# in the run: <path>.reset clears the counters, <path>.dump writes them to <path>; llvm-profdata merge makes the profile).
+# <file>: built with that profile. Not set, empty or 0: neither, as before (nx2/make_game.py passes a shipped profile).
+VK_PGO = os.environ.get("RX_VK_PGO", "")
+
+
+def vk_pgo_flags(asked=None):
+    """The flags RX_VK_PGO adds to the renderer's own files. asked: its value (the environment's when not given)"""
+    asked = VK_PGO if asked is None else asked
+    if asked in ("", "0"):
+        return []
+    if asked == "gen":
+        return ["-fprofile-instr-generate", "-mllvm", "-disable-vp=true"]
+    # (the profile's contents in the flags the object key hashes, as the hot code's: its path names no key, flag_text)
+    with open(asked, "rb") as f:
+        sha = hashlib.sha1(f.read(), usedforsecurity=False).hexdigest()[:16]
+    return ["-fprofile-instr-use=" + asked, "-DTRIFORCE_VK_PROFILE_SHA1=" + sha, "-Wno-profile-instr-out-of-date",
+            "-Wno-profile-instr-unprofiled"]
 
 
 # (linux) Linux builds: an ELF executable and triforce_vk.so, the Win32 calls of host/ and gpu/vk on POSIX
@@ -69,6 +90,18 @@ POSIX = os.path.join(kit.HERE, "..", "host", "posix")
 SYSROOT = os.environ.get("HOOKSHOT_SYSROOT", "")
 EXE = "triforce" if LINUX else "Triforce.exe"
 VK_LIB = "triforce_vk.so" if LINUX else "triforce_vk.dll"
+
+
+def repro_link(asked=None, linux=None):
+    """(Triforce, 11-22, the performance audit's IO-45, after Source A's) What HOOKSHOT_LINK_REPRO=1 adds to the Windows
+    links of the game's exe and of the renderer: /Brepro, with which lld writes a hash of the file where it otherwise
+    writes the time of the link, so that two links of the same objects are the same bytes and make_game.py's finish can
+    pass the unchanged exe over (INSTALLED_NOTE there). Off unless asked: it changes the bytes of every linked file once.
+    asked: the switch's value (the environment's when not given)"""
+    asked = os.environ.get("HOOKSHOT_LINK_REPRO", "") if asked is None else asked
+    if asked != "1" or (LINUX if linux is None else linux):
+        return []
+    return [toolchain.link_opt("/Brepro")]
 
 
 def check_vk_symbols(so):
@@ -666,7 +699,8 @@ def mem_need(src):
         with open(src, "rb") as f:
             text = f.read()
         # (each function from the newline before its definition, as this was first measured)
-        starts = [m.start() - 1 for m in lifted_c.HEAD_BYTES.finditer(text)] + [len(text)]
+        # ((Triforce, 11-22, the performance audit's IO-40) lifted_c.definitions: HEAD_BYTES's matches, found by jumps)
+        starts = [m.start() - 1 for m in lifted_c.definitions(text)] + [len(text)]
         sizes = [b - a for a, b in zip(starts, starts[1:])]
         giant = GIANT_MB * sum((s / (1 << 20)) ** 2 for s in sizes if s >= GIANT_BYTES) if giants_counted() else 0
         if name.startswith("code_hot"):
@@ -674,6 +708,11 @@ def mem_need(src):
         largest = max(sizes or [0])
         return int(max(400 + 50 * len(text) / (1 << 20) + 250 * largest / (1 << 20), 300 + 50 * len(text) / (1 << 20) + giant))
     return 1000 if src.endswith(".cpp") else 400
+
+
+class CompileStopped(Exception):
+    """((Triforce, 11-21, the performance audit's LIFT-31) The build is stopping: a compile that waited at the memory gate
+    is not started (MemoryGate.stop)"""
 
 
 class MemoryGate:
@@ -684,10 +723,15 @@ class MemoryGate:
     on Windows up to 4 (half the threads on smaller CPUs) always run, as Windows pages rather than fails (issues 502, 503, 511: 1-2
     compilers on 16 GB PCs took hours); on Linux one (issue 531: Linux stops a compiler that does not fit, and it is compiled again
     alone). The free memory is read again as compiles start and end, so a game or browser opened during the build makes later
-    compiles wait"""
+    compiles wait
+
+    (Triforce, 11-21, the performance audit's LIFT-31, after Source A's) stop(): the build is ending on an exception. The
+    pool's workers, one a CPU thread, wait here, and a compile that has left the pool's queue cannot be cancelled there:
+    one that waits, or comes after, raises CompileStopped and takes no lease"""
 
     def __init__(self):
         self.cv = threading.Condition()
+        self.stopped = False
         self.running = {}   # (per-compile lease: [need, Popen or None]; one source can have several objects)
         self.reserve = float(os.environ.get("HOOKSHOT_MEM_RESERVE_GB") or 1.5) * 1024
         self.floor = max(1, min(4, (os.cpu_count() or 2) // 2)) if os.name == "nt" else 1
@@ -695,7 +739,7 @@ class MemoryGate:
     def enter(self, src):
         need = mem_need(src)
         with self.cv:
-            while len(self.running) >= self.floor:
+            while not self.stopped and len(self.running) >= self.floor:
                 free = free_mb()
                 if free is None:
                     break
@@ -703,9 +747,16 @@ class MemoryGate:
                 if free - owed - self.reserve >= need:
                     break
                 self.cv.wait(1.0)
+            if self.stopped:
+                raise CompileStopped(src)
             lease = object()
             self.running[lease] = [need, None]
             return lease
+
+    def stop(self):
+        with self.cv:
+            self.stopped = True
+            self.cv.notify_all()
 
     def started(self, lease, proc):
         with self.cv:
@@ -830,6 +881,10 @@ def flag_text(fl):
             continue
         if f.startswith("--sysroot="):
             f = "--sysroot=<sysroot>"
+        elif VK_PGO not in ("", "0", "gen") and f == "-fprofile-instr-use=" + VK_PGO:
+            # ((Triforce, 11-21, LIFT-10) the renderer's profile by its contents (TRIFORCE_VK_PROFILE_SHA1, beside it), not by
+            # where it is: another work folder's copy of the same profile is no new key)
+            f = "-fprofile-instr-use=<vk profile>"
         else:
             f = f.replace(kit.ROOT, "<root>")
         kept.append(f)
@@ -1075,6 +1130,14 @@ def main():
         srcs = []
     if a.dry_run:   # (the lift's files: there is no game here)
         srcs = [s for s in srcs if os.path.dirname(s) != gen]
+    # ((Triforce, 11-22, the performance audit's LIFT-17, after Source A's) RX_COLD_OPT=O2, or a file that lists chunks: those
+    # lifted chunks at -O2 too (never the hot pieces), each compiled as parts of RX_COLD_PART_MB under <build>/split in place
+    # of the chunk (nx2/cold_parts.py). Unset: srcs as they are, and no file takes cold_fl below
+    cold_stats = {}
+    srcs, cold = cold_parts.expand(srcs, os.path.join(out, "split"), os.environ, stats=cold_stats)
+    if cold:
+        print("RX_COLD_OPT: %d files at -O2 (parts of %d MB; %d chunks cut again, %d kept as cut before)" % (
+            len(cold), cold_parts.part_bytes(os.environ) >> 20, cold_stats.get("written", 0), cold_stats.get("kept", 0)), flush=True)
     # the longest first, so the long ones do not end up alone at the end (compile_cost)
     costs = chunk_costs(gen)
     srcs.sort(key=lambda s: -compile_cost(s, costs))
@@ -1099,8 +1162,9 @@ def main():
         # new profile kept the hot code built from the old one)
         with open(PGO, "rb") as f:
             hot_fl = hot_fl + ["-fprofile-instr-use=" + PGO, "-DHOOKSHOT_PROFILE_SHA1=" + hashlib.sha1(f.read(), usedforsecurity=False).hexdigest()[:16]]
+    cold_fl = cold_parts.cold_flags(fl, a.opt, os.environ) if cold else fl   # ((Triforce, LIFT-17) -O2 and the part size)
     jobs = [(cc, s, os.path.join(obj_dir, os.path.basename(s)[:-2] + ".o"),
-             hot_fl if os.path.basename(s).startswith("code_hot") else fl,
+             hot_fl if os.path.basename(s).startswith("code_hot") else cold_fl if s in cold else fl,
              shim_deps if os.path.dirname(s) == NX2_RT else deps) for s in srcs]
     # (issue 624) what the game code's object keys are made of, as short fingerprints: two builds' logs side by side say which part
     # changed when an update compiled everything again (the headers, the flags, the profile, or the lifted code itself)
@@ -1213,7 +1277,10 @@ def main():
             # (what the code takes for granted, which newer C++ libraries bring in by themselves and older ones do not: issue 48)
             "-include", "algorithm", "-include", "cstdio", "-include", "cstdlib", "-include", "cstring", "-include", "functional",
             "-include", "string", "-include", "vector",
-            "-std=c++20", "-O2", "-g0", "-DNDEBUG", "-Wno-everything", "-DVK_NO_PROTOTYPES", "-DMKWVK_BUILDING",
+            # ((Triforce, 11-21) HOOKSHOT_VK_LINES=1: a line table in the renderer (the same code, DWARF lines only) for a profile's
+            # exact functions, inlined ones too, through llvm-symbolizer: the linker map lacks the file-local functions)
+            "-std=c++20", "-O2", "-gline-tables-only" if os.environ.get("HOOKSHOT_VK_LINES") == "1" else "-g0", "-DNDEBUG",
+            "-Wno-everything", "-DVK_NO_PROTOTYPES", "-DMKWVK_BUILDING",
             *(["-DHOOKSHOT_RELEASE"] if os.environ.get("RX_RELEASE") == "1" else []),   # (the shaders precompiled before the game)
             # (Eden's recompiler before suyu's root: suyu has its own shader_recompiler/ headers, and a Shader::Info
             # of the other layout in some objects is what crashed the descriptor walk. MKWVK_INCLUDES changes the
@@ -1285,11 +1352,16 @@ def main():
         # (the bundled fonts, compiled in: nx2/ui_fonts.py's file of the build's own)
         vk_jobs.append((cxx, fonts_cpp, os.path.join(obj_dir, "vk_ui_fonts.o"), target() + (["-fPIC"] if LINUX else []) + ["-O0", "-g0", "-w"],
                         b""))
+        vk_pgo = vk_pgo_flags()   # ((Triforce, 11-21, LIFT-10) the renderer's own files alone)
+        if VK_PGO == "gen" and not LINUX:   # (what writes the counters, the DLL's own copy: host/pgo_rt.c)
+            vk_jobs.append((cc, os.path.join(HOST, "pgo_rt.c"), os.path.join(obj_dir, "vk_pgo_rt.o"),
+                            target() + ["-O2", "-g0", '-DPGO_ENV="RX_VK_PGO_FILE"'], b""))
         for src in vk_sources():
             name = os.path.relpath(src, vk).replace(os.sep, "_")[:-4]
             lib = os.path.relpath(src, vk).split(os.sep)[0] in ("eden", "sirit")
             vk_jobs.append((cxx, src, os.path.join(obj_dir, "vk_" + name + ".o"),
-                            vflags + ([shader_stamp, translation_def] if os.path.basename(src) == "vk_shader.cpp" else []) +
+                            vflags + ([] if lib else vk_pgo) +
+                            ([shader_stamp, translation_def] if os.path.basename(src) == "vk_shader.cpp" else []) +
                             ([stamp_def] if os.path.basename(src) == "vk_menu.cpp" else []) +
                             (ngx_flags if os.path.basename(src) == "vk_dlss.cpp" else []) +
                             (sl_flags if os.path.basename(src) == "vk_dlssg.cpp" else []) +
@@ -1351,21 +1423,33 @@ def main():
     with concurrent.futures.ThreadPoolExecutor(a.jobs) as ex:
         # (as each ends, not in order: the builder app shows progress from these lines, and the biggest file comes first)
         submitted = {ex.submit(compile_one, job): job for job in jobs}
-        for future in concurrent.futures.as_completed(submitted):
-            src, secs, err = future.result()
-            size = os.path.getsize(src) >> 20
-            if err:
-                failed.append(submitted[future])
-                print("not compiled yet: %s (%d MB, %.0fs), tried again alone at the end:\n%s"
-                      % (os.path.basename(src), size, secs, err[-1500:]), flush=True)
-            else:
-                print("  %-16s %4d MB  %6.0fs  (%.0fs)" % (os.path.basename(src), size, secs, time.time() - t0), flush=True)
-            if counted:
-                print("@@file %s %.1f %s" % (os.path.basename(src), secs,
-                                             "failed" if err else "cached" if secs <= 0 else "new"), flush=True)
-                if not err and expected.get(src):
-                    pending.remove(expected[src].pop())
-                    print("@@eta %d" % eta_left(pending, eta_jobs), flush=True)
+        try:
+            for future in concurrent.futures.as_completed(submitted):
+                src, secs, err = future.result()
+                size = os.path.getsize(src) >> 20
+                if err:
+                    failed.append(submitted[future])
+                    print("not compiled yet: %s (%d MB, %.0fs), tried again alone at the end:\n%s"
+                          % (os.path.basename(src), size, secs, err[-1500:]), flush=True)
+                else:
+                    print("  %-16s %4d MB  %6.0fs  (%.0fs)" % (os.path.basename(src), size, secs, time.time() - t0), flush=True)
+                if counted:
+                    print("@@file %s %.1f %s" % (os.path.basename(src), secs,
+                                                 "failed" if err else "cached" if secs <= 0 else "new"), flush=True)
+                    if not err and expected.get(src):
+                        pending.remove(expected[src].pop())
+                        print("@@eta %d" % eta_left(pending, eta_jobs), flush=True)
+        except BaseException:
+            # ((Triforce, 11-21, the performance audit's LIFT-31, after Source A's) A compiler's error comes back as a value and
+            # is tried again alone. An exception does not: a compiler that is missing or blocked, an object or its stamp that
+            # cannot be written, a full disk in cache_put, a file gone before its size is asked, Ctrl-C. It leaves this block,
+            # and the pool's exit then ran every compile still queued first, the whole compile with nothing said, before the
+            # build stopped; and make_game deletes those objects, as no "compiled in" line follows. So: the queued ones are
+            # cancelled, and those waiting at the memory gate are told to go (MemoryGate.stop); the compilers running end)
+            if GATE:
+                GATE.stop()
+            ex.shutdown(wait=False, cancel_futures=True)
+            raise
     # (a compiler that ran out of memory beside the others dies "due to signal": a player's 24 MB code_021.c, 2026-11-08. The
     # files that failed are compiled again one at a time, with all the memory, before the build gives up)
     still = 0
@@ -1421,6 +1505,7 @@ def main():
         t = time.time()
         r = subprocess.run([cc] + toolchain.native_target() + toolchain.native_link() +
                            ["-o", exe, toolchain.link_opt("/map:" + exe[:-4] + ".map"), toolchain.link_opt("/stack:8388608"), "@" + rsp] + HOT_ORDER() + HOST_LIBS +
+                           repro_link() +   # ((Triforce, 11-22, IO-45) HOOKSHOT_LINK_REPRO=1: no link time in the file)
                            ([toolchain.link_opt("/nodefaultlib:clang_rt.profile.lib")] if PGO == "gen" else []) +
                            ([os.path.join(kit.WORK, "hookshot.res")] if os.path.exists(os.path.join(kit.WORK, "hookshot.res")) else []) +   # (nx2/make_icon.py)
                            [win_manifest.write(os.path.join(out, "hookshot_manifest.res"))] +   # (UTF-8 paths: nx2/win_manifest.py)
@@ -1475,7 +1560,7 @@ def main():
                 ([ngx_library(NGX_SDK, True)] if NGX_SDK else []) + ["-ldl", "-lpthread", "-lm"]
         else:   # (Triforce: advapi32 for RivaTuner Statistics Server's folder in the registry, gpu/vk/rtss_sys_win.cpp)
             link = [cc] + toolchain.native_target() + toolchain.native_link() + \
-                ["-shared", "-o", vdll, toolchain.link_opt("/map:" + vdll[:-4] + ".map"), "@" + vrsp, "-luser32", "-ladvapi32"] +               (["-lc++", "-lunwind"] if toolchain.mingw() else []) + ngx_link(NGX_SDK, toolchain.mingw())
+                ["-shared", "-o", vdll, toolchain.link_opt("/map:" + vdll[:-4] + ".map"), "@" + vrsp, "-luser32", "-ladvapi32"] +               (["-lc++", "-lunwind"] if toolchain.mingw() else []) + ngx_link(NGX_SDK, toolchain.mingw()) + repro_link()
         r = subprocess.run(link, capture_output=True, text=True)
         if r.returncode:
             undefined = sorted({l.strip() for l in (r.stdout + r.stderr).splitlines() if "undefined symbol" in l})

@@ -12,6 +12,7 @@
 #include "vk_api.h"
 #include "vk_vendor.h"
 #include "write_gen.h"   // (WriteGen: a page write generation, 64 bits)
+#include "memory_priority.h"   // ((Triforce, 11-22, TEX-47) RX_VK_MEMORY_PRIORITY's tiers
 
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
 #include <intrin.h>
@@ -55,6 +56,7 @@ struct Device {
          graphics_pipeline_library = false, custom_border_color = false, dynamic_state3 = false,
          depth_clip_control = false, null_descriptor = false, index_uint8 = false, push_descriptor = false,
          conditional_rendering = false, provoking_vertex = false, vertex_divisor = false, stencil_export = false, memory_budget = false,
+         memory_priority = false,   // ((Triforce, 11-22, TEX-47) VK_EXT_memory_priority and its feature, asked for with RX_VK_MEMORY_PRIORITY alone
          checkpoints = false,   // (RX_VK_CHECKPOINTS: VK_NV_device_diagnostic_checkpoints)
          buffer_marker = false, // (RX_VK_CHECKPOINTS=1 without the NV extension: VK_AMD_buffer_marker, AMD and Intel)
          device_fault = false,  // (VK_EXT_device_fault: what a lost device faulted on)
@@ -79,6 +81,7 @@ struct Device {
     VkShaderStageFlags sg32_stages = 0;   // (stages that run at 32 lanes when asked: the size the translated programs assume)
     uint32_t subgroup_size = 32, subgroup_max = 32;   // (the lanes a stage not pinned runs at, and the most it can have)
     VkDriverId driver_id{};
+    bool radv_gcn = false;   // ((Triforce, 11-22, MEM-23) RADV on a GCN 1 to 4 GPU: vk_vendor.h radv_gcn, set in create_device)
     VendorFixes fixes{};   // (hookshot) the vendor and driver workarounds this device needs (vk_vendor.h; vk_main.cpp create_device)
     uint32_t max_push_descriptors = 0;
     // no window (HOS_HEADLESS): presents go to an image of their own, which RX_VK_SHOTS can write out
@@ -95,6 +98,7 @@ struct Device {
     std::vector<VkSemaphore> swap_rendered;   // present waits belong to acquired images, not frame slots
     std::mutex present_mu;   // (the swapchain: presents and resizes)
     std::atomic<uint64_t> swap_resize{0};   // (a new window size, width << 32 | height: the next present makes the swapchain)
+    uint64_t swap_generation = 0;   // ((Triforce) one more for each swapchain made: an image present_image holds belongs to one)
     // (hookshot) a queue of a compute family for vkQueuePresentKHR alone (vk_main.cpp create_device; RX_VK_PRESENT_QUEUE=0 / 1).
     // VK_NULL_HANDLE: presents go on `queue` under present_mu. Its own lock: taken after present_mu, never before it
     VkQueue present_queue = VK_NULL_HANDLE;
@@ -129,6 +133,14 @@ bool pools_mirrored();   // ((Triforce, upstream #2464) vk_memory.cpp mirror_on:
 void memory_ram_watch(uint64_t presents);
 bool memory_ram_low();                       // (under 3 GB available, or a tenth of a PC of more than 30 GB)
 bool memory_ram_short();                     // (under 1.5 GB available at two looks in a row)
+// ((Triforce, 11-22, the performance audit's MEM-141) the swap-aware pressure hold (vk_memory.cpp, linux_pressure.h; off unless
+// RX_VK_SWAP_RESERVE_MB is set, never on Windows): whether it is on, the cut of an integrated GPU's texture budget, the bytes
+// a valve gave (1: staging arenas, 2: capture spares; the imports count themselves), and the imports' limit for the episode
+bool memory_swap_hold();
+uint64_t memory_swap_cut();
+void memory_swap_valve(int valve, uint64_t bytes);
+uint64_t memory_swap_episode_want();
+void memory_swap_gave(uint64_t bytes);
 bool memory_ram_fits(uint64_t bytes);        // (a copy of that many bytes fits in the RAM available, with 2 GB to spare)
 bool memory_ram_fits_now(uint64_t bytes);    // ((Triforce) the same with the RAM looked at now: the preparation's checkpoints)
 void memory_process(uint64_t* working_set, uint64_t* private_bytes);   // (the process's, asked now; 0 when not known)
@@ -287,6 +299,10 @@ bool create_buffer_cached(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buf
                           void** mapped, bool dedicated = false);   // (vk_vma.cpp: cached host memory, mapped)
 void flush_mapped(VmaAllocation allocation, uint64_t size);
 bool host_cached(VmaAllocation allocation);   // (its memory type has VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
+// ((Triforce, 11-22, MEM-39) vk_vma.cpp: the lab's capture buffer in uncached host memory; an allocation's memory type)
+bool create_buffer_uncached(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buffer, VmaAllocation& allocation,
+                            void** mapped, bool dedicated = false);
+uint32_t alloc_memory_type(VmaAllocation allocation, VkMemoryPropertyFlags* flags);
 void flush_mapped_range(VmaAllocation allocation, uint64_t offset, uint64_t size);
 void invalidate_mapped(VmaAllocation allocation, uint64_t size);   // (the CPU is to read what the GPU wrote: a no-op in coherent memory)
 void memory_stamp_gpu(uint64_t guest, uint64_t size);   // (a GPU write: memory_stamp, and the pages noted)
@@ -305,6 +321,8 @@ void memory_drop_shadow(uint64_t guest, uint64_t size);   // (a write the captur
 /// (EvilBoyce) the newest submission value whose write-back reaches into [guest, guest + size) (0: none ever); *ever set
 /// when any write-back ever did
 uint64_t memory_writeback_value(uint64_t guest, uint64_t size, bool* ever);
+/// ((Triforce, THREAD-25) page_marks.h, no lock) false: no write-back ever reached a page of the range: *ever above is false
+bool memory_writeback_marked(uint64_t guest, uint64_t size);
 void memory_note_readback(uint64_t guest, uint64_t size);   // (PR 430) a CPU read of GPU results: see memory_rb_refresh
 /// (Triforce) around the write of an NVN event's word by a command buffer's signal: its write-back is not one the captures of
 /// its page wait for (vk_memory.cpp). This thread's bindings while on
@@ -317,6 +335,9 @@ void memory_note_gpu_write(uint64_t gpu, uint64_t size);
 /// (vk_replay.cpp) The GPU's progress on the recordings' timeline, and a wait for it to reach v
 uint64_t vk_timeline_completed();
 void vk_timeline_wait(uint64_t v);
+/// ((Triforce, 11-22, the performance audit's SYNC-122) the same wait for a caller other than a capture's take: who is
+/// wb_rec_wait.h's Caller (1 a read of a page put off, 2 a binding of one); its held part is counted under it
+void vk_timeline_wait_from(uint64_t v, int who);
 // ((Triforce) RX_VK_LATE_QUEUE: the highest timeline value on the queue; a wait for a sent one (no flush; false: not reached in 1 s);
 // the late pages' fixes applied (dev.present_mu held; queue_flush_locked does it first); vk_memory.cpp's side
 uint64_t vk_timeline_signal_sent();
@@ -328,6 +349,7 @@ void memory_late_fix_apply(uint64_t done);
 /// ((Triforce, wp20) of this thread's last vk_timeline_wait, the part after the writer's recording was done (ns): wb_rec_wait.h)
 int64_t vk_timeline_wait_held_last();
 WriteGen memory_generation();
+WriteGen memory_generation_any_thread();   // ((Triforce, 11-22, MEM-85) the same, read with an atomic load: from a thread that makes none)
 uintptr_t memory_stamp_who(uint64_t guest, WriteGen* gen, uintptr_t* anchor);   // (RX_VK_STAMP_SRC: who wrote that page last)
 /// 1: a page of [guest, guest + size) was written after generation gen; 0: none was
 bool memory_written_since(uint64_t guest, uint64_t size, WriteGen gen);
@@ -353,7 +375,12 @@ bool has_stencil(VkFormat f);
 
 // device memory (vk_vma.cpp, Vulkan Memory Allocator)
 bool vma_init(PFN_vkGetInstanceProcAddr gipa);
+/// ((Triforce, 11-22, the performance audit's TEX-47, after Source A's) RX_VK_MEMORY_PRIORITY's tiers where the device has
+/// VK_EXT_memory_priority (dev.memory_priority), else none: memory_priority.h. First asked once the device is made
+const memory_priority::Tiers& memory_tiers();
 extern uint64_t test_card_ballast;   // (vk_vma.cpp, RX_VK_TEST_CARD_MB: 0 outside that lab test)
+/// (vk_memory.cpp) The card's video memory in bytes: its largest device-local heap, less RX_VK_TEST_CARD_MB's ballast
+uint64_t device_vram_bytes();
 void vma_blocks_ahead_check();   // (vk_vma.cpp: the blocks made ahead given back while VRAM is short; every 600 presents)
 /// (textures: from the textures' own pool, the one image_compact_* moves allocations in: vk_texture.cpp's compaction)
 bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated = false, bool target = false,
@@ -418,9 +445,19 @@ void vma_log_image_blocks();   // (the image pools' blocks: what they hold, and 
 PFN_vkGetInstanceProcAddr instance_proc();   // vk_main.cpp
 
 bool create_swapchain(uint32_t width, uint32_t height);
+/// (Triforce, 11-22, the performance audit's PRESENT-45, after Source A's; vk_main.cpp, surface_lost.h) A result of an
+/// acquire, a present or a swapchain's creation is a lost surface that is recovered from: VK_ERROR_SURFACE_LOST_KHR, with
+/// RX_VK_SURFACE_RECOVER on (unless =0) and no DLSS frame generation
+bool surface_recover(VkResult result);
+/// ...and what hangs on the lost surface let go, the surface last (dev.present_mu held; no present in hand on the present
+/// thread): the next create_swapchain makes a surface for the window again
+void invalidate_lost_surface();
 bool replay_start();                          // vk_replay.cpp
 bool precompile_wanted();                     // vk_draw.cpp
 void precompile_run(void (*progress)(size_t done, size_t total));
+void texture_pipelines_unprepared();         // ((Triforce) vk_draw.cpp: no precompile: the cache read, the converters made)
+VkResult shared_cache_compute(const VkComputePipelineCreateInfo* ci, VkPipeline* out);   // (vk_draw.cpp: through that cache)
+void texture_pipelines_warm();                // ((Triforce) vk_texture.cpp: the texture converters' pipelines, before the game)
 bool prepare_run(void (*progress)(size_t done, size_t total), bool background);
 bool pcache_carry_rebuild();   // ((Triforce) after prepare_run: the carried pipeline cache over its cap, a fresh one: pcache_carry.h)
 void pcache_carry_done();      // ((Triforce) the preparation gone through and saved: a carried history no longer open: pcache_carry.h)
@@ -435,6 +472,9 @@ void predict_run(void (*progress)(size_t done, size_t total));   // (after a pre
 /// what is done kept (the program cache, the driver's) and not counted as a start that ended inside them
 void prepare_stop();
 bool prepare_stopped();
+/// ((Triforce, 11-22, PIPE-23) Whether this start only prepares the shaders and plays no game (vk_main.cpp prepare_only): its
+/// end saves the pipeline cache itself, so the precompile's end leaves that to it (vk_draw.cpp precompile_end_save)
+bool prepare_only_start();
 /// What prepare_run is doing, for the start-up screen: 0 the shaders translated, 1 the graphics driver's part of them
 int prepare_pass();
 /// Whether prepare_run has that second pass at all here (off unless the stage libraries are switched on): the screen's steps

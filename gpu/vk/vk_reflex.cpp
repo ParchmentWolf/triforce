@@ -297,7 +297,11 @@ bool sleep_now() {
     }
     VkSemaphoreWaitInfo w{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
     w.semaphoreCount = 1, w.pSemaphores = &r.wake, w.pValues = &value;
-    vkWaitSemaphores(dev.device, &w, 100000000ull);   // (100 ms at most: a driver that never wakes it does not stop the game)
+    {
+        // ((Triforce, 11-22, SYNC-27) the driver's sleep for latency is pacing, not a wait for the GPU's work: not counted)
+        const ::gpu_wait_kinds::Exclude pacing;
+        vkWaitSemaphores(dev.device, &w, 100000000ull);   // (100 ms at most: a driver that never wakes it does not stop the game)
+    }
     std::lock_guard lk(r.mu);
     if (!on() || generation != r.swapchain_generation || value != r.wake_value) return true;
     mark(VK_LATENCY_MARKER_SIMULATION_START_NV);

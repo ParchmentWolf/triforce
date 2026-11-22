@@ -64,8 +64,8 @@ static bool all_done(int seconds) {
 }
 
 static void case_until() {
-    CHECK(helper_spin::bound_ns(nullptr) == 100000);
-    CHECK(helper_spin::bound_ns("") == 100000);
+    CHECK(helper_spin::bound_ns(nullptr) == 20000);
+    CHECK(helper_spin::bound_ns("") == 20000);
     CHECK(helper_spin::bound_ns("0") == 0);
     CHECK(helper_spin::bound_ns("-5") == 0);
     CHECK(helper_spin::bound_ns("250") == 250000);

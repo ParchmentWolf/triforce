@@ -253,6 +253,40 @@ F8 to one of the controls yourself, the key stays the game's and the row takes t
 
 <p align="center"><img src="assets/readme/divider.svg" alt="" width="100%"></p>
 
+## <img src="assets/readme/gold.svg" alt="" width="26"> Achievements
+
+*On by default.* `HOS_ACHIEVEMENTS=0` in `triforce_env.txt` beside the game turns them off. Things you do in the game are marked as earned, as a console's or a store's achievements are: a notice at the
+top of the screen shows the one you earned, with its icon and a sound at the **Menu sounds** row's volume.
+
+- **The list:** **Achievements** on the System tab of the Options opens a page with every achievement, its icon, the
+  line about it, and whether and when you earned it. Left, Right, Up and Down move; **L** and **R** turn the page.
+
+- **25 come with Triforce:** the Spiritual Stones, the Master Sword, each medallion, the songs, Gold Skulltula tokens
+  and a few items. They are earned by what Link carries, read from the save data once a second while a save is loaded.
+  Nothing in the game or the save is changed.
+- **Earned once, for the game folder:** `triforce_achievements.txt` beside the game keeps them, with the time. Loading
+  an older save takes none away; delete the file to start over. `triforce_log.txt` has a line for each one earned.
+- **Your own:** a file `achievements.txt` beside the game adds more, read at the start:
+
+  ```
+  [Name of the achievement]
+  about: A line about it.
+  icon: gem blue
+  item Item_Token_Gold 30
+  flag <a flag's name>
+  ```
+
+  A name of up to 40 characters, and 1 to 16 conditions that must all hold: `item <name> [<how many>]` (an item's
+  name as `gpu/vk/oot_cheat_items.h` lists it) or `flag <name>` (a name from the Debug tab's **Game flags** page). The icon is
+  drawn, not a picture file: a shape (`star`, `sword`, `gem`, `medal`, `note`, `token`, `shield`) and, if you like, a
+  colour (`gold`, `green`, `red`, `blue`, `purple`, `orange`, `yellow`, `silver`); without the line it is a gold star.
+  One that does not read is left out, and the log says how many.
+- The Debug tab's inventory and flag tools earn them too: they change the same save data.
+
+They are Triforce's own: Steam and Xbox do not see them.
+
+<p align="center"><img src="assets/readme/divider.svg" alt="" width="100%"></p>
+
 ## <img src="assets/readme/gold.svg" alt="" width="26"> If something goes wrong
 
 | What happens | What to try |

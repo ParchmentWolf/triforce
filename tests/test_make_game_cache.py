@@ -37,6 +37,8 @@ class NupCacheTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="hookshot-cache-test-")
         self.addCleanup(self.temporary.cleanup)
+        # (the performance audit's IO-47: main() locks its work folder; let go before the folder is deleted)
+        self.addCleanup(make_game.release_work)
         self.root = Path(self.temporary.name).resolve()
         self.out = self.root / "output"
         self.work = self.root / "work"
@@ -326,6 +328,103 @@ class RomfsCopyTests(unittest.TestCase):
                 with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
                     make_game.refuse_dump_links(src)
                 link.unlink()
+
+    # ---- (11-21, the performance audit's IO-41) the link check from the folders' listings, each folder made once ----
+
+    def test_the_link_check_asks_no_file_one_by_one(self):
+        with tempfile.TemporaryDirectory(prefix="hookshot-dump-listing-") as folder:
+            src = Path(folder) / "romfs"
+            (src / "Model" / "Deep" / "er").mkdir(parents=True)
+            for name in ("a.zs", "Model/b.zs", "Model/Deep/c.zs", "Model/Deep/er/d.zs"):
+                (src / name).write_bytes(b"game data")
+            with mock.patch.object(make_game.os, "lstat", side_effect=AssertionError("an os.lstat for one entry")), \
+                    mock.patch.object(make_game.os, "walk", side_effect=AssertionError("os.walk passes over what it cannot list")):
+                make_game.refuse_dump_links(src)
+            with mock.patch.dict(os.environ, {"HOOKSHOT_DUMP_LINKS_LSTAT": "1"}), \
+                    mock.patch.object(make_game.os, "lstat", side_effect=AssertionError("asked")):
+                with self.assertRaisesRegex(AssertionError, "asked"):   # (the switch: as before)
+                    make_game.refuse_dump_links(src)
+
+    def test_a_link_three_folders_down_is_refused(self):
+        with tempfile.TemporaryDirectory(prefix="hookshot-dump-deep-") as folder:
+            src, outside = Path(folder) / "romfs", Path(folder) / "outside"
+            deep = src / "Model" / "Deep" / "er"
+            deep.mkdir(parents=True)
+            outside.mkdir()
+            (outside / "secret").write_bytes(b"not the game's")
+            (deep / "d.zs").write_bytes(b"game data")
+            make_game.refuse_dump_links(src)
+            made = 0
+            try:
+                (deep / "link.zs").symlink_to(outside / "secret")
+                made += 1
+            except OSError:
+                pass
+            else:
+                with contextlib.redirect_stdout(io.StringIO()) as said, self.assertRaises(SystemExit):
+                    make_game.refuse_dump_links(src)
+                self.assertIn("contain a link", said.getvalue())
+                (deep / "link.zs").unlink()
+            if os.name == "nt":   # (a junction needs no privilege: a folder that is a reparse point)
+                import subprocess
+                junction = deep / "Junction"
+                if subprocess.run(["cmd", "/c", "mklink", "/J", str(junction), str(outside)], capture_output=True).returncode == 0:
+                    made += 1
+                    with contextlib.redirect_stdout(io.StringIO()) as said, self.assertRaises(SystemExit):
+                        make_game.refuse_dump_links(src)
+                    self.assertIn("contain a link", said.getvalue())
+                    self.assertIn("Junction", said.getvalue())
+                    os.rmdir(junction)
+            if not made:
+                self.skipTest("neither symbolic links nor junctions here")
+            make_game.refuse_dump_links(src)   # (with the links gone: plain again)
+
+    def test_a_folder_that_cannot_be_listed_stops_the_build(self):
+        with tempfile.TemporaryDirectory(prefix="hookshot-dump-unlisted-") as folder:
+            src = Path(folder) / "romfs"
+            (src / "Model" / "Locked").mkdir(parents=True)
+            (src / "Model" / "a.zs").write_bytes(b"game data")
+            real = os.scandir
+
+            def listing(path):
+                if os.path.basename(str(path)) == "Locked":
+                    raise PermissionError(errno.EACCES, "authored: access denied")
+                return real(path)
+            with mock.patch.object(make_game.os, "scandir", side_effect=listing), \
+                    contextlib.redirect_stdout(io.StringIO()) as said, self.assertRaises(SystemExit):
+                make_game.refuse_dump_links(src)
+            self.assertIn("Could not read the game files at", said.getvalue())
+            self.assertIn("Locked", said.getvalue())
+
+    def test_the_copy_makes_each_folder_once_and_asks_for_no_target(self):
+        with tempfile.TemporaryDirectory(prefix="hookshot-romfs-walk-") as folder:
+            src, dst = Path(folder) / "source", Path(folder) / "destination"
+            (src / "Model" / "Deep").mkdir(parents=True)
+            names = ["top.bin"] + ["Model/m%d.bin" % i for i in range(40)] + ["Model/Deep/d%d.bin" % i for i in range(40)]
+            for name in names:
+                (src / name).write_bytes(name.encode())
+            real_makedirs, made = os.makedirs, []
+
+            def makedirs(path, *a, **k):
+                made.append(os.path.normcase(str(path)))
+                return real_makedirs(path, *a, **k)
+            real_exists = os.path.exists
+
+            def exists(path):   # (os.makedirs asks about folders itself: only a file's target counts)
+                if str(path).endswith(".bin"):
+                    raise AssertionError("asked whether a target exists: " + str(path))
+                return real_exists(path)
+            with mock.patch.object(make_game.os, "makedirs", side_effect=makedirs), \
+                    mock.patch.object(make_game.os.path, "exists", side_effect=exists), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                make_game.link_or_copy(src, dst)
+            self.assertEqual(len(made), 3, "one makedirs a folder, not one a file: %r" % made)
+            self.assertEqual(len(set(made)), 3)
+            for name in names:   # (the top folder's files and the nested ones: the same file, not a copy)
+                self.assertTrue(os.path.samefile(src / name, dst / name), name)
+            with contextlib.redirect_stdout(io.StringIO()):
+                make_game.link_or_copy(src, dst)   # (again over what is there: every link says it exists, and is passed over)
+            self.assertEqual(sorted(p.name for p in dst.iterdir()), ["Model", "top.bin"])
 
 
 if __name__ == "__main__":

@@ -217,6 +217,23 @@ int main() {
     CHECK(keep_all_pipelines(32 * GB, 19121 * MB, 7696 * MB) && !keep_all_pipelines(32 * GB, 19121 * MB, own_for_keep(7696 * MB, 4874 * MB, false)));
     CHECK(keep_all_pipelines(32 * GB, 19121 * MB, own_for_keep(7696 * MB, 4874 * MB, true)));   // (AMD: as before)
     CHECK(keep_all_pipelines(64 * GB, 40 * GB, own_for_keep(6 * GB, 5 * GB, false)));   // (a 64 GB PC keeps all still)
+    // (11-22: the retired imports kept for good given back all the same past the heap's high mark, or for a minute after an
+    // import was refused for want of room)
+    CHECK(!retired_pressed(6000 * MB, 8000 * MB, 85, 100000, 0) && retired_pressed(6801 * MB, 8000 * MB, 85, 100000, 0));
+    CHECK(!retired_pressed(6800 * MB, 8000 * MB, 85, 100000, 0) && !retired_pressed(9 * GB, 0, 85, 100000, 0));
+    CHECK(!retired_pressed(9 * GB, 8 * GB, 0, 100000, 0));   // (no mark: the heap says nothing)
+    CHECK(retired_pressed(0, 0, 85, 100000, 100000 - 59999) && !retired_pressed(0, 0, 85, 100000, 100000 - 60000));
+    CHECK(retired_pressed(1 * GB, 8 * GB, 85, 100000, 99000) && !retired_pressed(1 * GB, 8 * GB, 85, 100000, 0));
+    // (11-22: every pipeline kept on a discrete GPU in a PC of under 20 GB while the game is told its mapped pages are used;
+    // the switches read as the host reads them)
+    CHECK(query_used_on(nullptr, nullptr, nullptr) && query_used_on("1", "5", nullptr) && query_used_on("00", nullptr, nullptr));
+    CHECK(!query_used_on("0", nullptr, nullptr) && !query_used_on(nullptr, "0", nullptr) && !query_used_on(nullptr, "", nullptr));
+    CHECK(query_used_on(nullptr, "0", "1") && !query_used_on(nullptr, "0", "0") && !query_used_on("0", "0", "2"));
+    CHECK(keep_all_small_pc(true, 15731 * MB, true) && !keep_all_small_pc(false, 15731 * MB, true));
+    CHECK(!keep_all_small_pc(true, 15731 * MB, false) && !keep_all_small_pc(true, 20 * GB, true) && !keep_all_small_pc(true, 0, true));
+    // (11-22: the capture's spares held to 32 MB on a small card or a PC of under 20 GB; a 16 GB PC reports ~15.7 GB)
+    CHECK(spare_capped(true, 64 * GB) && spare_capped(false, 15731 * MB) && spare_capped(false, 20 * GB - 1));
+    CHECK(!spare_capped(false, 20 * GB) && !spare_capped(false, 32 * GB) && !spare_capped(false, 0));
     // (the RAM's rules)
     CHECK(short_now(1535 * MB) && !short_now(1536 * MB) && short_now(0));
     CHECK(low_now(3 * GB - 1, 16 * GB) && !low_now(3 * GB, 16 * GB) && !low_now(3 * GB, 30 * GB));
@@ -266,6 +283,11 @@ def check_source():
         raise SystemExit("the precompile's keep goes by the PC's total RAM, not the RAM the game can have")
     if "mem_parts::own_for_keep(ws, cache_read, amd)" not in keep or "pcache_read_ws.load()" not in keep:
         raise SystemExit("the precompile's keep counts the pipeline cache's read as room for the pipelines")
+    small = "if (!e && mem_parts::keep_all_small_pc(discrete, ms.ullTotalPhys, query_on)) {"
+    if small not in keep or "VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU" not in keep or \
+            not keep.index("allowed < (6656ull << 20)") < keep.index(small) < keep.index("mem_parts::keep_all_pipelines("):
+        raise SystemExit("the precompile does not keep every pipeline on a discrete GPU in a PC of under 20 GB (after the card's "
+                         "rule, before the RAM's, and not with RX_VK_PRECOMPILE_KEEP=auto)")
     init = between(draw, "void pcache_init() {", "\n}\n")
     if "pcache_read_ws = ws1 > ws0 ? ws1 - ws0 : 0;" not in init:
         raise SystemExit("pcache_init does not record what the cache's read added to the working set")
@@ -275,6 +297,24 @@ def check_source():
     bg = between(draw, "void predict_background() {", "\n}\n")
     if "while (!prepare_stopped() && memory_ram_low()) Sleep(500);" not in bg:
         raise SystemExit("the builder behind the game does not rest while the RAM is low")
+    give = between(mem, "void retired_imports_give_back() {", "\n}\n")
+    if "mem_parts::retired_pressed(used, budget, high, now, refused)" not in give or "give_back = pressed;" not in give or \
+            "const bool pressed_back = keep && give_back && p.mstate == Pool::MIRROR_NONE" not in give or \
+            "if (keep && !retired_keep_set()) {" not in give:
+        raise SystemExit("the retired imports kept for good are not given back when the system heap is full or an import was "
+                         "refused (or RX_VK_KEEP_RETIRED=1 no longer keeps them always)")
+    refused = between(mem, "const VkResult allocated = vkAllocateMemory(dev.device, &ai, nullptr, &p.memory);", "return false;")
+    if "import_room_refused_ms.store(import_now_ms()" not in refused:
+        raise SystemExit("an import refused for want of room is not noted for the retired imports' give-back")
+    spare = between(mem, "uint64_t cap_spare_max() {", "\n}\n")
+    if "mem_parts::spare_capped(small_card, total)" not in spare or "ram_now(&avail, &total)" not in spare or \
+            spare.index('getenv("RX_VK_CAP_SPARE_MB")') > spare.index("ram_now("):
+        raise SystemExit("the capture's spares are not held to 32 MB on a PC short of RAM, or RX_VK_CAP_SPARE_MB no longer "
+                         "decides first")
+    imports = between(mem, "void imports_give_back() {", "\n}\n")
+    if 'static const bool ram_rule = getenv("RX_VK_IMPORT_RAM") && atoi(getenv("RX_VK_IMPORT_RAM")) != 0;' not in imports or \
+            "if (ram_rule && calls % 256 == 0) {" not in imports:
+        raise SystemExit("the imports' RAM trigger is on by default (it gave back every unbound import every ~20 s on 16 GB PCs)")
     dev_md = (ROOT / "docs/development.md").read_text(encoding="utf-8")
     for switch in ("`RX_VK_MEM_PARTS=0`", "`RX_VK_PCACHE_RAM=1`", "`RX_VK_PRECOMPILE_KEEP=1` or `0`"):
         if switch not in dev_md:

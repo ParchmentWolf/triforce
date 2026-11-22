@@ -15,8 +15,15 @@ And what follows from the die: the affinity a game thread gets (hos_x3d_thread_m
 with no die exactly what it was before), and the replay's core, which pick_reserved_core (cut out of hos_thread.c) takes
 from the die's cores: the die's last core, not the processor's.
 
+(Triforce, 11-22, the performance audit's THREAD-49, after Source A's.) Whether a core of the die is kept for the replay
+(hos_x3d_keep_replay_core, hos_x3d_reserved): with SMT off none is, so the game has all 8 of the die's cores; with SMT
+on one is, as before; HOS_RESERVE_CORE=1 and a replay on a thread of its own keep one, =0 keeps none. Run from the
+caches to the game threads' affinity on the made-up processors above and on this PC's kind (8 cores, 16 logical
+processors, one L3), where nothing may change.
+
 The source is read for what cannot run here: HOS_X3D=0 turns it off, the log says what was found, the reader passes the
-process's affinity and the group count, and the reserved core is chosen among the die's cores.
+process's affinity and the group count, the reserved core is chosen among the die's cores, and hos_reserved_cpus asks
+the rule with the switch's value and whether the replay has its own thread.
 
     python -I -B tests/test_x3d_placement.py [--cc gcc]
 """
@@ -79,6 +86,21 @@ static uint64_t reserved(uint64_t die) {
     for (int i = 0; i < ncores; i++)
         if (!die || (cores[i] & die)) m[n] = cores[i], c[n++] = classes[i];
     return pick_reserved_core(m, c, n);
+}
+/* ((Triforce, THREAD-49) the core hos_reserved_cpus keeps, from the caches on: the die, its last core, the rule. asked:
+   HOS_RESERVE_CORE, -1 not set; own: the replay on a thread of its own) */
+static uint64_t kept_die;
+static uint64_t kept(uint64_t allowed, int asked, int own) {
+    int n = 0;
+    kept_die = pick(allowed, 1);
+    for (int i = 0; i < ncores; i++)
+        if (!kept_die || (cores[i] & kept_die)) n++;
+    return hos_x3d_reserved(reserved(kept_die), kept_die, n, asked, own);
+}
+/* (and the affinity a game thread then gets) */
+static uint64_t game(uint64_t allowed, int asked, int own) {
+    const uint64_t r = kept(allowed, asked, own);
+    return hos_x3d_thread_mask(allowed, kept_die, r);
 }
 
 int main(void) {
@@ -191,6 +213,66 @@ int main(void) {
     CHECK(hos_x3d_thread_mask(0xFFFF, 0xFFFF0000ull, 0xC000) == 0x3FFF, "a die the process is not on: as with none");
     CHECK(hos_x3d_thread_mask(0xC0FF, 0xFF00, 0xC000) == 0xC000, "the die's processors all reserved: the die");
 
+    /* ---- (Triforce, THREAD-49) whether a core of the die is kept for the replay ---- */
+    CHECK(hos_x3d_keep_replay_core(0xFF, 8, -1, 0) == 0, "8 cores on 8 logical processors, not set: none kept");
+    CHECK(hos_x3d_keep_replay_core(0xFFFF, 8, -1, 0) == 1, "8 cores on 16 logical processors, not set: one kept, as before");
+    CHECK(hos_x3d_keep_replay_core(0xFF, 8, 1, 0) == 1 && hos_x3d_keep_replay_core(0xFFFF, 8, 1, 0) == 1, "asked for: kept");
+    CHECK(hos_x3d_keep_replay_core(0xFF, 8, 0, 0) == 0 && hos_x3d_keep_replay_core(0xFFFF, 8, 0, 0) == 0, "asked not to: none");
+    CHECK(hos_x3d_keep_replay_core(0xFFFF, 8, 0, 1) == 0, "asked not to, with the replay's own thread: none, as before");
+    CHECK(hos_x3d_keep_replay_core(0xFF, 8, -1, 1) == 1, "the replay on a thread of its own: kept, the thread is pinned there");
+    CHECK(hos_x3d_keep_replay_core(0, 8, -1, 0) == 1 && hos_x3d_keep_replay_core(0, 0, -1, 0) == 1, "no die: as before");
+    CHECK(hos_x3d_keep_replay_core(0xFF, 0, -1, 0) == 1, "the die's cores not counted: as before");
+    CHECK(hos_x3d_reserved(0x80, 0xFF, 8, -1, 0) == 0 && hos_x3d_reserved(0x80, 0xFF, 8, 1, 0) == 0x80, "the kept core, or none");
+
+    /* a two-die X3D with SMT off (16 logical processors): none kept, a game thread has the whole die */
+    fresh();
+    add_cores(16, 1, 0, MB(1), 0);
+    add_l3(0xFF, MB(96)), add_l3(0xFF00, MB(32));
+    CHECK(kept(0xFFFF, -1, 0) == 0 && kept_die == 0xFF, "SMT off: no core of the die kept");
+    CHECK(game(0xFFFF, -1, 0) == 0xFF, "a game thread there: all 8 of the die's cores");
+    CHECK(kept(0xFFFF, 1, 0) == 0x80 && game(0xFFFF, 1, 0) == 0x7F, "HOS_RESERVE_CORE=1: the die's last core, as before");
+    CHECK(kept(0xFFFF, -1, 1) == 0x80 && game(0xFFFF, -1, 1) == 0x7F, "RX_VK_ASYNC=1: the replay thread's core is kept");
+    CHECK(kept(0xFFFF, 0, 0) == 0 && game(0xFFFF, 0, 0) == 0xFF, "HOS_RESERVE_CORE=0: none, as before");
+    /* the large cache on the second die, SMT off */
+    fresh();
+    add_cores(16, 1, 0, MB(1), 0);
+    add_l3(0xFF, MB(32)), add_l3(0xFF00, MB(96));
+    CHECK(kept(0xFFFF, -1, 0) == 0 && game(0xFFFF, -1, 0) == 0xFF00, "the second die, SMT off: none kept, the die whole");
+    /* the same part with SMT on: one kept, exactly as before */
+    fresh();
+    add_cores(16, 2, 0, MB(1), 0);
+    add_l3(0xFFFF, MB(96)), add_l3(0xFFFF0000ull, MB(32));
+    CHECK(kept(0xFFFFFFFFull, -1, 0) == 0xC000 && game(0xFFFFFFFFull, -1, 0) == 0x3FFF, "SMT on: the die's last core kept, as before");
+    CHECK(kept(0xFFFFFFFFull, 1, 0) == 0xC000 && kept(0xFFFFFFFFull, -1, 1) == 0xC000, "and with the switch or the replay's own thread");
+    /* SMT on, the process held to one logical processor of each core: 8 processors on the die's 8 cores, as SMT off */
+    CHECK(kept(0xFFFF5555ull, -1, 0) == 0 && kept_die == 0x5555 && game(0xFFFF5555ull, -1, 0) == 0x5555,
+          "one processor a core allowed: none kept");
+    /* this PC's kind: 8 cores, 16 logical processors, one L3: no die, and the core is kept whatever the replay's thread */
+    fresh();
+    add_cores(8, 2, 0, MB(1), 0);
+    add_l3(0xFFFF, MB(32));
+    CHECK(kept(0xFFFF, -1, 0) == 0xC000 && kept_die == 0 && game(0xFFFF, -1, 0) == 0x3FFF, "8 cores, 16 processors, one L3: as before");
+    CHECK(kept(0xFFFF, 1, 0) == 0xC000 && kept(0xFFFF, -1, 1) == 0xC000 && kept(0xFFFF, 0, 0) == 0, "and with the switch");
+    /* the same with SMT off (8 logical processors, one L3): still no die, so still kept: the rule is the die's alone */
+    fresh();
+    add_cores(8, 1, 0, MB(1), 0);
+    add_l3(0xFF, MB(96));
+    CHECK(kept(0xFF, -1, 0) == 0x80 && kept_die == 0 && game(0xFF, -1, 0) == 0x7F, "one die with SMT off: as before");
+    /* two dies alike with SMT off, a six-core cache die, an Intel processor of two kinds of core: no die, as before */
+    fresh();
+    add_cores(16, 1, 0, MB(1), 0);
+    add_l3(0xFF, MB(32)), add_l3(0xFF00, MB(32));
+    CHECK(kept(0xFFFF, -1, 0) == 0x8000 && game(0xFFFF, -1, 0) == 0x7FFF, "two dies alike, SMT off: the processor's last core");
+    fresh();
+    add_cores(12, 1, 0, MB(1), 0);
+    add_l3(0x3F, MB(96)), add_l3(0xFC0, MB(32));
+    CHECK(kept(0xFFF, -1, 0) == 0x800 && kept_die == 0, "six cores under the large cache, SMT off: no die, the last core kept");
+    fresh();
+    add_cores(8, 2, 0, MB(2), 1);
+    add_cores(16, 1, 16, MB(4), 0);
+    add_l3(0xFFFFFFFFull, MB(36));
+    CHECK(kept(0xFFFFFFFFull, -1, 0) == 0xC000 && game(0xFFFFFFFFull, -1, 0) == 0xFFFF3FFFull, "two kinds of core: as before");
+
     printf(fails ? "x3d placement: FAILED\n" : "x3d placement: all checks passed\n");
     return fails != 0;
 }
@@ -202,6 +284,7 @@ def check_source(thread):
     cpus = block(thread, "static uint64_t hos_x3d_cpus(")
     last = block(thread, "static uint64_t last_fastest_core(")
     pin = block(thread, "void hos_thread_pin(")
+    kept = block(thread, "uint64_t hos_reserved_cpus(void) {")
     for text, needle, why in (
             (detect, "RelationCache", "the caches are not read"),
             (detect, "e->Cache.GroupMask.Group == group", "caches of another processor group are taken"),
@@ -211,9 +294,23 @@ def check_source(thread):
             (cpus, "hos_log(\"cpu: logical processors", "what was found is not logged"),
             (last, "const uint64_t die = hos_x3d_cpus();", "the replay's core is not chosen with the die"),
             (last, "(!die || ((uint64_t)e->Processor.GroupMask[0].Mask & die))", "the replay's core is not among the die's cores"),
-            (pin, "hos_x3d_thread_mask((uint64_t)proc, die, reserved)", "a game thread's affinity is not the header's")):
+            (pin, "hos_x3d_thread_mask((uint64_t)proc, die, reserved)", "a game thread's affinity is not the header's"),
+            # ((Triforce, THREAD-49) the rule is asked with the switch's value and whether the replay has its own thread)
+            (kept, 'const char *e = getenv("HOS_RESERVE_CORE");', "HOS_RESERVE_CORE is not read"),
+            (kept, "const int asked = e ? atoi(e) != 0 : -1;", "the switch not set is not told from the switch set"),
+            (kept, "if (!asked) return mask;", "HOS_RESERVE_CORE=0 no longer keeps none on every processor"),
+            (kept, "const uint64_t die = hos_x3d_cpus();", "the rule is not asked about the die the game's threads are kept on"),
+            (kept, "if (cores && fast && !hos_x3d_reserved(fast, die, cores, asked, rx_async_replay())) {",
+             "hos_reserved_cpus does not ask the header whether a core of the die is kept"),
+            (kept, 'hos_log("cpu: no core kept for the replay on the cache die (HOS_RESERVE_CORE=1: one is)");',
+             "keeping no core on the die leaves no line in the log")):
         if needle not in text:
             raise SystemExit("host/hos_thread.c: " + why)
+    if kept.index("!hos_x3d_reserved(fast, die, cores, asked, rx_async_replay())") > kept.index("if (cores) return mask = fast;"):
+        raise SystemExit("host/hos_thread.c: hos_reserved_cpus keeps the die's core before it asks the rule")
+    dev = (ROOT / "docs" / "development.md").read_text(encoding="utf-8")
+    if "`HOS_RESERVE_CORE=0`, `=1` |" not in dev or "`cpu: no core kept for the replay on the cache die`" not in dev:
+        raise SystemExit("docs/development.md: HOS_RESERVE_CORE=1 and the cache die's rule are not in the switches table")
     # (the reader is Windows' alone: Linux and the web keep what they had)
     at = thread.index("static uint64_t x3d_detect(")
     if thread.rindex("#if defined(_WIN32)", 0, at) < thread.rindex("#endif", 0, at):

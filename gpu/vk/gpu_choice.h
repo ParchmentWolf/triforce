@@ -46,4 +46,24 @@ inline int pick(const std::string& want, const std::vector<std::string>& names, 
     return menu_device(menu, (int)names.size());
 }
 
+/// ((Triforce) 11-22, tickets "igpu targeted for shader cache", "Launcher \"GPU device\" setting is non-functional" (RX 6600
+/// with a Ryzen 5600G's graphics) and on 0.6.0 "still picking IGPU for building shaders") The choice that pick takes by its
+/// number alone (no saved name, or a name no card has here) when that number is the processor's graphics while a card of its
+/// own is listed: not taken, Auto instead. Such a number comes from an options file written before 11-20, when the launcher
+/// numbered the cards in Windows' order (the display class's driver keys: the processor graphics' driver first on a 5600G)
+/// and saved no name with it; the update to 0.6.0 still prepared its shaders there and the game started there, as no name
+/// came with the number until the row was chosen again. A choice saved with its name (the launcher and the menu since 11-20)
+/// is taken as it is, the processor graphics too. types: the usable devices' VkPhysicalDeviceType (1 integrated, 2 discrete),
+/// in the game's order, as names
+inline bool unnamed_integrated(const std::string& want, const std::vector<std::string>& names, const std::vector<int>& types,
+                               int menu) {
+    const int k = pick(want, names, menu);
+    if (k < 0 || (size_t)k >= types.size() || types[(size_t)k] != 1) return false;
+    const std::string key = name_key(want);
+    if (!key.empty() && name_key(names[(size_t)k]) == key) return false;   // (chosen by its name)
+    for (const int t : types)
+        if (t == 2) return true;
+    return false;
+}
+
 } // namespace mkwvk::gpu_choice

@@ -106,8 +106,25 @@ def check_source():
     submit = block(replay, "void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at = 0, bool part = false) {")
     in_order(submit, ["if (event_writes_held(r.cmd)) {", "end_pass(r.cmd), full_barrier(r.cmd,", "draw_flush_recording(r.slot);",
                       "if (batch_on()) {", "barrier_rules::batch_hold(way, !signal_value, submit_depth > 0);",
-                      "if (hold || !pend.cbs.empty()) {", "pend.recs++;", "barrier_rules::batch_flush(way, hold,", "return;",
+                      "if (hold || !pend.cbs.empty()) {", "pend.recs++;", "barrier_rules::batch_flush(way, hold,",
+                      # ((Triforce, 11-22, the performance audit's SYNC-09) RX_VK_BATCH_IDLE: after the cap's flush, the rule before the GPU's poll
+                      "if (barrier_rules::batch_idle(way, !pend.cbs.empty(), batch_idle_on()) && batch_gpu_idle()) flush_reason = FR_IDLE, queue_flush_locked();",
+                      "return;",
                       "vkQueueSubmit2(dev.queue, 1, &si, r.fence);"], "vk_replay.cpp submit_recording")
+    # ((Triforce, 11-22, the performance audit's SYNC-09) RX_VK_BATCH_IDLE: read once through the rule, off unless set; the GPU's
+    # poll under the queue's lock; its flushes counted as "idle"; the switches table
+    idle_on = block(replay, "bool batch_idle_on() {")
+    if 'barrier_rules::batch_idle_on(getenv("RX_VK_BATCH_IDLE"));' not in idle_on or "static const bool on" not in idle_on:
+        raise SystemExit("vk_replay.cpp batch_idle_on does not read RX_VK_BATCH_IDLE once through the rule")
+    gpu_idle = block(replay, "bool batch_gpu_idle() {")
+    if "vkGetSemaphoreCounterValue(dev.device, batch_tl, &done) == VK_SUCCESS && done >= batch_flushed;" not in gpu_idle:
+        raise SystemExit("vk_replay.cpp batch_gpu_idle is not the batches' timeline against the last batch flushed")
+    if replay.count("batch_gpu_idle()") != 2 or "FR_VALUE, FR_IDLE, FR_COUNT };" not in replay or \
+            "(long long)(st_reason[FR_IDLE] - r0[FR_IDLE])," not in replay or "value %lld, idle %lld, other %lld" not in replay:
+        raise SystemExit("vk_replay.cpp: the idle flush is asked for somewhere else, or not counted in the batched submits' line")
+    dev_md = (VK.parent.parent / "docs/development.md").read_text(encoding="utf-8")
+    if not any(line.startswith("| `RX_VK_BATCH_IDLE=1` |") and "**off unless set on every driver**" in line for line in dev_md.splitlines()):
+        raise SystemExit("docs/development.md: no row for RX_VK_BATCH_IDLE with its default")
     job = block(replay, "void submit_job(std::vector<uint64_t>& handles, uint64_t value, uint64_t queue) {")
     in_order(job, ["submit_depth++;", "if (!--submit_depth && batch_way() == barrier_rules::Batch::Parts) queue_flush_for(FR_OTHER);",
                    "run_submit("], "vk_replay.cpp submit_job")
@@ -116,7 +133,7 @@ def check_source():
         raise SystemExit("vk_replay.cpp queue_flush_locked: the held recordings' count is not cleared with them")
     begin = block(draw, "void begin_pass(")
     in_order(begin, ["end_pass(cmd);", "if (pass_resuming) pass_resume_barrier(cmd);", "else pass_start_barrier(cmd);",
-                     "work_since_barrier = true;", "pass_at = at;", "pass().sampled.clear(), pass().sampled_targets = 0, pass().written = 0;",
+                     "work_since_barrier = true;", "pass_at = at;", "ps.sampled.clear(), ps.sampled_targets = 0, ps.written = 0;",
                      "vkCmdBeginRendering(cmd, &ri);"], "vk_draw.cpp begin_pass")
     take = block(draw, "bool pass_carry_take() {")
     if "pass_carry_on = pass().open && !par_active.load(std::memory_order_relaxed);" not in take or \
@@ -208,6 +225,14 @@ int main() {
     CHECK(batch_flush(Batch::Off, false, 0, 32));
     CHECK(!batch_flush(Batch::Hold, true, 31, 32) && batch_flush(Batch::Hold, true, 32, 32));
     CHECK(batch_flush(Batch::Parts, false, 1, 4) && !batch_flush(Batch::Parts, true, 3, 4) && batch_flush(Batch::Parts, true, 4, 4));
+    // ((Triforce, 11-22, the performance audit's SYNC-09) RX_VK_BATCH_IDLE: off unless set to a number other than 0; the rule
+    // only in Hold mode, with something held, the switch on
+    CHECK(!batch_idle_on(nullptr) && !batch_idle_on("") && !batch_idle_on("0") && !batch_idle_on("off") && batch_idle_on("1") && batch_idle_on("2"));
+    CHECK(batch_idle(Batch::Hold, true, true));
+    CHECK(!batch_idle(Batch::Hold, true, false) && !batch_idle(Batch::Hold, false, true));
+    CHECK(!batch_idle(Batch::Parts, true, true) && !batch_idle(Batch::Off, true, true));
+    for (int m = 0; m < 3; m++)                                         // (unset, nothing asks the GPU, in any mode)
+        for (int held = 0; held < 2; held++) CHECK(!batch_idle((Batch)m, held != 0, batch_idle_on(nullptr)));
     // (submit_recording's way with RX_VK_BATCH=parts, over a game's submits: the command buffers reach the queue in the order they
     // were submitted, a part never waits, at most 4 wait, and none is left once the submit's replay returns)
     struct Sub { int id; bool part; };

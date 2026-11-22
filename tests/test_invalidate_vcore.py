@@ -14,7 +14,9 @@ RUN_ALL_ARGS = ["--cxx", "g++"]
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("vulkan", "fallback", "immediate", "fallback-immediate", "zero", "already-away",
-         "non-guest", "disabled", "producer")
+         "non-guest", "disabled", "producer",
+         # ((Triforce, THREAD-25) the back end asked first: nothing to wait for (no call, the core kept), something, no Vulkan back end)
+         "quick", "quick-declined", "quick-fallback")
 
 
 def block(source, marker):

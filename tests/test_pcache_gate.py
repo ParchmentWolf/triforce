@@ -123,8 +123,12 @@ def check_source():
     # ((Triforce) cached_graphics: the guard's creation through the play cache, tests/test_pcache_play.py)
     if "const PcacheUse use(pcache_door, wanted);" not in build or build.count("cached_graphics(cache, &ci, &pl)") != 2:
         raise SystemExit("build_graphics does not hold the gate over its creation and its retry")
-    if "return vkCreateComputePipelines(dev.device, pcache_use().cache, 1, ci, nullptr, out);" not in \
-            between(draw, "VkResult shared_cache_compute(", "\n}\n"):
+    # ((Triforce, 11-22, the performance audit's PIPE-95) through the play cache as a dispatch's, under the gate, held in a
+    # variable over the creation; the bare creation of RX_VK_PCACHE_OWN_PASSES=0 takes the same gate's cache
+    shared = between(draw, "VkResult shared_cache_compute(const VkComputePipelineCreateInfo* ci, VkPipeline* out) {", "\n}\n")
+    if "const auto use = pcache_use();" not in shared or "return cached_compute(use.cache, ci, out);" not in shared or \
+            shared.index("const auto use = pcache_use();") > shared.index("vkCreateComputePipelines(") or \
+            "vkCreateComputePipelines(dev.device, use.cache, 1, ci, nullptr, out);" not in shared or "pcache," in shared:
         raise SystemExit("the other files' compute pipelines are made past the gate")
     for name in ("vk_aa.cpp", "vk_fsr3.cpp"):
         text = (ROOT / "gpu/vk" / name).read_text(encoding="utf-8")

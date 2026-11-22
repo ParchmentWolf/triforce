@@ -12,6 +12,14 @@ W functions and the C runtime's file functions take paths of MAX_PATH (260) and 
 folder (the game's own nn::fs paths add the long-path prefix themselves, host/nn_fs.c fs_wide; host/hos_paths.h's and gpu/vk/vk_paths.h's
 probe too). Without that setting it changes nothing.
 
+(Triforce) HOOKSHOT_SEGMENT_HEAP=1 at the build: heapType SegmentHeap (Windows 10 2004 and newer) puts the whole process on
+Windows' segment heap in place of the NT heap, its DLLs and the graphics driver too. Measured on an RX 6700 XT (AMD's Windows
+driver, a cold shader preparation): 76% of the driver's compile threads' samples waited on the NT heap's lock, 12 workers ran
+slower than 6, and the first part of the preparation took 1,478 s against 982 s on the segment heap; play, four pairs of
+runs, within the noise. Not measured on NVIDIA, Intel or Windows 10, and the heap is fixed when the process starts, so the
+arms are two exes. On by default since the lab's play A/B on an RTX card (11-22: no fps lost); HOOKSHOT_SEGMENT_HEAP=0: off. The log's "the shaders' preparation runs on" line says which heap the process has
+(gpu/vk/prepare_threads.h segment_heap).
+
     python nx2/win_manifest.py [out.res]
 """
 import os
@@ -33,6 +41,27 @@ MANIFEST = b"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 </assembly>
 """
 
+# ((Triforce) HOOKSHOT_SEGMENT_HEAP=1: the element manifest() puts after longPathAware)
+SEGMENT_HEAP = b"""      <heapType xmlns="http://schemas.microsoft.com/SMI/2020/WindowsSettings">SegmentHeap</heapType>
+"""
+_SEGMENT_HEAP_AFTER = b"""<longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+"""
+
+
+def segment_heap_asked(environ=None):
+    """(Triforce) The exe on Windows' segment heap unless HOOKSHOT_SEGMENT_HEAP=0 (the NT heap, as before). On by default since the
+    lab A/B of 11-22 (the Market, 3+3, one build each way on an RTX card: 81.4 against 80.6 fps, 1% low 59.9 against 58.0)"""
+    return (os.environ if environ is None else environ).get("HOOKSHOT_SEGMENT_HEAP", "").strip() != "0"
+
+
+def manifest(segment_heap=False):
+    """MANIFEST, with SEGMENT_HEAP in its windowsSettings when segment_heap"""
+    if not segment_heap:
+        return MANIFEST
+    at = MANIFEST.index(_SEGMENT_HEAP_AFTER) + len(_SEGMENT_HEAP_AFTER)
+    return MANIFEST[:at] + SEGMENT_HEAP + MANIFEST[at:]
+
+
 RT_MANIFEST = 24
 CREATEPROCESS_MANIFEST_RESOURCE_ID = 1   # (the one an exe's loader reads)
 
@@ -48,9 +77,10 @@ def res_bytes(manifest=MANIFEST):
     return res_entry(0, 0, b"", 0, 0) + res_entry(RT_MANIFEST, CREATEPROCESS_MANIFEST_RESOURCE_ID, manifest)
 
 
-def write(path):
-    """hookshot_manifest.res at path, rewritten only when its bytes change (the link reads it each time)"""
-    data = res_bytes()
+def write(path, segment_heap=None):
+    """hookshot_manifest.res at path, rewritten only when its bytes change (the link reads it each time). segment_heap: None,
+    as HOOKSHOT_SEGMENT_HEAP says (segment_heap_asked)"""
+    data = res_bytes(manifest(segment_heap_asked() if segment_heap is None else segment_heap))
     try:
         with open(path, "rb") as f:
             if f.read() == data:

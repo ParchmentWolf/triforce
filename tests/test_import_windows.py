@@ -60,6 +60,7 @@ thread_local bool import_cooling = false;
 thread_local int import_result = 0;
 bool import_on_hold(uint64_t, uint64_t) { import_cooling = false; return false; }
 void import_remember_failure(uint64_t, uint64_t) {}
+bool small_chunks_wanted() { return false; }   // ((Triforce, 11-22, MEM-16) the chunk's default: tests/test_import_chunk_default.py)
 '''+guard+'''
     p.lo=lo;p.hi=hi;imports++;return true;
 }
@@ -133,7 +134,7 @@ int main(int argc,char **argv) {
     with tempfile.TemporaryDirectory(prefix='import-windows-',dir=work) as temp:
         directory=Path(temp).resolve();directory.relative_to(work.resolve());cpp=directory/'fixture.cpp';exe=directory/'fixture.exe';cpp.write_text(fixture,encoding='utf-8')
         subprocess.run([a.cxx,'-std=c++20','-O2','-D_CRT_SECURE_NO_WARNINGS',str(cpp),'-o',str(exe)],check=True)
-        for chunk in ('16','3','0'):
+        for chunk in ('16','4','3','0'):
             subprocess.run([str(exe)],env=dict(os.environ,RX_VK_IMPORT_CHUNK_MB=chunk,RX_VK_PREFETCH_CHUNKS='0'),check=True)
         for mode in ('1','0','2'):
             subprocess.run([str(exe),mode],env=dict(os.environ,RX_VK_IMPORT_CHUNK_MB='16',RX_VK_PREFETCH_CHUNKS='0' if mode=='0' else '1'),check=True)

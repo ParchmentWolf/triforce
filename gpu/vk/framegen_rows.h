@@ -232,4 +232,24 @@ template <class Ops> void teardown(Ops& ops, bool exiting) {
     ops.destroy_images();
 }
 
+// ---- (Triforce, 11-20) What a present writes into a set of frames: never past the frames the set was made with ----
+// The owner's "upscaling crash": 0xc0000005 reading 0x590 in NVIDIA's driver, inside a vkCmdCopyImage the recorder thread
+// ran, in three runs of 11-20, each with frame interpolation on and the Frame generation row stepped up in the options
+// (Auto in the first, 3x at the next start, 5x at the one after). The sets' frames are made for the row's multiplier when
+// a present begins (vk_framegen.cpp ensure_size); the present then waits for the display thread to let a set go, and
+// while frames are made the display thread is the one that runs the menu (present_image, menu_tick), so a step of the row
+// lands in that wait. The multiplier read again after it was more than the frames made, and the game's frame was copied
+// into an image that was never made (VK_NULL_HANDLE). A step down only left frames unused. The row's new multiplier takes
+// effect at the next present, which makes the sets anew.
+/// The multiplier a present records with: the row's, and no more than the frames its sets were made with
+constexpr int set_multiplier(int row_multiplier, int made_with) {
+    const int most = made_with < 1 ? 1 : made_with;
+    return row_multiplier < 1 ? 1 : row_multiplier > most ? most : row_multiplier;
+}
+/// The game's own frame's place in a set, after `made` made ones: the set's last frame at most
+constexpr int game_slot(int made, int made_with) {
+    const int last = (made_with < 1 ? 1 : made_with) - 1;
+    return made < 0 ? 0 : made > last ? last : made;
+}
+
 } // namespace mkwvk::framegen_rows

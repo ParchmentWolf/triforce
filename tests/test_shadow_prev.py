@@ -85,7 +85,8 @@ def check_source():
         "if (!dropped.empty() && dropped[c->slots[i]]) continue;", "if (s == shadow.end() || !s->second.b) continue;",
         "cap_ready(*c, c->slots[i]);",
         "if (sh_on && !sh_any++) sh_looks.assign(c->copied.size(), shadow_prev::Look{});",
-        "if (memcmp(s->second.b.get(), (const uint8_t*)c->map + (uint64_t)c->slots[i] * 4096, 4096) != 0) {",
+        # ((Triforce, 11-22, MEM-39) the capture's bytes from the staging when it holds the page: tests/test_tex_same_staged.py)
+        "cap_page_bytes(*c, c->slots[i]);", "if (memcmp(s->second.b.get(), cap_b, 4096) != 0) {",
         "if (sh_on)", "sh_looks[i] = shadow_prev::look(false, s->second.b.get(), s->second.prev, cap_page_bytes(*c, c->slots[i]), sh_prev,",
         "sh_vers);", "continue;", "same_pages.push_back({p, gens.page_tex(p)});",
         "if (sh_on) sh_looks[i] = shadow_prev::look(true, s->second.b.get(), s->second.prev, nullptr, sh_prev, sh_vers);",
@@ -99,7 +100,7 @@ def check_source():
         # (the shadow's loop: the pages of this capture, for one taken twice, only when a look was kept)
         "std::sort(same_set.begin(), same_set.end());", "if (sh_any) {", "sh_pages.push_back(p);",
         "std::sort(sh_pages.begin(), sh_pages.end());",
-        "for (; i < c->copied.size(); i++) {", "if (!in_tex_merged((uint64_t)p << 12)) continue;",
+        "for (; i < c->copied.size(); i++) {", "if (!in_tex.in((uint64_t)p << 12)) continue;",   # ((Triforce, 11-22, MEM-42) the loop's walk)
         "if (shadow_n.load(std::memory_order_relaxed) >= kShadowMax && !shadow.count(p)) {",
         # (left: before the slot is taken, as the slot is now)
         "if (sh_any && sh_looks[i].v != shadow_prev::NONE) {", "const auto s = shadow.find(p);",

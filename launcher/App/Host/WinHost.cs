@@ -305,11 +305,11 @@ public sealed class WinHost : IHost
 
     [DllImport("user32", CharSet = CharSet.Unicode)] static extern ushort RegisterClassEx(ref WNDCLASSEX c);
     [DllImport("user32", CharSet = CharSet.Unicode)] static extern IntPtr CreateWindowEx(uint ex, string cls, string name, uint style, int x, int y, int w, int h, IntPtr parent, IntPtr menu, IntPtr inst, IntPtr p);
-    [DllImport("user32")] static extern IntPtr DefWindowProc(IntPtr h, uint m, IntPtr w, IntPtr l);
-    [DllImport("user32")] static extern int GetMessage(out MSG m, IntPtr h, uint a, uint b);
+    [DllImport("user32", CharSet = CharSet.Unicode)] static extern IntPtr DefWindowProc(IntPtr h, uint m, IntPtr w, IntPtr l);
+    [DllImport("user32", CharSet = CharSet.Unicode)] static extern int GetMessage(out MSG m, IntPtr h, uint a, uint b);
     [DllImport("user32")] static extern bool TranslateMessage(ref MSG m);
-    [DllImport("user32")] static extern IntPtr DispatchMessage(ref MSG m);
-    [DllImport("user32")] static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
+    [DllImport("user32", CharSet = CharSet.Unicode)] static extern IntPtr DispatchMessage(ref MSG m);
+    [DllImport("user32", CharSet = CharSet.Unicode)] static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
     [DllImport("user32")] static extern void PostQuitMessage(int c);
     [DllImport("user32")] static extern bool ShowWindow(IntPtr h, int c);
     [DllImport("user32")] static extern bool UpdateWindow(IntPtr h);
@@ -318,8 +318,8 @@ public sealed class WinHost : IHost
     [DllImport("user32")] static extern bool SetForegroundWindow(IntPtr h);
     [DllImport("user32")] static extern bool GetClientRect(IntPtr h, out RECT r);
     [DllImport("user32")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int w, int hh, uint f);
-    [DllImport("user32")] static extern IntPtr LoadCursor(IntPtr i, int id);
-    [DllImport("user32")] static extern IntPtr LoadIcon(IntPtr i, IntPtr id);
+    [DllImport("user32", CharSet = CharSet.Unicode)] static extern IntPtr LoadCursor(IntPtr i, int id);
+    [DllImport("user32", CharSet = CharSet.Unicode)] static extern IntPtr LoadIcon(IntPtr i, IntPtr id);
     [DllImport("user32")] static extern uint GetDpiForSystem();
     [DllImport("user32")] static extern bool SetProcessDpiAwarenessContext(IntPtr v);
     [DllImport("user32")] static extern bool SystemParametersInfo(uint a, uint b, ref RECT r, uint c);

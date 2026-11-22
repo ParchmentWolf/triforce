@@ -49,6 +49,9 @@ static void hos_log(const char *fmt, ...) { (void)fmt; }
 static uint64_t hos_ticks(void) { return 0; }
 static int fps_max(void) { return 60; }   /* (nn_vi.c's Frame rate cap: the console's 60 here) */
 static int64_t steady_period(int64_t base, int64_t now) { (void)now; return base; }   /* ((Triforce) the Steady frame rate row off) */
+static void movie_pace_decide(void) {}             /* ((Triforce, 11-22, PRESENT-30) no movie plays here: paced by the cap) */
+static int pace_fps(void) { return fps_max(); }
+void hos_bench_present(int64_t now) { (void)now; }   /* (benchmark mode's note of each present: not on here) */
 '''
 
 SUFFIX = r'''
@@ -87,6 +90,7 @@ def main():
     args = parser.parse_args()
     source = (args.source / "host/nn_vi.c").read_text(encoding="utf-8")
     helper = block(source, "static void present_trace(") if "static void present_trace(" in source else ""
+    helper += "\n" + block(source, "static int cmp_i64_desc(")   # (the 1% low's sort, which the cut-out present calls)
     actual = block(source, "void hos_vi_native_presented(")
     states = []
     with tempfile.TemporaryDirectory(prefix="present-trace-") as tmp:

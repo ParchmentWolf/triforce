@@ -2,6 +2,9 @@
    commit (TOTK commits its whole 4 GB window up front; MKW's 512 GB window is only reserved), and stand-ins for the
    hooks of files not taken into host/ (the renderer and display, the profiler, mods, TOTK's own patches). */
 #include "hos.h"
+#include "heap_commit.h"   /* ((Triforce, 11-21, MEM-09) the heap committed as it is touched: its rules) */
+#include "stall_host.h"   /* ((Triforce, 11-22, OS-51) the host's part of a long frame, counted where it is spent) */
+#include "host_alloc.h"   /* ((Triforce, 11-22, OS-04) the wait at Windows' commit limit: its length, and the host's own allocations) */
 #include <stdio.h>
 #include <stdlib.h>
 #define WIN32_LEAN_AND_MEAN
@@ -15,6 +18,83 @@
    The runtime commits what it hands out (image, system region, heap, address regions: hos_commit), because host
    APIs given guest buffers (ReadFile into a game buffer) fail on reserved pages without raising an exception. A
    guest or host access to a page nothing committed is committed on first touch, 64 KB at a time, by the handler. */
+/* ((Triforce, 11-21, the performance audit's MEM-09, after Source A's) A commit refused at Windows' commit limit (1455: RAM
+   and page file full) is tried again for up to 5 s, 100 times 50 ms apart: the renderer gives its textures' commit back
+   when the system's runs low (vk_texture.cpp, RX_VK_TEX_COMMIT_FREE_MB), and a page file set to grow does. Before, the
+   commit failed at once and the game's next write into those pages ended it. With the heap committed as it is touched
+   (heap_commit.h) a refusal can come at any first touch. 1: committed after waiting; 0: not */
+/* ((Triforce, 11-22, the performance audit's OS-04) HOS_COMMIT_WAIT_MS, read once: how long a refusal at the commit limit
+   is waited out, here and in hos_xmalloc below: 5000 ms unless set, 0 for no wait at all (host_alloc.h) */
+int hos_commit_wait_ms(void) {
+    static int ms = -1;
+    if (ms < 0) ms = host_alloc_wait_ms(getenv("HOS_COMMIT_WAIT_MS"));
+    return ms;
+}
+static int commit_wait(void *p, SIZE_T size) {
+    static volatile LONG made, given_up;
+    const int tries = host_alloc_tries(hos_commit_wait_ms());   /* ((Triforce, OS-04) 100 for the 5 s; 0: the refusal stands at once) */
+    for (int i = 0; i < tries; i++) {
+        Sleep(50);
+        if (VirtualAlloc(p, size, MEM_COMMIT, PAGE_READWRITE)) {
+            const LONG n = InterlockedIncrement(&made);
+            if (n <= 8 || (n & 255) == 0)
+                hos_log("mem: commit of %#llx bytes refused at the commit limit, made after %d ms (%ld so far)",
+                        (unsigned long long)size, (i + 1) * 50, (long)n);
+            return 1;
+        }
+        if (GetLastError() != ERROR_COMMITMENT_LIMIT) return 0;
+    }
+    if (tries && InterlockedIncrement(&given_up) <= 8)
+        hos_log("mem: commit of %#llx bytes still refused after %d ms at the commit limit", (unsigned long long)size,
+                tries * HOST_ALLOC_STEP_MS);
+    return 0;
+}
+/* ((Triforce, 11-22, the performance audit's OS-04, after Source A's) The host's own tables at the commit limit: malloc,
+   calloc and realloc that are tried again every 50 ms for up to HOS_COMMIT_WAIT_MS before they answer NULL, on which
+   their callers end the game as before (host_alloc.h has why). The thread keeps its virtual core while it waits: some of
+   the callers hold a lock of the host's, and a thread that queued for its core again under one could wait on a thread
+   that holds a core and waits for that lock. The first 8 rescues and the first 8 refusals are logged, and a refusal
+   that stands brings the out-of-memory notice, once */
+typedef struct { int kind; void *p; size_t count, n; } HostAllocAsk;
+static void *host_alloc_try(void *ctx) {
+    const HostAllocAsk *a = (const HostAllocAsk *)ctx;
+    return a->kind == 0 ? malloc(a->n) : a->kind == 1 ? calloc(a->count, a->n) : realloc(a->p, a->n);
+}
+static void host_alloc_sleep(int ms) { Sleep((DWORD)ms); }
+DWORD WINAPI hos_out_of_memory_box(LPVOID);
+static void *host_alloc(HostAllocAsk *a) {
+    void *p = host_alloc_try(a);
+    if (p || !a->n || (a->kind == 1 && !a->count)) return p;   /* (a size of 0: the C library's own answer) */
+    static volatile LONG made, given_up, said;
+    int waited = 0;
+    p = host_alloc_retry(host_alloc_try, a, host_alloc_tries(hos_commit_wait_ms()), host_alloc_sleep, &waited);
+    const unsigned long long bytes = (unsigned long long)a->n * (a->kind == 1 ? a->count : 1);
+    if (p) {
+        const LONG n = InterlockedIncrement(&made);
+        if (n <= 8 || (n & 255) == 0)
+            hos_log("mem: a host allocation of %llu bytes refused, made after %d ms (%ld so far)", bytes, waited, (long)n);
+        return p;
+    }
+    if (InterlockedIncrement(&given_up) <= 8)
+        hos_log("mem: a host allocation of %llu bytes still refused after %d ms", bytes, waited);
+    if (InterlockedExchange(&said, 1) == 0) {
+        hos_log("mem: Windows is out of memory (RAM and page file): close other programs, or let Windows manage the page file size");
+        CloseHandle(CreateThread(NULL, 0, hos_out_of_memory_box, NULL, 0, NULL));
+    }
+    return NULL;
+}
+void *hos_xmalloc(size_t n) {
+    HostAllocAsk a = {0, NULL, 1, n};
+    return host_alloc(&a);
+}
+void *hos_xcalloc(size_t count, size_t size) {
+    HostAllocAsk a = {1, NULL, count, size};
+    return host_alloc(&a);
+}
+void *hos_xrealloc(void *p, size_t n) {
+    HostAllocAsk a = {2, p, 1, n};
+    return host_alloc(&a);
+}
 void *hos_mem_commit_begin(uint64_t addr, uint64_t size);   /* ((Triforce) hos_mem.c: the census's notes around the commit) */
 void hos_mem_commit_end(void *had, uint64_t addr, uint64_t size, int committed);
 int hos_commit(uint64_t addr, uint64_t size) {
@@ -40,8 +120,10 @@ int hos_commit(uint64_t addr, uint64_t size) {
     void *const census_had = hos_mem_commit_begin(lo, hi - lo);
     /* (Triforce: a commit of committed pages resets their protection, the lazy write-back's too: rx_backend.c) */
     const int io = hos_guest_io_begin(GP(lo), hi - lo);
-    const int committed = VirtualAlloc(GP(lo), (SIZE_T)(hi - lo), MEM_COMMIT, PAGE_READWRITE) != NULL;
-    const DWORD commit_err = committed ? 0 : GetLastError();
+    int committed = VirtualAlloc(GP(lo), (SIZE_T)(hi - lo), MEM_COMMIT, PAGE_READWRITE) != NULL;
+    DWORD commit_err = committed ? 0 : GetLastError();
+    /* ((Triforce, 11-21, MEM-09) refused at the commit limit: tried again for up to 5 s, commit_wait above) */
+    if (!committed && commit_err == ERROR_COMMITMENT_LIMIT && commit_wait(GP(lo), (SIZE_T)(hi - lo))) committed = 1, commit_err = 0;
     hos_guest_io_end(io);
     hos_mem_commit_end(census_had, lo, hi - lo, committed);
     if (!committed) {
@@ -59,6 +141,20 @@ int hos_commit(uint64_t addr, uint64_t size) {
         return 0;
     }
     return 1;
+}
+
+/* ((Triforce, 11-21, MEM-09) Guest memory about to go to the kernel (a file read into it, a write from it): with the heap
+   committed as it is touched (hos_heap_on_touch, hos_mem.c), each page of [addr, addr + size) is read once first, so that
+   one still only reserved is committed by the handler below, as the CPU's own first touch of it would. The kernel does
+   not fault a page in: ReadFile into heap pages nothing touched yet failed with no exception. A byte read a 4 KB page,
+   nothing written: 30 microseconds for a 100 MB buffer in use. Not VirtualQuery for which pages are reserved: it walks
+   every page of the committed region it is asked in, GBs of them, and the title ran 105 to 141 fps for 240 with it in
+   each read. With the heap committed whole (HOS_HEAP_COMMIT=1, large pages, Linux) nothing is done, as before */
+int hos_heap_on_touch;
+void hos_guest_touch(uint64_t addr, uint64_t size) {
+    if (!hos_heap_on_touch || !size || !hos_guest_range(addr, size)) return;
+    const uint64_t end = addr + size;
+    for (uint64_t a = addr; a < end; a = (a | 0xFFF) + 1) (void)*(volatile const uint8_t *)GP(a);
 }
 
 DWORD WINAPI hos_out_of_memory_box(LPVOID unused) {
@@ -80,12 +176,38 @@ static LONG CALLBACK commit_on_touch(EXCEPTION_POINTERS *info) {
     const uint64_t guest = (uint64_t)(p - A64_MEM);
     if (guest < 0x100000) return EXCEPTION_CONTINUE_SEARCH;   /* (a null pointer: the game's own fault) */
     MEMORY_BASIC_INFORMATION mbi;
-    if (!VirtualQuery(p, &mbi, sizeof mbi) || mbi.State != MEM_RESERVE) return EXCEPTION_CONTINUE_SEARCH;
-    static volatile LONG touched;
-    if (InterlockedIncrement(&touched) <= 16)
+    if (!VirtualQuery(p, &mbi, sizeof mbi)) return EXCEPTION_CONTINUE_SEARCH;
+#ifdef _WIN32
+    /* ((Triforce, 11-21, MEM-09) another thread committed this 64 KB between the fault and the look: the access is tried
+       again. With the heap committed as it is touched, two threads touching one new chunk at once is common, and the second
+       went on to the crash report. Read-write only: the lazy write-back's pages and the watches' are their own handlers'.
+       Windows only: Linux's VirtualQuery stand-in calls every guest page committed and read-write, and every fault in the
+       window would be tried again for ever) */
+    if (heap_touch_again(mbi.State == MEM_COMMIT, mbi.Protect == PAGE_READWRITE, rec->ExceptionInformation[0]))
+        return EXCEPTION_CONTINUE_EXECUTION;
+#endif
+    if (mbi.State != MEM_RESERVE) return EXCEPTION_CONTINUE_SEARCH;
+    /* ((Triforce, 11-21, MEM-09) the heap's own first touches are how it is committed now (hos_mem.c SetMemoryHeapSize):
+       counted apart, and not among the 16 lines for pages nothing handed out) */
+    const int heap = guest >= HOS_HEAP_BASE && guest - HOS_HEAP_BASE < hos_heap_size;
+    static volatile LONG touched, heap_touched;
+    if (!heap && InterlockedIncrement(&touched) <= 16)
         hos_log("mem: %#llx committed on first touch (nothing handed it out)", (unsigned long long)guest);
-    if (!VirtualAlloc(GP(guest & ~0xFFFFULL), 0x10000, MEM_COMMIT, PAGE_READWRITE)) return EXCEPTION_CONTINUE_SEARCH;
-    hos_mem_note(HOS_MEM_TOUCHED, guest & ~0xFFFFULL, 0x10000);   /* ((Triforce) the census: atomics only, no lock) */
+    /* (only the reserved pages of its 64 KB: a commit over committed ones resets their protection, heap_commit.h) */
+    const uint64_t run = (uint64_t)((const uint8_t *)mbi.BaseAddress - A64_MEM);
+    uint64_t lo, hi;
+    heap_touch_range(guest, run, run + mbi.RegionSize, &lo, &hi);
+    if (!VirtualAlloc(GP(lo), (SIZE_T)(hi - lo), MEM_COMMIT, PAGE_READWRITE) &&
+        !(GetLastError() == ERROR_COMMITMENT_LIMIT && commit_wait(GP(lo), (SIZE_T)(hi - lo))))   /* (at the limit: waited for) */
+        return EXCEPTION_CONTINUE_SEARCH;
+    hos_mem_note(HOS_MEM_TOUCHED, lo, hi - lo);   /* ((Triforce) the census: atomics only, no lock) */
+    if (heap) {
+        const LONG n = InterlockedIncrement(&heap_touched);
+        if (heap_touch_said(n))
+            hos_log("mem: the heap is committed as it is touched: %ld first touches so far, 64 KB each at most (%ld MB of its "
+                    "%llu; HOS_HEAP_COMMIT=1: all of it at the start, as before)", (long)n, (long)(n >> 4),
+                    (unsigned long long)(hos_heap_size >> 20));
+    }
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
@@ -785,21 +907,79 @@ void hos_host_thread_register_self(const char *name) {   /* (hos_prof.c: names f
     wchar_t w[64];
     if (MultiByteToWideChar(CP_UTF8, 0, name, -1, w, 64)) SetThreadDescription(GetCurrentThread(), w);
 }
-void hos_process_memory(uint64_t *private_bytes, uint64_t *working_set) {
-    typedef struct {
-        DWORD cb, PageFaultCount;
-        SIZE_T PeakWorkingSetSize, WorkingSetSize, QuotaPeakPagedPoolUsage, QuotaPagedPoolUsage,
-            QuotaPeakNonPagedPoolUsage, QuotaNonPagedPoolUsage, PagefileUsage, PeakPagefileUsage, PrivateUsage;
-    } Counters;
-    typedef BOOL(WINAPI * Fn)(HANDLE, Counters *, DWORD);
+typedef struct {
+    DWORD cb, PageFaultCount;
+    SIZE_T PeakWorkingSetSize, WorkingSetSize, QuotaPeakPagedPoolUsage, QuotaPagedPoolUsage,
+        QuotaPeakNonPagedPoolUsage, QuotaNonPagedPoolUsage, PagefileUsage, PeakPagefileUsage, PrivateUsage;
+} ProcessCounters;
+/* (the process's memory counters as Windows keeps them; all zero when they cannot be read) */
+static void process_counters(ProcessCounters *m) {
+    typedef BOOL(WINAPI * Fn)(HANDLE, ProcessCounters *, DWORD);
     static Fn fn;
     if (!fn) fn = (Fn)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "K32GetProcessMemoryInfo");
-    Counters m;
-    memset(&m, 0, sizeof m);
-    m.cb = sizeof m;
-    if (!fn || !fn(GetCurrentProcess(), &m, sizeof m)) memset(&m, 0, sizeof m);
+    memset(m, 0, sizeof *m);
+    m->cb = sizeof *m;
+    if (!fn || !fn(GetCurrentProcess(), m, sizeof *m)) memset(m, 0, sizeof *m);
+}
+void hos_process_memory(uint64_t *private_bytes, uint64_t *working_set) {
+    ProcessCounters m;
+    process_counters(&m);
     *private_bytes = m.PrivateUsage;
     *working_set = m.WorkingSetSize;
+}
+
+/* ---- (Triforce, 11-22, the performance audit's OS-51, after Source B's) the host's part of a long frame --------------------
+   host/stall_host.h has what is counted and the line. The counters are here, and the look the present makes
+   (nvn_native.c nvnQueuePresentTexture, on the presenting thread): every present takes what was counted since the last
+   one, with the process's page faults and CPU time (one K32GetProcessMemoryInfo and one GetProcessTimes), and a present
+   that comes the stall line's threshold or more after the last one logs it. HOS_STALL_HOST=0, or RX_VK_STALL_LOG=0: none
+   of it, and neither system call */
+StallHostCause hos_stall_host[STALL_HOST_CAUSES];
+int64_t hos_stall_host_us = -1;
+/* (the process's page faults so far, soft and hard together, and its CPU time in the kernel and in its own code, in ns;
+   zero where they cannot be read) */
+static void process_work(uint64_t *page_faults, int64_t *kernel_ns, int64_t *user_ns) {
+    ProcessCounters m;
+    process_counters(&m);
+    *page_faults = m.PageFaultCount;
+    *kernel_ns = *user_ns = 0;
+#if defined(_WIN32)
+    FILETIME made, ended, kernel, user;
+    if (GetProcessTimes(GetCurrentProcess(), &made, &ended, &kernel, &user)) {
+        *kernel_ns = (int64_t)(((uint64_t)kernel.dwHighDateTime << 32) | kernel.dwLowDateTime) * 100;
+        *user_ns = (int64_t)(((uint64_t)user.dwHighDateTime << 32) | user.dwLowDateTime) * 100;
+    }
+#endif
+}
+void hos_stall_host_presented(void) {
+    void hos_vcore_waits_take(int64_t *ns, int64_t *count, int64_t *longest);
+    extern volatile LONG64 hos_present_count;   /* display.c */
+    static int64_t last_ns, last_kernel, last_user;
+    static uint64_t last_faults;
+    static StallHostBound bound = STALL_HOST_BOUND;
+    const int64_t threshold_us = stall_host_us();
+    if (!threshold_us) return;
+    const int64_t now = hos_now_ns();
+    StallHostFrame f;
+    uint64_t faults;
+    int64_t kernel, user;
+    process_work(&faults, &kernel, &user);
+    for (int i = 0; i < STALL_HOST_CAUSES; i++) f.cause[i] = stall_host_take(&hos_stall_host[i]);
+    {   /* (the waits for a virtual core are counted where they end, with the virtual cores' lock held: hos_thread.c) */
+        StallHostCause *w = &f.cause[STALL_HOST_CORE_WAIT];
+        hos_vcore_waits_take(&w->ns, &w->count, &w->longest);
+        w->bytes = 0;
+    }
+    if (last_ns && now - last_ns >= threshold_us * 1000 && stall_host_bound_take(&bound, now)) {
+        char line[1024];
+        f.frame = (int64_t)hos_present_count, f.gap_ns = now - last_ns;
+        f.page_faults = (uint32_t)(faults - last_faults);   /* (Windows' count is 32 bits and wraps) */
+        f.kernel_ns = kernel - last_kernel, f.user_ns = user - last_user;
+        f.held = bound.held, bound.held = 0;
+        stall_host_line(&f, line, sizeof line);
+        hos_log("%s", line);
+    }
+    last_ns = now, last_faults = faults, last_kernel = kernel, last_user = user;
 }
 
 /* ---- (Triforce) the guest memory census's thread (host/guest_census.h has why) ---------------------------------------------

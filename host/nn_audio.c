@@ -8,8 +8,10 @@
        -> sub mixes in dependency order (sub mix volume, then to their destination)
        -> the final mix (volume) -> the device sink (its channel map: 5.1 as it is to a 5.1 device, else down to stereo)
        -> waveOut
-   and signals the renderer event the game's audio thread waits on. Effects are accepted and left out (dry signal);
-   aux effects pass through. Played sample counts and released wave buffers go back to the game as on hardware.
+   and signals the renderer event the game's audio thread waits on. A mix's effects (I3DL2 and plain reverbs, delays,
+   biquad filters) run on its buffers in the order the game added them, and splitter destinations have their biquad
+   filters (see "mix effects"); aux effects pass through. Played sample counts and released wave buffers go back to
+   the game as on hardware.
    The game's parameter changes take effect together at RequestUpdateAudioRenderer, and volume changes ramp over a
    frame, as the console's renderer does them (see "parameter updates").
    HOS_AUDIO_DUMP=<file.wav>: also write what is played (checking without speakers); HOS_AUDIO=0: silence;
@@ -51,7 +53,7 @@ void hos_system_event_signal(uint64_t key);
 #define MAX_WB 32            /* queued wave buffers per voice */
 #define MAX_REL 128
 
-enum { K_VOICE = 1, K_MIX, K_SPLITTER, K_SINK, K_POOL, K_EFFECT, K_CONFIG };
+enum { K_VOICE = 1, K_MIX, K_SPLITTER, K_SINK, K_POOL, K_EFFECT, K_CONFIG, K_BIQUAD, K_DELAY };
 enum { FMT_INVALID, FMT_PCM8, FMT_PCM16, FMT_PCM24, FMT_PCM32, FMT_FLOAT, FMT_ADPCM };
 enum { PLAY_STARTED, PLAY_STOPPED, PLAY_PAUSED };
 enum { DEST_NONE, DEST_MIX, DEST_SPLITTER };
@@ -71,6 +73,8 @@ typedef struct {
     int dest_mix[MAX_SPLIT_DESTS];
     float vol[MAX_SPLIT_DESTS][MAX_CH][MAX_BUF];
     float ramp[MAX_SPLIT_DESTS][MAX_CH][MAX_BUF];   /* the volumes the last frame ended with */
+    int bq_on[MAX_SPLIT_DESTS][2];             /* each destination's two biquad filters (SetSplitterBiquadFilterParameter) */
+    float bq_b[MAX_SPLIT_DESTS][2][3], bq_a[MAX_SPLIT_DESTS][2][2], bq_z[MAX_SPLIT_DESTS][2][MAX_CH][2];
 } Splitter;
 
 typedef struct {
@@ -299,12 +303,61 @@ typedef struct {
     float line[4][REV_LINE];
     int pos[4], len[4];
     float lp[4];                    /* damping filter states */
+    int seq;                        /* (the order effects were added in: effects_frame) */
+    /* a plain reverb's (AddReverb) parameters: gains 0 to 1, times as nn::TimeSpan; plain_reverb_params turns them
+       into the fields above each frame */
+    int plain, early_mode, late_mode;
+    float p_early, p_late, p_reverb, p_out, p_dry, p_hf, p_color;
+    int64_t p_decay_ns, p_pre_ns;
+    uint64_t buffer;                /* (the game's work buffer, for RemoveReverb) */
 } Reverb;
 static Reverb reverbs[MAX_EFFECTS];
+static int fx_seq;
+/* HOS_AUDIO_EFFECTS=0: the plain reverb, delay and biquad filter effects and the splitter biquad filters accepted and
+   left out, as before they were emulated (the I3DL2 reverb still runs) */
+static int effects_on(void) {
+    static int on = -1;
+    if (on < 0) on = !(getenv("HOS_AUDIO_EFFECTS") && atoi(getenv("HOS_AUDIO_EFFECTS")) == 0);
+    return on;
+}
+/* an effect left disabled still copies its inputs to its outputs where they differ, as the renderer's do */
+static void fx_bypass(const int8_t *in, const int8_t *out, int n, Mix *m) {
+    for (int c = 0; c < n; c++)
+        if (in[c] != out[c] && in[c] >= 0 && in[c] < m->buffers && out[c] >= 0 && out[c] < m->buffers)
+            memcpy(m->buf[out[c]], m->buf[in[c]], sizeof m->buf[0]);
+}
+static float clamp01(float f) { return f > 0.0f ? (f < 1.0f ? f : 1.0f) : 0.0f; }
+static float gain_mb(float g) { return g > 0.00001f ? 2000.0f * log10f(g) : -10000.0f; }
+/* The plain reverb on the same delay network: EarlyMode SmallRoom 0, LargeRoom 1, Hall 2, Cavern 3,
+   NoEarlyReflection 4; LateMode Room 0, Hall 1, MetallicCorridor 2, Cavern 3, MaximumDelay 4. Reverb gain feeds
+   both parts, early and late gain each part, out gain the wet sum; coloration is less diffusion. The DSP's own early
+   and late tables are not ours: the modes set the line lengths and the late part's delay. */
+static void plain_reverb_params(Reverb *rv) {
+    static const float density[5] = {50, 100, 25, 100, 100}, late_ms[5] = {5, 10, 4, 20, 30};
+    const int em = rv->early_mode >= 0 && rv->early_mode < 5 ? rv->early_mode : 2;
+    const int lm = rv->late_mode >= 0 && rv->late_mode < 5 ? rv->late_mode : 1;
+    const float wet = clamp01(rv->p_out) * clamp01(rv->p_reverb);
+    rv->room = 0;
+    rv->refl = em == 4 ? -10000.0f : gain_mb(wet * clamp01(rv->p_early));
+    rv->reverb = gain_mb(wet * clamp01(rv->p_late));
+    rv->dry = clamp01(rv->p_dry);
+    rv->hf_ratio = rv->p_hf < 0.1f ? 0.1f : rv->p_hf > 1.0f ? 1.0f : rv->p_hf;
+    rv->hf_ref = 5000;
+    rv->diffusion = 100.0f * (1.0f - 0.7f * clamp01(rv->p_color));
+    rv->density = density[lm];
+    rv->decay_ns = rv->p_decay_ns > 0 ? rv->p_decay_ns : 1000000000ll;
+    rv->refl_delay_ns = rv->p_pre_ns > 0 ? rv->p_pre_ns : 0;
+    rv->late_delay_ns = (int64_t)(late_ms[lm] * 1e6f);
+}
 static float mb_gain(float mb) { return powf(10.0f, mb / 2000.0f); }
 static void reverb_frame(Reverb *rv, Mix *m) {
     static int off = -1;
     if (off < 0) off = getenv("HOS_AUDIO_NO_REVERB") != NULL;
+    if (rv->plain) {
+        if (!effects_on()) return;
+        if (!rv->enabled) { fx_bypass(rv->in, rv->out, rv->n, m); return; }
+        plain_reverb_params(rv);
+    }
     if (off || !rv->enabled || rv->n <= 0) return;
     static const int base_len[4] = {1559, 1617, 1491, 1422};
     const float density = rv->density > 0 ? rv->density / 100.0f : 1.0f;
@@ -370,9 +423,148 @@ static void reverb_frame(Reverb *rv, Mix *m) {
         }
     }
 }
+
+/* ---- mix effects: biquad filter and delay ----------------------------------------------------------------------
+   As the console's renderer runs them on a mix's buffers, each channel its input buffer to its output buffer
+   (SetXInputOutput; the same buffer in place). Biquad filter: the game's coefficients (TBiquadFilterParameter<float>,
+   the denominator added, as the voices' filters) in transposed direct form II. Delay: a line per channel of the
+   delay time, fed in gain x input plus the lines' outputs through the feedback gain (x 0.98) and the channel spread
+   (to the neighbouring channels), through a one-pole low pass (0.95 x the low pass amount); out = dry gain x input
+   + the line's output. Both allocate nothing here: the delay's lines are taken by AddDelay. */
+#define MAX_FX 32
+#define DELAY_CH 6                  /* (the renderer's most) */
+#define DELAY_MAX (RATE * 5)        /* a delay line: 5 s at most */
+typedef struct {
+    int used, mix, enabled, on, n, seq;   /* (on: the parameter's own enable) */
+    int8_t in[MAX_CH], out[MAX_CH];
+    float b[3], a[2], z[MAX_CH][2];
+} Biquad;
+typedef struct {
+    int used, mix, enabled, n, seq, cap, len, pos;
+    int8_t in[DELAY_CH], out[DELAY_CH];
+    int64_t time_ns, max_ns;
+    float in_gain, feedback, dry, spread, lowpass;
+    float lp[DELAY_CH];
+    float *line;                    /* cap frames a channel, one channel after another */
+    uint64_t buffer;                /* (the game's work buffer, for RemoveDelay) */
+} Delay;
+static Biquad biquads[MAX_FX];
+static Delay delays[MAX_FX];
+static void biquad_run(const float *b, const float *a, float *z, const float *in, float *out) {   /* (in may be out) */
+    float z0 = z[0], z1 = z[1];
+    for (int i = 0; i < FRAME; i++) {
+        const float x = in[i], y = b[0] * x + z0;
+        z0 = b[1] * x + a[0] * y + z1;
+        z1 = b[2] * x + a[1] * y;
+        out[i] = y;
+    }
+    if (!isfinite(z0) || !isfinite(z1)) {   /* (blown up: silence and start over rather than a full-scale burst) */
+        z0 = z1 = 0;
+        memset(out, 0, FRAME * sizeof *out);
+    }
+    z[0] = z0;
+    z[1] = z1;
+}
+static void biquad_frame(Biquad *f, Mix *m) {
+    if (!f->enabled || !f->on) { fx_bypass(f->in, f->out, f->n, m); return; }
+    for (int c = 0; c < f->n; c++) {
+        const int bi = f->in[c], bo = f->out[c];
+        if (bi >= 0 && bi < m->buffers && bo >= 0 && bo < m->buffers) biquad_run(f->b, f->a, f->z[c], m->buf[bi], m->buf[bo]);
+    }
+}
+static void delay_frame(Delay *dl, Mix *m) {
+    if (!dl->enabled || !dl->line || dl->n <= 0) { fx_bypass(dl->in, dl->out, dl->n, m); return; }
+    const int n = dl->n, cap = dl->cap;
+    const double want = (double)dl->time_ns * RATE / 1e9;
+    const int len = want < 1 ? 1 : want < cap ? (int)want : cap;
+    if (len != dl->len) { dl->len = len; if (dl->pos >= len) dl->pos = 0; }
+    /* the feedback matrix: stereo each line to the other, 4 channels to the two beside it, 5.1 front to centre and
+       the rear on its side, centre to both fronts, LFE to itself alone */
+    const float fb = clamp01(dl->feedback) * 0.98f, spread = clamp01(dl->spread), base = (1.0f - spread) * fb;
+    const float cross = (n == 4 || n == 6 ? 0.5f : 1.0f) * spread * fb;
+    float mx[DELAY_CH][DELAY_CH] = {{0}};
+    for (int c = 0; c < n; c++) mx[c][c] = n == 2 || n == 4 || n == 6 ? base : fb;
+    if (n == 2) mx[0][1] = mx[1][0] = cross;
+    if (n == 4)
+        for (int c = 0; c < 4; c++) mx[c][(c + 1) % 4] = mx[c][(c + 3) % 4] = cross;
+    if (n == 6) {
+        mx[0][2] = mx[0][4] = mx[1][2] = mx[1][5] = mx[2][0] = mx[2][1] = cross;
+        mx[4][0] = mx[4][5] = mx[5][1] = mx[5][4] = cross;
+        mx[3][3] = fb;
+    }
+    const float lp_fb = 0.95f * clamp01(dl->lowpass), lp_in = 1.0f - lp_fb, in_gain = dl->in_gain, dry = dl->dry;
+    const float *src[DELAY_CH];
+    float *dst[DELAY_CH];
+    for (int c = 0; c < n; c++) {
+        src[c] = dl->in[c] >= 0 && dl->in[c] < m->buffers ? m->buf[dl->in[c]] : NULL;
+        dst[c] = dl->out[c] >= 0 && dl->out[c] < m->buffers ? m->buf[dl->out[c]] : NULL;
+    }
+    int pos = dl->pos;
+    for (int i = 0; i < FRAME; i++) {
+        float x[DELAY_CH], d[DELAY_CH];
+        for (int c = 0; c < n; c++) {
+            x[c] = src[c] ? src[c][i] : 0.0f;
+            d[c] = dl->line[c * cap + pos];
+        }
+        for (int c = 0; c < n; c++) {
+            float t = in_gain * x[c];
+            for (int k = 0; k < n; k++) t += mx[c][k] * d[k];
+            dl->lp[c] = lp_fb * dl->lp[c] + lp_in * t;
+            dl->line[c * cap + pos] = dl->lp[c];
+        }
+        for (int c = 0; c < n; c++)
+            if (dst[c]) dst[c][i] = dry * x[c] + d[c];
+        if (++pos >= len) pos = 0;
+    }
+    dl->pos = pos;
+    for (int c = 0; c < n; c++)
+        if (!isfinite(dl->lp[c])) {   /* (a NaN would stay in the line for good) */
+            memset(dl->line, 0, (size_t)cap * n * sizeof *dl->line);
+            memset(dl->lp, 0, sizeof dl->lp);
+            break;
+        }
+}
+/* A mix's effects in the order the game added them; HOS_AUDIO_EFFECTS=0: the I3DL2 reverb alone, as before */
 static void effects_frame(int mix) {
+    struct { int seq, kind, i; } run[MAX_EFFECTS + 2 * MAX_FX];
+    int n = 0;
+    const int all = effects_on();
     for (int e = 0; e < MAX_EFFECTS; e++)
-        if (reverbs[e].used && reverbs[e].mix == mix) reverb_frame(&reverbs[e], &mixes[mix]);
+        if (reverbs[e].used && reverbs[e].mix == mix && (all || !reverbs[e].plain)) run[n].seq = reverbs[e].seq, run[n].kind = 0, run[n++].i = e;
+    for (int e = 0; all && e < MAX_FX; e++) {
+        if (biquads[e].used && biquads[e].mix == mix) run[n].seq = biquads[e].seq, run[n].kind = 1, run[n++].i = e;
+        if (delays[e].used && delays[e].mix == mix) run[n].seq = delays[e].seq, run[n].kind = 2, run[n++].i = e;
+    }
+    for (int a = 1; a < n; a++)
+        for (int b = a; b > 0 && run[b].seq < run[b - 1].seq; b--) {
+            const int s = run[b].seq, k = run[b].kind, i = run[b].i;
+            run[b] = run[b - 1];
+            run[b - 1].seq = s, run[b - 1].kind = k, run[b - 1].i = i;
+        }
+    for (int k = 0; k < n; k++) {
+        if (run[k].kind == 0) reverb_frame(&reverbs[run[k].i], &mixes[mix]);
+        else if (run[k].kind == 1) biquad_frame(&biquads[run[k].i], &mixes[mix]);
+        else delay_frame(&delays[run[k].i], &mixes[mix]);
+    }
+}
+static void effects_drop_mix(int mix) {   /* (a mix slot taken again: the effects of the one released there go; the
+                                              I3DL2 reverb's as before, kept) */
+    for (int e = 0; e < MAX_EFFECTS; e++)
+        if (reverbs[e].plain && reverbs[e].mix == mix) reverbs[e].used = 0;
+    for (int e = 0; e < MAX_FX; e++) {
+        if (biquads[e].mix == mix) biquads[e].used = 0;
+        if (delays[e].mix == mix) delays[e].used = 0;   /* (its lines stay for the next AddDelay to free) */
+    }
+}
+/* A splitter destination's two biquad filters on one channel of a voice: the filtered samples (in tmp), or in */
+static const float *splitter_filtered(Splitter *s, int d, int ch, const float *in, float *tmp) {
+    const float *src = in;
+    for (int q = 0; q < 2; q++) {
+        if (!s->bq_on[d][q]) continue;
+        biquad_run(s->bq_b[d][q], s->bq_a[d][q], s->bq_z[d][q][ch], src, tmp);
+        src = tmp;
+    }
+    return src;
 }
 
 /* ---- the mixer ------------------------------------------------------------------------------------------------- */
@@ -435,17 +627,22 @@ static void render_voice(Voice *v) {
             }
     } else if (v->dest_kind == DEST_SPLITTER && splitters[v->dest].used) {
         Splitter *s = &splitters[v->dest];
+        const int fx = effects_on();   /* (the destinations' biquad filters: HOS_AUDIO_EFFECTS=0 leaves them out) */
         for (int d = 0; d < s->dests; d++) {
             const int mi = s->dest_mix[d];
             if (mi < 0 || !mixes[mi].used) continue;
             Mix *m = &mixes[mi];
-            for (int ch = 0; ch < v->channels && ch < MAX_CH; ch++)
+            const int filtered = fx && (s->bq_on[d][0] || s->bq_on[d][1]);
+            for (int ch = 0; ch < v->channels && ch < MAX_CH; ch++) {
+                float tmp[FRAME];
+                const float *src = filtered ? splitter_filtered(s, d, ch, out[ch], tmp) : out[ch];
                 for (int b = 0; b < m->buffers; b++) {
                     const float g0 = s->ramp[d][ch][b], g1 = s->vol[d][ch][b];
                     if (g0 == 0.0f && g1 == 0.0f) continue;
                     const float dg = (g1 - g0) / FRAME;
-                    for (int i = 0; i < FRAME; i++) m->buf[b][i] += out[ch][i] * (g0 + dg * (float)(i + 1));
+                    for (int i = 0; i < FRAME; i++) m->buf[b][i] += src[i] * (g0 + dg * (float)(i + 1));
                 }
+            }
         }
     }
     memcpy(v->ramp_vol, v->vol, sizeof v->ramp_vol);   /* (splitters catch up in render_frame) */
@@ -590,6 +787,13 @@ static void render_frame(int16_t *pcm, int channels) {   /* 240 frames of the de
             lim_env = want < lim_env ? want : lim_env + (want - lim_env) * 0.0004f;
             for (int ch = 0; ch < nch; ch++) out[ch][i] *= lim_in * lim_env * lim_out;
         }
+    {   /* ((Triforce, 11-20) the Mods screen's music (mods_music.c): while that screen is open from the title, the game's
+           own mix (the title's music) fades to nothing and the game's shop theme plays quietly in its place; after the
+           limiter, the game's mix's own, and before the options' sounds, which stay as loud as they are) */
+        float *channels[6];
+        for (int ch = 0; ch < nch && ch < 6; ch++) channels[ch] = out[ch];
+        hos_mods_music_frame(channels, nch < 6 ? nch : 6, FRAME);
+    }
     /* (Triforce) the options' own sounds, the game's interface sounds (menu_sound.c), into the front left and right:
        after the limiter, which is the game's mix's own, and before the Master volume, which is over them too */
     hos_menu_sound_frame(out[0], out[1], FRAME);
@@ -1011,7 +1215,7 @@ static void output_frame(const int16_t *pcm) {
    HOS_AUDIO_IMMEDIATE=1: every change applied as it comes (as before). */
 enum { OP_VOICE_RELEASE, OP_VOICE_DEST, OP_VOICE_MIX_VOLUME, OP_VOICE_VOLUME, OP_VOICE_PITCH, OP_VOICE_BIQUAD,
        OP_VOICE_STATE, OP_VOICE_APPEND, OP_MIX_RELEASE, OP_MIX_VOLUME, OP_MIX_DEST, OP_MIX_MIX_VOLUME, OP_SPLIT_RELEASE,
-       OP_SPLIT_DEST, OP_SPLIT_VOLUME };
+       OP_SPLIT_DEST, OP_SPLIT_VOLUME, OP_SPLIT_BIQUAD };
 typedef struct {
     int op, idx, tgt;          /* our voice / mix / splitter; a destination mix or splitter (-1: none) */
     int i0, i1, i2;            /* (op-specific: a kind, an index, channels, a state) */
@@ -1096,6 +1300,12 @@ static void apply(const Cmd *k) {   /* (with the lock held) */
     case OP_SPLIT_VOLUME:
         s->vol[k->i0][k->i1][k->i2] = k->f;
         if (s->dest_mix[k->i0] < 0) s->dest_mix[k->i0] = tgt_mix;
+        break;
+    case OP_SPLIT_BIQUAD:   /* (destination i0, filter i1, on i2) */
+        if (k->i2 && !s->bq_on[k->i0][k->i1]) memset(s->bq_z[k->i0][k->i1], 0, sizeof s->bq_z[k->i0][k->i1]);
+        s->bq_on[k->i0][k->i1] = k->i2;
+        memcpy(s->bq_b[k->i0][k->i1], k->b, sizeof k->b);
+        memcpy(s->bq_a[k->i0][k->i1], k->a, sizeof k->a);
         break;
     }
 }
@@ -1278,6 +1488,7 @@ static int new_mix(uint64_t obj, int final_mix, int buffers) {
     while (i < MAX_MIXES && mixes[i].used) i++;
     if (i == MAX_MIXES) { au_unlock(); return 0; }
     memset(&mixes[i], 0, sizeof mixes[i]);
+    effects_drop_mix(i);
     mixes[i].used = 1;
     mixes[i].final_mix = final_mix;
     mixes[i].buffers = buffers < 1 ? 1 : buffers > MAX_BUF ? MAX_BUF : buffers;
@@ -1397,6 +1608,28 @@ static void set_split_volume(Ctx *c) {
 }
 HLE(_ZN2nn5audio20SetSplitterMixVolumeEPNS0_12SplitterTypeEiPNS0_10SubMixTypeEfii) { set_split_volume(c); }
 HLE(_ZN2nn5audio20SetSplitterMixVolumeEPNS0_12SplitterTypeEiPNS0_12FinalMixTypeEfii) { set_split_volume(c); }
+/* SetSplitterBiquadFilterParameter(SplitterType*, int destinationIndex, mix, int filterIndex,
+   const TBiquadFilterParameter<float>&): bool @0, numerator[3] @4, additive-feedback denominator[2] @16, as the
+   voices'. The game sets both of a destination's filters (off) as it sets the destination, then its own. */
+static void set_split_biquad(Ctx *c) {
+    au_lock();
+    const int d = (int)ARG(1), f = (int)ARG(3);
+    const uint64_t p = ARG(4);
+    if (splitter_of(ARG(0)) && d >= 0 && d < MAX_SPLIT_DESTS && f >= 0 && f < 2 && p) {
+        Cmd k = {.op = OP_SPLIT_BIQUAD, .idx = splitter_index(ARG(0)), .tgt = mix_index(ARG(2)), .i0 = d, .i1 = f,
+                 .i2 = *(uint8_t *)GP(p) != 0};
+        memcpy(k.b, GP(p + 4), sizeof k.b);
+        memcpy(k.a, GP(p + 16), sizeof k.a);
+        submit(&k);
+        static int logged;
+        if (k.i2 && logged++ < 8)
+            AUT("audio: splitter %d destination %d biquad %d: b %.3f %.3f %.3f a %.3f %.3f", k.idx, d, f, k.b[0], k.b[1],
+                k.b[2], k.a[0], k.a[1]);
+    }
+    au_unlock();
+}
+HLE(_ZN2nn5audio32SetSplitterBiquadFilterParameterEPNS0_12SplitterTypeEiPNS0_10SubMixTypeEiRKNS0_22TBiquadFilterParameterIfEE) { set_split_biquad(c); }
+HLE(_ZN2nn5audio32SetSplitterBiquadFilterParameterEPNS0_12SplitterTypeEiPNS0_12FinalMixTypeEiRKNS0_22TBiquadFilterParameterIfEE) { set_split_biquad(c); }
 
 /* ---- the device sink: AddDeviceSink(config, DeviceSinkType*, FinalMixType*, const int8* input, int count, name) - */
 HLE(_ZN2nn5audio13AddDeviceSinkEPNS0_19AudioRendererConfigEPNS0_14DeviceSinkTypeEPNS0_12FinalMixTypeEPKaiPKc) {
@@ -1570,6 +1803,7 @@ HLE(_ZN2nn5audio16AppendWaveBufferEPNS0_9VoiceTypeEPKNS0_10WaveBufferE) {
                 FILE *f = fopen(path, "wb");
                 if (f) {
                     fwrite(v->coefs, 1, 32, f);
+                    hos_guest_touch(w.buffer, (uint64_t)w.size);   /* ((Triforce, 11-21, MEM-09) fwrite hands it to the kernel) */
                     const int io = hos_guest_io_begin(GP(w.buffer), (uint64_t)w.size);   /* (Triforce: rx_backend.c) */
                     fwrite(GP(w.buffer), 1, (size_t)w.size, f);
                     hos_guest_io_end(io);
@@ -1619,9 +1853,13 @@ HLE(_ZN2nn5audio25GetVoicePlayedSampleCountEPKNS0_9VoiceTypeE) {
 }
 HLE(_ZN2nn5audio20IsVoiceDroppedFlagOnEPKNS0_9VoiceTypeE) { RET(0); }
 
-/* ---- effects: accepted, not processed (the dry signal goes through) -------------------------------------------- */
+/* ---- aux effects: accepted, passed through ----------------------------------------------------------------------
+   The game reads the send buffer and writes the return buffer on its own threads (its CPU effects); with nothing to
+   read, it writes nothing back, and the mix goes through as it came. */
 HLE(_ZN2nn5audio6AddAuxEPNS0_19AudioRendererConfigEPNS0_7AuxTypeEPNS0_10SubMixTypeEPvS7_m) { RET(0); }
 HLE(_ZN2nn5audio6AddAuxEPNS0_19AudioRendererConfigEPNS0_7AuxTypeEPNS0_12FinalMixTypeEPvS7_m) { RET(0); }
+HLE(_ZN2nn5audio13SetAuxEnabledEPNS0_7AuxTypeEb) {}
+HLE(_ZN2nn5audio17SetAuxInputOutputEPNS0_7AuxTypeEPKaS4_i) {}
 HLE(_ZN2nn5audio12IsAuxEnabledEPKNS0_7AuxTypeE) { RET(1); }
 HLE(_ZN2nn5audio14IsAuxRemovableEPKNS0_7AuxTypeE) { RET(1); }
 HLE(_ZN2nn5audio17ReadAuxSendBufferEPNS0_7AuxTypeEPii) { RET(0); }
@@ -1645,14 +1883,14 @@ static Reverb *reverb_of(uint64_t obj) {
     const int i = get_handle(obj, K_EFFECT);
     return i >= 0 && i < MAX_EFFECTS && reverbs[i].used ? &reverbs[i] : NULL;
 }
-static void add_reverb(Ctx *c) {
+static void add_reverb(Ctx *c, int plain) {
     au_lock();
     int e = 0;
     while (e < MAX_EFFECTS && reverbs[e].used) e++;
     const int m = mix_index(ARG(4));
     if (e == MAX_EFFECTS || m < 0) {
         au_unlock();
-        AUT("audio: i3dl2 reverb refused (mix %d)", m);
+        AUT("audio: %s reverb refused (mix %d)", plain ? "plain" : "i3dl2", m);
         RET(0x1A9 << 9 | 153);   /* (out of effects: an audio result) */
         return;
     }
@@ -1666,13 +1904,22 @@ static void add_reverb(Ctx *c) {
     rv->room = -1000; rv->room_hf = -100; rv->refl = -2602; rv->reverb = 200; rv->hf_ratio = 0.83f;
     rv->diffusion = 100; rv->density = 100; rv->hf_ref = 5000; rv->dry = 1.0f;
     rv->decay_ns = 1490000000ll; rv->refl_delay_ns = 7000000; rv->late_delay_ns = 11000000;
+    rv->seq = ++fx_seq;
+    rv->buffer = ARG(2);
+    if (plain) {   /* (until the game sets its own: a hall, half early and late) */
+        rv->plain = 1;
+        rv->early_mode = 2;
+        rv->late_mode = 1;
+        rv->p_early = rv->p_late = 0.5f; rv->p_reverb = rv->p_out = rv->p_dry = 1.0f; rv->p_hf = 0.5f; rv->p_color = 0.5f;
+        rv->p_decay_ns = 1500000000ll; rv->p_pre_ns = 10000000;
+    }
     put_handle(ARG(1), K_EFFECT, e);
     au_unlock();
-    AUT("audio: i3dl2 reverb %d on mix %d, %d channels", e, m, rv->n);
+    AUT("audio: %s reverb %d on mix %d, %d channels", plain ? "plain" : "i3dl2", e, m, rv->n);
     RET(0);
 }
-HLE(_ZN2nn5audio14AddI3dl2ReverbEPNS0_19AudioRendererConfigEPNS0_15I3dl2ReverbTypeEPvmPNS0_10SubMixTypeEi) { add_reverb(c); }
-HLE(_ZN2nn5audio14AddI3dl2ReverbEPNS0_19AudioRendererConfigEPNS0_15I3dl2ReverbTypeEPvmPNS0_12FinalMixTypeEi) { add_reverb(c); }
+HLE(_ZN2nn5audio14AddI3dl2ReverbEPNS0_19AudioRendererConfigEPNS0_15I3dl2ReverbTypeEPvmPNS0_10SubMixTypeEi) { add_reverb(c, 0); }
+HLE(_ZN2nn5audio14AddI3dl2ReverbEPNS0_19AudioRendererConfigEPNS0_15I3dl2ReverbTypeEPvmPNS0_12FinalMixTypeEi) { add_reverb(c, 0); }
 static void ret_float(Ctx *c, float f) {
     uint32_t bits;
     memcpy(&bits, &f, 4);
@@ -1736,4 +1983,242 @@ HLE(_ZN2nn5audio25GetI3dl2ReverbInputOutputEPKNS0_15I3dl2ReverbTypeEPaS4_Pii) {
         *(int8_t *)GP(ARG(2) + k) = rv->out[k];
     }
     if (ARG(3)) G32(ARG(3)) = (uint32_t)n;
+}
+
+/* ---- plain reverb: AddReverb(config, ReverbType*, buffer, size, SubMixType* / FinalMixType*, channels) ---------- */
+static Reverb *plain_of(uint64_t obj) {
+    Reverb *rv = reverb_of(obj);
+    return rv && rv->plain ? rv : NULL;
+}
+HLE(_ZN2nn5audio9AddReverbEPNS0_19AudioRendererConfigEPNS0_10ReverbTypeEPvmPNS0_10SubMixTypeEi) { add_reverb(c, 1); }
+HLE(_ZN2nn5audio9AddReverbEPNS0_19AudioRendererConfigEPNS0_10ReverbTypeEPvmPNS0_12FinalMixTypeEi) { add_reverb(c, 1); }
+static void remove_reverb(Ctx *c) {   /* (RemoveReverb(config, ReverbType*, mix): the work buffer back) */
+    au_lock();
+    Reverb *rv = plain_of(ARG(1));
+    uint64_t buffer = 0;
+    if (rv) rv->used = 0, buffer = rv->buffer;
+    au_unlock();
+    if (rv) G64(ARG(1)) = 0;
+    RET(buffer);
+}
+HLE(_ZN2nn5audio12RemoveReverbEPNS0_19AudioRendererConfigEPNS0_10ReverbTypeEPNS0_10SubMixTypeE) { remove_reverb(c); }
+HLE(_ZN2nn5audio12RemoveReverbEPNS0_19AudioRendererConfigEPNS0_10ReverbTypeEPNS0_12FinalMixTypeE) { remove_reverb(c); }
+HLE(_ZN2nn5audio18SetReverbEarlyModeEPNS0_10ReverbTypeENS1_9EarlyModeE) { Reverb *rv = plain_of(ARG(0)); if (rv) rv->early_mode = (int)ARG(1); }
+HLE(_ZN2nn5audio17SetReverbLateModeEPNS0_10ReverbTypeENS1_8LateModeE) { Reverb *rv = plain_of(ARG(0)); if (rv) rv->late_mode = (int)ARG(1); }
+HLE(_ZN2nn5audio18SetReverbEarlyGainEPNS0_10ReverbTypeEf) { Reverb *rv = plain_of(ARG(0)); if (rv) rv->p_early = farg(c, 0); }
+HLE(_ZN2nn5audio17SetReverbLateGainEPNS0_10ReverbTypeEf) { Reverb *rv = plain_of(ARG(0)); if (rv) rv->p_late = farg(c, 0); }
+HLE(_ZN2nn5audio19SetReverbReverbGainEPNS0_10ReverbTypeEf) { Reverb *rv = plain_of(ARG(0)); if (rv) rv->p_reverb = farg(c, 0); }
+HLE(_ZN2nn5audio16SetReverbOutGainEPNS0_10ReverbTypeEf) { Reverb *rv = plain_of(ARG(0)); if (rv) rv->p_out = farg(c, 0); }
+HLE(_ZN2nn5audio16SetReverbDryGainEPNS0_10ReverbTypeEf) { Reverb *rv = plain_of(ARG(0)); if (rv) rv->p_dry = farg(c, 0); }
+HLE(_ZN2nn5audio32SetReverbHighFrequencyDecayRatioEPNS0_10ReverbTypeEf) { Reverb *rv = plain_of(ARG(0)); if (rv) rv->p_hf = farg(c, 0); }
+HLE(_ZN2nn5audio19SetReverbColorationEPNS0_10ReverbTypeEf) { Reverb *rv = plain_of(ARG(0)); if (rv) rv->p_color = farg(c, 0); }
+HLE(_ZN2nn5audio18SetReverbDecayTimeEPNS0_10ReverbTypeENS_8TimeSpanE) { Reverb *rv = plain_of(ARG(0)); if (rv) rv->p_decay_ns = (int64_t)ARG(1); }
+HLE(_ZN2nn5audio21SetReverbPredelayTimeEPNS0_10ReverbTypeENS_8TimeSpanE) { Reverb *rv = plain_of(ARG(0)); if (rv) rv->p_pre_ns = (int64_t)ARG(1); }
+HLE(_ZN2nn5audio16SetReverbEnabledEPNS0_10ReverbTypeEb) {
+    Reverb *rv = plain_of(ARG(0));
+    if (rv) rv->enabled = (int)(ARG(1) & 1);
+    AUT("audio: plain reverb %s", ARG(1) & 1 ? "on" : "off");
+}
+HLE(_ZN2nn5audio15IsReverbEnabledEPKNS0_10ReverbTypeE) { Reverb *rv = plain_of(ARG(0)); RET(rv ? rv->enabled : 0); }
+HLE(_ZN2nn5audio20SetReverbInputOutputEPNS0_10ReverbTypeEPKaS4_i) {
+    Reverb *rv = plain_of(ARG(0));
+    if (!rv) return;
+    const int n = (int)ARG(3) > MAX_CH ? MAX_CH : (int)ARG(3) < 0 ? 0 : (int)ARG(3);
+    for (int k = 0; k < n; k++) {
+        rv->in[k] = *(int8_t *)GP(ARG(1) + k);
+        rv->out[k] = *(int8_t *)GP(ARG(2) + k);
+    }
+    rv->n = n;
+}
+HLE(_ZN2nn5audio20GetReverbInputOutputEPKNS0_10ReverbTypeEPaS4_Pii) {
+    Reverb *rv = plain_of(ARG(0));
+    const int n = rv ? rv->n : 0;
+    for (int k = 0; k < n && k < (int)ARG(4); k++) {
+        *(int8_t *)GP(ARG(1) + k) = rv->in[k];
+        *(int8_t *)GP(ARG(2) + k) = rv->out[k];
+    }
+    if (ARG(3)) G32(ARG(3)) = (uint32_t)n;
+}
+
+/* ---- biquad filter: AddBiquadFilter(config, BiquadFilterType*, SubMixType* / FinalMixType*) -------------------- */
+static Biquad *biquad_of(uint64_t obj) {
+    const int i = get_handle(obj, K_BIQUAD);
+    return i >= 0 && i < MAX_FX && biquads[i].used ? &biquads[i] : NULL;
+}
+static void add_biquad(Ctx *c) {
+    au_lock();
+    int e = 0;
+    while (e < MAX_FX && biquads[e].used) e++;
+    const int m = mix_index(ARG(2));
+    if (e == MAX_FX || m < 0) {
+        au_unlock();
+        AUT("audio: biquad filter refused (mix %d)", m);
+        RET(0x1A9 << 9 | 153);
+        return;
+    }
+    Biquad *f = &biquads[e];
+    memset(f, 0, sizeof *f);
+    f->used = 1;
+    f->mix = m;
+    f->seq = ++fx_seq;
+    f->n = mixes[m].buffers < MAX_CH ? mixes[m].buffers : MAX_CH;   /* (until SetBiquadFilterInputOutput) */
+    for (int k = 0; k < MAX_CH; k++) f->in[k] = f->out[k] = (int8_t)k;
+    f->b[0] = 1.0f;
+    put_handle(ARG(1), K_BIQUAD, e);
+    au_unlock();
+    AUT("audio: biquad filter %d on mix %d", e, m);
+    RET(0);
+}
+HLE(_ZN2nn5audio15AddBiquadFilterEPNS0_19AudioRendererConfigEPNS0_16BiquadFilterTypeEPNS0_10SubMixTypeE) { add_biquad(c); }
+HLE(_ZN2nn5audio15AddBiquadFilterEPNS0_19AudioRendererConfigEPNS0_16BiquadFilterTypeEPNS0_12FinalMixTypeE) { add_biquad(c); }
+static void remove_biquad(Ctx *c) {
+    au_lock();
+    Biquad *f = biquad_of(ARG(1));
+    if (f) f->used = 0;
+    au_unlock();
+    if (f) G64(ARG(1)) = 0;
+}
+HLE(_ZN2nn5audio18RemoveBiquadFilterEPNS0_19AudioRendererConfigEPNS0_16BiquadFilterTypeEPNS0_10SubMixTypeE) { remove_biquad(c); }
+HLE(_ZN2nn5audio18RemoveBiquadFilterEPNS0_19AudioRendererConfigEPNS0_16BiquadFilterTypeEPNS0_12FinalMixTypeE) { remove_biquad(c); }
+HLE(_ZN2nn5audio26SetBiquadFilterInputOutputEPNS0_16BiquadFilterTypeEPKaS4_i) {
+    au_lock();
+    Biquad *f = biquad_of(ARG(0));
+    if (f) {
+        const int n = (int)ARG(3) > MAX_CH ? MAX_CH : (int)ARG(3) < 0 ? 0 : (int)ARG(3);
+        for (int k = 0; k < n; k++) {
+            f->in[k] = *(int8_t *)GP(ARG(1) + k);
+            f->out[k] = *(int8_t *)GP(ARG(2) + k);
+        }
+        f->n = n;
+        AUT("audio: biquad filter %d channels: %d", (int)(f - biquads), n);
+    }
+    au_unlock();
+}
+/* TBiquadFilterParameter<float>: bool @0, numerator[3] @4, additive-feedback denominator[2] @16 (as the voices').
+   The filter runs while both it (SetBiquadFilterEnabled) and its parameter are on. */
+HLE(_ZN2nn5audio24SetBiquadFilterParameterEPNS0_16BiquadFilterTypeERKNS0_22TBiquadFilterParameterIfEE) {
+    au_lock();
+    Biquad *f = biquad_of(ARG(0));
+    const uint64_t p = ARG(1);
+    if (f && p) {
+        const int on = *(uint8_t *)GP(p) != 0;
+        if (on && !f->on) memset(f->z, 0, sizeof f->z);
+        f->on = on;
+        memcpy(f->b, GP(p + 4), sizeof f->b);
+        memcpy(f->a, GP(p + 16), sizeof f->a);
+        static int logged;
+        if (on && logged++ < 8)
+            AUT("audio: biquad filter %d: b %.3f %.3f %.3f a %.3f %.3f", (int)(f - biquads), f->b[0], f->b[1], f->b[2],
+                f->a[0], f->a[1]);
+    }
+    au_unlock();
+}
+HLE(_ZN2nn5audio22SetBiquadFilterEnabledEPNS0_16BiquadFilterTypeEb) {
+    au_lock();
+    Biquad *f = biquad_of(ARG(0));
+    if (f) {
+        if ((ARG(1) & 1) && !f->enabled) memset(f->z, 0, sizeof f->z);
+        f->enabled = (int)(ARG(1) & 1);
+    }
+    au_unlock();
+}
+HLE(_ZN2nn5audio21IsBiquadFilterEnabledEPKNS0_16BiquadFilterTypeE) { Biquad *f = biquad_of(ARG(0)); RET(f ? f->enabled : 0); }
+
+/* ---- delay: AddDelay(config, DelayType*, buffer, size, SubMixType* / FinalMixType*, TimeSpan delayTimeMax,
+   channels). The lines are ours, taken here (the game's buffer is not used); until the game sets its gains the
+   delay passes the dry signal alone. There is no out gain to set: the line's output is added at 1. */
+static Delay *delay_of(uint64_t obj) {
+    const int i = get_handle(obj, K_DELAY);
+    return i >= 0 && i < MAX_FX && delays[i].used ? &delays[i] : NULL;
+}
+static void add_delay(Ctx *c) {
+    const int64_t max_ns = (int64_t)ARG(5);
+    const int n = (int)ARG(6) < 1 ? 1 : (int)ARG(6) > DELAY_CH ? DELAY_CH : (int)ARG(6);
+    const double frames = (double)max_ns * RATE / 1e9;
+    const int cap = frames < 1 ? 1 : frames < DELAY_MAX ? (int)frames + 1 : DELAY_MAX;
+    float *line = (float *)calloc((size_t)cap * n, sizeof *line);   /* (on the game's thread, before the lock) */
+    au_lock();
+    int e = 0;
+    while (e < MAX_FX && delays[e].used) e++;
+    const int m = mix_index(ARG(4));
+    if (e == MAX_FX || m < 0) {
+        au_unlock();
+        free(line);
+        AUT("audio: delay refused (mix %d)", m);
+        RET(0x1A9 << 9 | 153);
+        return;
+    }
+    Delay *dl = &delays[e];
+    float *old = dl->line;
+    memset(dl, 0, sizeof *dl);
+    dl->used = 1;
+    dl->mix = m;
+    dl->seq = ++fx_seq;
+    dl->n = n;
+    for (int k = 0; k < DELAY_CH; k++) dl->in[k] = dl->out[k] = (int8_t)k;
+    dl->line = line;
+    dl->cap = line ? cap : 0;
+    dl->max_ns = dl->time_ns = max_ns;
+    dl->dry = 1.0f;
+    dl->buffer = ARG(2);
+    put_handle(ARG(1), K_DELAY, e);
+    au_unlock();
+    free(old);
+    AUT("audio: delay %d on mix %d, %d channels, %.0f ms at most", e, m, n, (double)max_ns / 1e6);
+    RET(0);
+}
+HLE(_ZN2nn5audio8AddDelayEPNS0_19AudioRendererConfigEPNS0_9DelayTypeEPvmPNS0_10SubMixTypeENS_8TimeSpanEi) { add_delay(c); }
+HLE(_ZN2nn5audio8AddDelayEPNS0_19AudioRendererConfigEPNS0_9DelayTypeEPvmPNS0_12FinalMixTypeENS_8TimeSpanEi) { add_delay(c); }
+static void remove_delay(Ctx *c) {   /* (RemoveDelay(config, DelayType*, mix): the work buffer back) */
+    au_lock();
+    Delay *dl = delay_of(ARG(1));
+    uint64_t buffer = 0;
+    float *line = NULL;
+    if (dl) dl->used = 0, buffer = dl->buffer, line = dl->line, dl->line = NULL, dl->cap = 0;
+    au_unlock();
+    free(line);
+    if (dl) G64(ARG(1)) = 0;
+    RET(buffer);
+}
+HLE(_ZN2nn5audio11RemoveDelayEPNS0_19AudioRendererConfigEPNS0_9DelayTypeEPNS0_10SubMixTypeE) { remove_delay(c); }
+HLE(_ZN2nn5audio11RemoveDelayEPNS0_19AudioRendererConfigEPNS0_9DelayTypeEPNS0_12FinalMixTypeE) { remove_delay(c); }
+HLE(_ZN2nn5audio16IsDelayRemovableEPKNS0_9DelayTypeE) { RET(1); }
+HLE(_ZN2nn5audio15SetDelayEnabledEPNS0_9DelayTypeEb) {
+    au_lock();
+    Delay *dl = delay_of(ARG(0));
+    if (dl) {
+        if ((ARG(1) & 1) && !dl->enabled && dl->line) {   /* (switched on: the lines start empty) */
+            memset(dl->line, 0, (size_t)dl->cap * dl->n * sizeof *dl->line);
+            memset(dl->lp, 0, sizeof dl->lp);
+            dl->pos = 0;
+        }
+        dl->enabled = (int)(ARG(1) & 1);
+    }
+    au_unlock();
+    AUT("audio: delay %s", ARG(1) & 1 ? "on" : "off");
+}
+HLE(_ZN2nn5audio14IsDelayEnabledEPKNS0_9DelayTypeE) { Delay *dl = delay_of(ARG(0)); RET(dl ? dl->enabled : 0); }
+HLE(_ZN2nn5audio12SetDelayTimeEPNS0_9DelayTypeENS_8TimeSpanE) {
+    Delay *dl = delay_of(ARG(0));
+    if (dl) dl->time_ns = (int64_t)ARG(1) < 0 ? 0 : (int64_t)ARG(1) > dl->max_ns ? dl->max_ns : (int64_t)ARG(1);
+}
+HLE(_ZN2nn5audio12GetDelayTimeEPKNS0_9DelayTypeE) { Delay *dl = delay_of(ARG(0)); RET(dl ? (uint64_t)dl->time_ns : 0); }
+HLE(_ZN2nn5audio14SetDelayInGainEPNS0_9DelayTypeEf) { Delay *dl = delay_of(ARG(0)); if (dl) dl->in_gain = farg(c, 0); }
+HLE(_ZN2nn5audio20SetDelayFeedbackGainEPNS0_9DelayTypeEf) { Delay *dl = delay_of(ARG(0)); if (dl) dl->feedback = farg(c, 0); }
+HLE(_ZN2nn5audio15SetDelayDryGainEPNS0_9DelayTypeEf) { Delay *dl = delay_of(ARG(0)); if (dl) dl->dry = farg(c, 0); }
+HLE(_ZN2nn5audio21SetDelayChannelSpreadEPNS0_9DelayTypeEf) { Delay *dl = delay_of(ARG(0)); if (dl) dl->spread = farg(c, 0); }
+HLE(_ZN2nn5audio21SetDelayLowPassAmountEPNS0_9DelayTypeEf) { Delay *dl = delay_of(ARG(0)); if (dl) dl->lowpass = farg(c, 0); }
+HLE(_ZN2nn5audio19SetDelayInputOutputEPNS0_9DelayTypeEPKaS4_i) {
+    au_lock();
+    Delay *dl = delay_of(ARG(0));
+    if (dl) {   /* (no more channels than AddDelay took lines for) */
+        const int n = (int)ARG(3) > dl->n ? dl->n : (int)ARG(3) < 0 ? 0 : (int)ARG(3);
+        for (int k = 0; k < n; k++) {
+            dl->in[k] = *(int8_t *)GP(ARG(1) + k);
+            dl->out[k] = *(int8_t *)GP(ARG(2) + k);
+        }
+        dl->n = n;
+        AUT("audio: delay %d channels: %d", (int)(dl - delays), n);
+    }
+    au_unlock();
 }

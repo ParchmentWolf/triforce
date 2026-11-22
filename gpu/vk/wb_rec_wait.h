@@ -81,4 +81,108 @@ struct Finished {
     }
 };
 
+// ---- (Triforce, 11-22, the performance audit's SYNC-122, after Source B's) The reads' side of the same held timeline ----
+// A CPU readback (vk_replay.cpp invalidate) waits for its own write-back's value. Where the recording that carries it is known
+// it waits on the recordings' timeline (wait_recorded) and a stopped queue does not hold it. Where it is not known yet (the
+// writer still being recorded, or stopped at an event wait) it fell back to the submissions' timeline with no bound and no
+// second look: recorded and done a moment later, the read still waited until every older stopped submission had gone on. The
+// reads and bindings of pages put off (vk_memory.cpp late_unresolved_read, late_deferred_bound) wait in vk_timeline_wait, whose
+// held part was counted for all its callers together.
+//
+// RX_VK_WB_WAIT_REC is a mode now: 1 as it was (the waits end at the writer's recording), 2 the check: nothing ends earlier,
+// and the readback's fallback counts what 1 would not have waited. Unset, 0 or any other text: off, the fallback is the one
+// unbounded wait it was. Under 1 and 2 the fallback waits in slices of 1 ms and looks the recording up between them.
+// RX_VK_TL_REC=1 (and the lab knob tlrec) ended a capture's wait at value_rec's recording, a submission's FIRST part unless
+// RX_VK_REC_LAST: before the burst's write-backs are recorded. It now ends the wait as RX_VK_WB_WAIT_REC=1 does, at the
+// recording the submission was finished in (Finished); RX_VK_TL_REC=2 keeps the old lookup.
+
+/// RX_VK_WB_WAIT_REC's modes
+enum Mode { kOff = 0, kOn = 1, kCheck = 2 };
+/// Its text: "1" on, "2" the check; unset, empty, "0" and anything else (a word, another number, a number with a tail): off
+inline int mode(const char* text) {
+    if (!text || !text[0] || text[1]) return kOff;
+    return text[0] == '1' ? kOn : text[0] == '2' ? kCheck : kOff;
+}
+/// RX_VK_TL_REC's text names the old lookup (value_rec: a first part): the number 2
+inline bool tl_rec_first_part(const char* text) { return text && std::atoi(text) == 2; }
+/// Whether a capture's wait ends at the recording its submission was finished in: RX_VK_WB_WAIT_REC=1, or RX_VK_TL_REC (its
+/// switch or its knob: tl_rec) unless that asks for the old lookup, which has its own wait before this one
+inline bool ends_by_switch(int wb_mode, bool tl_rec, bool tl_first_part) {
+    return wb_mode == kOn || (tl_rec && !tl_first_part);
+}
+
+/// The waits' callers, for the held part by caller: a capture's take, a read of a page put off, a binding of one, a readback
+enum Caller { kTake = 0, kRead = 1, kBind = 2, kReadback = 3, kCallers = 4 };
+inline const char* caller_name(int who) {
+    static const char* const names[kCallers] = {"takes", "reads", "binds", "readbacks"};
+    return who >= 0 && who < kCallers ? names[who] : "?";
+}
+
+/// A slice of the readback's fallback wait (ns)
+constexpr uint64_t kSliceNs = 1000000ull;
+/// Whether the fallback waits in slices and looks the recording up between them: the mode on or the check, and a recordings'
+/// timeline to look on. Otherwise the one unbounded wait on the submissions' timeline, as before
+inline bool fallback_sliced(int wb_mode, bool has_rec_timeline) { return wb_mode != kOff && has_rec_timeline; }
+
+/// What a fallback wait did
+struct FallbackResult {
+    bool sliced = false;     // (it waited in slices)
+    bool known = false;      // (the writer's recording became known during the wait)
+    bool at_recording = false;   // (it ended with the recording's wait: mode 1)
+    bool error = false;      // (a wait gave something other than done or a timeout: a lost device; the wait ends)
+    int64_t rec_ns = -1;     // (when the recording was seen done, from the wait's start; -1: never seen)
+    int64_t total_ns = 0;
+    int64_t slices = 0;
+};
+/// The fallback wait over the calls it makes, so that a test can run it against a made-up GPU. d has:
+///   void plain()            the old wait: the held submits flushed, then the submissions' timeline, no bound
+///   void flush()            the held submits flushed (nothing when none is held)
+///   uint64_t lookup()       the recording the value was finished in, 0 while not known
+///   int rec_wait(seq)       the recordings' timeline waited for with no bound: 0 done, 2 an error
+///   bool rec_done(seq)      the recordings' timeline has passed seq (a poll)
+///   int slice()             the submissions' timeline waited for kSliceNs: 0 reached, 1 not yet, 2 an error
+///   int64_t now()           ns since the wait's start
+/// Mode 1 ends at the recording once it is known (no overall bound: the read needs its bytes). Mode 2 ends where the old wait
+/// ends, when the submissions' timeline reaches the value, and only notes when the recording was done. Mode 0: plain()
+template <class D>
+FallbackResult fallback_wait(int wb_mode, bool has_rec_timeline, D& d) {
+    FallbackResult r;
+    if (!fallback_sliced(wb_mode, has_rec_timeline)) {
+        d.plain();
+        r.total_ns = d.now();
+        return r;
+    }
+    r.sliced = true;
+    uint64_t seq = 0;
+    for (;;) {
+        d.flush();   // (a batched submit holds both timelines' signals; the writer may have been recorded and held since)
+        if (!seq) seq = d.lookup();
+        if (seq) {
+            r.known = true;
+            if (wb_mode == kOn) {
+                r.error = d.rec_wait(seq) != 0;
+                r.at_recording = !r.error;
+                r.rec_ns = d.now();
+                break;
+            }
+            if (r.rec_ns < 0 && d.rec_done(seq)) r.rec_ns = d.now();
+        }
+        const int s = d.slice();
+        r.slices++;
+        if (s == 1) continue;
+        r.error = s != 0;
+        // (the timeline cannot reach the value before the recording that finished it is done: seen now if not before)
+        if (!r.error && seq && r.rec_ns < 0 && d.rec_done(seq)) r.rec_ns = d.now();
+        break;
+    }
+    r.total_ns = d.now();
+    return r;
+}
+/// The part of a checked fallback wait (mode 2) after its writer's recording was seen done: what mode 1 would not have waited.
+/// To a slice's grain: the recording is looked at between slices
+inline int64_t fallback_held_ns(const FallbackResult& r) {
+    if (!r.sliced || r.at_recording || r.error || r.rec_ns < 0) return 0;
+    return held_ns(true, true, r.rec_ns, r.total_ns);
+}
+
 } // namespace mkwvk::wb_rec_wait

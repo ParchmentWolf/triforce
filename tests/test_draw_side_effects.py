@@ -25,6 +25,7 @@ FIXTURE = r"""
 #include <thread>
 #include <vector>
 #include "pipe_wait.h"
+#include "translate_wait.h"
 #define PROF_EXACT() ((void)0)
 #define PROF_HOT(x) ((void)0)
 #define SKIP_HERE() return
@@ -54,13 +55,14 @@ struct Stages {
 };
 struct Program {
     std::atomic<bool> ready{false};
+    uint64_t key = 0;   // ((Triforce, PIPE-30) read by the bounded wait)
     bool failed = false, fallback = false, fallback_task = false;
     int layout = 1, fallback_topology = 0;
     Stages stages{&ready, {}};
 };
 struct PipeEntry { std::atomic<bool> ready{false}; VkPipeline pipeline = 1; };
-struct Targets { bool persistent = true; };
-struct NvnState {};
+struct Targets { bool persistent = true; void* depth = nullptr; };   // ((Triforce, PIPE-29) depth: read by the budget)
+struct NvnState { struct { bool dt = false; } ds; };
 struct ParLock {};
 struct DrawArgs { bool indirect = true; int groups[3]{1, 1, 1}; int first_task = 0; };
 int fallback_task_groups(const Program&) { std::abort(); }
@@ -101,6 +103,21 @@ uint64_t texture_frame_no() { return 1; }
 pipe_wait::Pool& pipe_pool() { static pipe_wait::Pool p(50 * pipe_wait::kMs); return p; }
 pipe_wait::Pool& pipe_last() { static pipe_wait::Pool p(40 * pipe_wait::kMs); return p; }
 bool pipe_wait_for(const std::atomic<bool>&, int64_t) { std::abort(); }
+// ((Triforce, 11-22, PIPE-30) RX_VK_TRANSLATE_WAIT_MS unset, as here by default: the block waits as before.
+// tests/test_translate_wait.py runs it set)
+int translate_wait_ms() { return 0; }
+translate_wait::Notes& translate_notes() { static translate_wait::Notes n; return n; }
+pipe_wait::Pool& translate_pool() { static pipe_wait::Pool p; return p; }
+bool jobs_wait_for(const std::atomic<bool>&, int) { std::abort(); }
+std::atomic<int64_t> st_translate_bounded{0}, st_translate_left{0};
+// ((Triforce, 11-22, PIPE-29) RX_VK_PIPE_DEPTH_BUDGET unset, as here by default: depth-tested draws into new passes wait
+// as before. tests/test_pipe_depth_budget.py checks the rule set)
+bool pipe_depth_budget() { return false; }
+bool occ_counting_now() { return false; }
+bool pipe_depth_timed_out(const void*) { std::abort(); }
+void pipe_depth_time_out(const void*) { std::abort(); }
+std::atomic<int64_t> st_pipe_depth_waits{0}, st_pipe_depth_left{0};
+void logf(const char*, ...) {}
 int64_t st_pipe_new_waits, st_pipe_full_waits, st_pipe_full_held, st_pipe_full_left;
 bool exposure_log_on() { return false; }
 void exposure_note(NvnState&, const Program&) {}

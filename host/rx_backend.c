@@ -400,6 +400,8 @@ void hos_guest_io_end(int held) {
    has nothing left, or there is none. Both back end calls are found by name, as the lazy write-back's; without them nothing is
    told and the wait returns at once */
 static void (*volatile submit_waits_fn)(const uint64_t *, int);   /* (the back end's mkwvk_submit_waits, once it runs) */
+/* ((Triforce, 11-22, the performance audit's THREAD-25) the back end's mkwvk_invalidate_quick, once it runs: rx_nvn_invalidate) */
+static int (*volatile invalidate_quick_fn)(uint64_t, uint64_t);
 static int (*volatile replay_idle_wait_fn)(uint64_t);
 int rx_async_replay(void) {
     static volatile int on = -1;
@@ -455,6 +457,8 @@ int rx_start(void *hwnd) {
             /* (Triforce: the replay thread's two calls, rx_async_replay above; a back end without them has none) */
             submit_waits_fn = (void (*)(const uint64_t *, int))(void *)GetProcAddress(vk_module, "mkwvk_submit_waits");
             replay_idle_wait_fn = (int (*)(uint64_t))(void *)GetProcAddress(vk_module, "mkwvk_replay_idle_wait");
+            /* ((Triforce, THREAD-25) an invalidate with nothing to wait for; a back end without it is asked nothing) */
+            invalidate_quick_fn = (int (*)(uint64_t, uint64_t))(void *)GetProcAddress(vk_module, "mkwvk_invalidate_quick");
             hos_log("rx: renderer: %s (%s)", eden ? "Eden's" : "Vulkan", dll);
             flush_early();
             return 1;
@@ -596,9 +600,24 @@ void rx_nvn_texture_created(const nvn_tex *t) {
     if (vk && vk->nvn_texture_created) vk->nvn_texture_created(t);
 }
 void rx_nvn_program_released(const nvn_prog *p) { vk ? vk->nvn_program_released(p) : wgr_nvn_program_released(p); }
+/* ((Triforce, 11-21, the performance audit's THREAD-20, after Source A's) ReadTexels and WriteTexels reach the back end, which
+   waits for all the GPU work submitted (its finish) and then for the replay's lock: a GPU drain of 6 ms and more, at an
+   area's arrival and at boot, where the game calls them from its loading threads. The thread kept its virtual core through
+   that wait, and the game threads allowed only on that core waited with it, up to the 250 ms escape. No guest code runs in
+   the call, so the core is given up for it, as around rx_nvn_invalidate below. HOS_TEXELS_KEEP_CORE=1: kept, as before */
+static int texels_keep_core(void) {
+    static int keep = -1;
+    if (keep < 0) {
+        const char *e = getenv("HOS_TEXELS_KEEP_CORE");
+        keep = e && atoi(e) != 0;
+    }
+    return keep;
+}
 void rx_nvn_read_texels(const nvn_tex *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst,
                         size_t row, size_t img) {
+    const int away = texels_keep_core() ? 0 : hos_vcore_away();
     vk ? vk->nvn_read_texels(t, level, layer0, r, dst, row, img) : wgr_nvn_read_texels(t, level, layer0, r, dst, row, img);
+    if (away) hos_vcore_back();
 }
 void rx_nvn_write_texels(const nvn_tex *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src,
                          size_t row, size_t img) {
@@ -620,10 +639,18 @@ void rx_nvn_write_texels(const nvn_tex *t, unsigned level, unsigned layer0, cons
             }
         }
     }
+    /* ((Triforce, 11-21, THREAD-20) as the read: no core held through the back end's wait. The early path above never waits) */
+    const int away = texels_keep_core() ? 0 : hos_vcore_away();
     vk ? vk->nvn_write_texels(t, level, layer0, r, src, row, img)
        : wgr_nvn_write_texels(t, level, layer0, r, src, row, img);
+    if (away) hos_vcore_back();
 }
 void rx_nvn_invalidate(uint64_t gpu, uint64_t size) {
+    /* ((Triforce, 11-22, the performance audit's THREAD-25, after Source A's) The game invalidates each shape's 64-byte
+       occlusion slot, per view, and nearly none of those calls has anything to wait for; each gave the core up and queued
+       for it again. The back end is asked first, without a lock and without a wait (gpu/vk/page_marks.h has what it
+       looks at): 1, and the call is left out with the core kept. It answers 0 unless RX_VK_INVALIDATE_QUICK=1 */
+    if (vk && invalidate_quick_fn && invalidate_quick_fn(gpu, size)) return;
     /* The callback can wait for replay or GPU write-back: let another guest thread use this core meanwhile. */
     const int away = hos_vcore_away();
     int hos_ft_on(void);

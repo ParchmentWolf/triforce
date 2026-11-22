@@ -17,6 +17,9 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
 VkImage framegen_made_image(uint32_t* w, uint32_t* h);
 /// After that recording's submit (value): the display thread shows its frames
 void framegen_queue(uint64_t value);
+/// ((Triforce, 11-21, the performance audit's PRESENT-18) Each present, after framegen_queue: its images let go once it has
+/// been off for 120 presents. recorded: this present recorded made frames (framegen_idle.h)
+void framegen_idle(bool recorded);
 /// (Triforce) The hold of the last picture (present_hold.h, vk_replay.cpp do_present). A frame held is not given to
 /// framegen_record: the display thread shows the held picture (image GENERAL, w x h, crop as above or null; view: for the
 /// window's passes, or null) once, after the frames it has still to show, and nothing is made from it

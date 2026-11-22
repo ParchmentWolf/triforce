@@ -350,11 +350,53 @@ static void elsewhere() {
     CHECK(out.size() == 301);   // (300 programs' and the shared one, each once)
 }
 
+// ((Triforce, 11-21) the pipelines' order keeps more than the programs': a file of 4096 < n <= 16384 reads back, the programs'
+// reader still refuses it, a pipeline Record keeps up to its own cap and a merge goes up to it
+void cap() {
+    std::vector<uint64_t> keys;
+    for (uint64_t k = 1; k <= 10000; k++) keys.push_back(k);
+    const auto bytes = po::write(keys);
+    CHECK(po::read(bytes.data(), bytes.size()) == keys);
+    CHECK(program_order::read(bytes.data(), bytes.size(), po::kMagic).empty());
+    po::Record r;
+    for (uint64_t k = 1; k <= po::kKeysMax + 10; k++) r.add(k);
+    CHECK(r.keys.size() == po::kKeysMax);
+    program_order::Record pr;
+    for (uint64_t k = 1; k <= po::kKeysMax; k++) pr.add(k);
+    CHECK(pr.keys.size() == program_order::kKeysMax);
+    std::vector<uint64_t> before;
+    for (uint64_t k = 100000; k < 100000 + 9000; k++) before.push_back(k);
+    CHECK(po::merge(keys, before).size() == po::kKeysMax && po::merge(keys, before)[0] == 1);
+}
+
+// ((Triforce, 11-21) soft behind: behind() lets nothing go; a link behind goes first when a new one needs the room
+void soft() {
+    po::Held<int> h(4);
+    h.soft(true);
+    std::vector<po::Held<int>::One> gone;
+    const uint64_t libs[1] = {7};
+    for (int64_t p = 0; p < 4; p++) h.put(100 + (uint64_t)p, p, (int)p, libs, 1, gone);
+    h.behind(2, gone);
+    CHECK(gone.empty() && h.size() == 4);
+    CHECK(h.room(50));   // (full, but 0 and 1 are behind: room)
+    h.put(200, 50, 50, libs, 1, gone);
+    CHECK(gone.size() == 1 && gone[0].key == 100 && h.size() == 4);   // (the farthest behind went, not the farthest ahead)
+    po::Held<int>::One o;
+    CHECK(h.take(101, o) && o.place == 1);   // (one behind still taken by a draw that came back)
+    po::Held<int> hard(4);
+    std::vector<po::Held<int>::One> g2;
+    for (int64_t p = 0; p < 4; p++) hard.put(100 + (uint64_t)p, p, (int)p, libs, 1, g2);
+    hard.behind(2, g2);
+    CHECK(g2.size() == 2 && hard.size() == 2);   // (not soft: as before)
+}
+
 int main() {
     CHECK(po::on(nullptr) && po::on("1") && !po::on("0") && po::on("00"));
-    CHECK(po::kMagic != program_order::kMagic && po::kKeysMax == program_order::kKeysMax);
+    CHECK(po::kMagic != program_order::kMagic && po::kKeysMax == 16384 && program_order::kKeysMax == 4096);
     CHECK(po::kLinksMax >= 2 * pipe_warm::kLinksMax && po::kLibsMax >= 2 * po::kLinksMax && po::kPerVariant > 0);
     file();
+    cap();
+    soft();
     indexed();
     front();
     held();

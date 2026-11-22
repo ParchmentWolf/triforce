@@ -206,15 +206,65 @@ static void test_astc_authored() {
     CHECK(astc_opaque::block(plain(8).set(0, 11, 0x66).b, 12, 12));       // (8 x 5 weights of 2 bits: 80 bits)
     CHECK(!astc_opaque::block(plain(8).set(0, 11, 0x466).b, 12, 12));     // (two planes of 8 x 5: 80 weights, over 64)
     CHECK(!astc_opaque::block(plain(8).set(10, 1, 1).set(11, 2, 3).b, 8, 8));   // (two planes and four partitions)
-    // several partitions: one shared mode (bits 23 and 24 zero, the mode in bits 25 to 28), or a mode each (not looked for)
+    // several partitions: one shared mode (bits 23 and 24 zero, the mode in bits 25 to 28)
     for (unsigned cem = 0; cem < 16; cem++)
         for (unsigned parts = 1; parts < 4; parts++) {
             Block k = plain(15);
             k.set(11, 2, parts).set(23, 2, 0).set(25, 4, cem);
             CHECK(astc_opaque::block(k.b, 8, 8) == is_opaque_mode(cem));
-            k.set(23, 2, 1 + cem % 3);
-            CHECK(!astc_opaque::block(k.b, 8, 8));
         }
+    // ((11-21, the performance audit's TEX-50) a mode a partition, authored as the decoder reads it: bits 23 and 24 a number
+    // from 1 to 3, then a class bit a partition and two mode bits a partition, their first four in bits 25 to 28 and the rest
+    // right below the weights (plain's weights are 32 bits: at 96 less their count). Every class and mode of every partition:
+    // opaque only when each partition's mode is)
+    for (unsigned parts = 2; parts <= 4; parts++) {
+        const unsigned extra = 3 * parts - 4;
+        long opaque = 0, all = 0;
+        for (unsigned base = 1; base <= 3; base++)
+            for (uint32_t v = 0; v < (1u << (3 * parts)); v++, all++) {
+                Block k = plain(15);
+                k.set(11, 2, parts - 1).set(23, 2, base).set(25, 4, v & 15).set(128 - 32 - extra, extra, v >> 4);
+                bool want = true;
+                for (unsigned i = 0; i < parts; i++) {
+                    const unsigned cls = base - 1 + ((v >> i) & 1), mode = (cls << 2) | ((v >> (parts + 2 * i)) & 3);
+                    want = want && is_opaque_mode(mode);
+                }
+                CHECK(astc_opaque::block(k.b, 8, 8) == want);
+                opaque += want;
+                astc_opaque::parts_too = false;   // (RX_VK_TEX_BC1_PARTS=0: refused unread, as before)
+                CHECK(!astc_opaque::block(k.b, 8, 8));
+                astc_opaque::parts_too = true;
+            }
+        CHECK(opaque > 0 && opaque < all);
+    }
+    {   // (one partition with alpha among opaque ones: no. Three partitions over base 2, classes 0 1 1: modes 4, 8 and 8)
+        Block k = plain(15);
+        k.set(11, 2, 2).set(23, 2, 2).set(25, 4, 0b0110).set(128 - 32 - 5, 5, 0);
+        CHECK(!astc_opaque::block(k.b, 8, 8));   // (partition 0 is mode 4, luminance and alpha)
+        k.set(25, 4, 0b0111);                    // (classes 1 1 1: modes 8, 8 and 8)
+        CHECK(astc_opaque::block(k.b, 8, 8));
+        k.set(128 - 32 - 5, 5, 0b00011);         // (the last partition's mode bits 3: mode 11, HDR)
+        CHECK(!astc_opaque::block(k.b, 8, 8));
+    }
+    {   // (the decoder's last error with these bits counted: 8 x 4 weights of 3 bits are 96 bits, block mode 0x57; with 29 bits
+        // read and 2 more for two partitions 127, which fits; 5 or 8 more for three or four wrap, and the block is an error,
+        // (0, 0, 0, 0) on the GPU, whatever its modes say)
+        for (unsigned parts = 1; parts <= 4; parts++)
+            for (unsigned base = 0; base <= 3; base++) {
+                Block k = plain(8);
+                k.set(0, 11, 0x57).set(11, 2, parts - 1);
+                if (parts > 1) k.set(23, 6, base);   // (classes and mode bits all 0: every partition mode (base - 1) * 4, or 0 shared)
+                for (unsigned i = 29; i < 32; i++) k.set(i, 1, 0);
+                const unsigned extra = parts > 1 && base ? 3 * parts - 4 : 0;
+                const bool fits = 96 + (parts == 1 ? 17 : 29) + extra <= 128;
+                if (extra && fits) k.set(128 - 96 - extra, extra, 0);   // (where they do not fit they would lie over bits 23 and 24)
+                const unsigned mode = parts == 1 ? 8 : base ? (base - 1) << 2 : 0;
+                CHECK(astc_opaque::block(k.b, 8, 8) == (fits && is_opaque_mode(mode)));
+            }
+        Block k = plain(8);
+        k.set(0, 11, 0x57).set(11, 2, 2).set(23, 6, 1);   // (three partitions, a mode each, every mode 0: opaque but for the wrap)
+        CHECK(!astc_opaque::block(k.b, 8, 8));
+    }
     // a void extent: the constant's alpha, and the decoder's two errors
     Block v;
     v.set(0, 9, 0x1FC).set(9, 1, 0).set(10, 2, 3);

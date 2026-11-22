@@ -25,7 +25,7 @@ def main():
     build = between(draw, "VkPrimitiveTopology topo, int part, bool* cold) {", "\n}\n")
     for line, why in (
             ("const bool lib_cached = (part == 1 || part == 2) && gpl_libs_cached();", "only the two shader libraries are kept"),
-            ("const VkPipelineCache wanted = lib_cached || (part < 0 && !driver_cache_only) ? pcache : VK_NULL_HANDLE;",
+            ("const VkPipelineCache wanted = lib_cached || (part < 0 && !driver_cache_only && !pcache_libs_only) ? pcache : VK_NULL_HANDLE;",   # ((Triforce, 11-22, PIPE-78) whole pipelines out when lean)
              "the libraries are not built into the pipeline cache"),
             # ((Triforce) through the cache's gate, held over the creation: none once it is let go for the RAM, pcache_gate.h)
             ("const PcacheUse use(pcache_door, wanted);", "the creation does not hold the cache's gate"),

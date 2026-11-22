@@ -123,7 +123,10 @@ def check_sources():
     if "if (!SwitchToThread()) YieldProcessor();" not in block(thread, "static void yield_for_wait(void) {"):
         raise SystemExit("FAIL: host/hos_thread.c: the wait's end is not yielded as a short sleep yields")
     # (sleep_ns takes the timer from a millisecond on: the timer's part of the wait is never shorter)
-    if "if (ns < 1000000 && !short_timer) {" not in block(thread, "static void sleep_ns(int64_t ns) {"):
+    # ((11-21, OS-31) the body is sleep_for's and the rule short_sleep.h's: under PACE_WAIT_TIMER_MIN_NS it may yield)
+    if "if (short_sleep_yields(ns, how, guest)) {" not in block(thread, "static void sleep_for(int64_t ns, int guest) {") or \
+            "return ns < 1000000 && how <" not in (ROOT / "host" / "short_sleep.h").read_text(encoding="utf-8") or \
+            "static void sleep_ns(int64_t ns) { sleep_for(ns, 0); }" not in thread:
         raise SystemExit("FAIL: host/hos_thread.c sleep_ns no longer takes the timer from 1 ms on (PACE_WAIT_TIMER_MIN_NS)")
     if "void hos_sleep_until_ns(int64_t until, int64_t margin_ns);" not in hos:
         raise SystemExit("FAIL: host/hos.h does not declare hos_sleep_until_ns")

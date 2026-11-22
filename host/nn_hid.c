@@ -963,7 +963,6 @@ static int flight_jump_shortcut(uint64_t *buttons, int mode, int menu_open, int 
 static void read_input(uint64_t *buttons, int32_t stick[4]) {
     *buttons = 0;
     memset(stick, 0, 4 * sizeof *stick);
-    void hos_mouse_native_stick(int held);
     scripted_input(buttons, stick);
     /* ((Triforce, 11-19) benchmark mode (host/hos_bench.c) drives the game itself: its presses and stick alone, with the window
        in front or behind other windows; the player's devices do not count while it runs (a mouse or a pad would move the camera
@@ -1090,9 +1089,6 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
        controller's stick and the scripted presses are as they are) */
     if (walk_vk && key(walk_vk)) walk_keys(keys, rx_option(HOS_OPT_WALK_SCALE, 51));
     stick_max(stick, keys);
-    /* (hookshot, mouse_native.c) the keys and the pads are the right stick too: while they turn the camera, its angles are
-       the native mouse's new start, so the two do not undo each other */
-    hos_mouse_native_stick(stick[2] != 0 || stick[3] != 0);
 }
 
 static void vibration_send(uint64_t handle, uint64_t value);
@@ -1212,6 +1208,13 @@ static void npad_states(Ctx *c) {
     }
     if (connected) {
         read_input(&buttons, stick);
+        /* (mouse_native.c) the keys, the pads and the scripted presses are the right stick too: while they turn the camera,
+           its angles are the native mouse's new start, so the two do not undo each other. ((Triforce, 11-22) Told after
+           every read, not at the end of the window-in-front one alone: with the window behind another and Controller in
+           background on, the pad's turns were put back each frame and the camera moved a frame's worth (#bug-tracker,
+           11-21); the benchmark's camera turn too) */
+        void hos_mouse_native_stick(int held);
+        hos_mouse_native_stick(stick[2] != 0 || stick[3] != 0);
         mods_input(&buttons, stick);   /* (Triforce) the Mods entry's: below */
         {   /* (Triforce) the sprint button's press is its own while Link plays (host/oot_sprint.c) */
             void hos_oot_sprint_pad(uint64_t *buttons);

@@ -58,6 +58,8 @@ static partial class Tests
         Check(none.Text.Contains(" to "), "a range in words: " + none.Text);
         var amd = BuildEstimator.Estimate(BuildHistory.Load(root), false, 16, GpuVendor.Amd);
         Equal(TimeSpan.FromMinutes(120), amd.Of("shaders")!.High, "AMD's shader step up to 2 hours");
+        var intel = BuildEstimator.Estimate(BuildHistory.Load(root), false, 12, GpuVendor.Intel);
+        Equal(TimeSpan.FromMinutes(240), intel.Of("shaders")!.High, "Intel's shader step up to 4 hours (an A750: 4.3 h on v0.6.0)");
         File.WriteAllText(Path.Combine(root, "build_times.json"), new JsonObject
         {
             ["format"] = 1,
@@ -74,6 +76,8 @@ static partial class Tests
         var est2 = BuildEstimator.Estimate(BuildHistory.Load(root), false, 8, GpuVendor.Nvidia);
         Equal(TimeSpan.FromSeconds(1500), est2.Of("compile")!.Low, "the stage record wins");
         Equal(TimeSpan.FromSeconds(600), est2.Of("shaders")!.High, "the shader step measured too");
+        var upd = BuildEstimator.Estimate(BuildHistory.Load(root), true, 8, GpuVendor.Intel);
+        Equal(TimeSpan.FromSeconds(600), upd.Of("shaders")!.High, "an update with no update on record: the build's measured shader step, not the stated range");
         Equal("About 40 minutes", est2.Text, "one time in words");
         var tr = new BuildTracker();
         tr.Feed("@@stage compile Compiling");
@@ -83,6 +87,112 @@ static partial class Tests
         Equal("About 16 minutes left", BuildClock.LeftText(left), "in words");
         Equal("Almost done", BuildClock.LeftText(TimeSpan.FromSeconds(20)), "under a minute");
         Equal("1 h 5 min", BuildClock.Span(TimeSpan.FromMinutes(65)), "span");
+    }
+
+    static BuildEstimate OneStage(string stage, double low, double high, bool measured) =>
+        new(new[] { new StageEstimate(stage, TimeSpan.FromSeconds(low), TimeSpan.FromSeconds(high), measured) }, measured);
+
+    /// <summary>A stage run second by second on a fake clock: progress(t) said as the game says it (each time the tenth of a percent
+    /// moves), the shown time left asked each second as the App's tick does. The shown seconds at each second.</summary>
+    static double[] RunStage(BuildEstimate est, string stage, Func<double, double> progress, int seconds)
+    {
+        var t0 = new DateTime(2026, 11, 22, 10, 0, 0, DateTimeKind.Utc);
+        var now = t0;
+        var tr = new BuildTracker(() => now);
+        tr.Feed("@@stage " + stage + " x");
+        var shown = new double[seconds + 1];
+        var said = 0.0;
+        for (var t = 0; t <= seconds; t++)
+        {
+            now = t0.AddSeconds(t);
+            var p = Math.Floor(Math.Clamp(progress(t), 0, 1) * 1000) / 1000;
+            if (p > said) { said = p; tr.Feed("@@progress " + p.ToString("0.000", System.Globalization.CultureInfo.InvariantCulture)); }
+            shown[t] = BuildClock.Remaining(est, tr).TotalSeconds;
+        }
+        return shown;
+    }
+
+    static void EtaSlowStart()
+    {
+        // (an Intel-like shader step of an hour: the compute pipelines, the first 14 %, take 52 minutes; the rest 8. The rate since
+        // the stage began said 4 hours and more there)
+        static double P(double t) => t < 3120 ? 0.14 * t / 3120 : 0.14 + 0.86 * (t - 3120) / 480;
+        foreach (var (est, what) in new[] { (OneStage("shaders", 600, 2400, false), "the stated range"), (OneStage("shaders", 3600, 3600, true), "this PC's last time") })
+        {
+            var shown = RunStage(est, "shaders", P, 3600);
+            for (var t = 300; t <= 3600; t++)
+            {
+                Check(shown[t] < 90 * 60, what + ": no hours after the first minutes (" + BuildClock.LeftText(TimeSpan.FromSeconds(shown[t])) + " at " + t + " s)");
+                Check(shown[t] <= shown[t - 1] + 1, what + ": never up by more than a second a second (" + shown[t - 1] + " to " + shown[t] + " at " + t + " s)");
+            }
+            Check(shown[3540] < 180, what + ": near the end it says so: " + shown[3540]);
+        }
+        // (this PC's own time knows the hour: it is told within a quarter of an hour all the way)
+        var measured = RunStage(OneStage("shaders", 3600, 3600, true), "shaders", P, 3600);
+        for (var t = 0; t <= 3600; t += 60) Check(Math.Abs(measured[t] - (3600 - t)) < 15 * 60, "measured: " + measured[t] + " at " + t + " s");
+    }
+
+    static void EtaStall()
+    {
+        // (a 20 minute stage, steady, that sits 10 minutes on one item at 400 s)
+        static double P(double t) => t < 400 ? t / 1200 : t < 1000 ? 400.0 / 1200 : (t - 600) / 1200;
+        var shown = RunStage(OneStage("shaders", 1200, 1200, true), "shaders", P, 1800);
+        var before = shown[400];
+        var most = shown.Skip(400).Take(900).Max();
+        Check(most - before <= 4 * 60, "the stall and the steps after it add at most 4 minutes: " + before + " to " + most);
+        Check(shown.Skip(400).Take(600).Min() >= before - 120, "it holds while nothing moves: " + shown.Skip(400).Take(600).Min());
+        Check(Math.Abs(shown[1500] - 300) < 120, "back on time once it moves again: " + shown[1500]);
+        Check(shown[1790] < 60, "done at the end: " + shown[1790]);
+    }
+
+    static void EtaSteady()
+    {
+        var shown = RunStage(OneStage("shaders", 1200, 1200, true), "shaders", t => t / 1200, 1200);
+        for (var t = 60; t + 60 <= 1200; t += 60)
+        {
+            var fell = shown[t] - shown[t + 60];
+            Check(fell is > 45 and < 75, "a minute a minute (" + fell + " s at " + t + " s)");
+            Check(Math.Abs(shown[t] - (1200 - t)) < 60, "on time: " + shown[t] + " at " + t + " s");
+        }
+        // (slower than the stated range said: the measured rate takes over and it is told right by the middle)
+        var slow = RunStage(OneStage("shaders", 600, 2400, false), "shaders", t => t / 2400.0, 2400);
+        for (var t = 1200; t <= 2340; t += 60) Check(Math.Abs(slow[t] - (2400 - t)) < 0.2 * (2400 - t) + 60, "slow but steady: " + slow[t] + " at " + t + " s");
+        for (var t = 1; t <= 2400; t++) Check(slow[t] <= slow[t - 1] + 0.5, "never up by more than half a second a second at " + t + " s");
+    }
+
+    static void EtaOtherStages()
+    {
+        var est = new BuildEstimate(new[]
+        {
+            new StageEstimate("read", TimeSpan.FromSeconds(90), TimeSpan.FromSeconds(90), true), new StageEstimate("lift", TimeSpan.FromSeconds(130), TimeSpan.FromSeconds(130), true),
+            new StageEstimate("compile", TimeSpan.FromSeconds(1500), TimeSpan.FromSeconds(1500), true), new StageEstimate("finish", TimeSpan.FromSeconds(70), TimeSpan.FromSeconds(70), true),
+            new StageEstimate("shaders", TimeSpan.FromSeconds(600), TimeSpan.FromSeconds(600), true),
+        }, true);
+        var t0 = new DateTime(2026, 11, 22, 10, 0, 0, DateTimeKind.Utc);
+        var now = t0;
+        var tr = new BuildTracker(() => now);
+        Equal(TimeSpan.FromSeconds(2390), BuildClock.Estimated(est, tr), "before the first stage: every stage");
+        tr.Feed("@@stage lift Translating");
+        now = t0.AddSeconds(30);
+        Equal(TimeSpan.FromSeconds(100 + 1500 + 70 + 600), BuildClock.Estimated(est, tr), "no progress: its estimate less its time");
+        Equal(TimeSpan.FromSeconds(100 + 1500 + 70 + 600), BuildClock.Remaining(est, tr), "shown as it is");
+        now = t0.AddSeconds(40);
+        Equal(TimeSpan.FromSeconds(90 + 1500 + 70 + 600), BuildClock.Remaining(est, tr), "and counted down");
+        now = t0.AddSeconds(400);
+        Equal(TimeSpan.FromSeconds(13 + 0.25 * 270 + 1500 + 70 + 600), BuildClock.Estimated(est, tr), "past its estimate: a tenth of it and a quarter of the time over");
+        // (steady progress: by its rate)
+        var lift = new BuildTracker(() => now);
+        now = t0;
+        lift.Feed("@@stage lift Translating");
+        for (var t = 1; t <= 65; t++) { now = t0.AddSeconds(t); lift.Feed("@@progress " + (t / 130.0).ToString("0.000", System.Globalization.CultureInfo.InvariantCulture)); }
+        Check(Math.Abs(BuildClock.Estimated(est, lift).TotalSeconds - (65 + 1500 + 70 + 600)) < 3, "half way at its pace: " + BuildClock.Estimated(est, lift));
+        // (the compile by its @@eta, as before; the eta goes with the stage)
+        lift.Feed("@@stage compile Compiling");
+        lift.Feed("@@eta 300");
+        Equal(TimeSpan.FromSeconds(300 + 70 + 600), BuildClock.Estimated(est, lift), "the compile's eta");
+        lift.Feed("@@stage finish Putting");
+        Equal(TimeSpan.FromSeconds(70 + 600), BuildClock.Estimated(est, lift), "the eta ends with the compile");
+        Equal(1, lift.Recent.Count, "a new stage starts its samples over");
     }
 
     /// <summary>A test root with fake tools: tools\nx2\make_game.py, and this program as tools\python\python.exe.</summary>

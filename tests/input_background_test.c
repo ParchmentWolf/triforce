@@ -87,7 +87,10 @@ void binds_load(void) {
    read_input calls */
 int hos_mouse_native(void) { return -1; }
 void hos_mouse_native_free(int free) { (void)free; }
-void hos_mouse_native_stick(int held) { (void)held; }
+/* ((Triforce, 11-22) whether the right stick turns the camera, told after every read: behind another window too, where the
+   pads alone turned it, and the native mouse put the angles back each frame) */
+static int native_held = -1;
+void hos_mouse_native_stick(int held) { native_held = held; }
 static void mouse_setup(void) {}
 static void mouse_sens_keys(void) {}
 int mouse_stick(int32_t *x, int32_t *y, int held) { (void)x; (void)y; (void)held; mouse_queries++; return 0; }
@@ -113,8 +116,10 @@ static void packet(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx) {
     context.x[0] = 64; context.x[1] = 2; context.x[2] = 16; context.x[30] = 0x1234;
     G32(16) = NPAD_NO1;
     memset(memory + 64, 0xa5, 2 * STATE_SIZE + 8);
+    native_held = -1;
     npad_states(&context);
     CHECK(context.x[0] == 2);
+    CHECK(native_held == (rx != 0));   /* (the stick the game is given, told to the native mouse, the window in front or not) */
     expected_sampling++;
     for (int i = 0; i < 2; i++) {
         const uint64_t address = 64 + (uint64_t)i * STATE_SIZE;

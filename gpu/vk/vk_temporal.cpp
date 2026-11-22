@@ -55,9 +55,11 @@
 #include <unordered_map>
 #include <vector>
 
+#include "capture_tables.h"   // ((Triforce, the upscaler audit's UPS-02) the stored draws' tables, kept from frame to frame)
 #include "dlss_actor.h"
 #include "dlss_checks.h"
 #include "dlss_math.h"
+#include "redraw_state.h"    // ((Triforce, the upscaler audit's UPS-03) what a redraw still has to set)
 #include "framegen_rows.h"   // ((Triforce) pose_of, camera_cut: a camera cut starts a new history)
 #include "fsr3_math.h"       // ((Triforce, FSR4-10) jitter_phases: AMD's jitter length, for FSR 4 too)
 #include "stream_order.h"
@@ -334,8 +336,12 @@ struct State {
     bool capture_camera_own = false;
     uint64_t capture_unjittered = 0;   // (stored draws whose own camera's jitter is not the scene's, since the last status line)
     std::vector<Captured> captured;
-    std::unordered_map<uint64_t, int> captured_models;   // (by model: its draws so far this frame, for the key's nth)
-    std::unordered_map<uint64_t, Captured> captured_before;
+    // ((Triforce, 11-21, the upscaler audit's UPS-02) both keep their memory from frame to frame (capture_tables.h): as
+    // std::unordered_map they took a node from the heap for every stored draw every frame, and gave it back the frame after.
+    // RX_VK_CAPTURE_TABLES=0: as before
+    const bool capture_tables_kept = capture_tables::kept(getenv("RX_VK_CAPTURE_TABLES"));
+    capture_tables::Nth captured_models{capture_tables_kept};   // (by model: its draws so far this frame, for the key's nth)
+    capture_tables::Before<Captured> captured_before{capture_tables_kept};
     uint64_t captured_frame = 0;
     struct CaptureBuffer {
         VkBuffer buffer = VK_NULL_HANDLE;
@@ -966,6 +972,9 @@ std::vector<State::Captured> take_captures() {
     State& s = st();
     std::vector<State::Captured> c = std::move(s.captured);
     s.captured.clear(), s.captured_models.clear();
+    // ((Triforce, UPS-02) the next frame's list at this frame's size from its start: moved from, it grew from nothing again
+    // every frame, a dozen times over)
+    s.captured.reserve(capture_tables::room(c.size(), s.capture_tables_kept));
     // (Triforce: in stream order and named again, as the skinned draws are in actor_motion)
     stream_order::renumber(c, [](const State::Captured& k) { return k.k.stream_pos; },
                            [](State::Captured& k) -> uint64_t& { return k.key; });
@@ -1000,13 +1009,12 @@ int capture_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, 
         std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
         ~Timed() { s.actor_ns += (std::chrono::steady_clock::now() - t0).count(); }
     } timed{s};
-    std::unordered_map<uint64_t, State::Captured> old = std::move(s.captured_before);
-    s.captured_before.clear();
+    s.captured_before.turn();   // ((Triforce, UPS-02) what the last call put is the frame before's now: before())
     // (the frame before's are of the frame the engine last drew: else a gap, and their positions are older)
     const bool old_ok = history && s.captured_frame && s.captured_frame == to.last;
     s.captured_frame = texture_frame_no();
     for (const auto& c : caps)
-        if (c.k.depth == cam.depth) s.captured_before[c.key] = c;
+        if (c.k.depth == cam.depth) s.captured_before.put(c.key, c);
     // (RX_VK_DLSS_TRACE=<frames>: on vk_draw.cpp's traced frames, each stored draw left out here and why)
     static const int trace_every = env_switch("RX_VK_DLSS_TRACE");
     const uint64_t now = texture_frame_no();
@@ -1028,8 +1036,8 @@ int capture_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, 
             left(c, "another depth target than the scene's");
             continue;
         }
-        const auto it = old_ok ? old.find(c.key) : old.end();
-        if (it == old.end()) {
+        const State::Captured* const was = old_ok ? s.captured_before.before(c.key) : nullptr;
+        if (!was) {
             s.actor_skipped++;
             left(c, !old_ok ? "no history" : "not drawn the frame before (its key)");
             continue;
@@ -1044,7 +1052,7 @@ int capture_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, 
                 continue;
             }
         }
-        const State::Captured& o = it->second;
+        const State::Captured& o = *was;
         dlss_actor::CapturePush push{c.address, o.address, c.first, o.first, c.count, o.count, {}, {}};
         for (int i = 0; i < 2; i++) {
             push.jitter_now[i] = c.own ? c.jitter[i] : cam.jitter[i];
@@ -1131,14 +1139,21 @@ int capture_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, 
     }
     // (the positions the scene's draws stored: the prep pass's barrier is after them)
     if (!begin_redraw(cmd, s.capture, cam, before, to.jitter_before, reproject, rw, rh, dview, to.motion)) return 0;
+    // ((Triforce, 11-21, the upscaler audit's UPS-03) the topology, the restart and the index buffer only where a draw's
+    // differ from what the pass has set (redraw_state.h): each draw set all three before, three commands a draw of which
+    // nearly all said what was set already. RX_VK_REDRAW_STATE=0: every draw sets them, as before
+    static const bool set_every = redraw_state::every(getenv("RX_VK_REDRAW_STATE"));
+    redraw_state::Pass set;
+    set.all = set_every;
     for (const Redraw& d : draws) {   // (the same indices, base vertex and topology: VertexIndex names the same vertex)
         const CaptureDraw& k = d.c->k;
         vkCmdPushConstants(cmd, s.actor_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof d.push, &d.push);
-        vkCmdSetPrimitiveTopology(cmd, k.topology);
-        vkCmdSetPrimitiveRestartEnable(cmd, k.restart ? VK_TRUE : VK_FALSE);
+        if (redraw_state::topology(set, (uint32_t)k.topology)) vkCmdSetPrimitiveTopology(cmd, k.topology);
+        if (redraw_state::restart(set, k.restart)) vkCmdSetPrimitiveRestartEnable(cmd, k.restart ? VK_TRUE : VK_FALSE);
         if (k.itype != dlss_actor::kNoIndices) {
             const VkIndexType type = k.itype == 0 ? VK_INDEX_TYPE_UINT8_EXT : k.itype == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
-            vkCmdBindIndexBuffer(cmd, d.ib.buffer, d.ib.offset, type);
+            if (redraw_state::index(set, (uint64_t)d.ib.buffer, (uint64_t)d.ib.offset, (uint32_t)type))
+                vkCmdBindIndexBuffer(cmd, d.ib.buffer, d.ib.offset, type);
             vkCmdDrawIndexed(cmd, (uint32_t)k.count, 1, 0, k.base_vertex, 0);
         } else {
             vkCmdDraw(cmd, (uint32_t)k.count, 1, (uint32_t)k.base_vertex, 0);
@@ -1498,7 +1513,7 @@ void temporal_capture_draw(const CaptureDraw& k, CaptureSlot* out) {
     }
     // (its name across frames: as the actor motion's, the n-th draw of a model this frame the n-th the frame before)
     const uint64_t model = dlss_actor::key(k.vbuf, k.ibuf, k.count, k.base_vertex, k.program, 0);
-    const int nth = s.captured_models[model >> 8]++;
+    const int nth = s.captured_models.next(model >> 8);
     State::Captured c;
     c.k = k, c.key = dlss_actor::key(k.vbuf, k.ibuf, k.count, k.base_vertex, k.program, nth);
     c.address = b.address + s.capture_used, c.first = first, c.count = n;

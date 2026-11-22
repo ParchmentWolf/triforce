@@ -1,5 +1,10 @@
 """Exercise the actual generic upscale fallback without Vulkan or a GPU.
 
+(Triforce, 11-22, the performance audit's GPUWORK-21, after Source B's and Source A's; gpu/vk/stub_same_size.h.) A gameplay
+network that cannot run is stood in for at its input's size too, and both gameplay networks take the typed upscale: the
+cases 9dc, 9dc-same, fd-same, same and 9dc-pipeline-failure, and all of them once more with RX_VK_STUB_SAME_SIZE=0 (as
+before: a same-size 9dc98871 declined, an upscaling one blitted). The rule's header is compiled with the function.
+
 python tests/test_upscale_fallback.py [--source gpu/vk/vk_draw.cpp] [--cxx clang++]
 Use --cxx g++ on Linux, or --cxx cl in a configured Visual Studio compiler shell. No SDK needed.
 """
@@ -36,6 +41,7 @@ PREFIX = r'''
 #include <string>
 #include <unordered_set>
 #include <vector>
+#include "stub_same_size.h"   // ((Triforce, 11-22, GPUWORK-21) the rule upscale_stub asks, as it is)
 
 // Only the Vulkan declarations used by upscale_stub; no Vulkan SDK or runtime.
 using VkCommandBuffer = uintptr_t;
@@ -200,15 +206,18 @@ void vkCmdBlitImage(VkCommandBuffer, VkImage a, VkImageLayout al, VkImage b, VkI
            bl == VK_IMAGE_LAYOUT_GENERAL && n == 1 && filter == VK_FILTER_LINEAR);
     assert(r->srcSubresource.mipLevel == 0 && r->srcSubresource.baseArrayLayer == 0 &&
            r->dstSubresource.mipLevel == 0 && r->dstSubresource.baseArrayLayer == 0);
-    assert(r->srcOffsets[1].x == 64 && r->srcOffsets[1].y == 32 && r->dstOffsets[1].x == 128 &&
-           r->dstOffsets[1].y == 64);
+    assert(r->srcOffsets[1].x == 64 && r->srcOffsets[1].y == 32 && r->dstOffsets[1].x == (int32_t)dst.width &&
+           r->dstOffsets[1].y == (int32_t)dst.height);
     blits++;
 }
 '''
 SUFFIX = r'''
 int main(int argc, char **argv) {
-    assert(argc == 2);
+    assert(argc == 2 || argc == 3);
     const std::string mode = argv[1];
+    // ((Triforce, 11-22, GPUWORK-21) "off": run with RX_VK_STUB_SAME_SIZE=0, where everything is as it was before the rule)
+    const bool rule = !(argc == 3 && std::string(argv[2]) == "off");
+    const bool same = mode == "same" || mode == "9dc-same" || mode == "fd-same";
     uint64_t key = 0x0775215f8da720e6ull;
     destination.gpu = 20;
     destination.d.format = 63;
@@ -233,9 +242,13 @@ int main(int argc, char **argv) {
         source.d.swizzle_r = 4;
     if (mode.compare(0, 2, "fd") == 0)
         key = 0xfd029a317a9a4b94ull;
-    if (mode == "9dc")
+    if (mode.compare(0, 3, "9dc") == 0)
         key = 0x9dc98871eb7fc101ull;
-    if (mode == "pipeline-failure" || mode == "fd-pipeline-failure")
+    if (same) {   // (the output as large as the input: the network of Render resolution 100%)
+        destination.d.width = 64, destination.d.height = 32;
+        dst.width = 64, dst.height = 32;
+    }
+    if (mode == "pipeline-failure" || mode == "fd-pipeline-failure" || mode == "9dc-pipeline-failure")
         pipeline_ok = false;
     if (mode == "no-storage" || mode == "fd-no-storage")
         missing_storage = true;
@@ -252,8 +265,25 @@ int main(int argc, char **argv) {
     NvnState state;
     state.tex[5][0] = 1;
     state.img[5][0] = 2;
-    assert(upscale_stub((VkCommandBuffer)5, state, key));
-    if (mode == "captured" || mode == "fd") {
+    // ((Triforce, 11-22, GPUWORK-21) the same size: a gameplay network is stood in for, any other program declined; with the
+    // rule off every one is declined, as before, and nothing is drawn or written)
+    const bool taken = upscale_stub((VkCommandBuffer)5, state, key);
+    if (same && !(rule && mode != "same")) {
+        assert(!taken && typed_calls == 0 && blits == 0 && writes == 0 && views == 0 && movie_calls == 0);
+        printf("PASS: %s declined%s\n", mode.c_str(), rule ? "" : " (RX_VK_STUB_SAME_SIZE=0)");
+        return 0;
+    }
+    assert(taken);
+    if (rule && (mode == "9dc" || mode == "9dc-same" || mode == "fd-same")) {
+        // (both gameplay networks through the typed upscale, at either size: nothing blitted)
+        assert(typed_calls == 1 && views == 2 && blits == 0 && writes == 1 && gameplay_warnings == 0);
+        assert(gameplay_logs == (mode == "fd-same" ? 1u : 0u));
+    } else if (mode == "9dc-pipeline-failure") {
+        // (the typed upscale could not be made: the blit, and with the rule its warning of wrong colours; without it
+        // 9dc98871 never asked for the typed upscale)
+        assert(typed_calls == (rule ? 1u : 0u) && views == (rule ? 2u : 0u) && blits == 1 && writes == 1);
+        assert(gameplay_warnings == (rule ? 1u : 0u) && gameplay_logs == 0);
+    } else if (mode == "captured" || mode == "fd") {
         if (typed_calls != 1 || views != 2 || blits != 0) {
             puts("RED: RGB9E5 input still used physical-format blit");
             return 7;
@@ -277,9 +307,34 @@ int main(int argc, char **argv) {
         assert(gameplay_warnings == 1 && gameplay_logs == 0);
     if (mode == "fd-r11" || mode == "9dc")
         assert(gameplay_warnings == 0 && gameplay_logs == 0);
+    if (mode == "9dc" && !rule) assert(typed_calls == 0 && blits == 1);   // (as before: the encoded bits blitted)
     printf("PASS: %s\n", mode.c_str());
 }
 '''
+
+RULE = r'''
+#include "stub_same_size.h"
+#include <cstdio>
+using namespace stub_same_size;
+// (the rule as constants: it decides at compile time)
+static_assert(sized(8192, 2048, false, false) && sized(8192, 2048, false, true), "an upscale's last pass is taken");
+static_assert(sized(2048, 2048, true, true), "a gameplay network at its input's size is taken");
+static_assert(!sized(2048, 2048, true, false), "not with the rule off");
+static_assert(!sized(2048, 2048, false, true), "not a program that is no gameplay network");
+static_assert(!sized(1024, 2048, true, true) && !sized(1024, 2048, false, false), "an output smaller than its input never");
+static_assert(!sized(0, 0, true, true), "nothing written is not taken");
+static_assert(typed(false, false, false) && typed(false, false, true), "a program that is no gameplay network asks for the typed upscale");
+static_assert(typed(true, true, false) && typed(true, true, true), "the 3/4 network does");
+static_assert(typed(true, false, true) && !typed(true, false, false), "the other gameplay network only with the rule");
+static_assert(warns(true, true, false) && warns(true, true, true) && warns(true, false, true), "the gameplay networks' blit warns");
+static_assert(!warns(true, false, false) && !warns(false, false, true) && !warns(false, false, false), "and no other");
+int main() {
+    const bool ok = on(nullptr) && on("1") && !on("0") && on("2");
+    std::puts(ok ? "PASS: the rule" : "FAIL: RX_VK_STUB_SAME_SIZE is not on unless 0");
+    return !ok;
+}
+'''
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -289,26 +344,53 @@ def main():
     body = block(args.source.read_text(encoding='utf-8'), 'bool upscale_stub(')
     env = os.environ.copy()
     env.pop('RX_VK_NO_UPSCALE_STUB', None)
+    env.pop('RX_VK_STUB_SAME_SIZE', None)
+    # ((Triforce, 11-22, GPUWORK-21) the rule's hooks, and its switch read once)
+    for line in ('static const bool same_size = stub_same_size::on(getenv("RX_VK_STUB_SAME_SIZE"));',
+                 'if (!stub_same_size::sized(out_area, in_area, gameplay, same_size))',
+                 'if (stub_same_size::typed(gameplay, gameplay_taau, same_size) && in.d.format == NVN_FORMAT_RGB9E5F',
+                 'if (stub_same_size::warns(gameplay, gameplay_taau, same_size) && in.d.format == NVN_FORMAT_RGB9E5F'):
+        if line not in body:
+            raise SystemExit('upscale_stub lost: ' + line)
+    if 'static const bool off = getenv("RX_VK_NO_UPSCALE_STUB") != nullptr;' not in body:
+        raise SystemExit('RX_VK_NO_UPSCALE_STUB no longer turns the stub off')
+    docs = (ROOT / 'docs/development.md').read_text(encoding='utf-8')
+    if '`RX_VK_STUB_SAME_SIZE=0`' not in docs or '`gpu/vk/stub_same_size.h`' not in docs:
+        raise SystemExit('docs/development.md: the switches table has no RX_VK_STUB_SAME_SIZE row')
     with tempfile.TemporaryDirectory(prefix='upscale-fallback-') as tmp:
         tmp = Path(tmp)
         source = tmp / 'check.cpp'
         exe = tmp / ('check.exe' if os.name == 'nt' else 'check')
         source.write_text(PREFIX + body + SUFFIX, encoding='utf-8')
         if Path(args.cxx).name.lower() in ('cl', 'cl.exe', 'clang-cl', 'clang-cl.exe'):
-            command = [args.cxx, '/nologo', '/std:c++20', '/EHsc', '/UNDEBUG', str(source),
+            command = [args.cxx, '/nologo', '/std:c++20', '/EHsc', '/UNDEBUG', '/I' + str(ROOT / 'gpu/vk'), str(source),
                        '/Fo' + str(tmp / 'check.obj'), '/Fe' + str(exe)]
             cwd = tmp
         else:
-            command = [args.cxx, '-std=c++20', '-UNDEBUG', str(source), '-o', str(exe)]
+            command = [args.cxx, '-std=c++20', '-UNDEBUG', '-I' + str(ROOT / 'gpu/vk'), str(source), '-o', str(exe)]
             cwd = None
         subprocess.run(command, cwd=cwd, env=env, check=True)
         cases = ('captured', 'r11', 'movie', 'view', 'skip', 'mip', 'swizzle', 'fd', 'fd-r11',
                  'fd-view', 'fd-pipeline-failure', 'fd-no-storage', 'fd-no-e5-sample',
                  'fd-no-e5-linear', 'fd-null-input-view', 'fd-null-output-view', '9dc',
                  'pipeline-failure', 'no-storage', 'no-e5-sample', 'no-e5-linear',
-                 'null-input-view', 'null-output-view', 'fsr3')
+                 'null-input-view', 'null-output-view', 'fsr3',
+                 '9dc-same', 'fd-same', 'same', '9dc-pipeline-failure')   # ((Triforce, 11-22, GPUWORK-21))
         for case in cases:
             subprocess.run([str(exe), case], env=env, check=True)
+        # (and all of them as before the rule: RX_VK_STUB_SAME_SIZE=0)
+        for case in cases:
+            subprocess.run([str(exe), case, 'off'], env={**env, 'RX_VK_STUB_SAME_SIZE': '0'}, check=True, stdout=subprocess.DEVNULL)
+        # (the rule itself)
+        rule = tmp / 'rule.cpp'
+        rule.write_text(RULE, encoding='utf-8')
+        rule_exe = tmp / ('rule.exe' if os.name == 'nt' else 'rule')
+        if Path(args.cxx).name.lower() in ('cl', 'cl.exe', 'clang-cl', 'clang-cl.exe'):
+            subprocess.run([args.cxx, '/nologo', '/std:c++20', '/EHsc', '/I' + str(ROOT / 'gpu/vk'), str(rule),
+                            '/Fo' + str(tmp / 'rule.obj'), '/Fe' + str(rule_exe)], cwd=tmp, env=env, check=True)
+        else:
+            subprocess.run([args.cxx, '-std=c++20', '-I' + str(ROOT / 'gpu/vk'), str(rule), '-o', str(rule_exe)], env=env, check=True)
+        subprocess.run([str(rule_exe)], env=env, check=True)
 
 if __name__ == '__main__':
     main()

@@ -97,6 +97,7 @@ PIN_TEST = r'''
 #include <cstdio>
 #include <cstdlib>
 #include "replay_prio.h"
+#include "replay_pin.h"
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); std::exit(1); } } while (0)
 typedef uintptr_t DWORD_PTR;
 typedef void* HANDLE;
@@ -115,6 +116,15 @@ DWORD_PTR SetThreadAffinityMask(HANDLE, DWORD_PTR m) { aff_sets++; DWORD_PTR was
 bool async_on() { return async; }
 uint64_t replay_pin_mask() { return mask; }
 int replay_prio_level() { return level_now; }
+// ((Triforce, THREAD-09) the soft pin's calls, replay_pin.h: soft_fast 0 is the strict pin, as on a processor of one kind of core;
+// tests/test_replay_pin_soft.py has the soft pin's own cases)
+uint64_t soft_fast = 0, core_now = 0;
+int ideal = 3, ideal_sets = 0;
+uint64_t replay_pin_soft(bool = true) { return soft_fast; }
+uint64_t replay_pin_own() { return affinity; }
+uint64_t replay_pin_core_now() { return core_now; }
+int replay_pin_ideal_now() { return ideal; }
+bool replay_pin_set_ideal(int lp) { ideal_sets++; ideal = lp; return true; }
 /* PIN */
 } // namespace mkwvk
 using namespace mkwvk;
@@ -159,6 +169,17 @@ int main() {
         { ReplayPin q; CHECK(aff_sets == 1); }
     }
     CHECK(affinity == 0xffff && prio == 0 && aff_sets == 2);
+    CHECK(ideal_sets == 0 && ideal == 3);   // (the strict pin sets no ideal processor)
+    // ((Triforce, THREAD-09) the soft pin beside the priority: widened, the reserved core's last processor as the ideal one, the
+    // core it is on left out; a pin inside it sets nothing; the priority, the affinity and the ideal processor all come back)
+    reset(0, 2), mask = 0xc00, soft_fast = 0xfff, affinity = 0xff3ff, core_now = 0x3;
+    {
+        ReplayPin p;
+        CHECK(affinity == 0xffc && ideal == 11 && prio == 2 && aff_sets == 2 && ideal_sets == 1);
+        { ReplayPin q; CHECK(aff_sets == 2 && ideal_sets == 1 && sets == 1); }
+    }
+    CHECK(affinity == 0xff3ff && ideal == 3 && prio == 0 && aff_sets == 3 && ideal_sets == 2 && sets == 2);
+    soft_fast = 0, affinity = 0xffff;
     reset(0, 2), mask = 0;
     for (int i = 0; i < 3; i++) { ReplayPin p; }   // (pin after pin: raised and given back each time)
     CHECK(prio == 0 && sets == 6);

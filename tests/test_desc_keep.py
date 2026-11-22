@@ -64,7 +64,7 @@ def check_build(source):
          "a storage buffer other than a single read-only one is kept")
     at = ssbo.index("buf_stamps(desc_keep::kSsbo)")
     need(at < ssbo.index("gpu_buffer_bind("), "a storage buffer's stamps are read after it is bound")
-    need(ssbo.index("dw().bufs.push_back(b ?") < ssbo.index("buf_keep(*kp, jb + k, *ke, desc_keep::kSsbo, addr, size, kn, kept_took, (bool)b"),
+    need(ssbo.index("dwr.bufs.push_back(b ?") < ssbo.index("buf_keep(*kp, jb + k, *ke, desc_keep::kSsbo, addr, size, kn, kept_took, (bool)b"),
          "a storage buffer is kept before its result, or without saying whether it was bound")
     begin = block(source, "void draw_begin_recording(")
     need("desc_rec++" in begin, "a new recording keeps the last one's buffers")

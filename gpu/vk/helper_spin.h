@@ -7,7 +7,7 @@
 // what it waits for comes within it, it never decides anything. The audit's trace: the helpers began a segment 0.262 ms after
 // they were given it, and the replay thread waited 1.74 ms a frame for them (r22-trace). tests/test_helper_spin.py
 //
-//   RX_VK_HELPER_SPIN_US=<us>: the spin's bound (100, NX2navi's; at most 1000000); 0: no spin, straight to the wait as before
+//   RX_VK_HELPER_SPIN_US=<us>: the spin's bound (20 since 11-21; 100 before, NX2navi's; at most 1000000); 0: no spin, straight to the wait as before
 #pragma once
 #include <chrono>
 #include <cstdint>
@@ -20,7 +20,8 @@ namespace helper_spin {
 
 /// The bound in nanoseconds that RX_VK_HELPER_SPIN_US's text gives (null: unset)
 inline int64_t bound_ns(const char* text) {
-    if (!text || !*text) return 100000;
+    if (!text || !*text) return 20000;   // ((Triforce, 11-21) 20 us, was 100 (NX2navi's): with the game's threads the frame's limit, a
+                                         // helper spinning 100 us took its SMT sibling from them. Lab A/B 79.3 -> 80.0, 1% low +2.0)
     const long long us = std::atoll(text);
     return us <= 0 ? 0 : us >= 1000000 ? 1000000000LL : us * 1000;
 }

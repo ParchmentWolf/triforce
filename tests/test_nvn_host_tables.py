@@ -82,6 +82,11 @@ static LONG64 InterlockedAdd64(volatile LONG64 *v, LONG64 d) { return *v += d; }
 static LONG64 InterlockedIncrement64(volatile LONG64 *v) { return ++*v; }
 static LONG64 InterlockedDecrement64(volatile LONG64 *v) { return --*v; }
 static void hos_log(const char *f, ...) { (void)f; }
+/* ((Triforce, OS-04) the tables allocate through host/host_alloc.h's three, which wait at Windows' commit limit before they
+   answer NULL (tests/test_commit_limit.py): here the C library's own */
+#define hos_xmalloc malloc
+#define hos_xcalloc calloc
+#define hos_xrealloc realloc
 static jmp_buf died;
 static int dying;
 static void die(const char *fmt, ...) { (void)fmt; if (dying) longjmp(died, 1); fprintf(stderr, "unexpected die\n"); exit(3); }

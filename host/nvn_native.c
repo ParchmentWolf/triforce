@@ -19,6 +19,8 @@
    own procs (program builders, native images, sparse tile layouts, recording modes). The SDK's exports reach the
    same functions as the proc table (nvn2_dispatch, from gen/nvn2_exports.c). */
 #include "hos.h"
+#include "host_alloc.h"   /* ((Triforce, 11-22, OS-04) allocations that wait at Windows' commit limit before they answer NULL) */
+#include "shadow_slot.h"   /* ((Triforce, 11-21, TEX-85) a character's shadow map's storage in steps) */
 #include "guest_bounds.h"   /* ((Triforce) hos_span_ok: the game's first and count checked without an int overflow) */
 #include "../gpu/render/rx_nvn.h"
 #include <stdio.h>
@@ -673,17 +675,53 @@ static int no_builder(Ctx *c, const char *what) {
     if (told++ < 4) hos_log("nvn: %s of no texture builder (lr %#llx): 0", what, (unsigned long long)c->x[30]);
     return 1;
 }
+/* ((Triforce, 11-21, the performance audit's TEX-85, after Source A's) A character's shadow map reserves the storage of the
+   next step of sides up (shadow_slot.h), so that the render targets the game makes after it keep their addresses while its
+   side changes from frame to frame. HOS_SHADOW_BUCKET=<step> (384); 0: every texture its own size, as before; not set, 0
+   where the target heap is pinned (nn_applet.c hos_rt_pool_pinned). The layout of the side it reserves in *out, or 0 when it
+   reserves its own. The texture's own layout (nvn_tex_layout of its builder) is not changed anywhere */
+static int shadow_slot_layout(const nvn_texdesc *d, nvn_texlayout *out) {
+    extern int hos_rt_pool_pinned(void);
+    static int step = -1;
+    static volatile long stepped;
+    int now = step;
+    if (now < 0) {
+        const char *e = getenv("HOS_SHADOW_BUCKET");
+        const int pinned = hos_rt_pool_pinned();   /* (-1: the heap not sized yet: asked again at the next map) */
+        now = (int)hos_shadow_slot_step(e, pinned > 0);
+        if (e || pinned >= 0) {
+            step = now;
+            hos_log("nvn: a character's shadow map reserves the storage of the next multiple of %d up (HOS_SHADOW_BUCKET%s; 0: "
+                    "its own size, as before)", now, e ? "" : pinned > 0 ? ": the target heap is pinned, so 0" : ", 384 when not set");
+        }
+    }
+    const uint32_t side = hos_shadow_slot_side(d->target == NVN_TEXTURE_TARGET_2D, d->format, d->levels, d->depth, d->width,
+                                               d->height, (uint32_t)now);
+    if (!side || side == d->width) return 0;
+    nvn_texdesc slot = *d;
+    slot.width = slot.height = side;
+    nvn_tex_layout(&slot, out);
+    const long n = __atomic_add_fetch(&stepped, 1, __ATOMIC_RELAXED);   /* (as it doubles: how often the game asks) */
+    if (n >= 1024 && !(n & (n - 1)))
+        hos_log("nvn: shadow maps answered a stepped storage: %ld so far (the last %ux%u as %ux%u)", n, d->width, d->height, side, side);
+    return 1;
+}
 NV(nvnTextureBuilderGetStorageSize) {
     if (no_builder(c, "storage size")) { RET(0); return; }
-    nvn_texlayout L;
+    nvn_texlayout L, slot;
     nvn_tex_layout(&CTB(P(0))->d, &L);
     if (!L.bpb) hos_log("nvn: texture format %#x unknown: storage size 0", CTB(P(0))->d.format);
+    /* ((Triforce, 11-21, TEX-85) the larger of its own and its slot's) */
+    if (L.bpb && shadow_slot_layout(&CTB(P(0))->d, &slot) && slot.size > L.size) L.size = slot.size;
     RET(L.size);
 }
 NV(nvnTextureBuilderGetStorageAlignment) {
     if (no_builder(c, "storage alignment")) { RET(512); return; }
-    nvn_texlayout L;
+    nvn_texlayout L, slot;
     nvn_tex_layout(&CTB(P(0))->d, &L);
+    /* ((Triforce, 11-21, TEX-85) the slot's where it is the larger: one alignment for every side within a step, and the
+       texture's own still met) */
+    if (L.bpb && shadow_slot_layout(&CTB(P(0))->d, &slot) && slot.align > L.align) L.align = slot.align;
     RET(L.align);
 }
 NV(nvnTextureBuilderGetZCullStorageSize) { RET(0); }   /* no ZCull: nothing to store */
@@ -1368,7 +1406,7 @@ static unsigned pool_class(size_t n) {
 static void *pool_get(size_t n, unsigned *cls) {
     const unsigned c = pool_off() ? POOL_MAX + 1 : pool_class(n);
     *cls = c;
-    if (c > POOL_MAX) return malloc(n);
+    if (c > POOL_MAX) return hos_xmalloc(n);   /* ((Triforce, OS-04) waits at the commit limit before it answers NULL: host_alloc.h) */
     AcquireSRWLockExclusive(&pool_lock);
     void *b = pool_head[c];
     if (b) {
@@ -1376,7 +1414,7 @@ static void *pool_get(size_t n, unsigned *cls) {
         pool_bytes[c] -= (uint64_t)1 << c;
     }
     ReleaseSRWLockExclusive(&pool_lock);
-    return b ? b : malloc((size_t)1 << c);
+    return b ? b : hos_xmalloc((size_t)1 << c);
 }
 static void pool_put(void *b, unsigned cls) {
     if (!b) return;
@@ -1417,7 +1455,7 @@ static cmd_rec *cmd_adopt(nvn_cmd *o) {
     const uint32_t s = ncmd_free ? cmd_free[--ncmd_free] : cmd_next++;
     if ((s >> CMD_CHUNK_BITS) >= CMD_CHUNKS) die("too many command buffers");
     if (!cmd_chunks[s >> CMD_CHUNK_BITS]) {
-        cmd_rec *k = (cmd_rec *)calloc((size_t)1 << CMD_CHUNK_BITS, sizeof *k);
+        cmd_rec *k = (cmd_rec *)hos_xcalloc((size_t)1 << CMD_CHUNK_BITS, sizeof *k);   /* ((Triforce, OS-04) host_alloc.h) */
         if (!k) die("command buffer table");
         cmd_chunks[s >> CMD_CHUNK_BITS] = k;
     }
@@ -1452,7 +1490,7 @@ static void cmd_release(nvn_cmd *o) {   /* the object's slot and recording buffe
     memset(r, 0, sizeof *r);
     if (ncmd_free == cap_cmd_free) {
         cap_cmd_free = cap_cmd_free ? cap_cmd_free * 2 : 256;
-        cmd_free = (uint32_t *)realloc(cmd_free, cap_cmd_free * sizeof *cmd_free);
+        cmd_free = (uint32_t *)hos_xrealloc(cmd_free, cap_cmd_free * sizeof *cmd_free);   /* ((Triforce, OS-04) host_alloc.h) */
         if (!cmd_free) die("command buffer table");
     }
     cmd_free[ncmd_free++] = o->slot;
@@ -1560,8 +1598,8 @@ static size_t live_at(uint64_t h, size_t cap) { return (size_t)((h * 0x9E3779B97
 static void live_handle_add(uint64_t h) {   /* (copy_lock held exclusively) */
     if ((nlive + 1) * 2 > live_cap) {
         const size_t cap = live_cap ? live_cap * 2 : 65536;
-        uint64_t *t = (uint64_t *)calloc(cap, sizeof *t);
-        live_table *pub = (live_table *)malloc(sizeof *pub);
+        uint64_t *t = (uint64_t *)hos_xcalloc(cap, sizeof *t);   /* ((Triforce, OS-04) host_alloc.h) */
+        live_table *pub = (live_table *)hos_xmalloc(sizeof *pub);
         if (!t || !pub) die("recording handle set");
         for (size_t i = 0; i < live_cap; i++) {
             if (!live_handles[i]) continue;
@@ -1635,7 +1673,7 @@ static void free_dead_copies(void) {   /* (copy_lock held) */
 static void dead_copy_add(copy_prefix *p, uint64_t after) {   /* (copy_lock held) */
     if (ndead == cap_dead) {
         cap_dead = cap_dead ? cap_dead * 2 : 1024;
-        dead = (dead_copy *)realloc(dead, cap_dead * sizeof *dead);
+        dead = (dead_copy *)hos_xrealloc(dead, cap_dead * sizeof *dead);   /* ((Triforce, OS-04) host_alloc.h) */
         if (!dead) die("recording copies let go");
     }
     dead[ndead].p = p;
@@ -1682,10 +1720,13 @@ static void release_copies(uint64_t lo, uint64_t hi) {
    or calling a recording waited behind it */
 #define SWEEP_EVERY 1024u
 #define SWEEP_SLICE 2688u   /* (65536 / 2688 * 1024: every bucket once in ~25,000 recordings) */
-static void sweep_overwritten_copies(void) {   /* (copy_lock held) */
+/* ((Triforce, 11-22, the performance audit's THREAD-56, after Source A's) it returns how many it let go and logs nothing:
+   its line was written with copy_lock held exclusively, every thread recording or calling a recording waiting behind the
+   write. nvnCommandBufferEndRecording says it once the lock is released) */
+static size_t sweep_overwritten_copies(void) {   /* (copy_lock held) */
     static int off = -1;
     if (off < 0) off = getenv("HOS_NVN_NO_SWEEP") != NULL;
-    if (off || !rec_buckets) return;
+    if (off || !rec_buckets) return 0;
     free_dead_copies();
     const uint64_t after = rx_nvn_pushed() + held_count();
     size_t swept = 0;
@@ -1721,8 +1762,7 @@ static void sweep_overwritten_copies(void) {   /* (copy_lock held) */
             swept++;
         }
     }
-    static int logged;
-    if (swept && logged++ < 12) hos_log("nvn: %zu copies of recordings whose control memory was reused let go (%zu live)", swept, ncopies);
+    return swept;
 }
 NV(nvnCommandBufferAddControlMemory) {
     nvn_cmd *o = CB(P(0));
@@ -1815,12 +1855,27 @@ NV(nvnCommandBufferEndRecording) {
     ncopies++;
     live_handle_add((uint64_t)(uintptr_t)copy);
     static uint64_t made;
-    if (++made % SWEEP_EVERY == 0) sweep_overwritten_copies();
-    if (made % 50000 == 0)
-        hos_log("nvn: %llu recordings made, %zu live copies (%.1f MB), %zu texture copies; %lld command buffers' segments "
-                "(%.1f MB)", (unsigned long long)made, ncopies, copy_bytes / 1048576.0, npins, (long long)seg_count,
-                seg_bytes / 1048576.0);
+    /* ((Triforce, 11-22, the performance audit's THREAD-56, after Source A's) what the sweep's line and the 50,000-recording
+       line say is taken under the lock; the lines are written after it is released, with the virtual core given up for
+       when this thread makes the write itself (HOS_LOG_SYNC=1, or the log's queue full): a write that blocks then holds
+       neither the recordings' lock nor a core another game thread waits for) */
+    static int sweeps_said;
+    const size_t swept = ++made % SWEEP_EVERY == 0 ? sweep_overwritten_copies() : 0;
+    const int say_swept = swept && sweeps_said < 12 ? ++sweeps_said : 0;
+    const int say_made = made % 50000 == 0;
+    const uint64_t made_now = made;
+    const size_t live_now = ncopies, pins_now = npins;
     ReleaseSRWLockExclusive(&copy_lock);
+    if (say_swept || say_made) {
+        const int away = hos_vcore_away();
+        if (say_swept)
+            hos_log("nvn: %zu copies of recordings whose control memory was reused let go (%zu live)", swept, live_now);
+        if (say_made)
+            hos_log("nvn: %llu recordings made, %zu live copies (%.1f MB), %zu texture copies; %lld command buffers' segments "
+                    "(%.1f MB)", (unsigned long long)made_now, live_now, copy_bytes / 1048576.0, pins_now, (long long)seg_count,
+                    seg_bytes / 1048576.0);
+        if (away) hos_vcore_back();
+    }
     if (watch_draw_cmd && watch_draw_cmd == (void *)o && nwatch_handles < 16) {
         watch_handles[nwatch_handles++] = (uint64_t)(uintptr_t)copy;
         watch_draw_cmd = NULL;
@@ -2315,7 +2370,7 @@ static int pin_same(const nvn_tex *a, const nvn_tex *b) {
 }
 static void pins_grow(void) {
     const size_t n = pin_slots ? pin_slots * 2 : (1u << 16);
-    nvn_tex **t = (nvn_tex **)calloc(n, sizeof *t);
+    nvn_tex **t = (nvn_tex **)hos_xcalloc(n, sizeof *t);   /* ((Triforce, OS-04) host_alloc.h) */
     if (!t) die("texture copies table (%zu slots)", n);
     for (size_t i = 0; i < pin_slots; i++)
         if (pins[i]) {
@@ -2734,8 +2789,12 @@ NV(nvnQueuePresentTexture) {
     extern volatile LONG64 hos_present_count;   /* display.c */
     InterlockedIncrement64(&hos_present_count);
     hos_vi_native_presented();
+    /* ((Triforce, 11-22, the performance audit's OS-51) the host's part of a frame as long as the stall line's: mkw_glue.c) */
+    { void hos_stall_host_presented(void); hos_stall_host_presented(); }
     void hos_mod_cheats_frame(void);   /* (Triforce) mod_cheats.c: the mods' cheat files, once a game frame; nothing without one */
     hos_mod_cheats_frame();
+    void hos_achievements_frame(void);
+    hos_achievements_frame();   /* ((Triforce) host/achievements.c: its lists read and named to the menu; nothing while it is off) */
 }
 
 /* ---- NVN2 (mkw-recomp): what the Switch 2's NVN adds, as MKW uses it ---- */

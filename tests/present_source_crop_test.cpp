@@ -16,6 +16,7 @@
 #define VK_USE_64_BIT_PTR_DEFINES 0
 #include <vulkan/vulkan.h>
 #include "vk_present_rect.h"
+#include "framegen_refresh.h"   // ((Triforce, 11-21, the upscaler audit's UPS-05) a fixed multiplier and the display's refresh
 #include "framegen_rows.h"   // (Triforce: the Frame generation row's AMD FSR 4, which framegen_record asks first)
 using namespace mkwvk;
 using VmaAllocation = void*;
@@ -28,7 +29,7 @@ constexpr bool vkCmdPushDescriptorSetKHR = true;
 constexpr uint32_t HDR_ENCODE_COMP_SPV[] = {0};
 bool init_scale() { std::abort(); }
 bool make_pipe(Pipe&, const uint32_t*, size_t, std::initializer_list<VkDescriptorType>, int) { std::abort(); }
-void logf(const char*) { std::abort(); }
+void logf(const char*, ...) { std::abort(); }   // ((Triforce, UPS-05) framegen_record's line takes arguments; never reached here)
 void device_wait_idle_locked() { std::abort(); }
 void drop_img(Img&) { std::abort(); }
 bool make_img(Img&, uint32_t, uint32_t, VkFormat, VkImageUsageFlags) { std::abort(); }
@@ -64,8 +65,10 @@ void vkCmdClearColorImage(VkCommandBuffer, VkImage, VkImageLayout, const VkClear
     CHECK(c->float32[0] == 0 && c->float32[1] == 0 && c->float32[2] == 0 && c->float32[3] == 1); ++clears;
 }
 bool init() { ++initializations; return true; }
+int multiplier();
 bool ensure_size(VkCommandBuffer, uint32_t w, uint32_t h) {
-    ++sizes; allocated_w = w; allocated_h = h; return true;
+    // (as the real one: the sets' frames are made for the multiplier, which framegen_record holds its own to)
+    ++sizes; allocated_w = w; allocated_h = h; fg.mult = multiplier(); return true;
 }
 int64_t now_ns() { return 1000000; }
 int multiplier() { return 2; }

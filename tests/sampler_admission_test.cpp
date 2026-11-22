@@ -159,6 +159,7 @@ void vkCmdPushDescriptorSetKHR(VkCommandBuffer, VkPipelineBindPoint, VkPipelineL
     check_writes(n, writes); descriptor_pushes++;
 }
 VkDescriptorPool make_pool() { return reinterpret_cast<VkDescriptorPool>(uintptr_t(11)); }
+void pool_took(const VkWriteDescriptorSet*, size_t) {}   // ((Triforce, 11-22, DESC-33) vk_draw.cpp: the sets a recording took, counted)
 void vkDestroyDescriptorPool(VkDevice, VkDescriptorPool pool, const VkAllocationCallbacks*) { assert(pool); }
 VkResult vkAllocateDescriptorSets(VkDevice, const VkDescriptorSetAllocateInfo*, VkDescriptorSet* out) {
     descriptor_allocs++; *out = reinterpret_cast<VkDescriptorSet>(uintptr_t(12)); return VK_SUCCESS;

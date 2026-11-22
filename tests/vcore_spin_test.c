@@ -63,6 +63,7 @@ typedef struct HosThread {
     volatile int vc_kick;
     int64_t vc_since, vc_grant_at;
     CONDITION_VARIABLE vc_cv;
+    int64_t cc_vcw, cc_vcw_ns;   /* (HOS_CORE_COUNT: the waits for a virtual core, counted in hos_vcore_back) */
 } HosThread;
 
 static int failures;
@@ -133,6 +134,9 @@ static int hos_thread_core(HosThread *t) {   /* (host/hos_thread.c's) */
     if (t->ideal_core >= 0) return t->ideal_core % n;
     return t->core_mask ? (int)(__builtin_ctzll(t->core_mask) % (unsigned)n) : 0;
 }
+/* ((Triforce, 11-22, OS-49) host/hos_thread.c's: the mask HOS_SIM_CPU holds the process to, none here; hos_sim_cpu.h's count) */
+static uint64_t sim_cpu_mask;
+static int hos_sim_cpu_count(uint64_t mask) { return __builtin_popcountll(mask); }
 
 #include "vcore_block.inc"
 

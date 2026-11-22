@@ -17,7 +17,7 @@ static partial class Tests
         yield return Sync("game options: keys, labels, choices, no Hookshot", GameOptionsLabels);
         yield return Sync("game options: the real triforce_options.ini (read only)", GameOptionsRealFile);
         yield return Sync("game options: round trip, merge, atomic write (a copy)", GameOptionsWrite);
-        yield return Sync("game options: Set's rules, Quality preset, Apply", GameOptionsSetRules);
+        yield return Sync("game options: Set's rules, merged rows, Upscaler, Apply", GameOptionsSetRules);
         yield return Sync("game options: an older options_version, a new file", GameOptionsOldVersion);
     }
 
@@ -55,6 +55,10 @@ static partial class Tests
             sb.Append(c);
         }
         body = sb.ToString();
+        // (the in-game UI merge, 11-20: section titles written as MENU_HEADING(tab, "title"), vk_menu.cpp's macro for a heading
+        // row: expanded here as the compiler does, so the sections are read again)
+        body = Regex.Replace(body, @"MENU_HEADING\((TAB_[A-Z]+),\s*(""(?:[^""\\]|\\.)*"")\)",
+            "{$1, $2, nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true}");
         var rows = new List<MenuRow>();
         foreach (Match m in Regex.Matches(body, @"\{(TAB_[A-Z]+),"))
         {
@@ -117,8 +121,8 @@ static partial class Tests
         Check(table.Count > 100, "the table read: " + table.Count + " entries");
         var symbols = new Dictionary<string, int>
         {
-            ["kLastOutput"] = 6, ["ur::kValues - 1"] = 6, ["ur::kUpscalers - 1"] = 6, ["ur::kModels - 1"] = 3, ["aa_rows::kValues - 1"] = 3,
-            ["2 + kMaxMics"] = 18, ["HOS_PROMPT_N"] = 6,
+            ["kLastOutput"] = 7, ["ur::kValues - 1"] = 6, ["ur::kUpscalers - 1"] = 6, ["ur::kModels - 1"] = 3, ["aa_rows::kValues - 1"] = 3,
+            ["2 + kMaxMics"] = 18, ["HOS_PROMPT_N"] = 6, ["mr7::FG_DLSS_LAST"] = 12, ["framegen_rows::kRowMax"] = 9,
         };
         int Num(string s, string what) => int.TryParse(s, out var v) ? v : symbols.TryGetValue(s, out v) ? v : throw new TestFailed(what + ": a symbol the test does not know, " + s);
         var tabs = new Dictionary<string, GameOptionTab>
@@ -127,13 +131,31 @@ static partial class Tests
             ["TAB_CONTROLS"] = GameOptionTab.Controls, ["TAB_SYSTEM"] = GameOptionTab.System, ["TAB_MOTION"] = GameOptionTab.Controls,
             ["TAB_PAGE"] = GameOptionTab.Controls,
         };
+        // ((Triforce, options_version 8) the saved values the merged rows stand for: the TAB_HIDDEN rows, each a part here, with
+        // the hidden row's range and vk_menu.h's default; and the merged rows' own (&merged.*): their default the view of their
+        // parts' defaults, by the schema's own rules)
+        var hidden = table.Where(r => r.Tab == "TAB_HIDDEN" && r.Value != "nullptr").ToList();
+        var partDefaults = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var r in hidden)
+        {
+            var key = GameOptionsSchema.IniKey(r.Name);
+            var part = GameOptionsSchema.Part(key);
+            Check(part != null, "the hidden row \"" + r.Name + "\" is a merged row's part, key " + key);
+            Equal(Num(r.Lo, r.Name), part!.Lo, r.Name + " (hidden): lo");
+            Equal(Num(r.Hi, r.Name), part.Hi, r.Name + " (hidden): hi");
+            Equal(defaults[r.Value["&opts.".Length..]], part.Default, r.Name + " (hidden): default");
+            Equal(1, GameOptionsSchema.All.Count(m => m.Parts?.Any(p => p.Key == key) == true), r.Name + " (hidden): the part of one merged row");
+            partDefaults[key] = part.Default;
+        }
+        Equal(string.Join(",", hidden.Select(r => GameOptionsSchema.IniKey(r.Name)).OrderBy(k => k, StringComparer.Ordinal)),
+            string.Join(",", GameOptionsSchema.Parts.Keys.OrderBy(k => k, StringComparer.Ordinal)), "the parts are the hidden rows");
         var left = new[] { "&opts.language", "&opts.pad_layout" };   // (Game language: language.txt's; Layout preset: KeptKeys)
         var sections = new Dictionary<string, string>();
         var names = new List<string>();
         foreach (var r in table)
         {
             if (r.Heading) { sections[r.Tab] = r.Name; continue; }
-            if (r.Value == "nullptr" || r.Tab == "TAB_DEBUG" || left.Contains(r.Value)) continue;
+            if (r.Value == "nullptr" || r.Tab == "TAB_DEBUG" || r.Tab == "TAB_HIDDEN" || left.Contains(r.Value)) continue;
             var row = GameOptionsSchema.ByName(r.Name);
             Check(row != null, "the menu's row \"" + r.Name + "\" is in the schema");
             names.Add(r.Name);
@@ -146,9 +168,24 @@ static partial class Tests
             Equal(r.Help, row.Help, r.Name + ": help");
             Equal(r.Restart, row.Restart, r.Name + ": restart");
             Equal(r.Exempt, row.PresetExempt, r.Name + ": preset exempt");
-            Equal(defaults[r.Value["&opts.".Length..]], row.Default, r.Name + ": default");
+            if (r.Value.StartsWith("&merged.", StringComparison.Ordinal))
+            {
+                Check(row.IsMerged, r.Name + ": a merged row");
+                Equal(row.Merge!.Of(row.Parts!.Select(p => partDefaults[p.Key]).ToArray()), row.Default, r.Name + ": default (its parts')");
+            }
+            else
+            {
+                Check(!row.IsMerged && GameOptionsSchema.IniKey(r.Name) == row.Key, r.Name + ": its own line, key " + row.Key);
+                Equal(defaults[r.Value["&opts.".Length..]], row.Default, r.Name + ": default");
+            }
         }
         Equal(string.Join("|", names), string.Join("|", GameOptionsSchema.All.Select(r => r.Name)), "the rows, in the menu's order");
+        // (the lines the game's save drops, merged_rows.h kDropped: kept keys, read once to move them)
+        var mr = File.ReadAllText(Path.Combine(dir!, "merged_rows.h"));
+        Check(mr.Contains("kVersion = " + GameOptionsSchema.CurrentVersion + ";"), "merged_rows.h's kVersion is CurrentVersion");
+        var dropped = Regex.Match(mr, @"kDropped\[\]\s*=\s*\{([^}]*)\}").Groups[1].Value;
+        foreach (Match d in Regex.Matches(dropped, "\"([^\"]+)\""))
+            Check(GameOptionsSchema.KeptKeys.ContainsKey(d.Groups[1].Value) && GameOptionsSchema.ByKey(d.Groups[1].Value) == null, d.Groups[1].Value + ": dropped by the game, a kept key here");
         // (the Debug tab's keys, and the Layout preset's, are the KeptKeys: each with its reason)
         foreach (var r in table.Where(r => r.Value != "nullptr" && !r.Heading && (r.Tab == "TAB_DEBUG" || r.Value == "&opts.pad_layout")))
             Check(GameOptionsSchema.KeptKeys.ContainsKey(GameOptionsSchema.IniKey(r.Name)), r.Name + "'s key " + GameOptionsSchema.IniKey(r.Name) + " is a kept key");
@@ -162,9 +199,18 @@ static partial class Tests
         Equal(all.Count, all.Select(r => r.Key).Distinct().Count(), "keys are unique");
         Check(all.All(r => r.Key.Length <= 31 && !r.Key.Contains(' ')), "keys as ini_key makes them");
         Equal("frame_rate_cap", GameOptionsSchema.Get("frame_rate_cap").Key, "renamed row keeps its key");
-        Equal("Game frame rate cap", GameOptionsSchema.Get("frame_rate_cap").Name, "by key");
-        Equal("amd_anti-lag_2", GameOptionsSchema.ByName("AMD Anti-Lag 2")!.Key, "AMD Anti-Lag 2's key");
-        Equal("upscaling", GameOptionsSchema.ByName("Window scaling filter")!.Key, "Window scaling filter's key");
+        Equal("Frame rate cap", GameOptionsSchema.Get("frame_rate_cap").Name, "by key");
+        // ((Triforce, options_version 8) the rows renamed into their groups keep their keys; a merged row has none of its own)
+        Equal("ultrawide", GameOptionsSchema.ByName("Aspect ratio")!.Key, "Aspect ratio's key");
+        Equal("hdr_paper_white", GameOptionsSchema.ByName("Paper white")!.Key, "Paper white's key");
+        Equal("renodx_bloom", GameOptionsSchema.ByName("Bloom")!.Key, "Bloom's key");
+        Equal(GameOptionsSchema.LatencyKey, GameOptionsSchema.ByName("Low latency")!.Key, "Low latency: a merged row");
+        Equal("nvidia_reflex,amd_anti-lag_2", string.Join(",", GameOptionsSchema.ByName("Low latency")!.Parts!.Select(p => p.Key)), "its parts' keys");
+        Equal(null, GameOptionsSchema.ByKey("amd_anti-lag_2"), "a part is no row");
+        Check(GameOptionsSchema.Part("amd_anti-lag_2") != null && GameOptionsSchema.IsValueKey("amd_anti-lag_2"), "but a value");
+        Check(!GameOptionsSchema.IsValueKey(GameOptionsSchema.HdrKey), "a merged row's own key is no line's");
+        foreach (var gone in new[] { "Quality preset", "Window scaling filter", "Reflex frame limit", "Handheld profile", "Stick dead zone", "Robust buffers" })
+            Equal(null, GameOptionsSchema.ByName(gone), gone + ": no row (options_version 8)");
         Equal("tail_early", GameOptionsSchema.IniKey("Start next frame early"), "Start next frame early's key");
         Equal("export_save_for_a_bug_report", GameOptionsSchema.IniKey("Export save for a bug report"), "a long name: 28 letters");
         Equal("abcdefghijklmnopqrstuvwxyzabcde", GameOptionsSchema.IniKey("ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGH"), "cut at 31");
@@ -186,25 +232,39 @@ static partial class Tests
             }
             else Equal(0, r.Choices.Count, r.Name + ": a slider has no choice list");
         }
-        Equal(1, all.Count(r => r.Tab == GameOptionTab.Graphics && r.Key == GameOptionsSchema.PresetKey), "the preset row");
-        Equal("Screen,Widescreen,Frame rate,High dynamic range,RenoDX", string.Join(",", GameOptionsSchema.Sections(GameOptionTab.Display)), "Display's sections");
-        Equal("Quality,Upscaling and edges,Smoothness,Latency,Advanced", string.Join(",", GameOptionsSchema.Sections(GameOptionTab.Graphics)), "Graphics' sections");
-        Equal("Camera,Sticks,Movement,Vibration,Other,Motion,Controls", string.Join(",", GameOptionsSchema.Sections(GameOptionTab.Controls)), "Controls' sections");
-        Equal(0, GameOptionsSchema.Sections(GameOptionTab.Audio).Count, "Audio has none");
+        Equal("Screen,Ultrawide,HDR,RenoDX,Overlay", string.Join(",", GameOptionsSchema.Sections(GameOptionTab.Display)), "Display's sections");
+        Equal("Upscaling,Anti-aliasing,Frame generation,Frame rate & latency,Textures,Advanced", string.Join(",", GameOptionsSchema.Sections(GameOptionTab.Graphics)), "Graphics' sections");
+        Equal("Controller,Mouse & keyboard,Rumble,Gameplay,Motion,Controls", string.Join(",", GameOptionsSchema.Sections(GameOptionTab.Controls)), "Controls' sections");
+        Equal("Sound,Microphone", string.Join(",", GameOptionsSchema.Sections(GameOptionTab.Audio)), "Audio's sections");
+        Equal("Game,Online", string.Join(",", GameOptionsSchema.Sections(GameOptionTab.System)), "System's sections (with rows)");
 
         string L(string key, int v) => GameOptionsSchema.Get(key).Label(v);
         string Cs(string key) => string.Join("|", GameOptionsSchema.Get(key).Choices.Select(c => c.Value + "=" + c.Label));
         Equal("-3=30|-2=40|-1=45|0=60 (the console's)|1=90|2=120|3=144|4=165|5=240|6=Monitor's rate", Cs("frame_rate_cap"), "fps cap");
-        Equal("3=1920x1080|0=2048x1152|1=2560x1440|2=3840x2160|4=5120x1440|6=5120x2160|5=5120x2880", Cs("output_res"), "output sizes, smallest first");
-        Equal("0=Game|1=NVIDIA DLSS|2=NVIDIA DLAA|3=AMD FSR 3.1|6=AMD FSR 3.1 Native AA|4=AMD FSR 4|5=AMD FSR 4 Native AA", Cs("dlss"), "upscalers in the menu's order");
+        Equal("7=1536x864 (handheld)|3=1920x1080|0=2048x1152|1=2560x1440|2=3840x2160|4=5120x1440|6=5120x2160|5=5120x2880", Cs("output_res"), "output sizes, smallest first");
+        Equal("0=Game|1=NVIDIA DLSS|3=AMD FSR 3.1|4=AMD FSR 4", Cs("dlss"), "upscalers: the engines, in the menu's order");
         Equal("0=Auto (dynamic)|1=100% (2048x1152)|2=75% (1536x864)|3=67% (1366x768)|4=50% (1024x576)", Cs("resolution"), "render resolution, the game's own");
-        Equal("0=Custom|1=Minimum (6GB)|2=Low (8GB)|3=Balanced (12GB)|4=High (16GB)|5=Ultra (20GB+)", Cs("quality_preset"), "presets");
         Equal("0=Off|1=Default", Cs("microphone"), "microphone without devices");
         Equal("0=Game SMAA|1=Off|2=FXAA|3=SMAA Ultra", Cs("anti-aliasing"), "anti-aliasing");
-        Equal("0=Off|1=Auto|2=2x|3=3x|4=4x|5=5x|6=6x|7=7x|8=8x|9=AMD FSR 4", Cs("frame_generation"), "frame generation");
+        Equal("0=Off|1=Auto|2=2x|3=3x|4=4x|5=5x|6=6x|7=7x|8=8x|9=AMD FSR|10=NVIDIA DLSS 2x|11=NVIDIA DLSS 3x|12=NVIDIA DLSS 4x", Cs(GameOptionsSchema.FrameGenKey), "frame generation, DLSS's merged in");
+        Equal("0=Off|1=Expanded|2=Native|3=Native + RenoDX", Cs(GameOptionsSchema.HdrKey), "HDR, RenoDX merged in");
+        Equal("0=Off|1=Even|2=Steady, any rate|3=Steady, refresh steps", Cs(GameOptionsSchema.PacingKey), "frame pacing, steady merged in");
         Equal("0=Auto|1=Switch|2=Xbox|3=PlayStation 4|4=PlayStation 5|5=Steam Deck|6=Keyboard & mouse", Cs("button_prompts"), "prompts");
-        Equal("0=Auto|1=Off|2=On", Cs("robust_buffers"), "robust");
         Equal("0=Insert or F1|1=F1 only", Cs("menu_shortcut"), "menu shortcut");
+        // (Low latency by the card's maker: NVIDIA's Reflex where it is not known)
+        var vendorBefore = GameOptionsSchema.LatencyVendorOf;
+        try
+        {
+            GameOptionsSchema.LatencyVendorOf = null;
+            Equal("0=Off|1=On|2=On + Boost", Cs(GameOptionsSchema.LatencyKey), "low latency, not known: Reflex's");
+            Equal(2, GameOptionsSchema.Get(GameOptionsSchema.LatencyKey).Default, "Reflex's default On + Boost");
+            GameOptionsSchema.LatencyVendorOf = () => LatencyVendor.Amd;
+            Equal("0=Off|1=On", Cs(GameOptionsSchema.LatencyKey), "AMD: Anti-Lag 2's");
+            Equal(0, GameOptionsSchema.Get(GameOptionsSchema.LatencyKey).Default, "Anti-Lag 2's default Off");
+            GameOptionsSchema.LatencyVendorOf = () => LatencyVendor.None;
+            Equal("0=Off", Cs(GameOptionsSchema.LatencyKey), "neither");
+        }
+        finally { GameOptionsSchema.LatencyVendorOf = vendorBefore; }
         Equal("1.25", L("mouse_sensitivity", 125), "sensitivity");
         Equal("0.51", L("walk_scale", 51), "walk scale");
         Equal("10000 nits", L("hdr_peak_brightness", 10000), "nits");
@@ -212,12 +272,15 @@ static partial class Tests
         Equal("85%", L("master_volume", 85), "volume");
         Equal("Off", L("menu_sounds", 0), "menu sounds 0");
         Equal("Off", L("rumble_strength", 0), "rumble 0");
-        Equal("As Stick dead zone", L("left_stick_dead_zone", -1), "own dead zone");
+        Equal("Default (24%)", L("left_stick_dead_zone", -1), "own dead zone's default");
         Equal("0%", L("right_stick_dead_zone", 0), "own dead zone 0");
         Equal("50", L("renodx_bloom", 50), "grade");
-        Equal("Default (24%)", L("stick_dead_zone", 0), "stick dead zone");
-        Equal("Off", L("upscaling", 7), "past the row: its first");
+        Equal("Normal", L("text_speed", 7), "past the row: its first");
         Equal("16:9", L("ultrawide", 0), "ultrawide");
+        Equal("1536x864 (handheld)", L("output_res", 7), "the handheld profile is an Output resolution");
+        Equal("NVIDIA DLSS", L("dlss", 2), "DLAA reads as its engine");
+        Equal("AMD FSR 3.1", L("dlss", 6), "FSR 3.1's native AA too");
+        Equal("Native (100%)", L("resolution", GameOptionsSchema.NativeStep), "the Render resolution's Native");
 
         // (the GPU device row: the names the launcher gives it)
         var before = GameOptionsSchema.GpuNames;
@@ -259,11 +322,34 @@ static partial class Tests
             text = File.ReadAllText(Path.Combine(nf, GameOptionsSchema.FileName));
             Check(text.Contains("gpu_device=0") && text.Contains("gpu_device_name=\r\n") || text.Contains("gpu_device_name=\n"),
                   "Auto: the name emptied: " + text.Replace("\n", " | "));
+            // ((Triforce) 11-22) a number saved before 11-20 has no name: the row's card chosen again (the same value) writes it,
+            // where nothing was written and the number alone decided; chosen again with its name there: nothing to write
+            GameOptionsSchema.GpuNames = () => new[] { "AMD Radeon(TM) Graphics", "AMD Radeon RX 6600" };
+            var old = NewRoot("gpuold");
+            File.WriteAllText(Path.Combine(old, GameOptionsSchema.FileName), "gpu_device=2\r\noptions_version=8\r\n");
+            opt = GameOptionsFile.Load(old);
+            opt.Set(GameOptionsSchema.GpuKey, 2);
+            Check(opt.Changes.ContainsKey(GameOptionsSchema.GpuKey), "the same card again without its name: a change");
+            opt.Save();
+            text = File.ReadAllText(Path.Combine(old, GameOptionsSchema.FileName));
+            Check(text.Contains("gpu_device=2\r\n") && text.Contains("gpu_device_name=AMD Radeon RX 6600\r\n"),
+                  "the name written beside the old number: " + text.Replace("\r\n", " | "));
+            opt = GameOptionsFile.Load(old);
+            opt.Set(GameOptionsSchema.GpuKey, 2);
+            Equal(0, opt.Changes.Count, "the same card again with its name: nothing to write");
+            File.WriteAllText(Path.Combine(old, GameOptionsSchema.FileName), "gpu_device=2\r\ngpu_device_name=AMD Radeon(TM) Graphics\r\noptions_version=8\r\n");
+            opt = GameOptionsFile.Load(old);
+            opt.Set(GameOptionsSchema.GpuKey, 2);
+            opt.Save();
+            text = File.ReadAllText(Path.Combine(old, GameOptionsSchema.FileName));
+            Check(text.Contains("gpu_device_name=AMD Radeon RX 6600\r\n") && !text.Contains("Radeon(TM)"),
+                  "another card's name beside the number: the row's card's: " + text.Replace("\r\n", " | "));
+            File.WriteAllText(Path.Combine(old, GameOptionsSchema.FileName), "gpu_device=0\r\noptions_version=8\r\n");
+            opt = GameOptionsFile.Load(old);
+            opt.Set(GameOptionsSchema.GpuKey, 0);
+            Equal(0, opt.Changes.Count, "Auto again: nothing to write");
         }
         finally { GameOptionsSchema.GpuNames = before; }
-
-        Equal(6, GameOptionsSchema.PresetSummaries.Count, "a summary for each preset");
-        Equal(0, GameOptionsSchema.PresetValues(0).Count, "Custom sets nothing");
     }
 
     // ---- the real file ----
@@ -290,8 +376,15 @@ static partial class Tests
             if (r.Kind == GameOptionKind.Choice)
                 Check(f.ChoicesOf(r.Key).Any(c => c.Value == v && c.Label == label), r.Name + ": " + v + " = \"" + label + "\" is one of its choices");
             else
-                Check(Regex.IsMatch(label, @"^(-?\d+( nits|%)?|\d\.\d\d|Off|Muted|As Stick dead zone)$"), r.Name + ": a slider's label \"" + label + "\"");
-            Check(f.Raw(r.Key) == null || v == r.AsRead(GameOptionsFile.Atoi(f.Raw(r.Key)!)), r.Name + ": the file's value as the game reads it");
+                Check(Regex.IsMatch(label, @"^(-?\d+( nits|%)?|\d\.\d\d|Off|Muted|Default \(24%\))$"), r.Name + ": a slider's label \"" + label + "\"");
+            Check(r.IsMerged || v == GameOptionsSchema.NativeStep || f.Raw(r.Key) == null || v == r.AsRead(GameOptionsFile.Atoi(f.Raw(r.Key)!)),
+                r.Name + ": the file's value as the game reads it");
+        }
+        // (the merged rows' parts: each its line's value, in its range; the game writes every one)
+        foreach (var p in GameOptionsSchema.Parts.Values)
+        {
+            Check(f.Raw(p.Key) != null, p.Key + ": the game wrote its line");
+            Equal(p.AsRead(GameOptionsFile.Atoi(f.Raw(p.Key)!)), f.Get(p.Key), p.Key + ": as the game reads it");
         }
         info.Refresh();
         Equal(len, info.Length, "the real file is not written");
@@ -357,31 +450,52 @@ static partial class Tests
         Equal("DCI-P3", Lb("renodx_color_space"), "colour space");
         Equal("Eye adaptation", Lb("renodx_midgray"), "midgray");
         Equal("Transformer 2 (M)", Lb("dlss_model"), "dlss model");
-        Equal("Lanczos", Lb("upscaling"), "filter");
         Equal("50%", Lb("sharpness"), "sharpness");
-        Equal("Off", Lb("robust_buffers"), "robust 1");
         Equal("Default", Lb("microphone"), "microphone");
         Equal("Full", Lb("texture_detail"), "texture detail");
-        Equal("Off", Lb("nvidia_reflex"), "reflex 0");
+        Equal("Off", Lb(GameOptionsSchema.LatencyKey), "low latency: reflex 0");
+        Equal("Even", Lb(GameOptionsSchema.PacingKey), "frame pacing on, no steady");
+        Equal("Off", Lb(GameOptionsSchema.HdrKey), "hdr 0");
+        Equal("Off", Lb(GameOptionsSchema.FrameGenKey), "no frame generation");
         Equal("Per frame", GameOptionsSchema.Get("game_speed").Label(0), "game speed 0");
         Equal("Real time", Lb("game_speed"), "game speed: its default without a line");
         Equal("80%", Lb("menu_sounds"), "menu sounds' default");
         Equal("Middle", Lb("ultrawide_hud"), "wide HUD");
         Equal("Centred, blurred sides", Lb("ultrawide_menus"), "wide menus");
-        Equal("layout_preset,debug_tools,replay_helper_threads,tail_early,options_version,menu_size,pad_a,key_a,key_cam_right",
+        Equal("Default (24%)", Lb("left_stick_dead_zone"), "a stick's own dead zone: its default");
+        // (a v0.5.1 file, options_version 7: the rows that went are other lines, kept for the game to drop)
+        Equal("quality_preset,upscaling,robust_buffers,layout_preset,debug_tools,replay_helper_threads,tail_early,options_version,menu_size,pad_a,key_a,key_cam_right",
             string.Join(",", fx.OtherLines.Select(o => o.Key)), "other lines in the file's order");
+        Equal("", string.Join(",", fx.UnknownKeys), "each one known");
         Equal("69,0", fx.OtherLines.Single(o => o.Key == "key_a").Value, "a binding's value as it is");
+        // ((Triforce, options_version 8) the Upscaler's engines and the Render resolution's Native (upscaler_rows.h step_engine):
+        // the game's own at 100% is the 3D at full size, so DLSS from it is DLSS's native AA, DLAA)
         fx.Set("dlss", 1);
-        Equal("Quality (67%)", fx.Label("resolution"), "with DLSS: its mode (100% moved to Quality)");
+        Equal(2, fx.Get("dlss"), "DLSS from the game's own at 100%: DLAA");
+        Equal("NVIDIA DLSS", fx.Label("dlss"), "shown as its engine");
+        Equal("Native (100%)", fx.Label("resolution"), "at Native");
+        Equal(GameOptionsSchema.NativeStep, fx.Get("resolution"), "the row's Native step");
         Equal("DLSS's own", fx.Label("anti-aliasing"), "aa with DLSS");
-        Equal("0,3,5,4,6", string.Join(",", fx.ChoicesOf("resolution").Select(c => c.Value)), "DLSS's steps");
-        fx.Set("dlss", 2);
-        Equal("Native (DLAA)", fx.Label("resolution"), "DLAA");
+        Equal("0,-1,3,5,4,6", string.Join(",", fx.ChoicesOf("resolution").Select(c => c.Value)), "DLSS's steps, Native among them");
+        Equal("0,2,3,4", string.Join(",", fx.ChoicesOf("dlss").Select(c => c.Value)), "the engines, DLSS by its saved value");
+        fx.Set("resolution", 3);
+        Equal(1, fx.Get("dlss"), "a mode: DLSS again");
+        Equal("Quality (67%)", fx.Label("resolution"), "DLSS's Quality");
+        fx.Set("resolution", GameOptionsSchema.NativeStep);
+        Equal(2, fx.Get("dlss"), "Native: DLAA");
+        Equal(3, fx.Changes["resolution"], "the saved resolution left as it was, for the other steps");
         fx.Set("dlss", 3);
+        Equal(6, fx.Get("dlss"), "FSR 3.1 from DLAA: FSR 3.1's native AA");
         Equal("FSR's own", fx.Label("anti-aliasing"), "aa with FSR");
         fx.Set("dlss", 0);
-        fx.Set("handheld_profile", 1);
-        Equal("67% (1024x576)", fx.Label("resolution"), "handheld profile's size (100% went to DLSS's Quality, which stays with the game's own)");
+        Equal(0, fx.Get("dlss"), "the game's own from a native AA");
+        Equal("100% (2560x1440)", fx.Label("resolution"), "at 100%");
+        fx.Set("output_res", GameOptionsSchema.HandheldOutput);
+        Equal("100% (1536x864)", fx.Label("resolution"), "the handheld profile's size");
+        fx.Set("resolution", 4);
+        fx.Set("dlss", 4);
+        Equal(4, fx.Get("dlss"), "FSR 4 from 50%: the engine");
+        Equal("Performance (50%)", fx.Label("resolution"), "its mode");
 
         // (the merge: a line changed outside since Load stays; the launcher's own change goes in; an unknown line stays in place)
         var m = NewGameFolder("game-options-merge", OptionsFixture);
@@ -396,7 +510,8 @@ static partial class Tests
         Check(merged.Contains("\r\nhdr=2\r\nzz_tool_line=5\r\n"), "the outside change and its new line kept in place");
         Check(merged.StartsWith("fullscreen=1\r\n"), "the launcher's change in its line");
         Check(merged.Contains("\r\nsharpness=70\r\n"), "a row changed on both sides: the launcher's (the later writer)");
-        Equal(outside.Replace("fullscreen=0", "fullscreen=1").Replace("sharpness=20", "sharpness=70"), merged, "every other line as the file had it");
+        Equal(outside.Replace("fullscreen=0", "fullscreen=1").Replace("sharpness=20", "sharpness=70").Replace("options_version=7", "options_version=8"), merged,
+            "every other line as the file had it (the version 7 file brought up to 8: nothing of it moves)");
         Equal("zz_tool_line", a.UnknownKeys.Single(), "an unknown key, kept");
         Equal(2, a.Get("hdr"), "this object holds the file as written");
 
@@ -407,7 +522,7 @@ static partial class Tests
         df.Set("sharpness", 30);
         df.Set("vsync", 0);
         df.Save();
-        Equal("sharpness=30\nsharpness=30\n#note\nvsync=0\noptions_version=7\nmenu_size=1\n", File.ReadAllText(Path.Combine(d, GameOptionsSchema.FileName)), "LF kept, line added, comment kept");
+        Equal("sharpness=30\nsharpness=30\n#note\nvsync=0\noptions_version=8\nmenu_size=1\n", File.ReadAllText(Path.Combine(d, GameOptionsSchema.FileName)), "LF kept, line added, comment kept, brought up to 8");
 
         // (a device's name in UTF-8: its bytes as they were, its label as text)
         var mic = "microphone_device=Mikrofon (Ä USB)";
@@ -445,53 +560,82 @@ static partial class Tests
         Equal(130, f.Set("mouse_sensitivity", 125), "onto the steps: the nearest, the larger on a tie");
         Equal(50, f.Set("rumble_strength", 60), "rumble on 25s");
         Equal(0, f.Set("output_res", 9), "an output past the list: the first");
+        Equal(7, f.Set("output_res", 7), "the handheld profile's output");
         Equal(-1, f.Set("left_stick_dead_zone", -7), "a range below 0");
         Equal(-3, f.Set("frame_rate_cap", -3), "the cap's 30");
 
-        // (the preset sets its rows; a row not exempt changed by hand makes it Custom, an exempt one does not)
-        f.Set("quality_preset", 4);
-        foreach (var (k, v) in new Dictionary<string, int> { ["resolution"] = 1, ["upscaling"] = 2, ["sharpness"] = 40, ["frame_pacing"] = 1, ["game_speed"] = 1, ["handheld_profile"] = 0, ["texture_detail"] = 1 })
-            Equal(v, f.Get(k), "High sets " + k);
-        Equal("High (16GB)", f.Label("quality_preset"), "the preset's label");
-        f.Set("fullscreen", 1);
-        Equal(4, f.Get("quality_preset"), "an exempt row leaves the preset");
-        f.Set("sharpness", 40);
-        Equal(4, f.Get("quality_preset"), "the same value is no change");
-        f.Set("sharpness", 60);
-        Equal(0, f.Get("quality_preset"), "a scaling row by hand: Custom");
-        // (with DLSS the preset's resolution is its nearest mode)
-        f.Set("dlss", 1);
-        f.Set("quality_preset", 2);
-        Equal(3, f.Get("resolution"), "Low's 75% with DLSS: Quality (67%)");
-        Equal(2, f.Get("texture_detail"), "Low: Reduced textures");
-        f.Set("quality_preset", 1);
-        Equal(4, f.Get("resolution"), "Minimum's 50% is DLSS's Performance");
-        Equal(3, f.Get("texture_detail"), "Minimum: Low textures");
-        Equal(1, f.Get("handheld_profile"), "Minimum: handheld profile");
-        // (another Upscaler moves the resolution onto its steps)
-        f.Set("dlss", 0);
-        f.Set("resolution", 2);
-        f.Set("dlss", 3);
-        Equal(3, f.Get("resolution"), "75% with FSR 3.1: 67%");
-        Equal(0, f.Get("quality_preset"), "the Upscaler is not exempt");
+        // ((Triforce, options_version 8) a merged row sets its parts (merged_rows.h *_set): one of a pair chosen, the other Off)
+        string Parts(string key) => string.Join(",", GameOptionsSchema.Get(key).Parts!.Select(p => p.Key + "=" + f.Get(p.Key)));
+        f.Set(GameOptionsSchema.FrameGenKey, 11);
+        Equal("frame_generation=0,dlss_frame_generation=2", Parts(GameOptionsSchema.FrameGenKey), "NVIDIA DLSS 3x");
+        f.Set(GameOptionsSchema.FrameGenKey, 4);
+        Equal("frame_generation=4,dlss_frame_generation=0", Parts(GameOptionsSchema.FrameGenKey), "4x, DLSS's off");
+        Equal(12, f.Set(GameOptionsSchema.FrameGenKey, 40), "past the end: DLSS 4x");
+        f.Set(GameOptionsSchema.HdrKey, 3);
+        Equal("hdr=2,renodx_hdr=1", Parts(GameOptionsSchema.HdrKey), "Native + RenoDX");
+        f.Set(GameOptionsSchema.HdrKey, 1);
+        Equal("hdr=1,renodx_hdr=0", Parts(GameOptionsSchema.HdrKey), "Expanded, RenoDX off");
+        f.Set(GameOptionsSchema.PacingKey, 3);
+        Equal("frame_pacing=1,steady_frame_rate=2", Parts(GameOptionsSchema.PacingKey), "Steady, refresh steps: pacing on");
+        f.Set(GameOptionsSchema.PacingKey, 0);
+        Equal("frame_pacing=0,steady_frame_rate=0", Parts(GameOptionsSchema.PacingKey), "Off");
+        var vendorBefore = GameOptionsSchema.LatencyVendorOf;
+        try
+        {
+            GameOptionsSchema.LatencyVendorOf = () => LatencyVendor.Nvidia;
+            f.Set(GameOptionsSchema.LatencyKey, 1);
+            Equal("nvidia_reflex=1,amd_anti-lag_2=0", Parts(GameOptionsSchema.LatencyKey), "NVIDIA: Reflex On");
+            GameOptionsSchema.LatencyVendorOf = () => LatencyVendor.Amd;
+            Equal(0, f.Get(GameOptionsSchema.LatencyKey), "AMD: Anti-Lag 2's Off (Reflex's line is NVIDIA's)");
+            Equal(1, f.Set(GameOptionsSchema.LatencyKey, 2), "AMD: On, its last");
+            Equal("nvidia_reflex=1,amd_anti-lag_2=1", Parts(GameOptionsSchema.LatencyKey), "Anti-Lag 2 on, Reflex as it was");
+            GameOptionsSchema.LatencyVendorOf = () => LatencyVendor.None;
+            f.Set(GameOptionsSchema.LatencyKey, 1);
+            Equal("nvidia_reflex=1,amd_anti-lag_2=1", Parts(GameOptionsSchema.LatencyKey), "neither: nothing changes");
+        }
+        finally { GameOptionsSchema.LatencyVendorOf = vendorBefore; }
+        Equal(2, f.Set("steady_frame_rate", 5), "a part by its own key: in its range");
+        Equal(3, f.Get(GameOptionsSchema.PacingKey), "and the row shows it");
+        // (a pair the old launcher could save both of: the row as the game shows it)
+        var both = GameOptionsFile.Load(NewGameFolder("game-options-both", "frame_generation=3\ndlss_frame_generation=1\nhdr=1\nrenodx_hdr=1\nframe_pacing=0\nsteady_frame_rate=1\noptions_version=8\n"));
+        Equal("NVIDIA DLSS 2x", both.Label(GameOptionsSchema.FrameGenKey), "DLSS's frame generation over the renderer's");
+        Equal("Expanded", both.Label(GameOptionsSchema.HdrKey), "RenoDX only with Native");
+        Equal("Steady, any rate", both.Label(GameOptionsSchema.PacingKey), "steady over pacing off");
 
-        // (Apply: the preset first, then the rest by the same rules)
+        // (the Upscaler: an engine; the Render resolution's Native goes with it, upscaler_rows.h step_engine)
+        var u = GameOptionsFile.Load(NewGameFolder("game-options-up", OptionsFixture));   // (dlss=0, resolution=1: 100%)
+        u.Set("dlss", 3);
+        Equal(6, u.Get("dlss"), "FSR 3.1 from 100%: its native AA");
+        u.Set("resolution", 4);
+        Equal(3, u.Get("dlss"), "a mode: FSR 3.1");
+        u.Set("dlss", 1);
+        Equal(1, u.Get("dlss"), "DLSS from 50%: DLSS");
+        Equal(4, u.Get("resolution"), "50% is DLSS's Performance");
+        u.Set("dlss", 0);
+        u.Set("resolution", 2);
+        u.Set("dlss", 3);
+        Equal(3, u.Get("resolution"), "75% with FSR 3.1: 67%");
+        u.Set("dlss", 0);
+        u.Set("resolution", GameOptionsSchema.NativeStep);
+        Equal(1, u.Get("resolution"), "the game's own at Native: 100%");
+        Equal(2, u.Set("dlss", 2), "DLAA by its saved value: as it is");
+
+        // (Apply: each with Set's rules)
         var b = GameOptionsFile.Load(NewGameFolder("game-options-apply", OptionsFixture));
-        var got = b.Apply(new Dictionary<string, int> { ["frame_generation"] = 2, ["quality_preset"] = 3, ["sharpness"] = 30 });
-        Equal(3, got["quality_preset"], "a preset row at the preset's own value keeps the preset");
-        Equal(2, got["frame_generation"], "frame generation set");
-        Equal(1, b.Get("upscaling"), "Balanced: Catmull-Rom");
-        var c = b.Apply(new Dictionary<string, int> { ["quality_preset"] = 5, ["sharpness"] = 80 });
-        Equal(0, c["quality_preset"], "a preset row changed after it: Custom, as in the game");
-        Equal(80, c["sharpness"], "and its value");
+        var got = b.Apply(new Dictionary<string, int> { [GameOptionsSchema.FrameGenKey] = 2, ["steady_frame_rate"] = 2, ["sharpness"] = 30 });
+        Equal(2, got[GameOptionsSchema.FrameGenKey], "frame generation set");
+        Equal(2, got["steady_frame_rate"], "a part by its key");
+        Equal(30, got["sharpness"], "sharpness");
         var changes = b.Changes.Count;
         Throws<KeyNotFoundException>(() => b.Apply(new Dictionary<string, int> { ["vsync"] = 0, ["descriptor_reuse"] = 0 }), "a key that is no row");
+        Throws<KeyNotFoundException>(() => b.Apply(new Dictionary<string, int> { ["quality_preset"] = 3 }), "the Quality preset is gone");
         Equal(changes, b.Changes.Count, "nothing set then");
         Equal(1, b.Get("vsync"), "vsync untouched");
         b.Save();
         var back = GameOptionsFile.Load(Path.GetDirectoryName(b.Path)!);
-        Equal(80, back.Get("sharpness"), "saved");
+        Equal(30, back.Get("sharpness"), "saved");
         Equal(2, back.Get("frame_generation"), "saved");
+        Equal("Steady, refresh steps", back.Label(GameOptionsSchema.PacingKey), "saved");
         Equal(0, back.Changes.Count, "a fresh read has no changes");
     }
 
@@ -507,14 +651,36 @@ static partial class Tests
         Equal(0, GameOptionsFile.Load(g).Get("ultrawide"), "without the screen: 16:9, as the game where it cannot ask");
         f.Set("sharpness", 30);
         f.Save();
-        Equal("frame_pacing=1\r\nultrawide=2\r\nnvidia_reflex=0\r\nsharpness=30\r\noptions_version=7\r\npad_a=0\r\n",
-            File.ReadAllText(Path.Combine(g, GameOptionsSchema.FileName)).Replace("tail_early=1\r\n", ""), "brought up to 7 as the game would read it");
-        Check(File.ReadAllText(Path.Combine(g, GameOptionsSchema.FileName)).Contains("tail_early=1\r\noptions_version=7"), "the Debug tab's tail_early too, before the version");
+        Equal("frame_pacing=1\r\nultrawide=2\r\nnvidia_reflex=0\r\nsharpness=30\r\noptions_version=8\r\npad_a=0\r\n",
+            File.ReadAllText(Path.Combine(g, GameOptionsSchema.FileName)).Replace("tail_early=1\r\n", ""), "brought up to 8 as the game would read it");
+        Check(File.ReadAllText(Path.Combine(g, GameOptionsSchema.FileName)).Contains("tail_early=1\r\noptions_version=8"), "the Debug tab's tail_early too, before the version");
         var again = GameOptionsFile.Load(g);
-        Equal(7, again.Version, "now 7");
-        again.Set("frame_pacing", 0);
+        Equal(8, again.Version, "now 8");
+        again.Set(GameOptionsSchema.PacingKey, 0);
         again.Save();
         Equal(0, GameOptionsFile.Load(g).Get("frame_pacing"), "and from 7 on the choice is read as it is");
+
+        // ((Triforce, options_version 8) a v0.5.1 file (7, the old rows' lines in it): the handheld profile becomes the Output
+        // resolution's 1536x864, the shared stick dead zone each stick's own that had none (merged_rows.h migrate)
+        var h = NewGameFolder("game-options-v7", "output_res=1\nhandheld_profile=1\nstick_dead_zone=3\nright_stick_dead_zone=12\nquality_preset=4\nupscaling=2\noptions_version=7\n");
+        var hf = GameOptionsFile.Load(h);
+        Equal(7, hf.Get("output_res"), "the handheld profile: the handheld output");
+        Equal("1536x864 (handheld)", hf.Label("output_res"), "its label");
+        Equal(15, hf.Get("left_stick_dead_zone"), "the shared 15% into the left stick's own");
+        Equal(12, hf.Get("right_stick_dead_zone"), "the right stick's own kept");
+        Equal("", string.Join(",", hf.UnknownKeys), "the old rows' lines: known");
+        hf.Set("vsync", 0);
+        hf.Save();
+        Equal("output_res=7\nhandheld_profile=1\nstick_dead_zone=3\nright_stick_dead_zone=12\nquality_preset=4\nupscaling=2\nvsync=0\nleft_stick_dead_zone=15\noptions_version=8\n",
+            File.ReadAllText(Path.Combine(h, GameOptionsSchema.FileName)), "brought up to 8: the moved values written, the old lines left for the game to drop");
+        var h8 = GameOptionsFile.Load(h);
+        h8.Set("output_res", 1);
+        h8.Save();
+        Equal(1, GameOptionsFile.Load(h).Get("output_res"), "from 8 on the old handheld_profile line moves nothing");
+        // (a 436f9ac-based build's 7: none of those lines, nothing moves)
+        var n7 = GameOptionsFile.Load(NewGameFolder("game-options-n7", "output_res=3\nleft_stick_dead_zone=-1\noptions_version=7\n"));
+        Equal(3, n7.Get("output_res"), "no handheld line: the output as it is");
+        Equal(-1, n7.Get("left_stick_dead_zone"), "no shared line: the default");
 
         // (no options_version line: Game speed real time; no resolution line but the old dynamic_resolution)
         var o = NewGameFolder("game-options-v0", "game_speed=0\ndynamic_resolution=0\n");
@@ -523,20 +689,23 @@ static partial class Tests
         Equal(1, of.Get("resolution"), "dynamic_resolution 0: 100%");
         Equal(2, of.Get("nvidia_reflex"), "Reflex On + Boost before 5");
 
-        // (no file: the defaults; a Save makes it with the changed rows and the version)
+        // (no file: the defaults; a Save makes it with the changed values, in the menu's order, and the version)
         var n = Path.Combine(NewRoot("game-options-new"), "game");
         Directory.CreateDirectory(n);
         var nf = GameOptionsFile.Load(n);
         Check(!nf.Exists, "no file");
         Equal(1, nf.Get("vsync"), "default");
         Equal("Off", nf.Label("fullscreen"), "default label");
+        Equal("Even", nf.Label(GameOptionsSchema.PacingKey), "frame pacing's default");
         nf.Save();
         Check(!File.Exists(nf.Path), "nothing to write: no file made");
-        nf.Set("vsync", 0);
         nf.Set("master_volume", 83);
+        nf.Set("vsync", 0);
+        nf.Set(GameOptionsSchema.PacingKey, 3);
         nf.Save();
         var nl = OperatingSystem.IsWindows() ? "\r\n" : "\n";
-        Equal("vsync=0" + nl + "master_volume=85" + nl + "options_version=7" + nl, File.ReadAllText(nf.Path), "a new file: the rows in the menu's order, then the version");
+        Equal("vsync=0" + nl + "steady_frame_rate=2" + nl + "master_volume=85" + nl + "options_version=8" + nl, File.ReadAllText(nf.Path),
+            "a new file: the values in the menu's order (a merged row's parts at its place; frame_pacing at its default not written), then the version");
         Check(nf.Exists, "now there");
     }
 }

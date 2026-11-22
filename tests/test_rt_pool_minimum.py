@@ -42,6 +42,8 @@ static const char *fixture_env(const char *name) {
 /* (local, RenoDX port: host/nn_vi.c's, whether the scene's colour target is RGBA16F for the run) */
 static int scene_rgba16f;
 int hos_scene_rgba16f(void) { return scene_rgba16f; }
+/* ((Triforce, 11-21, TEX-85) host/nn_applet.c's, beside the function: whether the heap is held to a size, which it notes) */
+static int rt_pool_pinned = -1;
 ''' + body + r'''
 #define WIDE(w, h) ((uint64_t)(h) << 32 | (w))
 static const struct {

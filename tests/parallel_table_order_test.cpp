@@ -3,6 +3,7 @@
 // change the same pages in one order and the queue runs their uploads in the other. No game, no GPU.
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -13,8 +14,10 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include "table_stream.h"   // ((Triforce, 11-22, SYNC-04) the flush's stream: gpu/vk, on the include path)
 
 namespace fixture {
+void logf(const char*, ...) {}   // (the flush's line for one over 1 ms)
 void require(bool ok, const char* why) {
     if (!ok) {
         std::fprintf(stderr, "FAIL: %s\n", why);

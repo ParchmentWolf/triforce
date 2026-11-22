@@ -269,11 +269,16 @@ PICTURE_BUTTONS = {"east": (869, 227, 31), "south": (800, 286, 31), "north": (80
 # the labels' bars (BARS: the left ones' right edge, the right ones' left edge, kept from the game's) to the picture's parts
 # (nx2/prompt_faces.py): each line's texture, bar (0 left, 1 right), row (its top; 6 pixels thick) and end: a Switch button (the
 # part of the pad input bound to it: one line per pad input, chosen by the controls; a face button or the d-pad: a frame round the
-# group, as the game's round its face buttons, the label's icon telling which) or a pad input (fixed: the sticks)
-GUIDES = ("ControllerGuide_Pro_00", "ControllerGuide_Pro_01")
+# group, as the game's round its face buttons, the label's icon telling which) or a pad input (fixed: the sticks).
+# (Triforce) The page has three more of them, drawn with the two first: _02 ZR's line, _03 the D-pad's frame round the Pro's d-pad
+# and _04 L's and R's lines. Left the game's, on a face's picture they pointed at the Pro's places: on the PlayStation pads, whose
+# left stick is where the Pro's d-pad is, the D-pad's frame went round the left stick (the ticket "Put d-pad arrows in the right
+# place"). Now made for each face as the others are; the D-pad's label follows Switch Up's pad input
+GUIDES = ("ControllerGuide_Pro_00", "ControllerGuide_Pro_01", "ControllerGuide_Pro_02", "ControllerGuide_Pro_03",
+          "ControllerGuide_Pro_04")
 GUIDE_SCALE, GUIDE_AT, BARS = 1.1136, (131.3, 462.6), (147, 1407)
 GUIDE_LINES = [(0, 0, 333, "zl"), (1, 0, 561, "minus"), (0, 0, 667, "lstick"), (0, 1, 558, "plus"), (0, 1, 713, "a"),
-               (0, 1, 1225, "rstick")]
+               (0, 1, 1225, "rstick"), (2, 1, 333, "zr"), (3, 0, 1015, "up"), (4, 0, 447, "l"), (4, 1, 446, "r")]
 
 
 def bntx_textures(b):
@@ -545,6 +550,30 @@ def guide_frame_at(where, group):
     return cx, cy, max(max(abs(x - cx), abs(y - cy)) + r for x, y, r in pts) + 8   # (from the centre to a corner, as the game's)
 
 
+# (Triforce, 11-22, the performance audit's IO-42, after Source A's) The lines that stay, widened (a 9 by 9 maximum, what a
+# route pays to cross), kept for the last image asked: every route of one line is given the same image (guide_layers: the
+# frames and each pad input's line), and each widened it again, 37 times for one face where 5 images differ. One entry,
+# by the image's id, holding the image itself: the entry is used only when it is that very object, so an id given again
+# to another image misses, and no step here changes an image in place. HOOKSHOT_PROMPTS_WIDEN_EACH=1 (read once):
+# widened at every route, as before.
+_WIDENED = {}
+WIDEN_EACH = os.environ.get("HOOKSHOT_PROMPTS_WIDEN_EACH", "0") not in ("", "0")
+
+
+def guide_widened(stays):
+    """the lines that stay (L) with every lit pixel grown to 9 by 9, as an array: _WIDENED above"""
+    import numpy as np
+    from PIL import ImageFilter
+    held = None if WIDEN_EACH else _WIDENED.get(id(stays))
+    if held is not None and held[0] is stays:
+        return held[1]
+    st = np.asarray(stays.filter(ImageFilter.MaxFilter(9)))
+    _WIDENED.clear()
+    if not WIDEN_EACH:
+        _WIDENED[id(stays)] = (stays, st)
+    return st
+
+
 def guide_route(size, bar, row, where, pad, stays, frame=None):
     """the way (points, the lines' pixels) of a line from a bar's row to the pad input's part, round the picture's other parts and
     with the fewest bends, crossing the lines that stay (L) as little as it can: it comes to a stick's centre, to a part just off
@@ -552,7 +581,6 @@ def guide_route(size, bar, row, where, pad, stays, frame=None):
     import heapq
     import math
     import numpy as np
-    from PIL import ImageFilter
     g = GUIDE_GRID
     x0, y0 = BARS[0] if bar == 0 else BARS[1], row + 3
     ilo, ihi = (0, (BARS[1] - x0) // g) if bar == 0 else (-((x0 - BARS[0]) // g), 0)
@@ -580,7 +608,7 @@ def guide_route(size, bar, row, where, pad, stays, frame=None):
             else:   # (the frame: a square on its corner, its sides 1.15 corners' distance off in x + y)
                 blocked |= np.abs(X - cx) + np.abs(Y - cy) < 1.15 * e + GUIDE_CLEAR
     blocked |= ((np.abs(X - BARS[0]) < 14) | (np.abs(X - BARS[1]) < 14)) & (Y != y0)   # (off the bars but on its own row)
-    st = np.asarray(stays.filter(ImageFilter.MaxFilter(9)))
+    st = guide_widened(stays)   # ((Triforce, 11-22, IO-42) once per image, not once per route)
     pen = np.where(st[np.clip(Y, 0, size[1] - 1), np.clip(X, 0, size[0] - 1)] > 0, GUIDE_CROSS, 0)
     dirs = ((1, 0), (-1, 0), (0, 1), (0, -1))
     goals = {}   # ((i, j, dir): (the end, extra cost)): the cell two before the end, coming the way it ends

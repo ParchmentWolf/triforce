@@ -25,7 +25,8 @@
 // they record only those trial frames. (Triforce, 11-15) And its rule (rule below): where the replay is plainly the frame's
 // limit they go on without a trial, and where they cannot pay no trial is made. (Triforce, 11-16) And once a way has held,
 // trials come ever rarer (up to some 14,400 presents apart) and shorter, and early only when the scene clearly changes (the
-// back-off, at Tuner).
+// back-off, at Tuner). (Triforce, 11-22) And both judge settled scenes only: the rule no window of a load or an arrival, and a
+// trial the scene changed under decides nothing (settled, at Tuner).
 //
 // The parallel replay was audited for this by reading (nothing could be run). What was found and is fixed, each with a
 // check in tests/test_parallel_fixes.py:
@@ -236,6 +237,18 @@ inline Verdict rule(const Frame& m, int threads) {
 ///   trial whose first and last parts (the same way) moved so had the scene change under it: the windows after it are the
 ///   new scene's reference, so the back-off starts again there too, the next trial kEvery on.
 /// A change of way, by a trial or by the rule, starts the back-off again. tests/test_replay_threads_tuner.py "backoff"
+/// (Triforce, 11-22) Settled (settled; vk_replay.cpp par_settled_on, RX_VK_TUNER_SETTLED=0: off, as before), after
+/// Kaefergeneral's #dev-fixes post: on a 5900X with an RTX 3090, where the helpers lost in every settled scene (1.2 to 4.5 ms a
+/// frame), Automatic was 6 to 10% slower than Off. The rule turned them on in the window of an area's load (long frames, the
+/// replay 71 to 82% of them, nearly every draw cuttable), not in the settled Market (the replay 62%), and the first trial after
+/// the arrival straddled the load ("parallel 4.76 ms a frame, the other way 24.10, parallel again 17.25: as it was"): the
+/// scene's change was seen (moved) but the verdict stood, for kEvery presents or more. So:
+/// - the rule judges a window only if the one before it, on the replay thread alone, describes the same scene (scene_moved,
+///   the back-off's test): a load's window and the first after it get no verdict, neither "on" nor "no trial". After a trial
+///   or a change of way the first window has none before it, so the rule's "on" comes a window later than it did;
+/// - a trial whose first and last parts moved so decides nothing, either way (not better, no recheck), and the next one comes
+///   kWindow after a window of the way in use like the one before it (settle_look), not kEvery later, and never while the rule
+///   says no trial. kHold and the thresholds as they were. tests/test_replay_threads_tuner.py "settled"
 class Tuner {
 public:
     static constexpr int kEvery = 900, kTake = 80, kSettle = 24, kWindow = 120, kHold = 4 * kEvery;
@@ -243,6 +256,7 @@ public:
     static constexpr double kClear = 1.10, kSceneDraws = 0.25, kSceneDrawsMin = 200, kScenePart = 0.30, kScenePartMs = 1.0;
     bool use_rule = true;
     bool backoff = true;   // (the back-off above; false: every step as before it)
+    bool settled = true;   // (the rule and the trials only on a settled scene, above; false: as before)
     int threads = 4;   // (the threads that record segments: rule()'s)
     struct Step {
         bool flip = false;         // change the way in use
@@ -262,6 +276,9 @@ public:
         bool moved = false;        // (the scene changed under the trial that ended: the back-off starts again)
         bool sure = false;         // (the trial kept the way, the other way longer than both its parts: the back-off grows)
         int64_t next = 0;          // (the present the next trial may begin at: set at a trial's end and at a scene change)
+        // (settled's)
+        bool unsettled = false;    // (a window the rule did not judge, or a trial that decided nothing: the scene moved)
+        bool settle = false;       // (the scene settled after such a trial: the next trial at next)
     };
     /// f: the frame just presented; on: the helper threads in use for it; order_only: both ways are the replay thread alone
     Step step(const Frame& f, bool on, bool order_only) {
@@ -272,31 +289,44 @@ public:
                 if (f.frame <= 60.0) win_.add(f);
                 if (++win_frames_ >= kWindow) {
                     if (win_.n >= kWindow * 3 / 4 && !order_only) {
-                        s.ruled = true, s.window = win_.mean(), s.verdict = rule(s.window, threads);
-                        const bool turn_on = s.verdict.kind == Verdict::kOn && frames_ >= hold_until_;
-                        s.rule_new = s.verdict.kind != last_ || turn_on;
-                        last_ = s.verdict.kind;
-                        if (turn_on) {
-                            s.flip = true;
-                            next_trial_ = frames_ + kEvery;
-                            if (backoff) held_ = 0, fresh_ = true, scene_restart();
-                        } else if (s.verdict.kind == Verdict::kOff) {
-                            next_trial_ = std::max(next_trial_, frames_ + kEvery);
-                            no_trial_until_ = frames_ + kEvery;
+                        // (settled: a window is judged only if the one before it, on the replay thread alone too, describes
+                        // the same scene)
+                        s.window = win_.mean();
+                        const bool same = !settled || (win_prev_set_ && !scene_moved(win_prev_, s.window));
+                        win_prev_ = s.window, win_prev_set_ = true;
+                        if (!same) {
+                            s.unsettled = true;
+                        } else {
+                            s.ruled = true, s.verdict = rule(s.window, threads);
+                            const bool turn_on = s.verdict.kind == Verdict::kOn && frames_ >= hold_until_;
+                            s.rule_new = s.verdict.kind != last_ || turn_on;
+                            last_ = s.verdict.kind;
+                            if (turn_on) {
+                                s.flip = true;
+                                next_trial_ = frames_ + kEvery;
+                                waiting_ = false, win_prev_set_ = false;   // (the way changed: a trial kEvery on, as after a change)
+                                if (backoff) held_ = 0, fresh_ = true, scene_restart();
+                            } else if (s.verdict.kind == Verdict::kOff) {
+                                next_trial_ = std::max(next_trial_, frames_ + kEvery);
+                                no_trial_until_ = frames_ + kEvery;
+                            }
                         }
+                    } else {
+                        win_prev_set_ = false;   // (a load, or DLSS / FSR kept in order: the next window has none before it)
                     }
                     win_ = Part{}, win_frames_ = 0;
                     if (s.flip) return s;
                 }
             } else {
-                win_ = Part{}, win_frames_ = 0;
+                win_ = Part{}, win_frames_ = 0, win_prev_set_ = false;
             }
-            if (backoff) scene_look(f, s);
+            if (waiting_) settle_look(f, s);
+            else if (backoff) scene_look(f, s);
             if (frames_ < next_trial_) return s;
             if (order_only) return s;
             phase_ = 1, n_ = 0;
             short_ = backoff && held_ >= 2;
-            win_ = Part{}, win_frames_ = 0;   // (the rule's next window begins after the trial)
+            win_ = Part{}, win_frames_ = 0, win_prev_set_ = false;   // (the rule's next window begins after the trial)
             sum_[0] = sum_[1] = sum_[2] = 0, cnt_[0] = cnt_[1] = cnt_[2] = 0;
             part_[0] = part_[1] = part_[2] = Part{};
             return s;
@@ -318,6 +348,11 @@ public:
             s.a = cnt_[0] ? sum_[0] / cnt_[0] : 0, s.b = cnt_[1] ? sum_[1] / cnt_[1] : 0, s.c = cnt_[2] ? sum_[2] / cnt_[2] : 0;
             s.better = s.ok && s.b < std::min(s.a, s.c) * 0.96;
             s.short_trial = short_;
+            // (settled: a trial whose first and last parts, the same way, describe two scenes measured the change of scene, not
+            // the way: it decides nothing, either way, and the next one waits for the scene to settle)
+            const bool moved = (backoff || settled) && cnt_[0] && cnt_[2] && scene_moved(part_[0].mean(), part_[2].mean());
+            s.moved = moved;
+            if (settled && moved) s.better = false, s.unsettled = true;
             if (s.better && short_) s.better = false, s.recheck = true;   // (a full trial decides: at once, below)
             if (s.better) {
                 s.flip = true, changes_++;
@@ -334,7 +369,6 @@ public:
                 // put off ever longer; such a trial costs little, its two ways' frames being about as long. The first trial
                 // after a change of scene or way that is too close to tell: kEvery, a second look soon. The trials' means
                 // drift with the scene, and right after a change the first is the one most often wrong)
-                s.moved = cnt_[0] && cnt_[2] && scene_moved(part_[0].mean(), part_[2].mean());
                 const double top = std::max(s.a, s.c);
                 s.sure = s.ok && !s.better && !s.recheck && !s.moved && s.b > top;
                 const bool again = !s.sure && fresh_;
@@ -344,6 +378,10 @@ public:
                 next_trial_ = frames_ + (s.recheck ? 1 : s.better || s.moved || again ? kEvery : s.sure ? put_off(held_) : 2 * kEvery);
                 last_end_ = frames_;
                 scene_restart();
+            }
+            if (s.unsettled) {   // (the next trial kWindow after a window like the one before it: settle_look)
+                waiting_ = true, next_trial_ = INT64_MAX;
+                settle_win_ = Part{}, settle_frames_ = 0, settle_prev_set_ = false;
             }
             s.next = next_trial_;
             s.trial = true, s.parts = part_;
@@ -367,6 +405,22 @@ public:
 
 private:
     void scene_restart() { scene_win_ = Part{}, scene_frames_ = 0, ref_set_ = false, strikes_ = 0; }
+    /// (settled: after a trial the scene moved under, the way's windows each against the one before; the first like it, and
+    /// the next trial kWindow on, never while the rule says no trial. A load breaks the run)
+    void settle_look(const Frame& f, Step& s) {
+        if (f.frame <= 60.0) settle_win_.add(f);
+        if (++settle_frames_ < kWindow) return;
+        const bool counted = settle_win_.n >= kWindow * 3 / 4;
+        const Frame m = settle_win_.mean();
+        settle_win_ = Part{}, settle_frames_ = 0;
+        const bool same = counted && settle_prev_set_ && !scene_moved(settle_prev_, m);
+        settle_prev_ = m, settle_prev_set_ = counted;
+        if (!same) return;
+        waiting_ = false, s.settle = true;
+        next_trial_ = std::max(frames_ + kWindow, no_trial_until_);
+        s.next = next_trial_;
+        if (backoff) scene_restart();   // (the settled scene is the back-off's reference)
+    }
     /// (between trials: the scene's windows against the reference, the next trial brought forward when two in a row moved)
     void scene_look(const Frame& f, Step& s) {
         if (f.frame <= 60.0) scene_win_.add(f);
@@ -406,6 +460,11 @@ private:
     int scene_frames_ = 0, strikes_ = 0;
     bool ref_set_ = false;
     Frame ref_;
+    // (settled's: the rule's window before, and after a trial the scene moved under, the wait for it to settle and its windows)
+    Frame win_prev_, settle_prev_;
+    bool win_prev_set_ = false, waiting_ = false, settle_prev_set_ = false;
+    Part settle_win_;
+    int settle_frames_ = 0;
 };
 
 } // namespace replay_threads

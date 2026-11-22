@@ -100,6 +100,31 @@ def main():
         raise SystemExit("vk_dlss.cpp: DLSS's feature is not made again for another DLSS model")
     if "upscaler_rows::dlss_preset(opts.dlss_model" not in function(dlss, "unsigned wanted_preset() {"):
         raise SystemExit("vk_dlss.cpp: the DLSS model row (and RX_VK_DLSS_PRESET over it) is not the preset asked for")
+    # ((Triforce, 11-22, the performance audit's PRESENT-36) the K row's CNN preset on a card under 7 GB: DLSS's preset and the
+    # menu's row ask the same function for the card's memory, which is 0 (K as chosen) unless RX_VK_DLSS_CNN_VRAM=1
+    wanted = function(dlss, "unsigned wanted_preset() {")
+    if ("const uint64_t vram = dlss_cnn_vram();" not in wanted
+            or "upscaler_rows::dlss_preset(opts.dlss_model, env && *env ? env : nullptr, vram)" not in wanted):
+        raise SystemExit("vk_dlss.cpp: wanted_preset does not ask dlss_cnn_vram() for the card's memory")
+    text = function(menu, "const char* tx_dlss_model(int v) {")
+    if 'if (ur::cnn_for_vram(v, dlss_cnn_vram())) return "CNN (E)";' not in text or text.index("dlss_preset_env()") > text.index("dlss_cnn_vram()"):
+        raise SystemExit("vk_menu.cpp: the DLSS model row does not read CNN (E) where DLSS draws with it, after RX_VK_DLSS_PRESET")
+    hint = function(menu, "const char* hn_dlss_model(int v, int variant) {")
+    if ("ur::cnn_for_vram(v, dlss_cnn_vram()) ? 2 : 0" not in hint or "if (variant == 2) return v == ur::MODEL_K ? cnn : nullptr;" not in hint
+            or "under 7 GB" not in hint):
+        raise SystemExit("vk_menu.cpp: the DLSS model row's help does not say why it reads CNN (E)")
+    vram = function(dlss, "uint64_t dlss_cnn_vram() {")
+    if ('static const bool on = env_switch("RX_VK_DLSS_CNN_VRAM") == 1;' not in vram or "return on ? device_vram_bytes() : 0;" not in vram
+            or dlss.index("uint64_t dlss_cnn_vram() {") < dlss.index("#else  // (no NGX SDK in this build")):
+        raise SystemExit("vk_dlss.cpp: dlss_cnn_vram is not off unless RX_VK_DLSS_CNN_VRAM=1, or not in a build without DLSS")
+    if "NVSDK_NGX_DLSS_Hint_Render_Preset_E == 5" not in feature:
+        raise SystemExit("vk_dlss.cpp: preset E's number is not checked against NVIDIA's")
+    if "uint64_t device_vram_bytes();" not in (ROOT / "gpu" / "vk" / "vk_internal.h").read_text(encoding="utf-8"):
+        raise SystemExit("vk_internal.h does not declare device_vram_bytes")
+    if "uint64_t dlss_cnn_vram();" not in (ROOT / "gpu" / "vk" / "vk_dlss.h").read_text(encoding="utf-8"):
+        raise SystemExit("vk_dlss.h does not declare dlss_cnn_vram")
+    if "| `RX_VK_DLSS_CNN_VRAM=1` |" not in (ROOT / "docs" / "development.md").read_text(encoding="utf-8"):
+        raise SystemExit("docs/development.md has no row for RX_VK_DLSS_CNN_VRAM")
     temporal = (ROOT / "gpu" / "vk" / "vk_temporal.cpp").read_text(encoding="utf-8")
     mode = function(temporal, "int temporal_mode() {")
     if "dlss_why() != DLSS_OK" not in mode or "fsr4_why() != FSR_OK" not in mode:

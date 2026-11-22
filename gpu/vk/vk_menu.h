@@ -176,6 +176,9 @@ extern int tex_bc1_at_start;
 bool preset_caps_memory();
 
 void menu_init();             // (the options from the file, once)
+/// (Triforce, 11-22, the performance audit's PRESENT-46) With RX_VK_FIRST_START_AUTO, a first start (no options file) on a
+/// weak card sets the Render resolution row; once, after the device is made (first_start.h)
+void menu_first_start();
 void menu_set_gpu_count(int count);
 /// ((Triforce) 11-20) the GPU device row's card by its name, as triforce_options.ini's gpu_device_name had it (empty: none
 /// saved): vk_main.cpp pick_device finds the card by it first (gpu_choice.h pick)
@@ -205,6 +208,9 @@ int menu_take_sound();
 /// (Triforce) 1 while the Mods entry under a game list has the cursor, or its screen is open (HOS_OPT_MODS_SELECTED: the
 /// host lets the game's own cursor go then, host/oot_menu.c)
 int menu_mods_selected();
+/// ((Triforce, 11-20) the Mods screen's music: 0 none, 1 the title's list is there (the tune read ahead), 2 the Mods screen
+/// is open from the title's list (HOS_OPT_MODS_MUSIC, host/mods_music.c)
+int menu_mods_music();
 /// (Triforce) 1 while the Mods screen's search takes typed text (HOS_OPT_TEXT_WANTED: host/display.c sends it then)
 int menu_text_wanted();
 /// (Triforce) What became of the picture a bug capture asked for (vk_bugshot.h bugshot_state): 0 none asked, 1 not there yet,

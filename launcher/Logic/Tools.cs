@@ -229,12 +229,24 @@ public sealed class Tools
     }
 
     /// <summary>Whether the tools in folder hold base b whole (progress: 0..1 while it reads the files). Remembers a match in base.have.</summary>
+    /// <summary>((Triforce, 11-21, ticket "Every tools update re-downloads the whole base, even when it didn't change") A file of the
+    /// base that the tools rewrite as they run: the bundled Python's bytecode caches (__pycache__\*.pyc), which Python writes
+    /// again whenever its sources are newer or the cache's interpreter differs. Their sizes and hashes in base.list were those of
+    /// the packed folder, so after one build 352 of the 417 differed and every update fetched the whole base (~95% of the tools)
+    /// again. Not compared: one that is stale or missing is made again by Python itself.</summary>
+    public static bool Regenerated(string path)
+    {
+        var p = path.Replace('\\', '/');
+        return p.EndsWith(".pyc", StringComparison.OrdinalIgnoreCase) || p.Contains("/__pycache__/", StringComparison.OrdinalIgnoreCase);
+    }
+
     public static bool HasBase(Base b, string folder, Action<double>? progress)
     {
         foreach (var d in b.Dirs)
             if (!Directory.Exists(Path.Combine(folder, d))) return false;
         foreach (var f in b.Files)   // (every file there, at its size: quick, and enough once base.have says the rest was read)
         {
+            if (Regenerated(f.Path)) continue;
             var fi = new FileInfo(Path.Combine(folder, f.Path));
             if (!fi.Exists || fi.Length != f.Size) return false;
         }
@@ -244,6 +256,7 @@ public sealed class Tools
         long total = Math.Max(1, b.Files.Sum(f => f.Size)), done = 0;
         foreach (var f in b.Files)
         {
+            if (Regenerated(f.Path)) { done += f.Size; continue; }
             string got;
             using (var s = File.OpenRead(Path.Combine(folder, f.Path))) got = Convert.ToHexStringLower(SHA256.HashData(s));
             if (got != f.Sha) return false;

@@ -19,6 +19,8 @@ Model:
     Xd unchanged, PACGA writes 0. Nothing in the game's own code can tell, since no pointer is ever signed.
   - MTE: tags are always 0. STG/ST2G only do their base-register writeback.
 """
+import os
+
 import a64emit
 import a64_lift
 
@@ -219,8 +221,22 @@ def ldar_stlr(w):
             % (rn, T, T, xr(rt), 1 << size))
 
 
+# (Triforce, 11-22, the performance audit's LIFT-47, after Source B's) DMB of the load or the store kind: ISHLD, ISHST and
+# the OSH, NSH and full-system forms, eight words (CRm<1:0> = 01 or 10; op2 = 101, so a DSB of those kinds is not one).
+# The kit writes every DMB and DSB as recomp_barrier(), an out-of-line full fence. x86-64 keeps load-load, load-store and
+# store-store order in hardware, so there such a DMB needs only that the compiler moves no guest access across it:
+# A64_DMB_LDST() (nx2/rtgen.py: nothing but a compiler barrier on x86-64, the full fence on any other host). A full DMB
+# (ISH, SY, ...), every DSB, ISB and STLR's locked store keep what they had, so store-load order holds as before.
+# Only when the lift runs with A64_DMB_LIGHT=1 (unset, empty or 0: the kit's fence; an A64_ name, so in the lift key).
+def dmb_light(w):
+    """Whether w is a DMB of the load or store kind that A64_DMB_LIGHT=1 turns into A64_DMB_LDST()"""
+    return (w & 0xFFFFF0FF) == 0xD50330BF and ((w >> 8) & 3) in (1, 2) and os.environ.get("A64_DMB_LIGHT", "0") not in ("", "0")
+
+
 def emit(w):
     """C for one of the forms above, or None (then suyu translates it)"""
+    if (w & 0xFFFFF0FF) == 0xD50330BF:                # DMB (LIFT-47: the LD and ST kinds, with A64_DMB_LIGHT=1)
+        return "A64_DMB_LDST();" if dmb_light(w) else None
     if (w & 0x3FBF7C00) == 0x089F7C00:                # LDAR, STLR, LDLAR, STLLR (o0 = bit 15)
         return ldar_stlr(w)
     if (w & 0xBF20FC00) == 0x0E209000 or (w & 0xBF00F400) == 0x0F003000:

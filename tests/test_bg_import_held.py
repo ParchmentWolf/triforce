@@ -82,6 +82,10 @@ void logf(const char*, ...) {}
 void guest_pages_set(uint64_t, uint64_t, uint64_t) {}
 void retire_pool(std::map<uint64_t, Pool>::iterator it) { retired_pools.push_back(imported.extract(it)); }
 std::vector<std::pair<uint64_t, uint64_t>> bg_held;
+std::deque<std::map<uint64_t, Pool>::node_type> evicted_pools;   // (the imports given back and not freed yet: none here)
+@@DEAD_IMPORT@@
+std::deque<DeadImport> dead_imports;
+@@LEAVING@@
 @@SEND@@
 @@LET_GO@@
 @@DRAIN@@
@@ -180,6 +184,8 @@ def main():
     fixture = (FIXTURE.replace("@@SEND@@", send)
                .replace("@@LET_GO@@", block(memory, "void bg_let_go(uint64_t lo, uint64_t hi) {"))
                .replace("@@DRAIN@@", block(memory, "void bg_drain() {"))
+               .replace("@@DEAD_IMPORT@@", re.search(r"^struct DeadImport \{[^\n]*\};$", memory, re.M).group(0))
+               .replace("@@LEAVING@@", block(memory, "bool imports_leaving_overlap(uint64_t lo, uint64_t hi) {"))
                .replace("@@IMPORTED@@", block(memory, "int memory_guest_imported(uint64_t lo, uint64_t hi) {")))
     with tempfile.TemporaryDirectory(prefix="bg-import-held-") as tmp:
         src, exe = Path(tmp) / "held.cpp", Path(tmp) / "held.exe"

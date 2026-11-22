@@ -276,6 +276,24 @@ static partial class Tests
         Equal("library", File.ReadAllText(Path.Combine(tools.Folder, "python", "lib.txt")), "the base moved over");
         File.WriteAllText(Path.Combine(tools.Folder, "python", "lib.txt"), "changed!");
         Check(!Tools.HasBase(b, tools.Folder, null), "a changed base file (other size) is not the base");
+
+        // (11-21, ticket "Every tools update re-downloads the whole base": Python rewrites its bytecode caches as it runs, and
+        // their sizes in base.list made every update fetch the base again)
+        var root2 = NewRoot("parts-pyc");
+        var t2 = new Tools(Ctx(root2));
+        var list2 = BaseList(("python/python.exe", "py"), ("python/Lib/__pycache__/os.cpython-314.pyc", "packed bytes"));
+        var b2 = Tools.ParseBaseList(list2)!;
+        Directory.CreateDirectory(Path.Combine(t2.Folder, "python", "Lib", "__pycache__"));
+        File.WriteAllText(Path.Combine(t2.Folder, "python", "python.exe"), "py");
+        File.WriteAllText(Path.Combine(t2.Folder, "python", "Lib", "__pycache__", "os.cpython-314.pyc"), "rewritten by python, longer");
+        Check(Tools.HasBase(b2, t2.Folder, null), "a bytecode cache Python rewrote is still the base");
+        File.Delete(Path.Combine(t2.Folder, "python", "Lib", "__pycache__", "os.cpython-314.pyc"));
+        File.Delete(Path.Combine(t2.Folder, Tools.BaseHave));
+        Check(Tools.HasBase(b2, t2.Folder, null), "and one missing (Python makes it again)");
+        File.WriteAllText(Path.Combine(t2.Folder, "python", "python.exe"), "other");
+        File.Delete(Path.Combine(t2.Folder, Tools.BaseHave));
+        Check(!Tools.HasBase(b2, t2.Folder, null), "a real base file changed still is not");
+        Check(Tools.Regenerated(@"python\Lib\x\__pycache__\a.pyc") && !Tools.Regenerated("python/Lib/os.py"), "what counts as rewritten");
     }
 
     static async Task ToolsUpdate()

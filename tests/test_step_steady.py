@@ -164,7 +164,7 @@ def check_source():
           "the steady step does not start afresh where the average does")
     check("secs_avg = step_steady(&steady, dt, (double)pace_period_ns / 1e9, timed ? 1.0 / 240.0 : 1.0 / top, 4.0 / 60.0);" in step,
           "the steady step is not taken from this interval and the paced period within each path's bounds")
-    check(step.index("const int top = timed ? 60 : fps_max();") < step.index("secs_avg = step_steady("),
+    check(step.index("const int top = timed ? 60 : pace;") < step.index("secs_avg = step_steady("),   # ((Triforce, 11-22, PRESENT-30) pace_fps())
           "the bounds are read before they are known")
     check("const double secs = secs_avg;" in step and "const double ratio = secs_avg * 60.0;" in step,
           "the step the game gets is not the one made")

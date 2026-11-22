@@ -16,6 +16,11 @@ words), and reads the source for what needs the game:
 - vk_timeline_wait looks the value up under rec_map_mu, waits for the recording on rec_timeline first, waits for the timeline
   unless the switch ends the wait there, with what is left of the one bound, and counts the held part for the stall line;
 - status_tick gives the held part to the stall line, and the switch is in the development guide.
+- (Triforce, 11-22, the performance audit's SYNC-122) the reads' side: the switch is a mode (2 the check); a readback whose
+  write-back is not recorded yet is counted, and under the mode waits in slices that look the finished table up (the header's
+  fallback_wait, run here against a made-up GPU on 20,000 random cases: the check ends exactly where the old wait ends, mode 1
+  never before the writer's recording is done and never after the old wait); RX_VK_TL_REC ends a wait at the recording that
+  finished the value, its old first-part lookup kept to =2; the held part is counted by caller (take, read, bind, readback).
 
     python -I -B tests/test_wb_rec_wait.py [--cxx g++]
 """
@@ -57,8 +62,12 @@ def check_source():
     par = replay[replay.index("memory_sync_mirrors_before_segments();"):]
     check(par[:par.index("\n", par.index("submit_recording("))].count("submit_recording(r, false, 0, true);") == 1,
           "a parallel replay's setup submit is not a part's")
-    check(sum(", 0, true)" in line for line in replay.splitlines() if "submit_recording(" in line) == 3,
-          "a submit other than the three parts' is a part's")
+    # ((Triforce, 11-22) four since v0.6.0: the parallel replay's early segments (RX_VK_SEG_EARLY) submit what came before them
+    # and the dry pass's uploads as a part too, ahead of every segment; this check still said three and failed on v0.6.0 itself)
+    check("submit_recording(r, false, 0, true);   // (a part: what came before and the dry pass's uploads, ahead of every segment)" in replay,
+          "the early segments' setup submit is not a part's")
+    check(sum(", 0, true)" in line for line in replay.splitlines() if "submit_recording(" in line) == 4,
+          "a submit other than the four parts' is a part's")
     finish = function(replay, "void finish_recording(uint64_t value) {")
     check("submit_recording(r, signal, at);" in finish, "finish_recording's submit does not end the recording")
     # (Triforce-dev: a present that leaves work stopped (RX_VK_PRESENT_DRAIN=2) names its timeline signal as finish_recording
@@ -71,7 +80,12 @@ def check_source():
             ("std::lock_guard mk(rec_map_mu);", "the table is read without its lock"),
             ("seq = fin_rec.of(v);", "the writer's recording is not looked up"),
             ("ri.pSemaphores = &rec_timeline;", "the recording is not waited for on the recordings' timeline"),
-            ("if (!wr::ends_at_recording(wb_wait_rec_on(), seq != 0, rec_done)) {", "the switch does not decide the timeline's wait"),
+            ("if (!wr::ends_at_recording(ends_here, seq != 0, rec_done)) {", "the switch does not decide the timeline's wait"),
+            # ((Triforce, 11-22, the performance audit's SYNC-122) the mode, RX_VK_TL_REC through the finished table, by caller
+            ("const bool ends_here = wr::ends_by_switch(wb_wait_rec_mode(), rb_fix(1), tl_rec_first_part_on());",
+             "RX_VK_TL_REC does not end the wait at the recording that finished the value"),
+            ("if (rb_fix(1) && tl_rec_first_part_on()) {", "RX_VK_TL_REC's old lookup (a first part) is not kept to RX_VK_TL_REC=2"),
+            ("stall_ct.wb_held_by_ns[wb_wait_who].fetch_add(held, std::memory_order_relaxed);", "the held part is not counted by caller"),
             ("wr::budget_left(wr::kBoundNs, rec_ns)", "the timeline's wait does not keep to what is left of the bound"),
             ("wr::held_ns(seq != 0, rec_done, rec_ns, waited_ns)", "the held part is not counted"),
             ("stall_ct.wb_held_ns.fetch_add(", "the held part does not reach the stall line's counts"),
@@ -85,8 +99,10 @@ def check_source():
           "vk_timeline_wait waits for the recording before the held submits are flushed")
     check("wb_held_last_ns = 0;" in wait[:wait.index("if (!timeline) return;")],
           "the thread's last held part is not reset at a wait's start")
-    on = function(replay, "static bool wb_wait_rec_on() {")
-    check('::mkwvk::wb_rec_wait::on(getenv("RX_VK_WB_WAIT_REC"))' in on, "RX_VK_WB_WAIT_REC is not read")
+    on = function(replay, "static int wb_wait_rec_mode() {")
+    check('const char* e = getenv("RX_VK_WB_WAIT_REC");' in on and "const int m = wr::mode(e);" in on, "RX_VK_WB_WAIT_REC is not read as a mode")
+    check("wb_wait_rec_on" not in replay, "the switch is read as on / off somewhere: 2 would be on")
+    check_reads(replay)
 
     tick = function(replay, "void status_tick() {")
     for needle in ("stall_ct.wb_held.load(", "stall_ct.wb_held_ns.load(",
@@ -96,6 +112,46 @@ def check_source():
 
     dev = (ROOT / "docs/development.md").read_text(encoding="utf-8")
     check("`RX_VK_WB_WAIT_REC=1`" in dev, "docs/development.md: RX_VK_WB_WAIT_REC is not in the switches table")
+
+
+def check_reads(replay):
+    """(Triforce, 11-22, the performance audit's SYNC-122) the reads' side: the readback's fallback, the callers, RX_VK_TL_REC"""
+    fb = function(replay, "void readback_fallback_wait(uint64_t v, bool by_recording) {")
+    for needle, why in (
+            ("void plain() { wait_value(v); }", "off, the fallback is not the wait it was"),
+            ("return fin_rec.of(v);", "the slices do not look the finished table up"),
+            ("std::lock_guard mk(rec_map_mu);", "the table is read without its lock"),
+            ("const VkResult res = vkWaitSemaphores(dev.device, &wi, wr::kSliceNs);", "the slices are not 1 ms waits on the timeline"),
+            ("return vkWaitSemaphores(dev.device, &ri, UINT64_MAX) == VK_SUCCESS ? 0 : 2;", "the recording's wait has a bound"),
+            ("wr::fallback_wait(wb_wait_rec_mode(), by_recording && rec_timeline != VK_NULL_HANDLE, calls);",
+             "the fallback is not the header's, by the switch's mode"),
+            ("stall_ct.wb_held_by_ns[wr::kReadback].fetch_add(held, std::memory_order_relaxed);", "its held part does not reach the stall line"),
+            ("st_rb_fb.fetch_add(1, std::memory_order_relaxed)", "the fallbacks are not counted")):
+        check(needle in fb, "vk_replay.cpp readback_fallback_wait: " + why)
+    inv = function(replay, "void invalidate(uint64_t gpu, uint64_t size) {")
+    check(inv.count("readback_fallback_wait(v, unforced);") == 1, "invalidate's fallback is not the counted one")
+    # (the replay thread's own path keeps its waits; only the last else, the submitting thread's, is the fallback)
+    at = inv.index("readback_fallback_wait(v, unforced);")
+    check(inv.rindex("if (async_unforced()) {", 0, at) < inv.rindex("} else {", 0, at) and inv.count("wait_value(v);") == 1,
+          "invalidate: the fallback is not where the unbounded wait on the timeline was")
+    check("st_rb_fb.exchange(0)" in inv and "(counted with RX_VK_WB_WAIT_REC=2: what 1 would not have waited)" in inv,
+          "the 3000-readback line does not say the fallbacks")
+    check("void vk_timeline_wait_from(uint64_t v, int who) {" in replay, "vk_timeline_wait_from is missing")
+    tick = function(replay, "void status_tick() {")
+    for needle in ("wb_by[i] = stall_ct.wb_held_by_ns[i].load(std::memory_order_relaxed);",
+                   "f.wb_held_by[i] = (wb_by[i] - s_wb_by[i]) / 1e6;", "s_wb_by[i] = wb_by[i];"):
+        check(needle in tick, "vk_replay.cpp status_tick: the held part by caller is not this frame's (%s)" % needle)
+    memory = (ROOT / "gpu/vk/vk_memory.cpp").read_text(encoding="utf-8")
+    read = function(memory, "void late_unresolved_read(uint64_t page0, uint64_t page1) {")
+    check("vk_timeline_wait_from(v, 1);" in read and "vk_timeline_wait(v)" not in read, "a read of a page put off does not wait as a read")
+    bind = memory[memory.index("deferred_late_n.store((int)deferred_late.size(), std::memory_order_relaxed);\n    }\n    for (uint32_t page : hit) {"):]
+    bind = bind[:bind.index("\n}\n")]
+    check("if (v > done0) vk_timeline_wait_from(v, 2);" in bind, "a binding of a page put off does not wait as a bind")
+    head = (ROOT / "gpu/vk/wb_rec_wait.h").read_text(encoding="utf-8")
+    check("kTake = 0, kRead = 1, kBind = 2, kReadback = 3, kCallers = 4" in head, "the callers' numbers moved: vk_memory.cpp passes 1 and 2")
+    dev = (ROOT / "docs/development.md").read_text(encoding="utf-8")
+    check("`RX_VK_WB_WAIT_REC=1`, `=2`" in dev and "`RX_VK_TL_REC=2` keeps the old lookup" in dev,
+          "docs/development.md: the mode and RX_VK_TL_REC are not in the switches table")
 
 
 def main():

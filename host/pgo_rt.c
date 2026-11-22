@@ -83,7 +83,12 @@ static DWORD WINAPI pgo_thread(void *arg) {
     return 0;
 }
 
+/* ((Triforce, 11-21, the performance audit's LIFT-10) the renderer's copy (triforce_vk, nx2/build.py RX_VK_PGO=gen) is
+   compiled with PGO_ENV "RX_VK_PGO_FILE": its counters are the DLL's own sections, written to its own file) */
+#ifndef PGO_ENV
+#define PGO_ENV "HOS_PGO"
+#endif
 __attribute__((constructor)) static void pgo_start(void) {
-    const char *e = getenv("HOS_PGO");
+    const char *e = getenv(PGO_ENV);
     if (e) CreateThread(NULL, 0, pgo_thread, _strdup(e), 0, NULL);
 }

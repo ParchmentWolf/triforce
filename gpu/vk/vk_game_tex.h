@@ -277,6 +277,20 @@ inline bool make_skin(std::vector<unsigned char>&& bntx_bytes, Skin& skin) {
         if (out.name == "SystemBgSh_00") out.img = shrink_mask(out.img, 4);
         skin.images.push_back(std::move(out));
     }
+    // ((Triforce) 11-18) The game's own pictures for the achievements' icons (vk_menu.cpp ach_icon), by the names his own game's
+    // archive lists them under: the Spiritual Stones and the medallions as the load list shows them, a song's icon, a Gold
+    // Skulltula's mark, a rupee. Taken when the archive has them and they are of a form this reads; the skin is whole
+    // without them, and the icons are then drawn
+    static const char* const more[] = {
+        "DataFileImportantIcon_00", "DataFileImportantIcon_01", "DataFileImportantIcon_02", "DataFileImportantIcon_03", "DataFileImportantIcon_04",
+        "DataFileImportantIcon_05", "DataFileImportantIcon_06", "DataFileImportantIcon_07", "DataFileImportantIcon_08",
+        "OcarinaMelodyIcon_00", "MapIconCollectSkullSign_00", "RupeeIconNew_00"};
+    for (const char* n : more) {
+        const Bntx::Entry* e = bntx.find(n);
+        Skin::Entry out;
+        out.name = n;
+        if (e && bntx.decode(*e, out.img)) skin.images.push_back(std::move(out));
+    }
     const Image *shape = skin.get("BtnThinBase_00"), *grain = skin.get("BtnThinBase_05");
     Skin::Entry row{"plate_row", make_plate(*shape, *grain, skin.get("BtnThinBase_04"), kPlateBlack, kPlateWhite, kPlateLine)};
     Skin::Entry row_sel{"plate_row_sel", row.img};   // (the selected row's plate is the same: the game marks it with the cursor alone)

@@ -321,7 +321,8 @@ def fn_cost(size):
 
 def text_cost(text):
     """The estimated compile cost of a C file of lifted functions"""
-    marks = [m.start() for m in HEAD.finditer(text)] + [len(text)]
+    # ((Triforce, 11-22, the performance audit's IO-40) lifted_c.noted_starts: where HEAD's matches start, found by jumps)
+    marks = list(lifted_c.noted_starts(text)) + [len(text)]
     return marks[0] + sum(fn_cost(b - a) for a, b in zip(marks, marks[1:]))
 
 
@@ -346,7 +347,7 @@ def split_one(gen_dir, path, budget):
     made, costs = [], {}
     with open(path, encoding="utf-8", newline="") as f:
         text = f.read()
-    marks = [h.start() for h in HEAD.finditer(text)]
+    marks = list(lifted_c.noted_starts(text))   # ((Triforce, 11-22, IO-40) as [h.start() for h in HEAD.finditer(text)])
     ends = marks[1:] + [len(text)]
     cost = [fn_cost(b - a) for a, b in zip(marks, ends)]
     total = sum(cost)

@@ -23,15 +23,20 @@ public sealed partial class Backend
             if (!CanChangeGame(out var f) || GameOptionsSchema.ByKey(key) is not { } row) return;
             var now = f!.Get(key);
             var text = H(row.Help ?? "") + (row.Restart ? "<br><span style=\"color:var(--text3)\">Takes effect the next time the game starts.</span>" : "");
-            if (key == Benchmark.KPreset)
-                text += "<br>" + string.Join("<br>", GameOptionsSchema.PresetSummaries.Select((s, i) => i == 0 ? "" : "<b>" + H(f.ChoicesOf(key).ElementAtOrDefault(i)?.Label) + "</b> " + H(s)).Where(x => x.Length > 0));
             var choices = f.ChoicesOf(key).AsEnumerable();
             if (key == Benchmark.KUpscaler)
             {
-                // (as the game's menu offers them: DLSS and DLAA with an NVIDIA card and DLSS in the build; FSR 4 on AMD cards)
+                // (as the game's menu offers them: DLSS (and DLAA, its Native) with an NVIDIA card and DLSS in the build; FSR 4 on AMD cards)
                 var dlss = Gpus.HasNvidia() && new Game(ctx).HasDlss(GameDir!);
                 var amd = Gpus.List().Any(x => x.Vendor == GpuVendor.Amd);
                 choices = choices.Where(c => c.Value == now || (c.Value is not (1 or 2) || dlss) && (c.Value is not (4 or 5) || amd));
+            }
+            if (key == GameOptionsSchema.FrameGenKey)
+            {
+                // ((Triforce, options_version 8) NVIDIA DLSS 2x to 4x, merged into the row, where DLSS frame generation can run:
+                // an NVIDIA card and DLSS in the build, as the game's menu offers them (vk_menu.cpp dlssg_offered))
+                var dlssg = Gpus.HasNvidia() && new Game(ctx).HasDlss(GameDir!);
+                choices = choices.Where(c => c.Value == now || c.Value < 10 || dlssg);
             }
             Choice(row.Name, text, "gopt.set", choices.Select(c => (c.Value.ToString(), c.Label, (string?)null, c.Value == now)), "Choose", key);
         });
@@ -74,7 +79,7 @@ public sealed partial class Backend
     {
         var g = GameDir;
         if (g == null) return null;
-        if (!gpusHooked) { GameOptionsSchema.UseGameGpus(() => GameDir); gpusHooked = true; }   // ((Triforce) 11-19: the game's own order)
+        if (!gpusHooked) { GameOptionsSchema.UseGameGpus(() => GameDir); GameOptionsSchema.UseSystemLatency(); gpusHooked = true; }   // ((Triforce) 11-19: the game's own order; options_version 8: Low latency by the card's maker)
         GameOptionsFile f;
         try { f = GameOptionsFile.Load(g, MainScreen()); }
         catch (Exception e) { Log.Write("game options: " + e.Message); return null; }
