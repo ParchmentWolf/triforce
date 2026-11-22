@@ -1,0 +1,18 @@
+#version 450
+// Stereo Accurate (gpu/vk/vk_xr.cpp): the right eye's picture (scene8, sRGB-encoded RGBA8) a little less saturated, each pixel
+// toward its own grey and darkened (vk_xr.cpp desat_right's amounts), so the two eyes' colours meet
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0, rgba8) uniform image2D picture;
+layout(push_constant) uniform Push {
+    ivec2 size;
+    float keep;   // the saturation kept, 0..1
+    float light;  // the brightness kept, 0..1
+} p;
+
+void main() {
+    const ivec2 at = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(at, p.size))) return;
+    vec4 c = imageLoad(picture, at);
+    const float grey = dot(c.rgb, vec3(0.2126, 0.7152, 0.0722));
+    imageStore(picture, at, vec4(mix(vec3(grey), c.rgb, p.keep) * p.light, c.a));
+}

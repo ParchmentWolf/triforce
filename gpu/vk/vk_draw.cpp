@@ -4440,6 +4440,22 @@ VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_
                 return {cur->stream, base, n};
             }
         }
+        // ((Triforce VR) and any other range holding a copy of a scene camera's matrices (an effect's, a billboard's): a copy with
+        // them moved too, when it has one)
+        if (xr_eye.on && xr_n_swaps && n <= 0x10000 && stream_reserve(n, align)) {
+            static thread_local std::vector<float> scan;
+            scan.resize((size_t)(n / 4));
+            if (memory_read_as_submitted(u.addr, scan.data(), (n / 4) * 4) && xr_swap_copies(scan.data(), (n / 4) * 4)) {
+                uint64_t base = ub_overlay(u.addr, n, cur->mapped, stream_alloc, align);
+                if (base == UINT64_MAX && (base = stream_alloc(n, align)) != UINT64_MAX)
+                    memory_read_as_submitted(u.addr, cur->mapped + base, n);
+                if (base != UINT64_MAX) {
+                    xr_swap_copies(reinterpret_cast<float*>(cur->mapped + base), (n / 4) * 4);
+                    xr_eye.copies++;
+                    return {cur->stream, base, n};
+                }
+            }
+        }
         // (updates the stream made to this range in this submission or ones still in flight: a copy with them in)
         // (room first: the overlay copies into the stream's mapping, which a move to a bigger stream in the middle would change)
         if (stream_reserve(n, align))
@@ -4869,7 +4885,8 @@ VkDescriptorBufferInfo kept_uniform(desc_keep::Prog* kp, size_t j, const NvnStat
     if (k == kNone) return uniform_range(s, st, index);
     if (xr_eye.on && k == kUbo) {   // ((Triforce VR) the other eye's camera: a copy each time, never the kept binding)
         const nvn_p_bind_buf& u = s.ubo[st.nvn_stage][index - 3];
-        if (xr_is_camera(u.addr)) return uniform_range(s, st, index);
+        (void)u;
+        return uniform_range(s, st, index);   // (every uniform buffer looked at: a camera, or a copy of one's matrices)
     }
     const uint64_t in0 = k == kC1 ? (uint64_t)(uintptr_t)&st : s.ubo[st.nvn_stage][index - 3].addr;
     const uint64_t in1 = k == kC1 ? 0 : s.ubo[st.nvn_stage][index - 3].size;
@@ -13575,12 +13592,30 @@ XrEyeCam xr_eye;
 namespace {
 std::mutex xr_det_mu;
 std::unordered_set<const Texture*> xr_w1, xr_w2;
+// the textures found carried from the left eye's walk into the right's: put back as they were before the left's (vk_xr_carry)
+struct XrCarried { const Texture* t; uint32_t id; uint64_t noted; };
+std::vector<XrCarried> xr_carry;
 bool xr_det_on() { return vk_xr_accurate_shift() > 0.0f || getenv("RX_VK_XR_DOUBLE"); }
 }  // namespace
 void xr_detect_reset(bool second) {
     std::lock_guard lk(xr_det_mu);
     (second ? xr_w2 : xr_w1).clear();
     if (!second) xr_w2.clear();
+    else xr_carry.clear();   // (the carried ones found anew in each right eye's walk: the next frame keeps those)
+}
+int xr_carry_images(VkImage* image, VkFormat* format, uint32_t* w, uint32_t* h, VkImageAspectFlags* aspect, int max) {
+    std::lock_guard lk(xr_det_mu);
+    int n = 0;
+    for (size_t i = 0; i < xr_carry.size();) {
+        const XrCarried& c = xr_carry[i];
+        if (texture_destroyed_since(c.id, c.noted)) {   // (gone: never looked at again)
+            xr_carry.erase(xr_carry.begin() + (long)i);
+            continue;
+        }
+        if (n < max) image[n] = c.t->image, format[n] = c.t->format, w[n] = c.t->width, h[n] = c.t->height, aspect[n] = c.t->aspect, n++;
+        i++;
+    }
+    return n;
 }
 void xr_detect_write(const Texture* tex) {
     if (!tex || !xr_det_on()) return;
@@ -13591,6 +13626,12 @@ void xr_detect_read(const Texture* tex, uint64_t key, const char* how) {
     if (!tex || !xr_eye.on) return;
     std::lock_guard lk(xr_det_mu);
     if (!xr_w1.count(tex) || xr_w2.count(tex)) return;
+    if ((tex->aspect == VK_IMAGE_ASPECT_COLOR_BIT || tex->aspect == VK_IMAGE_ASPECT_DEPTH_BIT) && tex->layers == 1 && tex->depth == 1 &&
+        tex->image && xr_carry.size() < 24) {
+        bool have = false;
+        for (const XrCarried& c : xr_carry) have |= c.t == tex && c.id == tex->id;
+        if (!have) xr_carry.push_back({tex, tex->id, texture_destroyed_count()});
+    }
     static std::unordered_set<uint64_t> told;
     const uint64_t k = key ^ ((uint64_t)tex->id << 1);
     if (told.size() >= 80 || !told.insert(k).second) return;
@@ -13610,7 +13651,33 @@ bool xr_is_camera(uint64_t addr) {
 }
 /// (Triforce VR) a camera block moved xr_eye.d metres along its own right: the view's translation (0x00), the view-projection
 /// made again (0x30 = projection 0x70 times the view), the inverse view's place (0xb0)
+// (the other eye's walk) the matrices the scene cameras held and what they became: copies of them in other uniform buffers (an
+// effect's own camera, a billboard's) are moved too (xr_swap_copies)
+struct XrSwap { float from[16], to[16]; int n; };
+XrSwap xr_swaps[12];
+int xr_n_swaps = 0;
+void xr_swaps_reset() { xr_n_swaps = 0; }
+void xr_swap_note(const float* from, const float* to, int n) {
+    for (int i = 0; i < xr_n_swaps; i++)
+        if (xr_swaps[i].n == n && !std::memcmp(xr_swaps[i].from, from, n * 4)) return;
+    if (xr_n_swaps >= 12) return;
+    XrSwap& w = xr_swaps[xr_n_swaps++];
+    std::memcpy(w.from, from, n * 4), std::memcpy(w.to, to, n * 4), w.n = n;
+}
+/// copies of a scene camera's matrices in the n bytes at p (word aligned) swapped for the other eye's: how many
+int xr_swap_copies(float* p, uint64_t n) {
+    int done = 0;
+    const uint64_t words = n / 4;
+    for (int i = 0; i < xr_n_swaps; i++) {
+        const XrSwap& w = xr_swaps[i];
+        for (uint64_t k = 0; k + (uint64_t)w.n <= words; k += 4)   // (matrices sit on 16-byte rows)
+            if (p[k] == w.from[0] && !std::memcmp(p + k, w.from, w.n * 4)) std::memcpy(p + k, w.to, w.n * 4), done++;
+    }
+    return done;
+}
 void xr_eye_shift(float* c) {
+    float before[0x100 / 4];
+    std::memcpy(before, c, sizeof before);
     const float d = xr_eye.d;
     c[3] -= d;
     const float* P = c + 0x70 / 4;
@@ -13622,6 +13689,9 @@ void xr_eye_shift(float* c) {
             c[0x30 / 4 + i * 4 + j] = v;
         }
     c[0xb0 / 4 + 3] += d * c[0], c[0xc0 / 4 + 3] += d * c[1], c[0xd0 / 4 + 3] += d * c[2];
+    xr_swap_note(before + 0x30 / 4, c + 0x30 / 4, 16);   // (the view-projection, the view, the inverse view)
+    xr_swap_note(before, c, 12);
+    xr_swap_note(before + 0xb0 / 4, c + 0xb0 / 4, 12);
 }
 bool xr_span_wanted() {
     static const bool v = getenv("RX_VK_XR_SPAN") && atoi(getenv("RX_VK_XR_SPAN")) != 0;

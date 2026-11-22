@@ -40,6 +40,7 @@
 #include "shaders/xr_depth_keep_comp_spv.h"
 #include "shaders/xr_depth_comp_spv.h"
 #include "shaders/xr_flat3d_comp_spv.h"
+#include "shaders/xr_desat_comp_spv.h"
 #include "shaders/xr_flat3d_conv_comp_spv.h"
 #include "shaders/xr_hud_comp_spv.h"
 #include "vk_work.h"
@@ -191,6 +192,11 @@ struct Xr {
     VkImageView flat8_view = VK_NULL_HANDLE;
     uint32_t flat_w = 0, flat_h = 0;
     int flat_age = 1000;   // presents since the last picture was made
+    // Stereo Accurate: the right eye's picture a little less saturated and darker (shaders/xr_desat.comp, desat_right)
+    VkDescriptorSetLayout desat_set = VK_NULL_HANDLE;
+    VkPipelineLayout desat_layout = VK_NULL_HANDLE;
+    VkPipeline desat_pipe = VK_NULL_HANDLE;
+    bool desat_tried = false;
     VkDescriptorSetLayout hud_set = VK_NULL_HANDLE;
     VkPipelineLayout hud_layout = VK_NULL_HANDLE;
     VkPipeline hud_pipe = VK_NULL_HANDLE;
@@ -2379,6 +2385,8 @@ extern "C" int vk_xr_wants_capture(int hdr) {
     return 0;
 }
 
+void desat_right(VkCommandBuffer cb);
+
 extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D extent, VkFormat format, VkImage picture,
                               VkImageLayout picture_layout, const int rect[4], VkSemaphoreSubmitInfo *signal) {
     Xr &x = xr();
@@ -2493,6 +2501,7 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
             const float shift = x.acc_shift.load(std::memory_order_relaxed);
             for (int c = 0; c < 3; c++) r.pose.p[c] += shift * hr2[c];
             if (make_panel(cb, !panel, d.aim && panel ? (int)(0.06f * (float)x.hud_h) : 0, x.target_view, x.scene_r_view)) {
+                desat_right(cb);   // (its colours down to the left eye's)
                 keep_eye(cb, r);
                 d = r;
             }
@@ -2754,4 +2763,98 @@ extern "C" void vk_xr_flat3d(VkCommandBuffer cb, VkImage window, int hdr, const 
     b.dstOffsets[0] = {to[0], to[1], 0}, b.dstOffsets[1] = {to[0] + to[2], to[1] + to[3], 1};
     vkCmdBlitImage(cb, x.flat8, VK_IMAGE_LAYOUT_GENERAL, window, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
     memory_barrier(cb);
+}
+
+namespace mkwvk {
+int xr_carry_images(VkImage* image, VkFormat* format, uint32_t* w, uint32_t* h, VkImageAspectFlags* aspect, int max);   // vk_draw.cpp
+}
+// Stereo Accurate: what the left eye's pass carries into the right's (textures the game reads from the frame before, which the
+// left's pass has already written: vk_draw.cpp xr_carry_images) put back for the right's. Phase 1, before the left's pass: each
+// copied to a backup; phase 2, before the right's: copied back. Their layout is the replay's GENERAL
+extern "C" void vk_xr_carry(VkCommandBuffer cb, int phase) {
+    Xr &x = xr();
+    if (!x.device) return;
+    struct Kept { VkImage src = VK_NULL_HANDLE, bak = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; VkFormat format{}; uint32_t w = 0, h = 0; VkImageAspectFlags aspect = 0; };
+    static Kept kept[24];
+    static int n_kept = 0;
+    std::lock_guard<std::mutex> lk(x.hud_mu);
+    if (phase == 1) {
+        VkImage img[24];
+        VkFormat fmt[24];
+        uint32_t w[24], h[24];
+        VkImageAspectFlags asp[24];
+        const int n = mkwvk::xr_carry_images(img, fmt, w, h, asp, 24);
+        n_kept = 0;
+        if (!n) return;
+        memory_barrier(cb);
+        for (int i = 0; i < n; i++) {
+            Kept *k = nullptr;
+            for (Kept &e : kept)   // (a backup of its format and size, else a slot made anew)
+                if (e.bak && e.format == fmt[i] && e.w == w[i] && e.h == h[i] && e.aspect == asp[i] && !e.src) { k = &e; break; }
+            if (!k)
+                for (Kept &e : kept)
+                    if (!e.bak) {
+                        if (!make_image(w[i], h[i], fmt[i], VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                        e.bak, e.view, asp[i]))
+                            e.bak = VK_NULL_HANDLE;
+                        else {
+                            e.format = fmt[i], e.w = w[i], e.h = h[i], e.aspect = asp[i];
+                            barrier(cb, e.bak, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, asp[i]);
+                            rt_log("vr: Accurate keeps a texture the left eye's pass carries into the right's: %ux%u format %d", w[i], h[i], (int)fmt[i]);
+                            k = &e;
+                        }
+                        break;
+                    }
+            if (!k) continue;
+            k->src = img[i];
+            VkImageCopy c{};
+            c.srcSubresource = c.dstSubresource = {asp[i], 0, 0, 1};
+            c.extent = {w[i], h[i], 1};
+            vkCmdCopyImage(cb, img[i], VK_IMAGE_LAYOUT_GENERAL, k->bak, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+            n_kept++;
+        }
+        memory_barrier(cb);
+        return;
+    }
+    if (!n_kept) return;
+    memory_barrier(cb);
+    for (Kept &e : kept) {
+        if (!e.src || !e.bak) continue;
+        VkImageCopy c{};
+        c.srcSubresource = c.dstSubresource = {e.aspect, 0, 0, 1};
+        c.extent = {e.w, e.h, 1};
+        vkCmdCopyImage(cb, e.bak, VK_IMAGE_LAYOUT_GENERAL, e.src, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+        e.src = VK_NULL_HANDLE;
+    }
+    memory_barrier(cb);
+    n_kept = 0;
+}
+
+// Stereo Accurate (vk_xr_capture, hud_mu held, the right eye's panel just made in scene8): its picture a little less saturated
+// and darker, so its colours meet the left eye's (its second drawing comes out more saturated and brighter: the game's lighting
+// carries a little of the left eye's drawing into it). Matched by eye in a Quest 3: 90% of its saturation, 78% of its brightness
+bool flat_pipeline(const VkDescriptorSetLayoutBinding *b, uint32_t n, uint32_t push, const uint32_t *code, size_t size,
+                   VkDescriptorSetLayout &set, VkPipelineLayout &layout, VkPipeline &pipe);
+void desat_right(VkCommandBuffer cb) {
+    Xr &x = xr();
+    constexpr float keep = 0.90f, light = 0.78f;
+    if (!x.scene8) return;
+    if (!x.desat_tried) {
+        x.desat_tried = true;
+        const VkDescriptorSetLayoutBinding b{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        if (!flat_pipeline(&b, 1, 16, XR_DESAT_COMP_SPV, sizeof XR_DESAT_COMP_SPV, x.desat_set, x.desat_layout, x.desat_pipe)) {
+            rt_log("vr: the right eye's colour shader could not be made: its colours as drawn");
+            x.desat_pipe = VK_NULL_HANDLE;
+        }
+    }
+    if (!x.desat_pipe) return;
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.desat_pipe);
+    const VkDescriptorImageInfo info{VK_NULL_HANDLE, x.scene8_view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstBinding = 0, w.descriptorCount = 1, w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, w.pImageInfo = &info;
+    vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.desat_layout, 0, 1, &w);
+    struct { int32_t w, h; float keep, light; } pc{(int32_t)x.hud_w, (int32_t)x.hud_h, keep, light};
+    vkCmdPushConstants(cb, x.desat_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+    vkCmdDispatch(cb, (x.hud_w + 7) / 8, (x.hud_h + 7) / 8, 1);
+    barrier(cb, x.scene8, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
 }
