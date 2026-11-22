@@ -179,7 +179,7 @@ const char* tx_vr_view(int v) { return v ? "Immersive" : "Theater"; }
 const char* tx_vr_camera(int v) { return v ? "Third person" : "First person"; }
 const char* tx_resolution(int v);
 const char* tx_vr_resolution(int v) { return v <= 0 ? "As in Graphics" : tx_resolution(v); }
-const char* tx_vr_stereo(int v) { return v == 1 ? "Balanced" : "Performant"; }
+const char* tx_vr_stereo(int v) { return v == 2 ? "Accurate" : v == 1 ? "Balanced" : "Performant"; }
 const char* tx_vr_controls(int v) { return v ? "Touch controllers" : "Gamepad"; }
 const char* tx_vr_hand(int v) { return v ? "Right-handed" : "Left-handed"; }
 const char* tx_vr_play(int v) { return v ? "Motion" : "Stationary"; }
@@ -1322,11 +1322,12 @@ Row rows[] = {
      "The size the 3D is drawn at while VR is on, in every stereo mode. As in Graphics: the Graphics tab's Render resolution "
      "(Auto lowers it under load, which looks blocky in the headset). A fixed size costs more GPU time but stays sharp. "
      "Applies after a restart.", nullptr, true, true, -1, false, "vr_resolution"},
-    {TAB_VR, "Stereo", &opts.vr_stereo, 0, 1, 1, tx_vr_stereo,
+    {TAB_VR, "Stereo", &opts.vr_stereo, 0, 2, 1, tx_vr_stereo,
      "Performant: the game draws one picture and each eye's is made from it and its depth at the game's full rate; "
      "edges beside near things can smear. Balanced: each eye is drawn in turn, true depth everywhere, with the game's "
      "time standing still for the second eye, so both eyes see the same moment; the world moves at half the game's "
-     "rate. The desktop window shows the left eye in Balanced.", nullptr, false, true, -1, false, "vr_stereo"},
+     "rate. Accurate: the frame is drawn twice, once for each eye, true depth everywhere at the game's full rate, for about twice "
+     "the GPU time. The desktop window shows the left eye in Balanced and the right eye in Accurate.", nullptr, false, true, -1, false, "vr_stereo"},
     {TAB_VR, "Depth", &opts.vr_depth, 0, 200, 5, tx_percent,
      "How far apart your eyes are in the game's world. 100% matches your own eyes; 0% shows both eyes the same flat "
      "picture.", nullptr, false, true, -1, false, "vr_depth"},
@@ -2110,7 +2111,7 @@ const VrKey vr_keys[] = {
     {"VR_SCREEN_CURVE", &opts.vr_screen_curve, nullptr},
     {"VR_CAMERA", &opts.vr_camera, "first|third"},
     {"VR_VIEW_SCALE", &opts.vr_view_scale, nullptr},
-    {"VR_STEREO", &opts.vr_stereo, "performant|balanced"},
+    {"VR_STEREO", &opts.vr_stereo, "performant|balanced|accurate"},
     {"VR_DEPTH", &opts.vr_depth, nullptr},
     {"VR_EYE_UP", &opts.vr_eye_up, nullptr},
     {"VR_EYE_SIDE", &opts.vr_eye_side, nullptr},

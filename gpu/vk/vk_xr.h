@@ -36,6 +36,10 @@ int vk_xr_depth_wanted(void);
 // vk_draw.cpp xr_stand_in, once the scene is drawn and before later passes reuse its depth target: the scene's depth (a sampled
 // view, in GENERAL) copied for this frame's depth stereo; binds a compute pipeline and push descriptors of its own
 void vk_xr_keep_depth(VkCommandBuffer cb, VkImageView depth, uint32_t w, uint32_t h);
+// Stereo Accurate: metres from the left eye's camera to the right's while it is on (0: not now); the right eye's pass (vk_replay.cpp)
+// begins (phase 1: the left eye's target copied apart) and ends (0)
+float vk_xr_accurate_shift(void);
+void vk_xr_second_eye(VkCommandBuffer cb, int phase);
 // vk_draw.cpp xr_stand_in, with the depth: the view the scene was drawn with (rows 0-2 of its 3x4 view: right, up, back, each with
 // its translation), so the picture is matched to the camera update that gave it (the game draws a frame behind them)
 void vk_xr_scene_camera(const float rows[12]);

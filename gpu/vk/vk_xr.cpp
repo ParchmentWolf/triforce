@@ -171,6 +171,13 @@ struct Xr {
     uint32_t hud_w = 0, hud_h = 0;
     VkFormat hud_format = VK_FORMAT_UNDEFINED;
     uint64_t kept = 0, used = 0;   // scenes kept, and the last one a panel was made from
+    // Stereo Accurate: the renderer draws the frame a second time for the right eye (vk_replay.cpp run_submit). Before that
+    // pass the target with the left eye's picture and HUD is copied to target_l; the pass's scene before the HUD goes to
+    // scene_r (second_now while it runs); acc_ready once both are there for this frame's picture
+    VkImage target_l = VK_NULL_HANDLE, scene_r = VK_NULL_HANDLE;
+    VkImageView target_l_view = VK_NULL_HANDLE, scene_r_view = VK_NULL_HANDLE;
+    bool second_now = false, acc_ready = false;
+    std::atomic<float> acc_shift{0.0f};   // metres the right eye's camera is from the left's (vk_xr_camera)
     VkDescriptorSetLayout hud_set = VK_NULL_HANDLE;
     VkPipelineLayout hud_layout = VK_NULL_HANDLE;
     VkPipeline hud_pipe = VK_NULL_HANDLE;
@@ -600,15 +607,18 @@ bool hud_wanted() { return strcmp(cfg_value("VR_HUD"), "panel") == 0; }
 // eye's update so both eyes show one moment, rather than performant's depth stereo from the head
 bool stereo_balanced() { return strcmp(cfg_value("VR_STEREO"), "balanced") == 0; }
 bool stereo_turns() { return stereo_balanced(); }
+// VR_STEREO=accurate: the game draws the left eye's picture and the renderer the same frame again for the right (true depth,
+// both eyes the same moment, the game's full rate)
+bool stereo_accurate() { return strcmp(cfg_value("VR_STEREO"), "accurate") == 0; }
 std::atomic<double> update_step{-1};
 
 // (vk_xr_capture, hud_mu held) the scene without the HUD (with it: keep_hud) and the HUD's panel made from the target as
 // it is now and the scene kept from before the HUD, the panel clear within `cut` pixels of its middle (the game's
 // reticle while Link aims); false when there is nothing new to make them from
-bool make_panel(VkCommandBuffer cb, bool keep_hud, int cut) {
+bool make_panel(VkCommandBuffer cb, bool keep_hud, int cut, VkImageView tview = VK_NULL_HANDLE, VkImageView sview = VK_NULL_HANDLE) {
     Xr &x = xr();
     if (!x.scene || !x.hud_target) return x.panel_no_scene++, false;
-    if (x.kept == x.used) return x.panel_not_new++, false;
+    if (x.kept == x.used && !tview) return x.panel_not_new++, false;
     if (!x.hud_tried) {
         x.hud_tried = true;
         if (!make_hud_pipeline()) {
@@ -639,8 +649,8 @@ bool make_panel(VkCommandBuffer cb, bool keep_hud, int cut) {
     barrier(cb, x.scene8, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     barrier(cb, x.panel8, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.hud_pipe);
-    const VkDescriptorImageInfo info[4] = {{x.nearest, x.target_view, VK_IMAGE_LAYOUT_GENERAL},
-                                           {x.nearest, x.scene_view, VK_IMAGE_LAYOUT_GENERAL},
+    const VkDescriptorImageInfo info[4] = {{x.nearest, tview ? tview : x.target_view, VK_IMAGE_LAYOUT_GENERAL},
+                                           {x.nearest, sview ? sview : x.scene_view, VK_IMAGE_LAYOUT_GENERAL},
                                            {VK_NULL_HANDLE, x.scene8_view, VK_IMAGE_LAYOUT_GENERAL},
                                            {VK_NULL_HANDLE, x.panel8_view, VK_IMAGE_LAYOUT_GENERAL}};
     VkWriteDescriptorSet w[4]{};
@@ -1890,10 +1900,11 @@ extern "C" void vk_xr_device_ready(VkInstance instance, VkPhysicalDevice phys, V
 extern "C" int vk_xr_head_wanted(void) { return xr().ok && strcmp(cfg_value("VR_VIEW"), "head") == 0; }
 
 extern "C" int vk_xr_depth_wanted(void) {   // (Balanced keeps the depth too: the hands and the reticle are hidden by it)
-    return vk_xr_head_wanted() && (cfg_int("VR_DEPTH") > 0 || stereo_turns());
+    return vk_xr_head_wanted() && (cfg_int("VR_DEPTH") > 0 || stereo_turns() || stereo_accurate());
 }
 
 extern "C" void vk_xr_keep_depth(VkCommandBuffer cb, VkImageView depth, uint32_t w, uint32_t h) {
+    if (xr().second_now) return;   // (Stereo Accurate's right eye: the left's depth is the one kept)
     Xr &x = xr();
     if (!x.ok || !x.head_view.load(std::memory_order_relaxed) || !depth || !w || !h) return;
     std::lock_guard<std::mutex> lk(x.hud_mu);
@@ -2129,7 +2140,12 @@ extern "C" int vk_xr_camera(double pos[3], double at[3], float up[3]) {
     // Stereo Balanced: this picture from one eye, the other the next (eyes in turn): the head moved half the eyes'
     // distance (VR_DEPTH percent of it, as depth stereo's) to that eye's side, the game's camera with it
     int eye = -1;
-    if (stereo_turns()) {
+    if (stereo_accurate()) {   // the left eye's place; the renderer's second pass moves the camera on to the right's
+        const float shift = ipd * 0.01f * (float)cfg_int("VR_DEPTH");
+        for (int c = 0; c < 3; c++) head.p[c] -= 0.5f * shift * hr[c];
+        x.acc_shift.store(shift, std::memory_order_relaxed);
+        eye = 0;
+    } else if (stereo_turns()) {
         {
             std::lock_guard<std::mutex> lk(x.frame_mu);
             const double step = update_step.load(std::memory_order_relaxed);
@@ -2214,10 +2230,58 @@ extern "C" VkImage vk_xr_scene_image(VkImage target, uint32_t w, uint32_t h, VkF
         x.hud_w = w, x.hud_h = h, x.hud_format = format;
         *init = 1;
     }
+    if (x.second_now) {   // (Stereo Accurate: the right eye's pass, its scene apart)
+        if (!x.scene_r && !make_image(w, h, format, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, x.scene_r, x.scene_r_view))
+            return VK_NULL_HANDLE;
+        if (!x.scene_r) return VK_NULL_HANDLE;
+        static bool told;
+        if (!told) told = true, *init = 1;
+        return x.scene_r;
+    }
     x.hud_target = target;
     x.kept++;
     x.scenes_kept++;
     return x.scene;
+}
+
+// Stereo Accurate: the right eye's pass begins (phase 1: the left eye's target, picture and HUD, copied apart first) or ends (0)
+extern "C" void vk_xr_second_eye(VkCommandBuffer cb, int phase) {
+    Xr &x = xr();
+    std::lock_guard<std::mutex> lk(x.hud_mu);
+    if (!phase) {
+        x.acc_ready = x.second_now && x.target_l && x.scene_r;
+        x.second_now = false;
+        return;
+    }
+    x.second_now = false, x.acc_ready = false;
+    if (!x.hud_target || !x.scene || !x.hud_w) return;
+    if (!x.target_l && !make_image(x.hud_w, x.hud_h, x.hud_format, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                   x.target_l, x.target_l_view))
+        return;
+    VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    mb.srcStageMask = mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    mb.srcAccessMask = mb.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dep.memoryBarrierCount = 1, dep.pMemoryBarriers = &mb;
+    static bool laid;
+    if (!laid) {
+        laid = true;
+        barrier(cb, x.target_l, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    }
+    vkCmdPipelineBarrier2(cb, &dep);
+    VkImageCopy c{};
+    c.srcSubresource = c.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    c.extent = {x.hud_w, x.hud_h, 1};
+    vkCmdCopyImage(cb, x.hud_target, VK_IMAGE_LAYOUT_GENERAL, x.target_l, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    vkCmdPipelineBarrier2(cb, &dep);
+    x.second_now = true;
+}
+
+// Stereo Accurate: how far right of the left eye the right eye's camera is, metres (0: not now)
+extern "C" float vk_xr_accurate_shift(void) {
+    Xr &x = xr();
+    return stereo_accurate() && x.ok && x.head_view.load(std::memory_order_relaxed) && x.running.load(std::memory_order_relaxed)
+               ? x.acc_shift.load(std::memory_order_relaxed) : 0.0f;
 }
 
 extern "C" int vk_xr_menu_buttons(uint64_t *buttons, float sticks[2][2]) {
@@ -2348,11 +2412,28 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
     uint32_t hw = 0, hh = 0;
     if (d.tracked && (panel || depth)) {
         std::lock_guard<std::mutex> lk(x.hud_mu);
-        made = make_panel(cb, !panel, d.aim && panel ? (int)(0.06f * (float)x.hud_h) : 0);
+        const bool pair = d.eye == 0 && stereo_accurate() && x.acc_ready;   // (Accurate: the left eye's target as its pass left it)
+        made = make_panel(cb, !panel, d.aim && panel ? (int)(0.06f * (float)x.hud_h) : 0, pair ? x.target_l_view : VK_NULL_HANDLE);
         hw = x.hud_w, hh = x.hud_h;
         if (made) make_aim(cb, d);
         if (made && depth && d.eye < 0) d.stereo = make_eyes(cb, d);
         if (made && d.eye >= 0) keep_eye(cb, d);   // Balanced: this eye's picture kept, both shown once both are
+        // Accurate: the left eye's panel was made from the scene and the target as the left eye's pass left it (target_l);
+        // the right eye's now, from its pass's scene and the target as it is, kept as eye 1: the pair shown at once
+        if (made && d.eye == 0 && stereo_accurate() && x.acc_ready) {
+            Drawn r = d;
+            r.eye = 1;
+            static const float right[3] = {1, 0, 0};
+            float hr2[3];
+            rotate(d.pose.q, right, hr2);
+            const float shift = x.acc_shift.load(std::memory_order_relaxed);
+            for (int c = 0; c < 3; c++) r.pose.p[c] += shift * hr2[c];
+            if (make_panel(cb, !panel, d.aim && panel ? (int)(0.06f * (float)x.hud_h) : 0, x.target_view, x.scene_r_view)) {
+                keep_eye(cb, r);
+                d = r;
+            }
+            x.acc_ready = false;
+        }
     }
     d.hud = made && panel;
     if (d.tracked && made) x.frozen = d;   // its world stays in scene8 and eye8 until the next one made

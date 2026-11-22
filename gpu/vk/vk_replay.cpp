@@ -2264,6 +2264,9 @@ void mesh_ahead_note(const uint8_t* p, const uint8_t* end) {
     }
 }
 
+// ((Triforce VR) a command buffer walked again for the other eye: what it would do to the game's memory and synchronisation
+// a second time is left out (event signals and waits, counters, the early tail)
+bool second_eye = false;
 void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* end = nullptr) {
     const Mode mode = rmode;
     const bool dry = mode == Mode::Dry, worker = mode == Mode::Worker;
@@ -2311,6 +2314,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
         case NOP_BEGIN: case NOP_JUMP: case NOP_CALL: break;
         // ---- memory the stream writes: on the GPU timeline ----
         case NOP_SIGNAL_EVENT: {
+            if (second_eye) break;
             if (!worker) {   // (in stream order: the replay thread's pass)
                 const auto e = payload<nvn_p_signal>(a, avail);
                 ev_cpu_apply();
@@ -2369,7 +2373,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             break;
         }
         case NOP_WAIT_EVENT: {   // (a wait for an event another queue's work signals: submit_job orders them)
-            if (worker) break;
+            if (worker || second_eye) break;
             const auto w = payload<nvn_p_wait_event>(a, avail);
             ev_cpu_apply();
             const uint32_t have = event_value_in(ev_values, w.gpu);
@@ -2396,6 +2400,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             break;
         }
         case NOP_REPORT_COUNTER: {
+            if (second_eye) break;
             if (worker) {   // (written by the dry pass, in stream order)
                 if (occ_live) {   // (Triforce, RX_VK_OCC_QUERY: counted by the queries of the draws this segment recorded)
                     const auto c = payload<nvn_p_counter>(a, avail);
@@ -2472,6 +2477,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             break;
         }
         case NOP_RESET_COUNTER: {
+            if (second_eye) break;
             const auto c = payload<nvn_p_counter>(a, avail);
             if (c.type == NVN_COUNTER_TYPE_SAMPLES_PASSED) {
                 s.samples_passed = 0;
@@ -3181,7 +3187,7 @@ void tail_begin(VkCommandBuffer& cmd) {
     draw_tail_watch(true);
 }
 void tail_at_dispatch(VkCommandBuffer& cmd, NvnState& s) {
-    if (tl.on || !tail_wanted()) return;
+    if (tl.on || !tail_wanted() || second_eye) return;
     if (rmode == Mode::Worker ? !tail_here : (rmode != Mode::Serial || par_active.load(std::memory_order_relaxed))) return;
     if (!rec_cur || rec_parts + 1 >= kMaxParts || dump_on() || !upscale_dispatch(s)) return;
     tail_begin(cmd);
@@ -4084,6 +4090,31 @@ const uint8_t* replay_handle_early(VkCommandBuffer& cmd, const uint8_t* h, bool 
 /// A command buffer of the submission from h (its start, or where it stopped at a wait): on the replay thread alone
 /// (RX_VK_PARALLEL off, a small one, dumps and profiles), or its dry pass there and its segments on the threads.
 /// may_stop: up to a wait not met, which it returns (null: the command buffer done)
+/// ((Triforce VR) RX_VK_XR_DOUBLE=<cm>, stage 1 of Accurate stereo's double render, a test on the screen: every other second
+/// each command buffer is walked once more right after itself (replay_handle), from the state it began with, without its
+/// memory and synchronisation side effects (second_eye), every binding of the scene camera's buffer a copy with the camera
+/// moved <cm> to its right (xr_eye): the picture presented is then the moved one's, so the view jumps sideways once a
+/// second. Here: this frame's moved camera, false when there is none (the test off, the other second, no camera yet)
+bool xr_double_prepare() {
+    if (const float vr = vk_xr_accurate_shift(); vr > 0.0f) {   // (VR's Stereo Accurate: every frame, the right eye)
+        xr_eye.d = vr;
+        return xr_eye.w != 0;
+    }
+    static const float cm = getenv("RX_VK_XR_DOUBLE") ? (float)atof(getenv("RX_VK_XR_DOUBLE")) : 0.0f;
+    if (cm == 0.0f) return false;
+    static uint64_t asked, no_cam, no_read, told_at;
+    asked++;
+    if (asked - told_at >= 20000) {
+        told_at = asked;
+        logf("vk: xr double: asked %llu times; no camera %llu, camera unreadable %llu", (unsigned long long)asked,
+             (unsigned long long)no_cam, (unsigned long long)no_read);
+    }
+    if ((texture_frame_no() / 60) % 2 == 0) return false;
+    if (!xr_eye.w) return no_cam++, false;
+    xr_eye.d = cm / 100.0f;   // (metres: the game's units)
+    return true;
+}
+
 const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_stop = false) {
     const int threads = par_threads();
     NvnState& state = *cur_state;
@@ -5071,10 +5102,37 @@ bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, 
     }
     VkCommandBuffer cmd = rec_cur->cmd;
     const uint8_t* stop = nullptr;
+    // ((Triforce VR) RX_VK_XR_DOUBLE, Accurate stereo's test: a submission that drew the scene walked whole once more right
+    // after itself (its clears, its scene, its lighting and the rest, in order) for the other eye, from the state it began with,
+    // its scene cameras moved (xr_eye) and its signals, waits and counters left out (second_eye). One begun anew notes its state)
+    static const bool xr_double_env = getenv("RX_VK_XR_DOUBLE") != nullptr;
+    const bool xr_double = xr_double_env || vk_xr_accurate_shift() > 0.0f;
+    static NvnState xr_began;
+    static uint64_t xr_began_value = 0;
+    if (xr_double && !p && cb == 0) xr_began = *cur_state, xr_began_value = value, xr_eye.cb_scene = false;
     for (; cb < n; cb++, p = nullptr) {
         if (!handles[cb]) continue;
         stop = replay_handle(cmd, p ? p : reinterpret_cast<const uint8_t*>(handles[cb]), may_stop);
         if (stop) break;
+    }
+    if (xr_double && !stop && xr_began_value == value && xr_eye.cb_scene && xr_double_prepare()) {
+        static NvnState again;
+        again = xr_began;
+        end_pass(rec_cur->cmd);
+        full_barrier(rec_cur->cmd, "barrier (the other eye's walk)");
+        vk_xr_second_eye(rec_cur->cmd, 1);   // (VR: the left eye's target copied apart, the right eye's scene kept apart)
+        xr_eye.hits = 0, xr_eye.on = true, second_eye = true;
+        VkCommandBuffer c2 = rec_cur->cmd;
+        for (int k = 0; k < n; k++)
+            if (handles[k]) replay(c2, again, reinterpret_cast<const uint8_t*>(handles[k]));
+        second_eye = false, xr_eye.on = false;
+        end_pass(rec_cur->cmd);
+        vk_xr_second_eye(rec_cur->cmd, 0);
+        full_barrier(rec_cur->cmd, "barrier (the other eye's walk done)");
+        static int told;
+        if (told++ % 60 == 0)
+            logf("vk: xr double: submission %llu walked again for the other eye: %d command buffers, %d camera bindings swapped",
+                 (unsigned long long)value, n, xr_eye.hits);
     }
     if (stop) {
         QueueRun& q = qruns[queue];

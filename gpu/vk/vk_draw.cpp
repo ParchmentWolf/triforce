@@ -4426,6 +4426,20 @@ VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_
         const uint64_t want = used ? std::max<uint64_t>(used, 16) : std::max<uint64_t>(u.size, 16);
         const uint64_t n = std::min<uint64_t>(std::min<uint64_t>(want, u.size ? std::max<uint64_t>(u.size, 16) : want),
                                               dev.props.limits.maxUniformBufferRange);
+        // ((Triforce VR) the other eye's walk: a range holding a scene camera one copy (the overlay's when the stream's updates
+        // touch it, else as submitted) with that camera moved to the eye (xr_eye_shift)
+        if (xr_eye.on && xr_is_camera(u.addr) && stream_reserve(n, align)) {
+            uint64_t base = ub_overlay(u.addr, n, cur->mapped, stream_alloc, align);
+            if (base == UINT64_MAX && (base = stream_alloc(n, align)) != UINT64_MAX)
+                memory_read_as_submitted(u.addr, cur->mapped + base, n);
+            float cam[0x230 / 4];   // (the whole block moved, then as much of it as the draw binds put in its copy)
+            if (base != UINT64_MAX && memory_read_as_submitted(u.addr, cam, sizeof cam)) {
+                xr_eye_shift(cam);
+                std::memcpy(cur->mapped + base, cam, std::min<uint64_t>(n, sizeof cam));
+                xr_eye.hits++;
+                return {cur->stream, base, n};
+            }
+        }
         // (updates the stream made to this range in this submission or ones still in flight: a copy with them in)
         // (room first: the overlay copies into the stream's mapping, which a move to a bigger stream in the middle would change)
         if (stream_reserve(n, align))
@@ -4853,6 +4867,10 @@ VkDescriptorBufferInfo kept_uniform(desc_keep::Prog* kp, size_t j, const NvnStat
     const bool user = index >= 3 && index < 3 + 16 && st.nvn_stage >= 0 && st.nvn_stage < kNvnStages;
     const Kind k = !kp ? kNone : index == 1 ? kC1 : user ? kUbo : kNone;
     if (k == kNone) return uniform_range(s, st, index);
+    if (xr_eye.on && k == kUbo) {   // ((Triforce VR) the other eye's camera: a copy each time, never the kept binding)
+        const nvn_p_bind_buf& u = s.ubo[st.nvn_stage][index - 3];
+        if (xr_is_camera(u.addr)) return uniform_range(s, st, index);
+    }
     const uint64_t in0 = k == kC1 ? (uint64_t)(uintptr_t)&st : s.ubo[st.nvn_stage][index - 3].addr;
     const uint64_t in1 = k == kC1 ? 0 : s.ubo[st.nvn_stage][index - 3].size;
     const Stamps now = buf_stamps(k);
@@ -9097,6 +9115,24 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     if (!told && at.n && at.color[0] && at.depth) {
         temporal_note_scene_draw(at.color[0], at.width, at.height, at.depth, s.ubo[0][0].addr, s.ubo[0][0].size);
         fsr3_inputs::note_scene_draw(at.color[0], at.width, at.height, at.depth, s.ubo[0][0].addr, s.ubo[0][0].size);
+    }
+    {   // ((Triforce VR) Accurate stereo's test: the scene's size, from a draw into it whose camera block names it (as
+        // temporal_note_scene_draw checks: the scene's format, a depth target, the camera's target size at 0x120)
+        static const bool xr_double_env = getenv("RX_VK_XR_DOUBLE") != nullptr;
+        const bool xr_double = xr_double_env || vk_xr_accurate_shift() > 0.0f;
+        // (and that this command buffer draws the scene with a camera: only those are walked again, what follows them (the
+        // bloom, the tone mapping, the HUD) runs once, on the other eye's scene)
+        if (xr_double && !xr_eye.on && at.n && at.color[0] && at.depth && temporal_scene_format(at.color[0]->format) &&
+            s.ubo[0][0].addr && s.ubo[0][0].size >= 0x230)
+            xr_eye.cb_scene = true;
+        if (xr_double && !xr_eye.on && at.n && at.color[0] && at.depth && temporal_scene_format(at.color[0]->format) &&
+            s.ubo[0][0].addr && s.ubo[0][0].size >= 0x230 && at.width >= 640 && (at.width != xr_eye.w || at.height != xr_eye.h)) {
+            float wh[2];
+            if (memory_read_as_submitted(s.ubo[0][0].addr + 0x120, wh, sizeof wh) && wh[0] == (float)at.width && wh[1] == (float)at.height) {
+                xr_eye.w = at.width, xr_eye.h = at.height;
+                logf("vk: xr double: the scene is %ux%u", at.width, at.height);
+            }
+        }
     }
     uint8_t types[8];
     target_types(at, types);
@@ -13534,6 +13570,33 @@ bool xs_cam(uint64_t a) {
     return false;
 }
 }  // namespace
+XrEyeCam xr_eye;
+/// (Triforce VR) a scene camera block at addr: its target's size the scene's (0x120), its projection's w row (0, 0, -1, 0) at 0xa0
+bool xr_is_camera(uint64_t addr) {
+    float c[0x130 / 4];
+    if (!memory_read_as_submitted(addr, c, sizeof c)) return false;
+    if (c[0xa0 / 4] != 0.0f || c[0xa4 / 4] != 0.0f || c[0xa8 / 4] != -1.0f || c[0xac / 4] != 0.0f) return false;   // (a perspective projection)
+    for (int r = 0; r < 3; r++) {   // (a view whose rotation's rows are unit length)
+        const float l = c[r * 4] * c[r * 4] + c[r * 4 + 1] * c[r * 4 + 1] + c[r * 4 + 2] * c[r * 4 + 2];
+        if (l < 0.98f || l > 1.02f) return false;
+    }
+    return c[0x120 / 4] >= 320.0f && c[0x124 / 4] >= 180.0f;   // (a target of a scene's size)
+}
+/// (Triforce VR) a camera block moved xr_eye.d metres along its own right: the view's translation (0x00), the view-projection
+/// made again (0x30 = projection 0x70 times the view), the inverse view's place (0xb0)
+void xr_eye_shift(float* c) {
+    const float d = xr_eye.d;
+    c[3] -= d;
+    const float* P = c + 0x70 / 4;
+    const float V[16] = {c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[10], c[11], 0, 0, 0, 1};
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) {
+            float v = 0;
+            for (int k = 0; k < 4; k++) v += P[i * 4 + k] * V[k * 4 + j];
+            c[0x30 / 4 + i * 4 + j] = v;
+        }
+    c[0xb0 / 4 + 3] += d * c[0], c[0xc0 / 4 + 3] += d * c[1], c[0xd0 / 4 + 3] += d * c[2];
+}
 bool xr_span_wanted() {
     static const bool v = getenv("RX_VK_XR_SPAN") && atoi(getenv("RX_VK_XR_SPAN")) != 0;
     return v;

@@ -114,6 +114,13 @@ bool dry_temporal_dispatch(NvnState& s);
 bool upscale_dispatch(NvnState& s);
 /// (Triforce VR) RX_VK_XR_SPAN=1: the scene span's measuring probe (vk_draw.cpp), each op of the stream in order
 bool xr_span_wanted();
+/// (Triforce VR) the other eye while a command buffer is walked again for it (vk_replay.cpp): every uniform buffer bound that
+/// holds a scene camera (the scene's size at 0x120, a perspective projection: the game keeps several, a ring) is a copy with
+/// that camera moved d metres to its right
+struct XrEyeCam { bool on = false; float d = 0; uint32_t w = 0, h = 0; int hits = 0; bool cb_scene = false; };
+extern XrEyeCam xr_eye;
+bool xr_is_camera(uint64_t addr);
+void xr_eye_shift(float* camera);
 void xr_span_probe(uint32_t op, const uint8_t* a, uint32_t avail, const uint8_t* cb_start, uint64_t rec, NvnState& s);
 void draw_tail_watch(bool on);
 uint64_t draw_tail_programs();
