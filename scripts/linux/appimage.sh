@@ -22,7 +22,12 @@ PY=$DEPS/python/bin/python3
 # ---- the Vulkan back end, built here once (it needs no game) ----
 VKW=$B/vk-work
 rm -rf "$VKW/sa/build/triforce_vk.so"
-OOT_WORK=$VKW RX_MARCH=x86-64-v3 RX_VK_ONLY=1 RX_RELEASE=1 "$PY" -I nx2/build.py --standalone --jobs "${JOBS:-$(nproc)}"
+# ((Triforce) 11-20, HOOKSHOT_FSR=1: with AMD FSR 4 (gpu/vk/vk_fsr4.cpp). A player's build reuses this back end as it is
+# (AppRun's HOOKSHOT_VK_PREBUILT), so built without it no Linux player could have FSR 4, whatever they set. With it, the
+# Upscaler row offers FSR 4 where the player's own Vulkan FSR 4 library (amd_fidelityfx_upscaler_vk.so) is in the game folder
+# or RX_VK_FSR_DIR and runs on their GPU; without the library it is not offered, as before. AMD ships no Linux library and
+# none is packed here)
+OOT_WORK=$VKW RX_MARCH=x86-64-v3 RX_VK_ONLY=1 RX_RELEASE=1 HOOKSHOT_FSR=1 "$PY" -I nx2/build.py --standalone --jobs "${JOBS:-$(nproc)}"
 VK=$VKW/sa/build/triforce_vk.so
 [ -f "$VK" ] || { echo "triforce_vk.so was not built"; exit 1; }
 
@@ -58,6 +63,10 @@ cp -a third_party/kenney_input "$T/third_party/"
 # ((Triforce) v0.5.0: SMAA's lookup textures, which gpu/vk/vk_aa.cpp includes: left out of v0.5.0's first AppImage, and every
 # Linux build stopped at vk_aa.cpp. scripts/linux/check_player_build.sh now checks every relative include of the image's sources)
 cp -a third_party/smaa "$T/third_party/"
+# ((Triforce) 11-20, ticket "launcher error when updating on 0.5.2 from 0.3.7": AMD FSR 4's API headers, which gpu/vk/vk_fsr4.cpp
+# includes when the build has FSR 4 (--fsr, HOOKSHOT_FSR=1, or --update of a folder built with it): left out, and the update of
+# such a folder stopped at vk_fsr4.cpp ("api/include/ffx_api.h file not found"))
+cp -a third_party/fidelityfx "$T/third_party/"
 # (NVIDIA DLSS, when ticked in the builder: scripts/ngx_sdk.py and the Vulkan back end's sources, compiled with HOOKSHOT_NGX_SDK)
 mkdir -p "$T/scripts"
 cp scripts/ngx_sdk.py "$T/scripts/"
@@ -76,6 +85,12 @@ find "$T" -name __pycache__ -prune -exec rm -rf {} +
 
 # ---- what it builds with ----
 cp -a "$DEPS/python" "$APPDIR/usr/python"
+# the launcher window (launcher/build.ps1 -Rid linux-x64 makes it; without it the classic builder window opens)
+if [ -f launcher/out/triforce-launcher ]; then
+    mkdir -p "$APPDIR/usr/bin"
+    cp launcher/out/triforce-launcher "$APPDIR/usr/bin/" && chmod +x "$APPDIR/usr/bin/triforce-launcher"
+    cp launcher/out/triforce.png "$APPDIR/usr/bin/" 2>/dev/null || true
+fi
 cp "$DEPS/tk/libtcl9tk9.0.so" "$DEPS/tk/libXft.so.2" "$DEPS/tk/libXrender.so.1" "$APPDIR/usr/python/lib/"
 mkdir -p "$L/emsdk"
 cp -a "$DEPS/emsdk/upstream" "$L/emsdk/"
@@ -92,6 +107,8 @@ mkdir -p "$T/licenses/imgui" "$T/licenses/zstd" "$T/licenses/libertinus"
 cp third_party/imgui/LICENSE.txt third_party/imgui/PROVENANCE.md "$T/licenses/imgui/"
 cp third_party/zstd/LICENSE third_party/zstd/PROVENANCE.md "$T/licenses/zstd/"
 cp third_party/fonts/libertinus/OFL.txt third_party/fonts/PROVENANCE.md "$T/licenses/libertinus/"
+mkdir -p "$T/licenses/fidelityfx"
+cp third_party/fidelityfx/LICENSE.md "$T/licenses/fidelityfx/"
 # ---- end of the licences ----
 
 # the sysroot: this system's C library (headers, start files, the libraries to link against) and GCC's runtime pieces

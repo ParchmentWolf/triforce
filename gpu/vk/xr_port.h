@@ -92,6 +92,8 @@ inline char *plat_last_sep(char *path) {
 // shown)
 namespace mkwvk {
 bool menu_is_open();
+bool menu_embedded();   // open over the game's own Options screen
 }
 int menu_perf_rect(int r[4]);
 inline int menu_is_open() { return mkwvk::menu_is_open(); }
+inline int menu_embedded() { return mkwvk::menu_embedded(); }
