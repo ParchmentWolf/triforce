@@ -7,6 +7,7 @@
    hos_romfs_dir and hos_user_dir are set by hos_main.c. Reads are positional (ReadFile with an offset), so any number
    of guest threads can read one file at once. Results: switchbrew "Error codes" (module 2 = fs). */
 #include "hos.h"
+#include "stall_host.h"   /* ((Triforce, 11-22, OS-51) the host's part of a long frame, counted where it is spent) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -532,8 +533,10 @@ HLE(_ZN2nn2fs6CommitEPKc) {
     if (i < ntx) {
         const int away = hos_vcore_away();
         const ULONGLONG t0 = GetTickCount64();
+        const int64_t stall0 = stall_host_begin();   /* ((Triforce, OS-51) the host's part of a long frame: stall_host.h) */
         tx_wait_locked();   /* (the Commit before this one: its staging folder is this one's) */
         const int staged = save_tx_stage(&tx_mounts[i].p);
+        stall_host_end(STALL_HOST_COMMIT, stall0, 0);
         if (staged == 1) {
             tx_finish_paths = tx_mounts[i].p;
             tx_thread = CreateThread(NULL, 0, tx_finish_main, NULL, 0, NULL);
@@ -562,9 +565,27 @@ HLE(_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci) {
     char path[HOS_FS_PATH];
     int writable = 0;
     const char *g = gstr(ARG(1));
-    if (!host_path(g, path, sizeof path, &writable)) { hos_log("fs: OpenFile(%s): unknown mount", g); RET(R_PATH_NOT_FOUND); return; }
+    /* ((Triforce, 11-21, the performance audit's IO-24, after Source A's) The virtual core is given up from here, not only
+       around CreateFileA below: host_path reaches the button prompts' builder (host/prompts.c hos_prompts_romfs), which
+       builds a file at its first open, a quarter of a second and more for the font or a texture, while the other openers
+       wait for it in Sleep(1); none of them holds a core now. Only host code runs from here to the open: the guest's path
+       is read above, and every return takes the core back before it answers the game. HOS_OPEN_KEEP_CORE=1: given up
+       around CreateFileA alone, as before */
+    static int open_keep_core = -1;
+    if (open_keep_core < 0) open_keep_core = getenv("HOS_OPEN_KEEP_CORE") != NULL;
+    int away = open_keep_core ? 0 : hos_vcore_away();
+    if (!host_path(g, path, sizeof path, &writable)) {
+        hos_log("fs: OpenFile(%s): unknown mount", g);
+        if (away) hos_vcore_back();
+        RET(R_PATH_NOT_FOUND);
+        return;
+    }
     int want_write = (ARG(2) & 6) != 0;
-    if (want_write && !writable) { RET(R_PATH_NOT_FOUND); return; }
+    if (want_write && !writable) {
+        if (away) hos_vcore_back();
+        RET(R_PATH_NOT_FOUND);
+        return;
+    }
     { void hos_bench_file_opened(const char *guest); hos_bench_file_opened(g); }   /* ((Triforce) benchmark mode: which save file loads */
     /* (mkw-recomp) HOS_NO_MOVIES=1: MKW's WebM movies (cup openings, billboards, emblems) are not found, and the
        game goes on without them (decoded by nn_video.c otherwise) */
@@ -573,6 +594,7 @@ HLE(_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci) {
         if (n > 5 && !_stricmp(g + n - 5, ".webm")) {
             static int logged;
             if (!logged++) hos_log("fs: OpenFile(%s): movies are left out (HOS_NO_MOVIES)", g);
+            if (away) hos_vcore_back();
             RET(R_PATH_NOT_FOUND);
             return;
         }
@@ -580,7 +602,11 @@ HLE(_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci) {
     { int hos_ultrawide_redirect(const char *guest, char *out, size_t cap);   /* (totk_ultrawide_ui.c: the HUD) */
       char alt[HOS_FS_PATH];
       if (!want_write && hos_ultrawide_redirect(g, alt, sizeof alt)) snprintf(path, sizeof path, "%s", alt); }
-    if (!want_write && hos_blank_cached_icon(g, path)) { RET(R_PATH_NOT_FOUND); return; }
+    if (!want_write && hos_blank_cached_icon(g, path)) {
+        if (away) hos_vcore_back();
+        RET(R_PATH_NOT_FOUND);
+        return;
+    }
     {   /* HOS_FS_OVERLAY=<folder> (a test): a file of the game's data found there is read in place of the game's own */
         const char *ov = getenv("HOS_FS_OVERLAY");
         const char *rel = !want_write && ov ? strstr(g, ":/") : NULL;
@@ -595,7 +621,7 @@ HLE(_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci) {
     }
     /* (mkw-recomp 16bc3bc: the host's file calls block, so the virtual core goes to another thread meanwhile, as
        Horizon would run another while this one waits for the file system. OoT's ARes loaders held it up to 250 ms) */
-    const int away = hos_vcore_away();
+    if (open_keep_core) away = hos_vcore_away();   /* ((Triforce, 11-21, IO-24) otherwise given up already, above) */
     HANDLE h = CreateFileA(path, GENERIC_READ | (want_write ? GENERIC_WRITE : 0), FILE_SHARE_READ | FILE_SHARE_WRITE,
                            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (away) hos_vcore_back();
@@ -629,6 +655,10 @@ static uint64_t read_at(Ctx *c, uint64_t id, int64_t off, uint64_t buf, uint64_t
         hos_sleep_ns(delay_ns);
     }
     const int away = hos_vcore_away();   /* (as OpenFile: no core held through the read) */
+    const int64_t stall0 = stall_host_begin();   /* ((Triforce, OS-51) the read itself, not the wait for the core after it) */
+    /* ((Triforce, 11-21, MEM-09) the kernel's ReadFile does not fault pages in: heap pages nothing touched yet (committed
+       as they are touched now, heap_commit.h) are touched for it first) */
+    hos_guest_touch(buf, size);
     const int io = hos_guest_io_begin(GP(buf), size);   /* (Triforce: the kernel writes there: rx_backend.c) */
     while (done < size) {
         OVERLAPPED ov = {0};
@@ -640,6 +670,7 @@ static uint64_t read_at(Ctx *c, uint64_t id, int64_t off, uint64_t buf, uint64_t
         done += got;
     }
     hos_guest_io_end(io);
+    stall_host_end(STALL_HOST_READ, stall0, done);
     if (away) hos_vcore_back();
     HOS_WRITTEN(GP(buf), (size_t)done);   /* (into guest memory: the GPU may read it) */
     {   /* HOS_FS_WATCH=<lo hex>:<hi hex> (debugging): reads into that guest range, with the file */
@@ -683,9 +714,12 @@ HLE(_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE) {
     DWORD put = 0;
     /* (hookshot) from guest memory only, and the whole size: a DWORD cut wrote less than asked and said so */
     if (ARG(3) <= 0xFFFFFFFFu && hos_guest_range(ARG(2), ARG(3))) {
+        const int64_t stall0 = stall_host_begin();   /* ((Triforce, OS-51) the host's part of a long frame: stall_host.h) */
+        hos_guest_touch(ARG(2), ARG(3));   /* ((Triforce, 11-21, MEM-09) as the read: touched before the kernel reads them) */
         const int io = hos_guest_io_begin(GP(ARG(2)), ARG(3));   /* (Triforce: the kernel reads there: rx_backend.c) */
         WriteFile(fh->h, GP(ARG(2)), (DWORD)ARG(3), &put, &ov);
         hos_guest_io_end(io);
+        stall_host_end(STALL_HOST_WRITE, stall0, put);
     }
     RET(put == ARG(3) ? 0 : 0x2EE202);
 }
@@ -697,7 +731,12 @@ HLE(_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl) {
     SetEndOfFile(fh->h);
     RET(0);
 }
-HLE(_ZN2nn2fs9FlushFileENS0_10FileHandleE) { FlushFileBuffers(get_handle(c, ARG(0))->h); RET(0); }
+HLE(_ZN2nn2fs9FlushFileENS0_10FileHandleE) {
+    const int64_t stall0 = stall_host_begin();   /* ((Triforce, OS-51) the host's part of a long frame: stall_host.h) */
+    FlushFileBuffers(get_handle(c, ARG(0))->h);
+    stall_host_end(STALL_HOST_FLUSH, stall0, 0);
+    RET(0);
+}
 HLE(_ZN2nn2fs9CloseFileENS0_10FileHandleE) {
     Handle *fh = get_handle(c, ARG(0));
     CloseHandle(fh->h);

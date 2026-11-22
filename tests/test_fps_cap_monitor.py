@@ -162,7 +162,9 @@ def main():
     loop = vsync[vsync.index("for (;;)"):]
     check("1000000000LL / fps_max()" in loop, "the vsync event's period is taken once, before Monitor's rate is known")
     presented = block(vi, "void hos_vi_native_presented(void) {")
-    check("const int interval = fps_max() < 60 ? 1 : present_interval;" in presented and "fps_max() * interval" in presented,
+    # ((Triforce, 11-22, PRESENT-30) the period is pace_fps()'s, which is the cap unless a movie plays at a cap of 60)
+    check("const int interval = fps_max() < 60 ? 1 : present_interval;" in presented and "pace_fps() * interval" in presented
+          and "return movie_pace_fps(movie_raise, fps_max());" in block(vi, "static int pace_fps(void) {"),
           "a cap under 60 that settles late is paced with the game's own interval on top")
     readme = (ROOT / "readme.md").read_text(encoding="utf-8")
     check("| Frame rate cap | 30, 40, 45, 60, 90, 120, 144, 165, 240, Monitor's rate" in readme,

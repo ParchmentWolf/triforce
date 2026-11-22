@@ -32,7 +32,7 @@ def main():
     magic = re.search(r"kStateMagic\[8\] = \{([^}]*)\}", draw).group(1)
     if "".join(re.findall(r"'(.)'", magic)).encode() != tool.MAGIC:
         raise SystemExit("the back end's magic and the tool's differ")
-    if "hookshot_pipeline_states_shipped.bin" not in draw:
+    if "triforce_pipeline_states_shipped.bin" not in draw:
         raise SystemExit("the back end does not read the shipped list")
 
     def rec(vs, fs, topo):
@@ -53,7 +53,7 @@ def main():
         merged = tool.read(out)
         if merged != [rec(1, 2, 3), rec(1, 2, 4), rec(5, 0, 3)]:
             raise SystemExit("merge: %d records, expected the 3 different ones in order" % len(merged))
-        # make_game: work/pipeline_states.bin beside the game as hookshot_pipeline_states_shipped.bin, none when there is none
+        # make_game: work/pipeline_states.bin beside the game as triforce_pipeline_states_shipped.bin, none when there is none
         make_game = load("make_game_under_test", ROOT / "nx2" / "make_game.py")
         game = os.path.join(d, "game")
         os.makedirs(game)
@@ -64,7 +64,7 @@ def main():
         os.makedirs(os.path.join(d, "work"))
         os.replace(out, os.path.join(d, "work", "pipeline_states.bin"))
         make_game.ship_state_list(game)
-        if tool.read(os.path.join(game, "hookshot_pipeline_states_shipped.bin")) != merged:
+        if tool.read(os.path.join(game, "triforce_pipeline_states_shipped.bin")) != merged:
             raise SystemExit("make_game did not ship work/pipeline_states.bin")
     print("pipeline state list: record, merge and shipping ok")
 

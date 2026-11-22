@@ -20,6 +20,8 @@ static void hos_log(const char *format, ...) { (void)format; }
 /* (host/rx_backend.c's: the lazy write-back's calls around the wave buffer dump, which no switch turns on here) */
 static int hos_guest_io_begin(const void *p, uint64_t n) { (void)p; (void)n; return 0; }
 static void hos_guest_io_end(int held) { CHECK(!held); }
+/* ((Triforce, 11-21, MEM-09) host/mkw_glue.c's: the dump's buffer read once before the kernel's write; not what is tested) */
+static void hos_guest_touch(uint64_t addr, uint64_t size) { (void)addr; (void)size; }
 
 /* Single-threaded test boundaries: the mixer's frames run between the game's calls, as its thread can. */
 static int lock_depth;

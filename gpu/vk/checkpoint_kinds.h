@@ -23,6 +23,7 @@ inline const char* name(char c) {
     case 'u': return "upload of texture";
     case 'g': return "GPU unswizzle of texture";
     case 'w': return "write-back diff pass, chunks";
+    case 's': return "mirror syncs' pass, chunks";   // ((Triforce, 11-21, MEM-48))
     case 'r': return "recording begun, value";
     case 'v': return "uploads of the recording, value";
     case 'z': return "recording ended, value";
@@ -45,6 +46,9 @@ inline const char* gap(char c) {
         return "that pool's write-back copies (its mirror -> guest memory, and the shadow's fill), then the write-back diff pass if "
                "one follows (w): with no w after it, the end of the recording (z)";
     case 'u': case 'g': return "that texture's upload or unswizzle itself";
+    case 's':
+        return "the mirror syncs' pass (one compute dispatch in the recording's uploads, reading a capture's buffer and writing "
+               "the pool's VRAM mirror by device address; RX_VK_MSYNC_PASS=0: copy regions), then the sync's copies from guest memory";
     case 'w':
         return "the write-back diff pass (one compute dispatch over every pool's chunks, reading mirrors and shadows and writing guest "
                "memory by device address), then its barrier and the end of the recording (z)";

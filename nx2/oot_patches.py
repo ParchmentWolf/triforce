@@ -22,6 +22,13 @@ Each is a runtime switch where it can be, so the game's own path stays reachable
 - ((Triforce) 11-19) The texture data compaction thread's step called through the host (host/oot_tex_compact.c): f_807da3f0's
   call of f_807da480. The host counts the cycles it starts and, with HOS_OOT_TEX_COMPACT_MS set, holds them to a pace; unset,
   the step runs as shipped. The supported build only.
+- ((Triforce) 11-22) The texture data manager's ask for a compaction round (f_80797240) also asks the host, which lets one through
+  at most once a second (host/oot_tex_compact.c hos_oot_tex_compact_due, HOS_OOT_TEX_ASK_MS; 0: as shipped). The supported
+  build only.
+- ((Triforce) 11-21, the performance audit's GAME-05) A character's or an object's shadow map's side through the host
+  (host/oot_shadow_step.h): f_802640a0 reads it once before it asks for the texture; hos_oot_shadow_side rounds it up to a
+  multiple of 64 (HOS_OOT_SHADOW_STEP), so the sides come round again and the render targets' pool serves them. The supported
+  build only.
 """
 import glob
 import os
@@ -863,6 +870,67 @@ def patch_tex_compact(s):
     return s, 1
 
 
+# ((Triforce) f_80797240, the game's texture data manager's step, runs every frame: with no compaction round asked for (+776)
+# and bit 1 of +960 set, it asks for one and sends the compaction thread the message, so a round could start every frame. The
+# ask's test also asks the host (host/oot_tex_compact.c hos_oot_tex_compact_due: at most once a second, HOS_OOT_TEX_ASK_MS);
+# a round held back is asked for again at the next step.
+TEX_ASK_HEAD = "void f_80797240(Ctx *__restrict A64_NOESC c) {\n"
+TEX_ASK_OLD = "    c->x[8]=recomp_load8(c,c->x[19] + 960);\nif (!((c->x[8] >> 1) & 1)) { goto L_80797288; }"
+TEX_ASK_NEW = ("    c->x[8]=recomp_load8(c,c->x[19] + 960);\nif (!((c->x[8] >> 1) & 1) || !hos_oot_tex_compact_due()) { goto L_80797288; }"
+               "   /* (nx2/oot_patches.py: host/oot_tex_compact.c) */")
+TEX_ASK_DECL = "int hos_oot_tex_compact_due(void);\n"
+
+
+def patch_tex_ask(s):
+    """The ask's test above in one file's text: (text, 1 when made now or found made). apply() wants 1 over the whole lift"""
+    at = _function(s, TEX_ASK_HEAD)
+    if at is None:
+        return s, 0
+    head, end = at
+    body = s[head:end]
+    if body.count(TEX_ASK_NEW) == 1:
+        return s, 1
+    if body.count(TEX_ASK_OLD) != 1 or s.count('#include "a64.h"\n') != 1:
+        return s, 0
+    s = s[:head] + body.replace(TEX_ASK_OLD, TEX_ASK_NEW, 1) + s[end:]
+    if TEX_ASK_DECL not in s:
+        s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + TEX_ASK_DECL, 1)
+    return s, 1
+
+
+# ((Triforce, 11-21, the performance audit's GAME-05, after Source B's) f_802640a0 (the game's 0x80264100 is in it) sizes a
+# character's or an object's shadow map: it reads the side once (ldr w10, [x21, #0x4e8]) before it asks for the texture, and
+# its later uses read the same register. That one read goes through the host, which rounds it up to a multiple of 64
+# (host/oot_shadow_step.h; HOS_OOT_SHADOW_STEP). The lifter writes a register as c->x[n] or, in a function whose registers
+# it keeps in locals, as xn_: both forms are looked for.
+SHADOW_STEP_HEAD = "void f_802640a0(Ctx *__restrict A64_NOESC c) {\n"
+SHADOW_STEP_FORMS = (("c->x[10]=recomp_load32(c,c->x[21] + 1256);",
+                      "c->x[10]=hos_oot_shadow_side(recomp_load32(c,c->x[21] + 1256));"),
+                     ("x10_=recomp_load32(c,x21_ + 1256);",
+                      "x10_=hos_oot_shadow_side(recomp_load32(c,x21_ + 1256));"))
+SHADOW_STEP_MARK = "   /* (nx2/oot_patches.py: a shadow map's side in steps, host/oot_shadow_step.h) */"
+SHADOW_STEP_DECL = "extern uint32_t hos_oot_shadow_side(uint32_t side);\n"
+
+
+def patch_shadow_step(s):
+    """The shadow map's side through the host: (text, 1) when the function is in s with it (made now or before), (s, 0) when
+    the function is not here or its code differs (another game version: left as it is)"""
+    at = _function(s, SHADOW_STEP_HEAD)
+    if at is None:
+        return s, 0
+    head, end = at
+    body = s[head:end]
+    for old, new in SHADOW_STEP_FORMS:
+        if body.count(new + SHADOW_STEP_MARK) == 1:
+            return s, 1
+        if body.count(old) == 1 and s.count('#include "a64.h"\n') == 1:
+            s = s[:head] + body.replace(old, new + SHADOW_STEP_MARK, 1) + s[end:]
+            if SHADOW_STEP_DECL not in s:
+                s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + SHADOW_STEP_DECL, 1)
+            return s, 1
+    return s, 0
+
+
 def apply(gen, *, protect_hearts=False, required=False):
     """required: the lift of the supported build (LIFE_BUILD_ID), whole: a missing output-size edit stops it (apply_output_size).
     The other patches only warn when their place is not found once."""
@@ -889,6 +957,8 @@ def apply(gen, *, protect_hearts=False, required=False):
     mod_size_sites = 0   # ((Triforce) patch_mod_sizes: its one call, the supported build's alone)
     heap_sites = [0, 0]   # (the GPU memory's sites, the CPU buffers': patch_heap_retry, the supported build only)
     tex_compact_sites = 0   # ((Triforce) patch_tex_compact: its one call, the supported build's alone)
+    tex_ask_sites = 0   # ((Triforce) patch_tex_ask: its one test, the supported build's alone)
+    shadow_step_sites = 0   # ((Triforce, 11-21, GAME-05) patch_shadow_step: the one read of a shadow map's side)
     anim_sites = 0   # ((Triforce VR) patch_after_anim: the late bone pass's calls with the arms' hook, 5 in the supported build)
     for path in sorted(glob.glob(os.path.join(glob.escape(gen), "code_*.c"))):
         with open(path, encoding="utf-8", newline="") as f:
@@ -1032,6 +1102,16 @@ def apply(gen, *, protect_hearts=False, required=False):
             if compacted != out:
                 print("oot_patches: the texture compaction's step through the host in", os.path.basename(path))
             out = compacted
+            asked, found = patch_tex_ask(out)
+            tex_ask_sites += found
+            if asked != out:
+                print("oot_patches: the texture compaction's ask at most once a second in", os.path.basename(path))
+            out = asked
+            stepped, found = patch_shadow_step(out)
+            shadow_step_sites += found
+            if stepped != out:
+                print("oot_patches: the shadow maps' side through the host in", os.path.basename(path))
+            out = stepped
         if out != s:
             whole_write.write_whole(path, out, newline="")
     if sound_jobs != 1:   # (without it, above 60 fps sounds and then the music can stop after a few loading zones)
@@ -1055,6 +1135,10 @@ def apply(gen, *, protect_hearts=False, required=False):
         print("oot_patches: WARNING: the resource size table's lookup was found at %d of 1 place" % mod_size_sites)
     if protect_hearts and tex_compact_sites != 1:   # (without it the compaction is neither counted nor paced: host/oot_tex_compact.c)
         print("oot_patches: WARNING: the texture compaction's step was found at %d of 1 place" % tex_compact_sites)
+    if protect_hearts and shadow_step_sites != 1:   # (without it every shadow map has a side of its own, as shipped: host/oot_shadow_step.h)
+        print("oot_patches: WARNING: the shadow maps' side was found at %d of 1 place" % shadow_step_sites)
+    if protect_hearts and tex_ask_sites != 1:   # (without it the compaction may be asked for every frame: host/oot_tex_compact.c)
+        print("oot_patches: WARNING: the texture compaction's ask was found at %d of 1 place" % tex_ask_sites)
     if protect_hearts and zstd_sites != len(ZSTD_SITES):   # (without them HOS_HOST_ZSTD does nothing, or half: host/hos_zstd.c)
         print("oot_patches: WARNING: the host's zstd decoder's calls were found at %d of %d places" % (zstd_sites, len(ZSTD_SITES)))
     if protect_hearts and heap_sites != [len(GPU_ALLOC_SITES), len(HEAP_ALLOC_SITES)]:   # (the supported build's functions)

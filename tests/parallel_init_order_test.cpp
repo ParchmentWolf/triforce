@@ -221,8 +221,12 @@ std::chrono::steady_clock::time_point bc_used_at;
 uint64_t bc_last_value = 0;
 std::atomic<bool> bc_have{false};
 constexpr uint32_t kBcLayers = 8;
+uint32_t bc_scratch_layers() { return kBcLayers; }   // ((11-21, TEX-10) the scratch's layers: a run's)
 VkImage bc_scratch = VK_NULL_HANDLE, bc_scratch2 = VK_NULL_HANDLE;
 bool bc_scratch_fresh = false, bc_scratch2_fresh = false;
+VkImage bc_small = VK_NULL_HANDLE;   // ((11-21, TEX-09) the small scratch: none here)
+bool bc_small_fresh = false;
+uint32_t bc_small_layers() { return 1; }
 bool bc_scratch_make() {
     bc_scratch = kScratch, bc_scratch_fresh = true, bc_have = true;
     return true;

@@ -231,8 +231,9 @@ def check_source():
     for fn in ("void dry_mark_written(NvnState& s, bool compute, bool first) {", "bool dry_temporal_dispatch(NvnState& s) {"):
         check("note_wait(t0, st_shader_wait_us);" in block(draw_c, fn), "the dry pass's translation waits are not counted (%s)" % fn[:fn.index("(")])
     # (every place that counts a wait counts it into one of the two: none adds to the waits by itself; every jobs_wait counted)
+    # ((Triforce, 11-22, PIPE-30) the fourth Shader wait: draw()'s bounded wait for a translating program, RX_VK_TRANSLATE_WAIT_MS)
     check(draw_c.count("st_wait_us.fetch_add") == 1 and draw_c.count("st_waits.fetch_add") == 1 and "st_waits++" not in draw_c and
-          draw_c.count("note_wait(t0, st_pipe_wait_us)") == 1 and draw_c.count("note_wait(t0, st_shader_wait_us)") == 3 and
+          draw_c.count("note_wait(t0, st_pipe_wait_us)") == 1 and draw_c.count("note_wait(t0, st_shader_wait_us)") == 4 and
           draw_c.count("note_wait(t0, into)") == 1, "a wait is counted outside note_wait")
     waits = re.findall(r"\n[^\n/]*\bjobs_wait\([^)]*\);[^\n]*\n([^\n]*)", draw_c)
     check(len(waits) == 4 and all("note_wait(t0, " in nxt for nxt in waits), "a jobs_wait in vk_draw.cpp is not timed into a wait counter: %r" % waits)

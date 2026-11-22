@@ -23,15 +23,15 @@ int main() {
     // as many values as columns, in their order; outside: the interval less the replay and the present
     ft::Split s;
     s.interval = 16.0, s.replay = 9.5, s.present = 0.5, s.dispatch = 0.75, s.qsubmit = 0.25, s.par_wait = 1.5, s.game_wait = 2.0;
-    s.captures = 1.25, s.wb_wait = 3.0, s.wb_held = 2.5, s.qs_bg = 0.1;
+    s.captures = 1.25, s.wb_wait = 3.0, s.wb_held = 2.5, s.qs_bg = 0.1, s.gpu_waits = 1.75;
     CHECK("outside", ft::outside(s) == 6.0);
     char l[512];
     const int n = ft::line(s, l, sizeof l);
     CHECK("a line", n > 0 && (size_t)n < sizeof l);
     CHECK("as many values as columns", commas(l) == commas(ft::kColumns));
-    CHECK("the values in the columns' order", !std::strcmp(l, "9.50,0.50,0.75,0.25,1.50,6.00,2.00,1.25,3.00,2.50,0.10"));
+    CHECK("the values in the columns' order", !std::strcmp(l, "9.50,0.50,0.75,0.25,1.50,6.00,2.00,1.25,3.00,2.50,0.10,1.75"));
     CHECK("the columns", std::string(ft::kColumns) == "replay_ms,present_ms,dispatch_ms,qsubmit_ms,par_wait_ms,outside_ms,"
-                                                      "game_wait_ms,captures_ms,wb_wait_ms,wb_held_ms,qs_bg_ms");
+                                                      "game_wait_ms,captures_ms,wb_wait_ms,wb_held_ms,qs_bg_ms,gpu_waits_ms");   // ((Triforce, 11-22, SYNC-27) the last one)
     // (a replay that began before the present before, a submit across it: outside below 0, written as it is)
     ft::Split o;
     o.interval = 10.0, o.replay = 11.0, o.present = 0.5;

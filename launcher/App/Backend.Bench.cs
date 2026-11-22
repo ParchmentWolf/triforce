@@ -176,7 +176,7 @@ public sealed partial class Backend
     /// <summary>The menu's own words for the values the benchmark touches (Triforce.Logic.GameOptionsSchema).</summary>
     static string BenchLabel(string key, int v, IReadOnlyList<SettingChange> all, bool after = false)
     {
-        if (GameOptionsSchema.ByKey(key) is not { } row) return v.ToString();
+        if (GameOptionsSchema.ByKey(key) is not { } row) return GameOptionsSchema.Part(key)?.Label(v) ?? v.ToString();   // ((Triforce, options_version 8) a merged row's part: Steady frame rate, Frame generation)
         if (key == Benchmark.KResolution)
         {
             // (its label follows the Upscaler: "Quality (67%)" with DLSS / FSR, "67%" without)

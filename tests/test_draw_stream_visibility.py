@@ -35,7 +35,7 @@ def main():
     actual += "\n" + block(draw, "BufferRef stream_copy(")
     fixture = fixture.replace("/* STREAM */", actual)
     flush = block(draw, "void draw_flush_recording(") if "void draw_flush_recording(" in draw else ""
-    fixture = fixture.replace("/* FLUSH */", flush).replace("/* BEGIN */", block(draw, "void draw_begin_recording("))
+    fixture = fixture.replace("/* FLUSH */", flush).replace("/* BEGIN */", block(draw, "void slot_reset_locked(") + "\n" + block(draw, "void draw_begin_recording("))
     fixture = fixture.replace("/* SUBMIT */", block(replay, "void submit_recording("))
     start = replay.index("        if (j->inits < 0) init_lost = true;")
     end = replay.index("        if (res == VK_ERROR_DEVICE_LOST) device_lost();", start)

@@ -1,6 +1,8 @@
 // The game's in-game Options (gpu/vk/vk_menu.cpp, the Row table) as plain data for the launcher: one GameOptionRow per row the
-// game keeps in triforce_options.ini, with its tab, section, name, key, range, default, help and the labels its value shows.
-// GameOptionsSchema.All lists them; GameOptionsFile reads and writes the file the way the game does.
+// game shows with a value, with its tab, section, name, key, range, default, help and the labels its value shows.
+// GameOptionsSchema.All lists them; GameOptionsFile reads and writes the file the way the game does. ((Triforce, options_version
+// 8) A merged row (HDR, Frame generation, Frame pacing, Low latency: gpu/vk/merged_rows.h) has no line of its own: it is a view
+// of two saved values, its Parts, each kept under its own key as before.)
 namespace Triforce.Logic;
 
 /// <summary>The Options screen's tabs, as the game's header shows them. (The game's Debug tab is not ported: its rows'
@@ -15,8 +17,8 @@ public enum GameOptionKind { Choice, Slider }
 public sealed record GameOptionChoice(int Value, string Label);
 
 /// <summary>The values of the other rows, for the labels that depend on them (the Render resolution's sizes follow the
-/// Upscaler, the Output resolution and the Handheld profile; the Anti-aliasing row shows the upscaler's own while one
-/// draws; the Microphone shows the saved device's name). GameOptionsFile is one.</summary>
+/// Upscaler and the Output resolution; the Anti-aliasing row shows the upscaler's own while one draws; the Microphone shows
+/// the saved device's name). GameOptionsFile is one.</summary>
 public interface IGameOptionValues
 {
     /// <summary>A row's value as the game reads it (its default when the file has no line).</summary>
@@ -25,37 +27,59 @@ public interface IGameOptionValues
     string? Raw(string key);
 }
 
-/// <summary>A row of the game's Options menu that has a value in triforce_options.ini.</summary>
+/// <summary>((Triforce, options_version 8) A saved value that a merged row stands for (vk_menu.cpp's TAB_HIDDEN rows): its key
+/// in triforce_options.ini, its range and default (vk_menu.h Options), and its own value's label (the hidden row's tx_*).</summary>
+public sealed record GameOptionPart(string Key, int Lo, int Hi, int Default, Func<int, string> Label)
+{
+    /// <summary>A value as the game reads it from the file: inside Lo..Hi.</summary>
+    public int AsRead(int value) => Math.Clamp(value, Lo, Hi);
+}
+
+/// <summary>A merged row's rules (merged_rows.h): its value from its parts' (Of), and its parts' from a new value of it and
+/// their values now (Split).</summary>
+public sealed record GameOptionMerge(Func<int[], int> Of, Func<int, int[], int[]> Split);
+
+/// <summary>A row of the game's Options menu that has a value in triforce_options.ini (its own line, or its Parts' lines).</summary>
 public sealed record GameOptionRow
 {
     /// <summary>The tab it is on. The Motion page's rows and the Controls page's Button prompts are on Controls, in
     /// the sections "Motion" and "Controls" (the rows that open those pages).</summary>
     public required GameOptionTab Tab { get; init; }
-    /// <summary>The heading above it on its tab (the menu's section rows), null where the tab has none (Audio).</summary>
+    /// <summary>The heading above it on its tab (the menu's MENU_HEADING rows), null where the tab has none.</summary>
     public required string? Section { get; init; }
     /// <summary>The row's name, exactly as the menu shows it.</summary>
     public required string Name { get; init; }
-    /// <summary>Its key in triforce_options.ini (vk_menu.cpp ini_key).</summary>
+    /// <summary>Its key in triforce_options.ini (vk_menu.cpp ini_key). A merged row has no line: its key here starts with '@'
+    /// and is the launcher's alone (its values are its Parts' keys).</summary>
     public required string Key { get; init; }
     public required int Lo { get; init; }
     public required int Hi { get; init; }
     public required int Step { get; init; }
-    /// <summary>The game's default (vk_menu.h Options): the value when the file has no line for it.</summary>
-    public required int Default { get; init; }
+    readonly int dflt;
+    /// <summary>The game's default (vk_menu.h Options): the value when the file has no line for it. A merged row's: the view
+    /// of its parts' defaults (Low latency's follows the card's maker).</summary>
+    public int Default { get => Merge != null ? Merge.Of(Parts!.Select(p => p.Default).ToArray()) : dflt; init => dflt = value; }
     public required GameOptionKind Kind { get; init; }
     /// <summary>The help under the list while the row is selected, exactly the menu's.</summary>
     public required string Help { get; init; }
     /// <summary>Read once at the game's start: a change applies after a restart (the menu tags it "After restart").</summary>
     public required bool Restart { get; init; }
-    /// <summary>A change here leaves the Quality preset alone; any other row changed by hand turns it back to Custom.</summary>
+    /// <summary>The table's preset_exempt flag. (Triforce, options_version 8) The Quality preset is gone and nothing reads it;
+    /// the rows keep their shape, so the flag is kept as the table has it.</summary>
     public required bool PresetExempt { get; init; }
+    /// <summary>A merged row's saved values, in merged_rows.h's order (null for a row with a line of its own).</summary>
+    public IReadOnlyList<GameOptionPart>? Parts { get; init; }
+    /// <summary>A merged row's rules (null for a row with a line of its own).</summary>
+    public GameOptionMerge? Merge { get; init; }
+    /// <summary>A merged row: a view of its Parts, no line of its own.</summary>
+    public bool IsMerged => Merge != null;
 
     internal Func<int, IGameOptionValues?, string> Format { get; init; } = (v, _) => v.ToString(System.Globalization.CultureInfo.InvariantCulture);
     internal Func<IReadOnlyList<GameOptionChoice>>? ChoiceList { get; init; }
 
     /// <summary>The values a Choice row offers, in the menu's order, with their labels as the menu shows them where nothing
     /// is known of this PC (fps cap 6 "Monitor's rate", GPU device from GameOptionsSchema.GpuNames). Empty for a Slider.
-    /// GameOptionsFile.ChoicesOf has the ones that follow the file's other rows (the Render resolution).</summary>
+    /// GameOptionsFile.ChoicesOf has the ones that follow the file's other rows (the Upscaler, the Render resolution).</summary>
     public IReadOnlyList<GameOptionChoice> Choices => ChoiceList?.Invoke() ?? Array.Empty<GameOptionChoice>();
 
     /// <summary>The label of a value, as the menu shows it with the other rows at their defaults.</summary>

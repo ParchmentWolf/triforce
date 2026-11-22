@@ -25,6 +25,15 @@ inline bool pressed(uint64_t used, uint64_t allowed) { return allowed && used > 
 /// into what a run gave back while the next one waits: under a 9.8 GB allowance the count reached 10.2 GB with 1.1-1.6 GB free
 inline uint64_t run_from(uint64_t min_free, bool is_pressed) { return is_pressed ? std::min<uint64_t>(min_free, 192ull << 20) : min_free; }
 
+/// ((Triforce, 11-22, the performance audit's TEX-38, after Source A's) That free space when RX_VK_COMPACT_MB is not set: a
+/// sixteenth of what the driver allows (bytes), 64 MB at least and 512 at most; 512 while the allowance is not known. A card
+/// that allows 8 GB or more starts a run from 512 MB, as it did; a 6 GB laptop that allows 5,233 MB from 327, where 512 MB
+/// left free in the blocks was a tenth of the card waiting for a run
+inline uint64_t default_min_free(uint64_t allowed) {
+    if (!allowed) return 512ull << 20;
+    return std::clamp<uint64_t>(allowed / 16, 64ull << 20, 512ull << 20);
+}
+
 /// The presents between the end of a run and the next look
 inline uint64_t rest(bool is_pressed) { return is_pressed ? 120 : 600; }
 
@@ -67,6 +76,18 @@ inline uint64_t reserve_pct(uint64_t pct) { return pct > kReservePoints ? pct - 
 /// to on their own: 7/8 of their budget once the textures hold more than it, as a pass over the budget cuts with the compaction
 /// off; UINT64_MAX: nothing
 inline uint64_t rule_target(uint64_t total, uint64_t rule_budget) { return total > rule_budget ? rule_budget / 8 * 7 : UINT64_MAX; }
+
+/// ((Triforce) RX_VK_EVICT_EXCESS, on by default) The same with the budget's size kept apart from what the 90% and 97% rules
+/// left (rule_budget): 7/8 of the size once the textures hold more than it, as above, but for those two rules their budget less
+/// kExcessSlack and no more. Their budget is "the textures less the excess", not a size: 62 MB over the 90% line on an 8 GB card
+/// took 7/8 of it, some 400 MB, all on screen again within the camera's turn, made again, and over the line again. The slack
+/// spaces the passes; the lower of the two when both apply; UINT64_MAX: nothing
+inline constexpr uint64_t kExcessSlack = 64ull << 20;
+inline uint64_t rule_target(uint64_t total, uint64_t size_budget, uint64_t rule_budget) {
+    uint64_t to = total > size_budget ? size_budget / 8 * 7 : UINT64_MAX;
+    if (rule_budget < size_budget && total > rule_budget) to = std::min(to, rule_budget - std::min(rule_budget, kExcessSlack));
+    return to;
+}
 
 /// What a live texture unused for that many presents may be let go down to in the hold's pass, the lowest of the lines that
 /// apply to it; UINT64_MAX: it stays. Three tiers:

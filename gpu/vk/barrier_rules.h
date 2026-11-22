@@ -71,6 +71,28 @@ inline bool split_in_pass(const char* env, uint32_t vendor, bool every_draw) {
     return false;   //  helper threads record most frames there, and the rule stands aside for them) and no gain (90.6 / 89.2 fps
                     //  against 92.8 / 90.3 with the old barriers)
 }
+/// ((Triforce, 11-22, the performance audit's REPLAY-14, after Source A's) Two workarounds for Intel's drivers at a submission's
+/// splits (vk_replay.cpp maybe_split and the dry pass's points). No other vendor has either unless its switch asks.
+/// RX_VK_SPLIT_BEFORE_DRAW: a part ends only right before a plain draw. On an Arc B580 a command buffer that begins with mesh
+/// draws drew its later plain draws as exploded triangles (Source A: 40 shard frames of 1,121 before, 0 of 1,101 after). Unset:
+/// on for Intel's GPUs (vendor 0x8086); 0 off; anything else on, on any GPU
+inline bool split_before_draw(const char* env, uint32_t vendor) {
+    if (env && *env) return std::strcmp(env, "0") != 0;
+    return vendor == 0x8086;
+}
+/// RX_VK_SPLIT_UBFLUSH: whether a part's end writes the submission's uniform updates so far into the game's memory. Without
+/// mirrors they land in the memory later parts' other reads and the game's CPU see, mid-submission, where an unsplit submission
+/// writes them once at its end: white blocks and flashes on Intel's integrated GPUs (Source A: 1 run of 3 before, 0 of 3
+/// after). Unset: on, as before, but off on Intel's GPUs without mirrors; 0 off; anything else on
+inline bool split_ub_flush(const char* env, uint32_t vendor, bool mirrors) {
+    if (env && *env) return std::strcmp(env, "0") != 0;
+    return !(vendor == 0x8086 && !mirrors);
+}
+/// A part may end right before this op: a plain draw (NOP_DRAW, _IDX, _INDIRECT: not a mesh draw, not a dispatch) that will
+/// draw (rendering on, no rasterizer discard)
+constexpr bool cut_ok(bool plain_draw, bool render_enabled, bool raster_discard) {
+    return plain_draw && render_enabled && !raster_discard;
+}
 /// Whether a part's split goes on in the same pass: the rule on, a pass open at the split, nothing recorded at the part's end (quiet:
 /// the work count as it was after the pass's end) and no event's write held then (written behind a full barrier before the part's
 /// write-backs, which copy its word to the game's memory: the GPU drained there all the same). ((Triforce, P4) no parallel replay's
@@ -84,6 +106,25 @@ inline bool split_carry(bool on, bool pass_open, bool quiet, bool writes_held) {
 inline bool split_start_full(bool carry, bool recorded_between) {
     return !carry || recorded_between;
 }
+
+/// ((Triforce, 11-22, the performance audit's SYNC-66, after Source B's) RX_VK_CHUNK: how many draws and dispatches a part of a
+/// long submission has (vk_replay.cpp maybe_split). 120 on every card since the parts were made: the GPU starts early, and each
+/// split costs a queue submit, two full barriers and the part's bookkeeping, about 27 times a frame in a serial replay. Source B
+/// cuts at 128 where the GPU idles while the CPU records and at 4096 on desktop drivers; what pays here is not measured on any
+/// driver, so the default by driver is 120 for each until the lab picks one (S1 and S2 with RX_VK_PARALLEL=0 and the lab knob
+/// chunk:<n>). vendor: the card's PCI vendor; radv: Mesa's RADV
+constexpr int64_t kPartDraws = 120;
+inline int64_t part_draws_default(uint32_t vendor, bool radv) {
+    (void)vendor, (void)radv;
+    return kPartDraws;
+}
+/// The size in force: RX_VK_CHUNK's number when the variable is set (0 or less: whole submissions, never split); else
+/// knob_or_default, the lab knob chunk:<n>'s number in its phases and the driver's default outside them
+inline int64_t part_draws(bool env_set, int64_t env_value, int64_t knob_or_default) {
+    return env_set ? env_value : knob_or_default;
+}
+/// As the size was read before: the variable's number, 120 unset
+inline int64_t part_draws_before(const char* env) { return env ? std::atoll(env) : 120; }
 
 /// RX_VK_EVENT_BARRIER: "late" the rule on any card; "full" (or any other value) as before; unset or empty: with the pass barrier's
 /// game mode (pass_barrier::game: NVIDIA's driver unless RX_VK_PASS_BARRIER says otherwise)
@@ -138,6 +179,19 @@ inline bool batch_flush(Batch m, bool added_held, size_t held, size_t cap) {
     if (m == Batch::Off) return true;
     if (m == Batch::Parts && !added_held) return true;
     return held >= cap;
+}
+/// ((Triforce, 11-22, the performance audit's SYNC-09, after Source A's) RX_VK_BATCH_IDLE: a submit that joins the held batch
+/// sends it at once when the GPU has finished every batch sent. A held batch otherwise waits for a wait, a present, the 2 ms
+/// poll or the cap of 32 while the GPU sits idle beside it, until the game waits mid-frame at a capture's late pages; while the
+/// GPU is busy, submits still group. Source A has it on wherever batching is (RADV), off where guest memory stayed host-pointer
+/// imports (each submit there pays amdgpu's page check, 15-45 ms). HERE: on only with a number other than 0; unset it is OFF,
+/// on every driver, until a Linux RADV machine has run it (the audit's lab proof; with NVIDIA's driver and AMD's and Intel's on
+/// Windows nothing is held). No guard for host-pointer imports is built: with the switch off unless asked there is nothing for it to guard
+inline bool batch_idle_on(const char* env) { return env && std::atoi(env) != 0; }
+/// Whether a held batch is looked at for an idle GPU after a submit joined it: the switch on, Hold mode only (Parts sends by
+/// its own rule, when the game's submit returns), and something held (the cap's flush may just have sent it all)
+inline bool batch_idle(Batch m, bool held, bool on) {
+    return on && m == Batch::Hold && held;
 }
 
 } // namespace mkwvk::barrier_rules

@@ -148,6 +148,9 @@ public sealed class Game
                 if (DropPrefixes.Any(p => key.StartsWith(p, StringComparison.Ordinal)) || DropNames.Contains(key)) si.Environment.Remove(key);
             si.RedirectStandardOutput = si.RedirectStandardError = true;
             si.RedirectStandardInput = true;
+            // ((Triforce, 11-21) the game's log into triforce_log.txt all the same: with stderr a pipe the game kept it there,
+            // and the pipe's lines are dropped below, so a session started with Play wrote no log (host/hos_main.c HOS_LOG_FILE)
+            si.Environment["HOS_LOG_FILE"] = "1";
         }
         si.Environment["HOOKSHOT_NO_UPDATE_CHECK"] = "1";
         var p = ctx.IsWindows ? Process.Start(si) : ctx.Platform.StartTree(si);

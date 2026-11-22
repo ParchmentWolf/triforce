@@ -21,7 +21,9 @@ BUILD_SCRIPT = ROOT / "nx2" / "build.py"
 
 def production_code(path):
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    names = {"tree_headers", "vk_sources", "flag_text", "object_key", "strip_comments", "translation_text", "translation_stamp"}
+    # ((11-21, the performance audit's LIFT-10) vk_pgo_flags: the renderer's own files' profile flags, which the jobs ask for)
+    names = {"tree_headers", "vk_sources", "flag_text", "object_key", "strip_comments", "translation_text", "translation_stamp",
+             "vk_pgo_flags"}
     functions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
     assert {n.name for n in functions} == names
     main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
@@ -89,8 +91,9 @@ class ShaderStampCacheTests(unittest.TestCase):
             path.write_bytes(text.encode())
         self.code = production_code(BUILD_SCRIPT)
 
-    def jobs(self, linux, version="fixture", release=False, ngx="", mingw="llvm-mingw", fsr=False):
+    def jobs(self, linux, version="fixture", release=False, ngx="", mingw="llvm-mingw", fsr=False, vk_pgo=""):
         namespace = {
+            "VK_PGO": vk_pgo,   # ((11-21, LIFT-10) RX_VK_PGO: "", "gen" or a profile's path)
             "os": os, "hashlib": hashlib,
             "GPU": str(self.root / "gpu"), "POSIX": str(self.root / "host/posix"), "HOST": str(self.root / "host"),
             "LINUX": linux, "CPU": ["-march=x86-64"],
@@ -207,6 +210,37 @@ class ShaderStampCacheTests(unittest.TestCase):
                 self.assertEqual({n for n, j in ngx.items() if "-DHOOKSHOT_NGX" in j["flags"]},
                                  {"gpu/vk/vk_dlss.cpp"} | ({"gpu/vk/vk_ngx_msvc_rt.cpp"} if mingw and not linux else set()))
                 self.assertEqual(self.changed(plain, {n: ngx[n] for n in plain}), {"gpu/vk/vk_dlss.cpp"})
+
+    def test_a_renderer_profile_reaches_only_the_renderers_own_files(self):
+        # ((11-21, the performance audit's LIFT-10) RX_VK_PGO=<file>: the back end's own files are built with the profile; the
+        # vendored translator, ImGui, zstd and the fonts are not; the same profile at another path is no new key, another
+        # profile is; and the shader stamp, which hashes the translator's text and not the flags, does not move)
+        one, moved, other = self.root / "a.profdata", self.root / "elsewhere" / "a.profdata", self.root / "b.profdata"
+        moved.parent.mkdir()
+        one.write_bytes(b"one profile"), moved.write_bytes(b"one profile"), other.write_bytes(b"another profile")
+        own = {"gpu/vk/vk_shader.cpp", "gpu/vk/vk_bank.cpp", "gpu/vk/vk_draw.cpp"}
+        for linux in (False, True):
+            with self.subTest(linux=linux):
+                plain = self.jobs(linux)
+                profiled = self.jobs(linux, vk_pgo=str(one))
+                changed = self.changed(plain, profiled)
+                self.assertTrue(own <= changed, changed)
+                for name in changed:
+                    # (the back end's own: gpu/vk's files and the two texture decoders it compiles with them)
+                    self.assertTrue(name.startswith("gpu/") and "/eden/" not in name and "/sirit/" not in name, name)
+                    self.assertTrue(any(f.startswith("-fprofile-instr-use=") for f in profiled[name]["flags"]), name)
+                self.assertEqual(self.changed(profiled, self.jobs(linux, vk_pgo=str(moved))), set())
+                self.assertEqual(self.changed(profiled, self.jobs(linux, vk_pgo=str(other))), changed)
+                stamp = lambda jobs: [f for f in jobs["gpu/vk/vk_shader.cpp"]["flags"] if "SHADER_STAMP" in f or "TRANSLATION" in f]
+                self.assertEqual(stamp(plain), stamp(profiled))
+                self.assertTrue(stamp(plain))
+                (self.root / "host/pgo_rt.c").write_bytes(b"int pgo;")   # (the counters' writer, which a counting DLL compiles)
+                counting = self.jobs(False, vk_pgo="gen") if not linux else None
+                if counting is not None:   # (Windows: the counters' writer joins the DLL)
+                    self.assertIn("host/pgo_rt.c", counting)
+                    self.assertIn('-DPGO_ENV="RX_VK_PGO_FILE"', counting["host/pgo_rt.c"]["flags"])
+                    self.assertIn("-fprofile-instr-generate", counting["gpu/vk/vk_draw.cpp"]["flags"])
+                    self.assertNotIn("-fprofile-instr-generate", counting["gpu/vk/eden/translate.cpp"]["flags"])
 
     def test_fsr_reaches_only_vk_fsr4(self):
         for linux in (False, True):

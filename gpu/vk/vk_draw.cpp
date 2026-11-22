@@ -41,6 +41,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 
 #include "vk_paths.h"
+#include "cpu_count.h"   // ((Triforce, 11-22, OS-49) the threads to size by: HOS_SIM_CPU
 #include "vk_draw.h"
 #include "flat_map.h"   // (flat open-addressing maps for the per-draw lookups)
 #include "aa_rows.h"
@@ -58,18 +59,34 @@
 #include "vk_shader.h"
 #include "vk_texture.h"
 #include "movie_upscale_policy.h"
+#include "upscale_off.h"      // ((Triforce, 11-22, GPUWORK-20) which network dispatches the plain stretch stands in for)
+#include "stub_same_size.h"   // ((Triforce, 11-22, GPUWORK-21) a gameplay network that cannot run, at its input's size: upscale_stub)
+#include "lab_ab.h"           // ((Triforce, 11-22, GPUWORK-20) the lab's "upoff" phases)
+#include "occ_lean.h"         // ((Triforce, 11-22, DESC-82) the occlusion proxies' census, RX_VK_OCC_LEAN=3)
 #include "prepare_threads.h"
+#include "warm_computes.h"    // ((Triforce) the compute pipelines the translation pass builds: only play's on Intel, prepare_run)
+#include "index_rebase.h"   // ((Triforce, 11-21, DESC-12) an indexed draw's buffer bound at 0, its offset the first index)
+#include "predict_stream.h"   // ((Triforce, 11-21, PIPE-83) the predicted builder's plan as record numbers)
 #include "pcache_bound.h"
 #include "pcache_carry.h"     // ((Triforce) the file carried over a stamp change at an update's preparation, capped)
 #include "pcache_gate.h"
 #include "pcache_play.h"      // ((Triforce) the pipeline cache's play file: cached_create, pcache_play_open, pipeline_cache_save)
 #include "warm_checkpoint.h"  // ((Triforce) the preparation's checkpoint saves of the pipeline cache: PcacheCheckpoints)
+#include "precompile_save.h"  // ((Triforce, 11-22, PIPE-23) the cache saved before the title after a long precompile: precompile_end_save)
 #include "mem_parts.h"
 #include "pipe_release.h"
 #include "pipe_warm.h"        // ((Triforce) a load's pipelines made behind its draws: pipelines_warm)
 #include "pipe_order.h"       // ((Triforce, wp18) and in the order the last sessions' draws first needed them: order_met)
 #include "gpl_rules.h"
 #include "lib_check.h"        // ((Triforce) whether the prepared stage libraries are still in the cache: lib_check_cold, prepare_run)
+#include "prepare_again.h"    // ((Triforce) a program cache made again for another GPU, the mark of the part without libraries: prepare_run)
+#include "predict_check.h"    // ((Triforce, 11-22, PIPE-68) whether the driver still has the predicted pipelines: predict_check_cold)
+#include "built_check.h"      // ((Triforce, 11-22, PIPE-21) whether the caches still have what <notes>.built lists: built_check_cold)
+#include "predict_types.h"   // ((Triforce, 11-22, PIPE-44) a predicted pipeline built once for its program: predict_first)
+#include "driver_faults.h"   // ((Triforce, 11-22, PIPE-57) programs the driver faulted on kept out of it: fault_quarantine)
+#include "translate_wait.h"  // ((Triforce, 11-22, PIPE-30) a bounded wait for a translating program: draw, translate_note)
+#include "pcache_libs.h"     // ((Triforce, 11-22, PIPE-78) a cache file of libraries alone on small-RAM NVIDIA PCs)
+#include "pipe_ahead.h"      // ((Triforce, 11-22, PIPE-81, its first step) where first-drawn pipelines stand: order_met)
 #include "spv_nan_select.h"   // ((Triforce) whether make_module rewrites modules on this device, for the stamps: module_patches)
 #include "spv_fog.h"          // ((Triforce) whether make_module patches the fog's module, for the light precompile's record: built_computes_key)
 #include "pipe_wait.h"        // ((Triforce) what a draw does whose pipeline is not ready, NX2navi's rules: draw, graphics_pipeline)
@@ -79,6 +96,8 @@
 #include "barrier_rules.h"    // ((Triforce) RX_VK_DISPATCH_BARRIER: a dispatch right after another)
 #include "desc_keep.h"        // (Triforce: per-binding descriptor reuse, build_descriptors)
 #include "desc_sig.h"         // (Triforce: the whole-draw skip by the signature of a draw's descriptor inputs, draw)
+#include "desc_pool_grow.h"   // ((Triforce, 11-22, DESC-33) a slot's descriptor pool at half, whole once a recording runs out)
+#include "desc_counts.h"      // ((Triforce, 11-22, DESC-22) a program's descriptor counts kept with it: build_descriptors)
 #include "view_keep.h"        // (Triforce: texture looks kept through other textures' ends, texture_view_of)
 #include "mesh_ahead.h"       // (Triforce: a run of indirect mesh draws' records copied at its first, RX_VK_MESH_AHEAD: mesh_indirect_convert)
 #include "checkpoint_kinds.h" // (Triforce: the markers' kinds and what lies after each, checkpoints_report)
@@ -154,6 +173,7 @@ const char* const kFineT[] = {"banks", "c1", "user uniform buffers", "storage bu
 enum FineC { FC_DRAWS, FC_BUILDS, FC_DESCS, FC_WRITES, FC_BANK_CALLS, FC_BANK_GEN, FC_BANK_FILLS, FC_BANK_FILL_BYTES, FC_BANK_SAME,
              FC_BANK_NEW, FC_BANK_NEW_BYTES, FC_C1_CALLS, FC_UBO_CALLS, FC_UBO_OVERLAY, FC_UBO_STREAM, FC_PUSH_FULL, FC_PUSH_DELTA,
              FC_PUSH_NONE, FC_PUSH_WRITES, FC_PUSH_DESCS, FC_BIND_PIPE, FC_DYN_FAST, FC_DYN_FULL, FC_DYN_CALLS, FC_VBIND, FC_IBIND,
+             FC_IBIND_MADE,   // ((Triforce, 11-21, DESC-12) of FC_IBIND's lookups, those that called vkCmdBindIndexBuffer)
              FC_PUSHC, FC_PIPE_FAST, FC_PIPE_MAP, FC_POOL_SETS, FC_POOL_DESCS, FC_SSBO_DESCS, FC_COUNT };
 const char* const kFineC[] = {"draws", "descriptor builds", "descriptors", "descriptor writes", "bank calls",
                                       "bank kept by its stage's generation", "bank fills", "bank bytes filled", "bank refills equal",
@@ -162,6 +182,7 @@ const char* const kFineC[] = {"draws", "descriptor builds", "descriptors", "desc
                                       "full pushes", "pushes of changed writes only", "pushes of nothing (all as pushed)",
                                       "writes pushed", "descriptors pushed", "pipeline binds", "dynamic state from the draw before",
                                       "dynamic state worked out", "dynamic state commands", "vertex stream binds", "index buffer binds",
+                                      "index buffer binds made (not on the command buffer already)",
                                       "push constants", "pipeline keys from the fast pair", "pipeline keys from the thread's map",
                                       "sets allocated (over the push limit)", "descriptors in them", "storage buffer descriptors built"};
 static_assert(std::size(kFineT) == FT_COUNT && std::size(kFineC) == FC_COUNT, "every section and count is named");
@@ -218,6 +239,34 @@ void pin_subgroup(VkPipelineShaderStageCreateInfo& st, uint32_t workgroup_x = 0)
     st.pNext = &size;
     if (workgroup_x && !(workgroup_x % 32) && dev.vk13.computeFullSubgroups)
         st.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+}
+/// ((Triforce, 11-22, the performance audit's PIPE-52, after Source A's and Source B's) A compute program's stage: held to 32
+/// lanes only where the program can tell how many run beside it (compute_pin.h: a vote, a lane mask, the lane's index, a
+/// shuffle, FSWZADD, a matrix multiply, a barrier of Subgroup scope, or shared memory in a workgroup of 32 or fewer). The
+/// others get the driver's choice: neither the required size nor the full-subgroups flag. Mesa's Intel driver compiles a
+/// pinned program for 32 lanes only, minutes and gigabytes on the large ones. RX_VK_COMPUTE_PIN=all, the default on every
+/// other driver: pin_subgroup as it was, nothing asked and nothing counted. All four places that make a compute program's
+/// pipeline call this, so the caches see one pipeline; graphics stages and the mesh fallback's stay with pin_subgroup
+std::atomic<int64_t> st_pin_pinned{0}, st_pin_free{0};
+void pin_compute(VkPipelineShaderStageCreateInfo& st, const Program& p) {
+    const compute_pin::Mode mode = compute_pin_mode();
+    if (mode == compute_pin::Mode::All) return pin_subgroup(st, p.workgroup[0]);
+    compute_pin::Facts f;
+    if (!p.stages.empty()) {
+        const Shader::Info& i = p.stages[0].info;
+        f.has_stage = true;
+        f.vote = i.uses_subgroup_vote, f.mask = i.uses_subgroup_mask, f.lane_index = i.uses_subgroup_invocation_id;
+        f.shuffles = i.uses_subgroup_shuffles, f.fswzadd = i.uses_fswzadd, f.matrices = i.uses_cooperative_matrix;
+        f.subgroup_barrier = !compute_lanes_free(st.module);   // (the stage's module, set by every caller before this)
+        f.shared_memory = p.shared_memory;
+        f.invocations = (uint64_t)p.workgroup[0] * p.workgroup[1] * p.workgroup[2];
+    }
+    if (!compute_pin::needed(mode, f)) {
+        st_pin_free++;
+        return;
+    }
+    st_pin_pinned++;
+    pin_subgroup(st, p.workgroup[0]);
 }
 
 inline uint64_t mix(uint64_t h, uint64_t v) {
@@ -420,6 +469,11 @@ thread_local uint64_t rec_value = 0;
 struct RecordingRes {
     VkDescriptorPool pool = VK_NULL_HANDLE;
     std::vector<VkDescriptorPool> extra;   // (pools added when the first ran out)
+    // ((Triforce, 11-22, the performance audit's DESC-33, after Source A's) the pool's size as a shift (1: half, 0: whole:
+    // desc_pool_grow.h), and what this recording took of the slot's pools (pool_took), for the "recording streams" line
+    uint32_t shift = 0;
+    desc_pool_grow::Took took;
+    bool reset_ahead = false;   // ((Triforce, 11-21, REPLAY-04) its reset was made at the recording's start already: draw_slot_reset)
     // (the stream in use: the first, or one a recording that outgrew it was moved to. Descriptors written before the move hold
     // the old buffer's range, so the old ones stay until the slot's next recording, which the GPU's use of this one is done by)
     VkBuffer stream = VK_NULL_HANDLE;
@@ -446,22 +500,40 @@ std::atomic<uint64_t> stream_peak{0}, stream_extra{0}, stream_grown{0};
 std::deque<RecordingRes> res;   // (a deque: a recording thread keeps its own in place while another is added)
 thread_local RecordingRes* cur = nullptr;
 
-VkDescriptorPool make_pool() {
+// ((Triforce, 11-22, the performance audit's DESC-33, after Source A's; desc_pool_grow.h) A slot's own pool is made at half
+// size and made whole at the first reset after a recording ran out of it (slot_reset_locked). RX_VK_DESC_POOL_GROW=0: whole
+// from the start, as before; read once. What the recordings took and how many pools that cost are counted for the "recording
+// streams" line, under ParLock: the most one recording took, the extra pools made, the slots made whole)
+bool pool_grow_on() {
+    static const bool on = desc_pool_grow::on(getenv("RX_VK_DESC_POOL_GROW"));
+    return on;
+}
+desc_pool_grow::Took pool_most;
+uint64_t pools_added = 0, pools_whole = 0;
+
+VkDescriptorPool make_pool(uint32_t shift = 0) {
     // (each recording's pool: 8192 sets of up to 32768 descriptors a type, for the programs with more descriptors than the push limit,
     // 24 or 48 pools at once, and the driver may keep host memory for all of that. A pool that runs out is followed by another of the same
     // size (cur->extra), so a smaller one is safe, and costs a pool made and destroyed per recording in a scene that needs more.
-    // RX_VK_DESC_POOL_DIV=<n> (1..32): a n-th of both)
+    // RX_VK_DESC_POOL_DIV=<n> (1..32): a n-th of both. (Triforce, 11-22, DESC-33) shift 1: half of both, a slot's first pool;
+    // the extra pools and a slot's pool once it ran out are whole, shift 0)
     static const uint32_t div = getenv("RX_VK_DESC_POOL_DIV") ? (uint32_t)std::clamp(atoi(getenv("RX_VK_DESC_POOL_DIV")), 1, 32) : 1;
+    namespace grow = desc_pool_grow;
+    const auto of = [&](int kind) { return grow::count(grow::kWhole[kind], shift, div); };
     const VkDescriptorPoolSize sizes[] = {
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768 / div}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16384 / div},
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32768 / div}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4096 / div},
-        {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 2048 / div}, {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 2048 / div}};
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, of(grow::kUniform)}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, of(grow::kStorage)},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, of(grow::kSampled)}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, of(grow::kStorageImage)},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, of(grow::kUniformTexel)}, {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, of(grow::kStorageTexel)}};
     VkDescriptorPoolCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    ci.maxSets = 8192 / div;
+    ci.maxSets = grow::count(grow::kSets, shift, div);
     ci.poolSizeCount = (uint32_t)std::size(sizes);
     ci.pPoolSizes = sizes;
     VkDescriptorPool p = VK_NULL_HANDLE;
     return vkCreateDescriptorPool(dev.device, &ci, nullptr, &p) == VK_SUCCESS ? p : VK_NULL_HANDLE;
+}
+/// ((Triforce, 11-22, DESC-33) One more set allocated in the recording's pools, with these writes: counted for the peaks)
+void pool_took(const VkWriteDescriptorSet* writes, size_t n) {
+    if (cur) desc_pool_grow::took(cur->took, writes, n);
 }
 
 constexpr VkBufferUsageFlags kStreamUse = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -793,6 +865,16 @@ struct PcachePreparing {   // (prepare_run, for its length)
     PcachePreparing() { pcache_preparing++; }
     ~PcachePreparing() { pcache_preparing--; }
 };
+// ((Triforce, 11-22, the performance audit's PIPE-23, after Source A's; precompile_save.h) RX_VK_PRECOMPILE_SAVE_S: the
+// seconds of building from which a keep-all precompile's end saves the cache before the title (30; 0: never, and the
+// preparation's compute pipelines are neither counted for the main file nor saved at its end, as before). Read once.
+// pcache_play_only_now: that save, on its caller's thread (a forced save runs there): the play file alone while there is
+// a play cache, pipeline_cache_save)
+int precompile_save_s() {
+    static const int s = precompile_save::after_s(getenv("RX_VK_PRECOMPILE_SAVE_S"));
+    return s;
+}
+thread_local bool pcache_play_only_now = false;
 // ---- (Triforce) The carry's state and its rules in use: tests/pipeline_cache_save_test.cpp builds this part as it is ----
 // ((Triforce) The carry over a stamp change (pcache_carry.h has why and the rules): the session's history of the file (its
 // base and carries, written beside it as <file>.base at each save), whether this session read a file of another stamp
@@ -960,6 +1042,60 @@ void pcache_carry_close() {
     file_writers::write_whole(pcache_path + ".base", out, sizeof out);
 }
 // ---- (Triforce) The carry's part ends ----
+/// (hookshot) Whether a pipeline cache's data (its header, the first 32 bytes, and its length) is this device's and driver's:
+/// the header's size, version, vendor, device and pipelineCacheUUID. ((Triforce) asked of the file's header before the rest of
+/// it is read, pcache_bound::read, and of the data read, as before)
+bool pcache_head_ok(const uint8_t* head, uint64_t size) {
+    if (size < 32) return false;
+    uint32_t head_size, version, vendor, device;
+    std::memcpy(&head_size, head, 4);
+    std::memcpy(&version, head + 4, 4);
+    std::memcpy(&vendor, head + 8, 4);
+    std::memcpy(&device, head + 12, 4);
+    return head_size >= 32 && head_size <= size && version == VK_PIPELINE_CACHE_HEADER_VERSION_ONE &&
+           vendor == dev.props.vendorID && device == dev.props.deviceID &&
+           !std::memcmp(head + 16, dev.props.pipelineCacheUUID, VK_UUID_SIZE);
+}
+// ((Triforce, 11-22, the performance audit's PIPE-78, after Source A's and Source B's; pcache_libs.h) RX_VK_PCACHE_LIBS_ONLY=1:
+// on NVIDIA's own driver with 20 GB of RAM or less and 512 MB or more in its own cache, a fresh pipeline cache file keeps the
+// stage libraries and the compute pipelines alone: whole graphics pipelines are left to the driver's cache (build_graphics),
+// and there is no play file. Decided when a fresh file begins, kept in <file>.lean for that file's life. Off unless set)
+bool pcache_libs_only = false;
+bool gpl_wanted();
+bool gpl_libs_cached();
+/// pcache_init's: fresh, no file read for these shaders (stamp); ram, the PC's. True: lean for this session
+bool pcache_libs_decide(bool fresh, const char* stamp, uint64_t ram) {
+    const int mode = pcache_libs::mode(getenv("RX_VK_PCACHE_LIBS_ONLY"));
+    if (!mode) return false;
+    const std::string lean = pcache_path + ".lean";
+    if (!fresh || prepare_only_start()) {   // (a file read stays as it began; a start that only prepares decides nothing)
+        const bool recorded = !fresh && pcache_libs::lean_read(lean, stamp);
+        if (recorded) logf("vk: pipeline cache: libraries only (this file began so, %s; RX_VK_PCACHE_LIBS_ONLY)", lean.c_str());
+        return pcache_libs::lean_now(mode, fresh, false, recorded);
+    }
+    pcache_libs::Pc pc;
+    pc.nvidia_proprietary = dev.driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY;
+    pc.ram = ram;
+    pc.gpl = gpl_wanted() && gpl_libs_cached();
+    pc.prepare_only = false;
+    if (pc.nvidia_proprietary || mode >= 2) {   // (the driver's folder walked only where it can matter)
+#ifdef _WIN32
+        pc.glcache = pcache_libs::folder_bytes(pcache_libs::nvidia_cache_dir(true, getenv("LOCALAPPDATA"), nullptr, nullptr, nullptr));
+#else
+        pc.glcache = pcache_libs::folder_bytes(pcache_libs::nvidia_cache_dir(false, nullptr, getenv("__GL_SHADER_DISK_CACHE_PATH"),
+                                                                             getenv("XDG_CACHE_HOME"), getenv("HOME")));
+#endif
+    }
+    const bool on = pcache_libs::choose(mode, pc);
+    if (on) pcache_libs::lean_write(lean, stamp);
+    else remove(lean.c_str());
+    logf("vk: pipeline cache: %s (%s driver, %llu MB of RAM, the driver's own cache %llu MB%s; RX_VK_PCACHE_LIBS_ONLY=%d)",
+         on ? "libraries only: whole graphics pipelines are left to the driver's own cache, no play file"
+            : "every pipeline in the file, as before",
+         pc.nvidia_proprietary ? "NVIDIA's" : "not NVIDIA's", (unsigned long long)(ram >> 20), (unsigned long long)(pc.glcache >> 20),
+         pc.gpl ? "" : ", no stage libraries kept", mode);
+    return on;
+}
 void pcache_init() {
     if (pcache) return;
     uint64_t ws0 = 0, priv0 = 0;   // ((Triforce) what the cache costs the RAM once the driver has it: the line below)
@@ -1070,8 +1206,12 @@ void pcache_init() {
         } else {
             // (whole or not at all: a file over the bound, or one whose read ends early, leaves data empty)
             uint64_t len = 0;
-            const pcache_bound::Read got = pcache_bound::read(pcache_path.c_str(), 32, pcache_bound_bytes, data, &len);
-            if (got == pcache_bound::Read::OverBound)
+            const pcache_bound::Read got = pcache_bound::read(pcache_path.c_str(), 32, pcache_bound_bytes, data, &len,
+                                                              pcache_head_ok);
+            if (got == pcache_bound::Read::Foreign)
+                logf("vk: pipeline cache %s (%llu MB) is another GPU's or driver's: not read past its header; the cache starts "
+                     "empty and the next save writes a new file over it", pcache_path.c_str(), (unsigned long long)(len >> 20));
+            else if (got == pcache_bound::Read::OverBound)
                 logf("vk: pipeline cache %s (%llu MB) is over the bound of %llu MB: not read; the cache starts empty and the next "
                      "save writes a new file over it (RX_VK_PCACHE_MAX_MB=<MB> sets the bound, 0 lifts it)", pcache_path.c_str(),
                      (unsigned long long)(len >> 20), (unsigned long long)(pcache_bound_bytes >> 20));
@@ -1081,17 +1221,7 @@ void pcache_init() {
         }
     }
     // (data of another device or driver is dropped before Vulkan sees it)
-    if (data.size() >= 32) {
-        uint32_t head_size, version, vendor, device;
-        std::memcpy(&head_size, data.data(), 4);
-        std::memcpy(&version, data.data() + 4, 4);
-        std::memcpy(&vendor, data.data() + 8, 4);
-        std::memcpy(&device, data.data() + 12, 4);
-        if (head_size < 32 || head_size > data.size() || version != VK_PIPELINE_CACHE_HEADER_VERSION_ONE ||   // (hookshot)
-            vendor != dev.props.vendorID || device != dev.props.deviceID ||
-            std::memcmp(data.data() + 16, dev.props.pipelineCacheUUID, VK_UUID_SIZE))
-            data.clear();
-    }
+    if (data.size() >= 32 && !pcache_head_ok(data.data(), data.size())) data.clear();
     VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     ci.initialDataSize = data.size();
     ci.pInitialData = data.empty() ? nullptr : data.data();
@@ -1109,6 +1239,8 @@ void pcache_init() {
         pcache_side = pcache_carry::session(how, history);
         if (with_data && carried) pcache_side.carried++;   // (pcache_bound.h carried: one carry more, the base as it was)
     }
+    // ((Triforce, 11-22, PIPE-78) a fresh file may begin lean; a file read stays as it began: pcache_libs_decide)
+    pcache_libs_only = pcache_libs_decide(!with_data, pcache_for, ram);
     pcache_from_file = pcache && ci.initialDataSize > 0;
     // ((Triforce) and whether that file holds only what this driver's part is made for: <file>.own, pcache_own_mark)
     pcache_from_own = pcache_from_file && !pcache_carried && pcache_own_named();
@@ -1142,9 +1274,10 @@ void pcache_init() {
 void pcache_play_open(bool same) {
     pcache_play_path = pcache_path.substr(0, pcache_path.size() - 4) + "_play.bin";
     static const bool on = !(getenv("RX_VK_PCACHE_PLAY_FILE") && atoi(getenv("RX_VK_PCACHE_PLAY_FILE")) == 0);
-    if (!on || !pcache || !dev.vk13.pipelineCreationCacheControl) {
+    if (!on || !pcache || !dev.vk13.pipelineCreationCacheControl || pcache_libs_only) {   // ((Triforce, 11-22, PIPE-78) lean: none)
         logf("vk: pipeline cache: no play file (%s): what a run compiles goes into the cache above",
-             !on ? "RX_VK_PCACHE_PLAY_FILE=0" : "no pipelineCreationCacheControl on this device");
+             !on ? "RX_VK_PCACHE_PLAY_FILE=0" : pcache_libs_only ? "libraries only, RX_VK_PCACHE_LIBS_ONLY"
+                                              : "no pipelineCreationCacheControl on this device");
         return;
     }
     char stamp[20];
@@ -1158,21 +1291,14 @@ void pcache_play_open(bool same) {
         }
     std::vector<uint8_t> data;
     uint64_t len = 0;
-    if (for_these && pcache_bound::read(pcache_play_path.c_str(), 32, pcache_bound_bytes, data, &len) != pcache_bound::Read::Ok)
-        data.clear();
-    if (data.size() >= 32) {   // (another device's or driver's data is dropped, as the main file's)
-        uint32_t head_size, version, vendor, device;
-        std::memcpy(&head_size, data.data(), 4);
-        std::memcpy(&version, data.data() + 4, 4);
-        std::memcpy(&vendor, data.data() + 8, 4);
-        std::memcpy(&device, data.data() + 12, 4);
-        if (head_size < 32 || head_size > data.size() || version != VK_PIPELINE_CACHE_HEADER_VERSION_ONE ||
-            vendor != dev.props.vendorID || device != dev.props.deviceID ||
-            std::memcmp(data.data() + 16, dev.props.pipelineCacheUUID, VK_UUID_SIZE))
-            data.clear();
-    } else {
-        data.clear();
-    }
+    const pcache_bound::Read got = for_these
+        ? pcache_bound::read(pcache_play_path.c_str(), 32, pcache_bound_bytes, data, &len, pcache_head_ok) : pcache_bound::Read::None;
+    if (got == pcache_bound::Read::Foreign)
+        logf("vk: pipeline cache %s (%llu MB) is another GPU's or driver's: not read past its header", pcache_play_path.c_str(),
+             (unsigned long long)(len >> 20));
+    if (got != pcache_bound::Read::Ok) data.clear();
+    // (another device's or driver's data is dropped, as the main file's)
+    if (data.size() < 32 || !pcache_head_ok(data.data(), data.size())) data.clear();
     VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     ci.initialDataSize = data.size();
     ci.pInitialData = data.empty() ? nullptr : data.data();
@@ -1295,6 +1421,70 @@ Targets rate_targets() {
     return t;
 }
 
+// ---- (Triforce, 11-22, the performance audit's PIPE-57, after Source A's; driver_faults.h) On AMD's Windows driver, a program
+// the driver faulted on is kept out of it, this run and (by triforce_driver_faults.txt) the next ones with that driver, and one
+// build of a program is inside the driver at a time. fault_key: the program whose build this thread has inside the driver now,
+// where that is on (0 otherwise: the guards are then as before); driver_fault_hit: the guard caught a fault in it ----
+thread_local uint64_t fault_key = 0;
+thread_local bool driver_fault_hit = false;
+uint32_t fault_vendor = 0, fault_driver = 0;   // (the file's lines are this vendor's and this driver version's)
+#ifdef _WIN32
+wchar_t fault_file_w[MAX_PATH * 2] = L"";       // (the file's path, made at its load: the fault's handler only writes it)
+/// The fault's handler's: the program's line appended to the file with the system's own calls, which take no lock of the
+/// C library's that another thread may hold, before driver_fault_restart can end the process
+void driver_fault_file_note() {
+    if (!fault_key || !fault_file_w[0]) return;
+    char l[driver_faults::kLine + 1];
+    const int n = driver_faults::line(l, fault_vendor, fault_driver, fault_key);
+    const HANDLE h = CreateFileW(fault_file_w, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+                                 FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD wrote = 0;
+    WriteFile(h, l, (DWORD)n, &wrote, nullptr);
+    FlushFileBuffers(h);
+    CloseHandle(h);
+}
+#endif
+int driver_faults_mode() {   // (RX_VK_DRIVER_FAULTS, read once: 0 off, 1 AMD's Windows driver, 2 every driver)
+    static const int mode = driver_faults::mode(getenv("RX_VK_DRIVER_FAULTS"));
+    return mode;
+}
+bool driver_faults_on() {
+#ifdef _WIN32
+    static const bool on = driver_faults::on(driver_faults_mode(), true, dev.driver_id == VK_DRIVER_ID_AMD_PROPRIETARY);
+#else
+    static const bool on = driver_faults::on(driver_faults_mode(), false, dev.driver_id == VK_DRIVER_ID_AMD_PROPRIETARY);
+#endif
+    return on;
+}
+/// The run's quarantine and gate, the file beside the executable read into it once, and said once
+driver_faults::Quarantine& fault_quarantine() {
+    static driver_faults::Quarantine q;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        char exe[MAX_PATH];
+        const DWORD n = game_module_path(exe, MAX_PATH);
+        const std::string dir(exe, n);
+        const std::string path = dir.substr(0, dir.find_last_of("\\/") + 1) + "triforce_driver_faults.txt";
+        fault_vendor = dev.props.vendorID, fault_driver = dev.props.driverVersion;
+        std::string text;
+        if (FILE* f = fopen(path.c_str(), "rb")) {
+            char buf[4096];
+            for (size_t got; (got = fread(buf, 1, sizeof buf, f)) > 0;) text.append(buf, got);
+            fclose(f);
+        }
+        const std::vector<uint64_t> keys = driver_faults::parse(text, fault_vendor, fault_driver);
+        q.load(keys);
+#ifdef _WIN32
+        if (!MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, fault_file_w, MAX_PATH * 2)) fault_file_w[0] = 0;
+#endif
+        logf("vk: driver faults: %zu programs the driver faulted on before are kept out of it (%s, lines of this driver; delete "
+             "it to try them again); one build of a program inside the driver at a time (RX_VK_DRIVER_FAULTS=0: neither)",
+             keys.size(), path.c_str());
+    });
+    return q;
+}
+
 // (hookshot) A driver's compiler that faults on a shader (amdvlk64.dll on a mesh program, Hookshot issue 26) costs that one draw, not the game
 #ifdef _WIN32
 // (Triforce, 11-13) Where the driver faulted: the module and offset of the faulting instruction, what it touched, and the
@@ -1405,6 +1595,9 @@ __declspec(noinline) VkResult guarded_graphics(VkPipelineCache cache, const VkGr
     __try {
         return vkCreateGraphicsPipelines(dev.device, cache, 1, ci, nullptr, pl);
     } __except (driver_fault_note(GetExceptionInformation(), "graphics")) {
+        // ((Triforce, 11-22, PIPE-57) where the quarantine is on: no handle the driver half wrote is kept, and the program's
+        // line is in the file before a restart can end the process)
+        if (fault_key) *pl = VK_NULL_HANDLE, driver_fault_hit = true, driver_fault_file_note();
         driver_fault_restart();
         return VK_ERROR_UNKNOWN;
     }
@@ -1503,11 +1696,79 @@ VkResult cached_compute(VkPipelineCache cache, const VkComputePipelineCreateInfo
 }
 VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, int part = -1,
                           bool* cold = nullptr);
+/// (Triforce, 11-21) RX_VK_MESH_OPT: -1 unset, 0 for "0", 1 for anything else
+int mesh_opt_switch() {
+    static const int v = [] {
+        const char* e = getenv("RX_VK_MESH_OPT");
+        return !e ? -1 : !strcmp(e, "0") ? 0 : 1;
+    }();
+    return v;
+}
+/// Whether task and mesh pipelines are built without the driver's optimizer (build_graphics): on AMD, but for RADV (unset), on
+/// every AMD driver (=0), nowhere (=1)
+bool mesh_unoptimized() {
+    const int v = mesh_opt_switch();
+    return dev.props.vendorID == 0x1002 && (v == 0 || (v < 0 && dev.driver_id != VK_DRIVER_ID_MESA_RADV));
+}
+/// Whether the RADV rule above builds native task and mesh pipelines with the optimizer that a build before it made without:
+/// the driver's part's stamp word kMeshOptRecipe (warmed_stamp_of)
+bool mesh_opt_recipe() {
+    return dev.props.vendorID == 0x1002 && dev.driver_id == VK_DRIVER_ID_MESA_RADV && mesh_opt_switch() < 0 && dev.mesh_shader &&
+           !dev.task_mesh_fallback;
+}
 bool gpl_libs_cached() {
     static const bool on = !getenv("RX_VK_GPL_NO_CACHE");
     return on;
 }
 thread_local bool driver_cache_only = false;   // (predict_run's: pipelines for the driver's own cache, not into ours)
+// ((Triforce, 11-22, the performance audit's PIPE-68, after Source B's; predict_check.h) RX_VK_PREDICT_CHECK, read once: 0 off,
+// 1 on, 2 every start. And the check's counter: the builds in play of programs the plan predicts that took over 20 ms, which
+// a driver that had kept them would not have compiled. predict_plan_keys: the plan's programs, sorted, set once by the
+// builder's thread when it has read the plan (predict_plan_keys_publish) and never freed; until then nothing is counted)
+int predict_check_mode() {
+    static const int mode = predict_check::mode(getenv("RX_VK_PREDICT_CHECK"));
+    return mode;
+}
+std::atomic<const std::vector<uint64_t>*> predict_plan_keys{nullptr};
+std::atomic<int64_t> st_predicted_slow{0}, st_predicted_slow_us{0};
+void predicted_play_build(uint64_t prog, int64_t us) {
+    if (!predict_check::slow(us)) return;
+    const std::vector<uint64_t>* keys = predict_plan_keys.load(std::memory_order_acquire);
+    if (!keys || !predict_check::has(*keys, prog)) return;
+    const int64_t n = st_predicted_slow.fetch_add(1, std::memory_order_relaxed) + 1;
+    const int64_t all = st_predicted_slow_us.fetch_add(us, std::memory_order_relaxed) + us;
+    static std::atomic<int64_t> said_ms{0};
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    int64_t said = said_ms.load(std::memory_order_relaxed);
+    if (predict_check::say(now, said) && said_ms.compare_exchange_strong(said, now))
+        logf("vk: predicted pipelines: %lld builds in play of predicted programs took over 20 ms so far, %.1f s in all: the driver "
+             "compiled them, it did not have them (RX_VK_PREDICT_CHECK)", (long long)n, all / 1e6);
+}
+// ((Triforce, 11-22, the performance audit's PIPE-21, after Source A's and Source B's; built_check.h) RX_VK_BUILT_CHECK, read
+// once: 0 off, 1 on, 2 always cold. And its counter: builds in play of pipelines the light precompile's record (<notes>.built)
+// says are in the caches that took 40 ms or more, and recorded compute programs the first dispatch's ask did not find.
+// built_play_keys: the record's keys and its compute programs, sorted, set once at the end of a light precompile that went by
+// the record (built_play_publish) and never freed; until then, and in a precompile that keeps everything, nothing is counted)
+int built_check_mode() {
+    static const int mode = built_check::mode(getenv("RX_VK_BUILT_CHECK"));
+    return mode;
+}
+std::atomic<const std::vector<uint64_t>*> built_play_keys{nullptr};
+std::atomic<int64_t> st_built_slow{0}, st_built_slow_us{0}, st_built_missed{0};
+void built_play_build(uint64_t key, int64_t us, bool compute) {
+    const std::vector<uint64_t>* keys = built_play_keys.load(std::memory_order_acquire);
+    if (!keys || !built_check::has(*keys, key)) return;
+    if (compute) st_built_missed.fetch_add(1, std::memory_order_relaxed);
+    else st_built_slow.fetch_add(1, std::memory_order_relaxed), st_built_slow_us.fetch_add(us, std::memory_order_relaxed);
+    static std::atomic<int64_t> said_ms{0};
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    int64_t said = said_ms.load(std::memory_order_relaxed);
+    if (built_check::say(now, said) && said_ms.compare_exchange_strong(said, now))
+        logf("vk: precompile's record: in play so far, %lld pipelines it says are in the caches took 40 ms or more to build "
+             "(%.1f s in all), and %lld compute programs it lists were not in them at their first dispatch: the caches lost "
+             "them since (RX_VK_BUILT_CHECK)", (long long)st_built_slow.load(std::memory_order_relaxed),
+             st_built_slow_us.load(std::memory_order_relaxed) / 1e6, (long long)st_built_missed.load(std::memory_order_relaxed));
+}
 // (lab, 11-13) RX_VK_TEST_DRIVER_FAULT=<n>[,<mode>]: the n-th predicted pipeline is handed to the driver broken, so that the
 // driver itself faults inside vkCreateGraphicsPipelines as it did in the lab on 11-13: what a start does after that can then be
 // watched at will. Mode 1 (default): the stages' pointer names no memory; mode 2: the first stage's module is no module
@@ -1537,6 +1798,51 @@ uint32_t target_write_mask(const Program& p, const NvnState& s, int i) {
     static const bool all = getenv("RX_VK_ALL_COMPONENTS") != nullptr;
     const uint32_t written = fs->info.frag_color_components[i];
     return (s.chmask.mask >> (4 * i)) & 0xF & (all || !written ? 0xFu : (uint32_t)written);
+}
+// ((Triforce, 11-22, the performance audit's DESC-82, after Source B's: its first step) RX_VK_OCC_LEAN=3: the census of the
+// draws an occlusion query counts that write no colour, by what would refuse them a pipeline without the fragment stage
+// (occ_lean.h). Only counted and logged: no pipeline, key or descriptor changes. Read once; unset, off
+}  // namespace (the switch is vk_draw.h's, for status_tick's line)
+bool occ_lean_census_on() {
+    static const bool on = [] {
+        const char* e = getenv("RX_VK_OCC_LEAN");
+        const bool v = occ_lean::mode_of(e) == 3;
+        if (v) logf("vk: the occlusion proxies' census (RX_VK_OCC_LEAN=3): the colour-off counted draws by class, a line every 600 presents");
+        else if (e && *e && atoi(e) != 0)
+            logf("vk: RX_VK_OCC_LEAN=%s: only the census (3) is built; the lean pipelines and their check are not: off", e);
+        return v;
+    }();
+    return on;
+}
+namespace {
+/// (draw(), the census on) a colour-off draw an open query counts: its class and its fragment stage's descriptors
+void occ_lean_note(const Program& p, const NvnState& s) {
+    const Stage* fs = nullptr;
+    for (const Stage& st : p.stages)
+        if (st.vk_stage == VK_SHADER_STAGE_FRAGMENT_BIT) fs = &st;
+    occ_lean::Facts f;
+    f.has_fragment = fs != nullptr;
+    uint32_t descriptors = 0;
+    if (fs) {
+        const Shader::Info& i = fs->info;
+        f.depth_out = i.stores_frag_depth, f.sample_mask = i.stores_sample_mask, f.demote = i.uses_demote_to_helper_invocation;
+        f.stores = i.stores_global_memory;
+        for (const auto& d : i.storage_buffers_descriptors) f.stores = f.stores || d.is_written, descriptors += d.count;
+        f.image_writes = i.uses_typeless_image_writes;
+        for (const auto& d : i.image_descriptors) f.image_writes = f.image_writes || d.is_written, descriptors += d.count;
+        for (const auto& d : i.image_buffer_descriptors) f.image_writes = f.image_writes || d.is_written, descriptors += d.count;
+        f.atomics = i.uses_global_increment || i.uses_global_decrement || i.uses_atomic_f32_add || i.uses_atomic_f16x2_add ||
+                    i.uses_atomic_f16x2_min || i.uses_atomic_f16x2_max || i.uses_atomic_f32x2_add || i.uses_atomic_f32x2_min ||
+                    i.uses_atomic_f32x2_max || i.uses_atomic_s32_min || i.uses_atomic_s32_max || i.uses_int64_bit_atomics ||
+                    i.uses_atomic_image_u32;
+        f.global = i.uses_global_memory;
+        for (const auto& d : i.constant_buffer_descriptors) descriptors += d.count;
+        for (const auto& d : i.texture_descriptors) descriptors += d.count;
+        for (const auto& d : i.texture_buffer_descriptors) descriptors += d.count;
+    }
+    f.a2c = s.ms.a2c != 0;
+    f.alpha_test = s.color.alpha_func != 0 && s.color.alpha_func != NVN_ALPHA_FUNC_ALWAYS;   // (not emulated: refused anyway)
+    occ_lean::census.note(occ_lean::classify(f), descriptors);
 }
 thread_local const Program* cur_program = nullptr;   // (the draw's, for its dynamic write masks)
 /// (hookshot) What target_write_mask reads of a program, as one word: whether its fragment stage stores each output and which
@@ -1874,10 +2180,13 @@ bool state_shipped_new() {
 /// waits; normal in a start that only prepares (HOOKSHOT_PREPARE_ONLY: Setup's build and update, --prepare-shaders) whose
 /// process was started below normal priority, where nothing of the game runs and a normal thread is still below every
 /// program of normal priority. Only where that is known: on Windows a process of the below normal or idle class (the Windows
-/// builders start their build tools so: Runner.cs, builder/py core.py BELOW_NORMAL_PRIORITY_CLASS), elsewhere a process with
+/// builders start their build tools so only with HOOKSHOT_LOW_PRIORITY=1 since the performance audit's OS-57: Runner.cs,
+/// builder/py core.py build_priority; by default the tools are of the normal class, and these workers then stay below
+/// normal in it, base 7 where they had base 6, still under every program of normal priority), elsewhere a process with
 /// a nice value above 0 (the Linux builder sets none, and there the posix SetThreadPriority leaves a normal thread at the
 /// process's nice). Any other process keeps them below normal: a process of normal priority (a --prepare-shaders from a
-/// shell) would have them compete with the desktop for the whole preparation, and in one above normal a normal thread is
+/// shell, a builder's default start) would have them compete with the desktop for the whole preparation, and in one
+/// above normal a normal thread is
 /// above every other program (prepare_threads.h: "on all of them at High the driver's compiles froze the whole PC"). As the
 /// process is at the first call
 int prepare_priority() {
@@ -1968,7 +2277,7 @@ struct PrepTimes {
     /// first well under 100 while the second is too, the workers waited (on one another, on a lock) rather than compiled
     std::string cpu_text(unsigned workers) const {
         const double wall = us_since(t0) / 1e6;
-        const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
+        const unsigned cpus = std::max(1u, cpu_count());
         const uint64_t p1 = process_cpu_us(), used = p1 > process0 ? p1 - process0 : 0, run = run_us.load(), cpu = cpu_us.load();
         char s[320];
         snprintf(s, sizeof s, "the %u workers on a processor %.0f%% of the time they ran (%.0f s of CPU in %.0f s), the process "
@@ -1984,7 +2293,7 @@ struct PrepTimes {
 /// keep their own counts
 unsigned prepare_workers() {
     static const unsigned n = [] {
-        const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
+        const unsigned cpus = std::max(1u, cpu_count());
         const char* e = getenv("RX_VK_PREPARE_THREADS");
         uint64_t ram_free = 0;
         bool above_normal = false;
@@ -1994,7 +2303,11 @@ unsigned prepare_workers() {
         if (GlobalMemoryStatusEx(&ms)) ram_free = ms.ullAvailPhys;
         const DWORD cls = GetPriorityClass(GetCurrentProcess());
         above_normal = cls == ABOVE_NORMAL_PRIORITY_CLASS || cls == HIGH_PRIORITY_CLASS || cls == REALTIME_PRIORITY_CLASS;
+        uint32_t heap_signature = 0;
+        if (const HANDLE heap = GetProcessHeap()) memcpy(&heap_signature, (const char*)heap + 16, sizeof heap_signature);
+        const char* heap = prepare_threads::heap_name(heap_signature);
 #else
+        const char* heap = nullptr;
         if (FILE* f = fopen("/proc/meminfo", "r")) {
             char line[128];
             unsigned long long kb = 0;
@@ -2004,9 +2317,10 @@ unsigned prepare_workers() {
         }
 #endif
         const unsigned v = prepare_threads::count(cpus, ram_free, above_normal, e ? atoi(e) : 0);
-        logf("vk: the shaders' preparation runs on %u threads (%u processors, %llu MB of RAM free%s%s; "
+        logf("vk: the shaders' preparation runs on %u threads (%u processors, %llu MB of RAM free%s%s%s%s; "
              "RX_VK_PREPARE_THREADS=<n>: on n)", v, cpus, (unsigned long long)(ram_free >> 20),
-             above_normal ? ", the process above normal priority: half" : "", e && atoi(e) > 0 ? ", as RX_VK_PREPARE_THREADS says" : "");
+             above_normal ? ", the process above normal priority: half" : "", e && atoi(e) > 0 ? ", as RX_VK_PREPARE_THREADS says" : "",
+             heap ? ", the process heap: " : "", heap ? heap : "");
         return v;
     }();
     return n;
@@ -2381,6 +2695,13 @@ std::atomic<int64_t> st_warm_over_budget{0}, st_warm_not_again{0};
 // the draws are in the last ones' are pipe_order_mu's (taken alone, or under warm_index_mu while the index is built; the
 // index's places are not changed after that). RX_VK_PIPELINE_ORDER=0: none, the warm from the notes as before)
 pipe_order::Held<VkPipeline> pipe_order_links;   // (gpl_mu)
+// ((Triforce, 11-21) RX_VK_ORDER_SOFT_BEHIND=1: links behind the draws kept until their room is needed (pipe_order.h Held::soft).
+// OFF by default: in the lab (adult tour, then child tour, the same order files each side) it took the links let go as behind
+// from 1269 to 3 and the links the draws took from 1536 to 1792, but the pipeline stalls moved 2.0 -> 1.8 s (child) and 2.1 ->
+// 2.2 s (adult), the worst 192 -> 319 ms: single tours, inside the noise
+const bool pipe_order_soft_set = (pipe_order_links.soft(getenv("RX_VK_ORDER_SOFT_BEHIND") &&
+                                                        atoi(getenv("RX_VK_ORDER_SOFT_BEHIND")) == 1),
+                                  true);
 std::atomic<bool> pipe_order_used{false};
 std::mutex pipe_order_mu;
 pipe_order::Index pipe_order_index;   // (by_variant: warm_index_mu; place: pipe_order_mu)
@@ -2559,12 +2880,26 @@ bool order_wanted(int64_t place) {
 /// ((Triforce, wp18; the draw's, under the table's lock) A draw needs the pipeline of key for the first time: a new entry, or
 /// one the precompile made that no draw had. Into this session's order; and where the draws are in the last sessions' moves
 /// on, the links held far behind them going with the libraries only they held (pipe_order.h)
-void order_met(uint64_t key) {
+// ((Triforce, 11-22, the performance audit's PIPE-81, after Source B's: its first step; pipe_ahead.h) With the order used, each
+// pipeline the draws first need counted by its place against where the draws are: within RX_VK_PIPE_AHEAD places ahead
+// (1024), further, behind, not in the order; and those within that the warm had linked. Nothing is built: the count says
+// whether a builder of whole pipelines just ahead would be worth it (draw_left_out_take's line). RX_VK_PIPE_AHEAD=0: not counted
+int64_t pipe_ahead_window() {
+    static const int64_t w = pipe_ahead::window(getenv("RX_VK_PIPE_AHEAD"));
+    return w;
+}
+std::atomic<int64_t> st_ahead[4] = {}, st_ahead_warm{0};   // (pipe_ahead::Where: none, near, far, behind)
+void order_met(uint64_t key, bool warm_linked = false) {
     if (!pipe_order_on()) return;
     int64_t from = 0;
     {
         std::lock_guard lk(pipe_order_mu);
         pipe_order_rec.add(key);
+        if (pipe_order_used.load(std::memory_order_relaxed) && pipe_ahead_window()) {   // ((Triforce, 11-22, PIPE-81) before it moves)
+            const pipe_ahead::Where w = pipe_ahead::where(pipe_order_index.at(key), pipe_order_front.furthest, pipe_ahead_window());
+            st_ahead[(int)w].fetch_add(1, std::memory_order_relaxed);
+            if (w == pipe_ahead::Where::Near && warm_linked) st_ahead_warm.fetch_add(1, std::memory_order_relaxed);
+        }
         if (!pipe_order_used.load(std::memory_order_relaxed) || !pipe_order_front.met(pipe_order_index.at(key))) return;
         from = pipe_order_front.from();
     }
@@ -2850,6 +3185,31 @@ pipe_wait::Pool& pipe_pool() {   // (RX_VK_PIPE_FRAME_WAIT_MS: the full-screen a
     static pipe_wait::Pool p(pipe_env_ms("RX_VK_PIPE_FRAME_WAIT_MS", pipe_wait::kFrameWaitMs, 500) * pipe_wait::kMs);
     return p;
 }
+// ((Triforce, 11-22, the performance audit's PIPE-30, after Source A's; translate_wait.h) RX_VK_TRANSLATE_WAIT_MS=<ms>, read
+// once: a draw into targets that hold an earlier frame whose program is still translating, of a key known to write no memory,
+// waits at most that much a frame in all (its own budget), then is left out. Off unless set: every such draw waits, as before)
+int translate_wait_ms() {
+    static const int ms = [] {
+        const char* e = getenv("RX_VK_TRANSLATE_WAIT_MS");
+        const int v = translate_wait::parse(e);
+        if (e)
+            logf(v ? "vk: a draw whose program is still translating, into targets that hold an earlier frame and of a program "
+                     "known to write no memory, waits up to %d ms a frame in all, then is left out (RX_VK_TRANSLATE_WAIT_MS)"
+                   : "vk: RX_VK_TRANSLATE_WAIT_MS=%d? 1 to 100 ms, digits only: off, such draws wait as before", v ? v : 0);
+        return v;
+    }();
+    return ms;
+}
+pipe_wait::Pool& translate_pool() {
+    static pipe_wait::Pool p(translate_wait_ms() * pipe_wait::kMs);
+    return p;
+}
+translate_wait::Notes& translate_notes() {
+    static translate_wait::Notes n;
+    return n;
+}
+std::atomic<int64_t> st_translate_bounded{0}, st_translate_left{0};
+void translate_note(const Program& p);   // (below draw(): whether a translated program writes memory, for the bound)
 pipe_wait::Pool& pipe_last() {   // (a full-screen draw's in a frame the hold cannot take, once the pool is spent)
     static pipe_wait::Pool p(pipe_wait::kLastWaitMs * pipe_wait::kMs);
     return p;
@@ -2877,6 +3237,30 @@ const pipe_wait::Rules& pipe_rules() {
         return x;
     }();
     return r;
+}
+// ((Triforce, 11-22, the performance audit's PIPE-29, after Source B's; pipe_wait.h depth_new) RX_VK_PIPE_DEPTH_BUDGET=1: a
+// depth-tested draw into a pass drawn once whose shaders write no memory waits from the frame's pool, then is left out; a
+// pipeline that ran out of time is left out at once until built (pipe_depth_out, emptied every 600 presents). Off unless set,
+// on every driver: the entry's default for Intel's Windows driver waits for the owner's word)
+bool pipe_depth_budget() {
+    static const bool on = [] {
+        const bool v = pipe_wait::depth_budget(getenv("RX_VK_PIPE_DEPTH_BUDGET"));
+        if (v) logf("vk: a depth-tested draw into a pass drawn once waits for its pipeline from the frame's %lld ms, then is left out "
+                    "(RX_VK_PIPE_DEPTH_BUDGET)", (long long)(pipe_pool().per_frame() / pipe_wait::kMs));
+        return v;
+    }();
+    return on;
+}
+std::mutex pipe_depth_mu;
+std::unordered_set<const void*> pipe_depth_out;   // (pipe_depth_mu: entries whose wait ran out, left out at once)
+std::atomic<int64_t> st_pipe_depth_waits{0}, st_pipe_depth_left{0};
+bool pipe_depth_timed_out(const void* pe) {
+    std::lock_guard lk(pipe_depth_mu);
+    return pipe_depth_out.count(pe) != 0;
+}
+void pipe_depth_time_out(const void* pe) {
+    std::lock_guard lk(pipe_depth_mu);
+    pipe_depth_out.insert(pe);
 }
 bool pipe_skip_new() {   // (RX_VK_PIPE_SKIP_NEW=0: a pass whose depth target alone was drawn before is kept, as before)
     static const bool on = !(getenv("RX_VK_PIPE_SKIP_NEW") && atoi(getenv("RX_VK_PIPE_SKIP_NEW")) == 0);
@@ -3030,6 +3414,7 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
     e->looked.store(true, std::memory_order_relaxed);   // ((Triforce) the draw's own, from the start: never given back)
     st_pipe_entries++, st_pipe_looked++;
     pipeline_note(key, p, s, at, topo, color_types);
+    translate_note(p);   // ((Triforce, 11-22, PIPE-30) whether its key writes memory, for the bounded wait)
     static const bool sync = getenv("RX_VK_SYNC_PIPELINES") != nullptr;
     if (sync) {
         e->pipeline = build_graphics(p, s, at, topo);
@@ -3040,10 +3425,12 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
     // when a library is cold: the entry stays not ready, and the draw is left out or waits for the full build)
     uint64_t cold[2]{};
     bool link_later = false;   // ((Triforce) the frame's links took their budget (pipe_wait.h LinkBudget): a worker links it)
+    bool warm_linked = false;  // ((Triforce, 11-22, PIPE-81) the warm had linked it: counted by order_met)
     if (gpl_wanted() && !p.fallback) {
         const auto t0 = std::chrono::steady_clock::now();
         // ((Triforce) the one the warm linked for this key behind the draws, in place of one of its own: pipe_warm.h)
         VkPipeline linked = warm_link_take(key);
+        warm_linked = linked != VK_NULL_HANDLE;
         const uint64_t frame = texture_frame_no();
         link_later = !linked && !gpl_skipped(p) && pipe_fast_workers() && !pipe_links().links(frame);
         if (!linked && !link_later) linked = gpl_link(p, s, at, topo, cold), st_links++;
@@ -3053,7 +3440,7 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
         gpl_rules::linked(*e, linked);   // ((Triforce) ready with it, or, not linked, left as it is for the whole build)
         if (gpl_skipped(p)) cold[0] = cold[1] = 0;   // (a start died with this variant's libraries in the driver: none is built)
     }
-    order_met(key);   // ((Triforce, wp18) the draws' first need, after the link the warm made for it was taken: pipe_order.h)
+    order_met(key, warm_linked);   // ((Triforce, wp18) the draws' first need, after the link the warm made for it was taken: pipe_order.h)
     struct Job {
         PipeEntry* e;
         const Program* p;
@@ -3293,20 +3680,19 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
         // (from PR 430, YunaraDebugs: on AMD the task and mesh programs (OoT's foliage culling, following pointers through its
         // tables) hung the GPU when the driver's optimizer built them: a device lost one to four minutes into Kokiri, each time with
         // another of them first (RX 6600, issues 461 and 484); never in runs where they were built without it. They are built
-        // without it on AMD. RX_VK_MESH_OPT=1: with it, as the others)
-        static const bool amd = [] {
-            VkPhysicalDeviceProperties pr{};
-            vkGetPhysicalDeviceProperties(dev.physical, &pr);
-            return pr.vendorID == 0x1002;
-        }();
-        static const bool mesh_opt = getenv("RX_VK_MESH_OPT") != nullptr;
-        if (amd && !mesh_opt) {
+        // without it on AMD's own drivers. (Triforce, 11-21) Not on RADV, where it is the other way round: built without the
+        // optimizer, the same culling task programs ran long enough to time out the GPU's ring and reset it at the save load (Steam
+        // Deck OLED, Mesa 26.2; an RX 6800 XT on RADV the same), and with it they did not (mesh_unoptimized).
+        // RX_VK_MESH_OPT=1: with it everywhere; =0: without it on every AMD driver, RADV too, as before)
+        if (mesh_unoptimized()) {
             bool mesh = false;
             for (const Stage& st : p.stages) mesh |= (st.vk_stage & (VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT)) != 0;
             if (mesh) {
                 ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
                 static std::atomic<int> told{0};
-                if (told++ < 1) logf("vk: task and mesh programs built without the driver's optimizer (AMD; RX_VK_MESH_OPT=1: with it)");
+                if (told++ < 1)
+                    logf("vk: task and mesh programs built without the driver's optimizer (%s; RX_VK_MESH_OPT=1: with it)",
+                         mesh_opt_switch() == 0 ? "AMD, RX_VK_MESH_OPT=0" : "AMD's own driver, not RADV");
             }
         }
     }
@@ -3324,8 +3710,24 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
     // (the two shader libraries go into our cache, as whole pipelines do: asked for under the flag, the driver answers from a cache
     // it is handed and not from its own on disk, so a library the warm pass built and let go was cold again at its first draw
     // (measured: 21 of 21). gpl_libs_cached: RX_VK_GPL_NO_CACHE=1 keeps them out, as before)
+    // ((Triforce, 11-22, the performance audit's PIPE-57, after Source A's; driver_faults.h) On AMD's Windows driver: a program
+    // the driver faulted on is not asked of it again, and one build of a program at a time: a second waits here, outside the
+    // driver, and a probe of the caches is told a compile is required. RX_VK_DRIVER_FAULTS=0, and other drivers: as before)
+    const bool fault_gated = driver_faults_on();
+    if (fault_gated) {
+        const driver_faults::Quarantine::Begin b = fault_quarantine().begin(p.key, cold == nullptr);
+        if (b == driver_faults::Quarantine::Begin::Busy) return *cold = true, VK_NULL_HANDLE;
+        if (b == driver_faults::Quarantine::Begin::Faulted) {
+            static std::atomic<int> told{0};
+            if (told++ < 10)
+                logf("vk: %016llx is kept out of the driver: it faulted in it (RX_VK_DRIVER_FAULTS)", (unsigned long long)p.key);
+            return VK_NULL_HANDLE;
+        }
+        fault_key = p.key, driver_fault_hit = false;
+    }
     const bool lib_cached = (part == 1 || part == 2) && gpl_libs_cached();
-    const VkPipelineCache wanted = lib_cached || (part < 0 && !driver_cache_only) ? pcache : VK_NULL_HANDLE;
+    // ((Triforce, 11-22, PIPE-78) a lean file: whole pipelines to the driver's own cache, libraries in ours: pcache_libs.h)
+    const VkPipelineCache wanted = lib_cached || (part < 0 && !driver_cache_only && !pcache_libs_only) ? pcache : VK_NULL_HANDLE;
     const PcacheUse use(pcache_door, wanted);   // ((Triforce) held over the creation and its retry: none once it is let go)
     const VkPipelineCache cache = use.cache;
     test_driver_fault(ci);   // (lab: RX_VK_TEST_DRIVER_FAULT)
@@ -3333,12 +3735,19 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
     VkResult r = cached_graphics(cache, &ci, &pl);
     // The AMD Windows compiler can reject ordinary graphics pipelines with its optimizer on.
     if (dev.props.vendorID == 0x1002 && dev.task_mesh_fallback && !p.mesh && part < 0 && r == VK_ERROR_UNKNOWN &&
-        !(ci.flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT)) {
+        !(ci.flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) && !driver_fault_hit) {   // ((Triforce, PIPE-57) not after a fault)
         ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
         pl = VK_NULL_HANDLE;
         r = cached_graphics(cache, &ci, &pl);
         if (r == VK_SUCCESS)
             logf("vk: graphics pipeline for %016llx recovered with optimization disabled", (unsigned long long)p.key);
+    }
+    if (fault_gated) {   // ((Triforce, 11-22, PIPE-57) out of the gate; a fault keeps the program out from now on)
+        fault_key = 0;
+        if (fault_quarantine().end(p.key, driver_fault_hit))
+            logf("vk: the driver faulted on %016llx: kept out of it from now on, and in triforce_driver_faults.txt for the next "
+                 "starts with this driver (RX_VK_DRIVER_FAULTS)", (unsigned long long)p.key);
+        driver_fault_hit = false;
     }
     if (cold && r == VK_PIPELINE_COMPILE_REQUIRED) return *cold = true, VK_NULL_HANDLE;
     if (part >= 0) {
@@ -3357,7 +3766,15 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
     }
     st_pipelines++;
     pcache_built_since_save += !driver_cache_only;
-    st_pipeline_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    const int64_t build_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    st_pipeline_us += build_us;
+    // ((Triforce, 11-22, PIPE-68) a whole pipeline made for the game, not for the driver's cache: counted when it is a
+    // predicted program's and took a compile's time. RX_VK_PREDICT_CHECK=0: not)
+    if (!driver_cache_only && pl && predict_check_mode()) predicted_play_build(p.key, build_us);
+    // ((Triforce, 11-22, PIPE-21) and when the light precompile's record says it is in the caches: built_play_build. The key
+    // is made only for a slow build, which is rare)
+    if (!driver_cache_only && pl && built_check::slow(build_us) && built_play_keys.load(std::memory_order_relaxed))
+        built_play_build(pipeline_key(p, s, at, topo), build_us, false);
     return pl;
 }
 
@@ -4012,8 +4429,9 @@ VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_
         // (updates the stream made to this range in this submission or ones still in flight: a copy with them in)
         // (room first: the overlay copies into the stream's mapping, which a move to a bigger stream in the middle would change)
         if (stream_reserve(n, align))
-            if (const uint64_t at = ub_overlay(u.addr, n, cur->mapped, [&](uint64_t bytes) { return stream_alloc(bytes, align); });
-                at != UINT64_MAX) {
+            // ((Triforce, 11-22, DESC-06) stream_alloc and its alignment as they are: it was a std::function made of a lambda
+            // at every uniform buffer)
+            if (const uint64_t at = ub_overlay(u.addr, n, cur->mapped, stream_alloc, align); at != UINT64_MAX) {
                 FINE_N(FC_UBO_OVERLAY, 1);
                 return {cur->stream, at, n};
             }
@@ -4033,7 +4451,10 @@ VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_
             return (dev.props.vendorID == 0x8086 || dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) && !pools_mirrored();
         }();
         BufferRef b = snapshot ? BufferRef{} : gpu_buffer_bind(u.addr, n, false);
-        if (b && b.offset % align == 0) return {b.buffer, b.offset, n};
+        // ((Triforce, 11-22, the performance audit's DESC-06, after Source A's) align is a power of two (the device's
+        // minUniformBufferOffsetAlignment, or 16; stream_reserve asks the same of it): a mask, where it was a division a
+        // uniform buffer)
+        if (b && !(b.offset & (align - 1))) return {b.buffer, b.offset, n};
         const uint64_t at = stream_alloc(n, align);   // (unaligned or outside the pools: copied into the stream)
         if (at == UINT64_MAX) return bi;
         FINE_N(FC_UBO_STREAM, 1);
@@ -4058,6 +4479,11 @@ struct DescWriter {
         writes.clear(), bufs.clear(), imgs.clear(), views.clear();
     }
 };
+// ((Triforce, 11-22, the performance audit's DESC-20, after Source A's) dw() is a thread-local pointer read and a null test
+// at each use (and a call for the address in a Linux library built with -fPIC): build_descriptors and bind_descriptors take
+// the thread's writer once at their top (auto& dwr = dw();) and use that. Sound because a thread has one DescWriter for its
+// whole life: made at the first dw(), reset in place (reset()), and nothing ever puts another object behind the pointer.
+// draw() keeps its four dw() (tests/test_mesh_fallback.py reads them). tests/test_tls_once.py holds the count)
 TLS_OBJECT(dw, DescWriter)
 TLS_OBJECT(draw_sampled, std::vector<const Texture*>)   // (the textures the descriptors being built sample or store)
 TLS_OBJECT(gfx_sampled, std::vector<const Texture*>)    // (the last draw's: kept while its descriptors are reused)
@@ -4326,6 +4752,14 @@ uint32_t sampled_handle(const NvnState& s, const Stage& st, const Shader::Textur
                                                                                                                        : handle_of(s, st, d, k);
 }
 
+/// ((Triforce, 11-22, the performance audit's DESC-22, after Source A's; desc_counts.h) Whether build_descriptors goes by
+/// the counts kept with the program: on unless RX_VK_DESC_COUNTS=0 (read once), and not in the lab's "descwalk" phases.
+/// (Here, before the part the descriptor reuse's tests cut out whole)
+bool desc_counts_on() {
+    static const bool env = desc_counts::on(getenv("RX_VK_DESC_COUNTS"));
+    return env && !lab_ab::on("descwalk");
+}
+
 // ---- (Triforce) Per-binding descriptor reuse (desc_keep.h), and what the descriptors' writes come to ----
 // (the counts of the frame statistics' "a frame's descriptors" line, desc_report. Each added as a load and a store, not an atomic add:
 // a few a draw on the replay thread, and the helper threads' racing adds lose a count at worst, as the file's other counters do)
@@ -4478,8 +4912,9 @@ VkSampler kept_texture(desc_keep::Prog* kp, size_t j, uint32_t handle, VkImageVi
 /// keep: a draw's build, through the per-binding reuse. scene: the draw renders the jittered scene (draw_in_scene), its
 /// textures sampled with the upscaler's LOD bias; a dispatch's never
 void build_descriptors(const NvnState& s, const Program& p, bool keep = false, bool scene = false) {
-    dw().reset();
-    dw().prog = &p;
+    auto& dwr = dw();   // ((Triforce, 11-22, DESC-20) once a call: the thread's one DescWriter, reset in place, never swapped (TLS_OBJECT(dw))
+    dwr.reset();
+    dwr.prog = &p;
     desc_fp().clear(), desc_fp_dummy = false;   // (RX_VK_DESC_SLOTGEN: the samplers' generation is read before the first handle,
     desc_samp_seen = sampler_registrations_generation();   // (so one registered during the build still forces the next rebuild)
     desc_destroy_seen = texture_destroy_generation();      // (an eviction retires views behind the slots' backs: it bumps only this)
@@ -4488,15 +4923,31 @@ void build_descriptors(const NvnState& s, const Program& p, bool keep = false, b
     dump_written().clear();
     dump_inputs().clear();
     size_t nbuf = 0, nimg = 0, nview = 0;
-    for (const Stage& st : p.stages) {
-        for (const auto& d : st.info.constant_buffer_descriptors) nbuf += d.count;
-        for (const auto& d : st.info.storage_buffers_descriptors) nbuf += d.count;
-        for (const auto& d : st.info.texture_buffer_descriptors) nview += d.count;
-        for (const auto& d : st.info.image_buffer_descriptors) nview += d.count;
-        for (const auto& d : st.info.texture_descriptors) nimg += d.count;
-        for (const auto& d : st.info.image_descriptors) nimg += d.count;
+    // ((Triforce, 11-22, the performance audit's DESC-22, after Source A's; desc_counts.h) the three sums are the program's,
+    // fixed once it is translated: kept packed on it (Program::desc_n), stored at its first build once ready and read at
+    // every later one. The six lists a stage are walked only while the word holds no counts (not counted yet, more than
+    // 1023 of a kind, the switch off, or the guard at the end said never)
+    const bool counts_on = desc_counts_on();
+    const uint32_t counted = counts_on ? p.desc_n.load(std::memory_order_relaxed) : desc_counts::kUnset;
+    const bool walked = !desc_counts::unpack(counted, &nbuf, &nimg, &nview);
+    if (walked) {
+        for (const Stage& st : p.stages) {
+            for (const auto& d : st.info.constant_buffer_descriptors) nbuf += d.count;
+            for (const auto& d : st.info.storage_buffers_descriptors) nbuf += d.count;
+            for (const auto& d : st.info.texture_buffer_descriptors) nview += d.count;
+            for (const auto& d : st.info.image_buffer_descriptors) nview += d.count;
+            for (const auto& d : st.info.texture_descriptors) nimg += d.count;
+            for (const auto& d : st.info.image_descriptors) nimg += d.count;
+        }
+        // (only once it is translated: its stages are filled before ready and never after)
+        if (desc_counts::stores(counts_on, p.ready.load(std::memory_order_acquire), p.desc_n.load(std::memory_order_relaxed)))
+            p.desc_n.store(desc_counts::pack(nbuf, nimg, nview), std::memory_order_relaxed);
     }
-    dw().bufs.reserve(nbuf), dw().imgs.reserve(nimg), dw().views.reserve(nview);   // (stable pointers below)
+    dwr.bufs.reserve(nbuf), dwr.imgs.reserve(nimg), dwr.views.reserve(nview);   // (stable pointers below)
+    // ((Triforce, 11-22, DESC-22) where the three are now: the guard at the end)
+    const void* const bufs_at = dwr.bufs.data();
+    const void* const imgs_at = dwr.imgs.data();
+    const void* const views_at = dwr.views.data();
     FINE_N(FC_DESCS, (int64_t)(nbuf + nimg + nview));
     // ((Triforce) a draw's descriptors through the per-binding reuse (desc_keep.h), each by its place in this order (jn): kp's
     // results are this program's. Not a dispatch's (keep: draw() only), a dump's, or the temporal upscaler's second recording)
@@ -4517,28 +4968,28 @@ void build_descriptors(const NvnState& s, const Program& p, bool keep = false, b
         const int ns = st.nvn_stage;
         for (const auto& d : info.constant_buffer_descriptors) {
             VkWriteDescriptorSet w = write(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, d.count);
-            const size_t first = dw().bufs.size();
+            const size_t first = dwr.bufs.size();
             const size_t jb = jn;
             jn += d.count;
             for (uint32_t k = 0; k < d.count; k++) {
                 const auto t0 = slow_desc_timing() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-                dw().bufs.push_back(kept_uniform(kp, jb + k, s, st, d.index + k));
-                if (slow_desc_timing()) slow_descriptor(t0, "uniform buffer", d.index + k, dw().bufs.back().range);
+                dwr.bufs.push_back(kept_uniform(kp, jb + k, s, st, d.index + k));
+                if (slow_desc_timing()) slow_descriptor(t0, "uniform buffer", d.index + k, dwr.bufs.back().range);
             }
-            w.pBufferInfo = &dw().bufs[first];
-            dw().writes.push_back(w);
+            w.pBufferInfo = &dwr.bufs[first];
+            dwr.writes.push_back(w);
         }
         for (const auto& d : info.storage_buffers_descriptors) {
             FINE_SCOPE(FT_STORAGE);
             FINE_N(FC_SSBO_DESCS, d.count);
             VkWriteDescriptorSet w = write(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, d.count);
-            const size_t first = dw().bufs.size();
+            const size_t first = dwr.bufs.size();
             const size_t jb = jn;
             jn += d.count;
             for (uint32_t k = 0; k < d.count; k++) {
                 const uint32_t off = d.cbuf_offset + k * 16;
                 if (d.count == 1 && d.cbuf_index == 0 && d.cbuf_offset == 0xff0) {   // (EvilOOT, RX_VK_MISS_LOG)
-                    dw().bufs.push_back(miss_binding(p.key));
+                    dwr.bufs.push_back(miss_binding(p.key));
                     continue;
                 }
                 // (AyyBeeDee20738, PR 138; EvilOOT the same before it, for OoT's culling tables in c4) through the stage's banks as
@@ -4554,7 +5005,7 @@ void build_descriptors(const NvnState& s, const Program& p, bool keep = false, b
                 const bool kept_took = ke && desc_keep::take(*ke, desc_keep::kSsbo, addr, size, 0, kn);
                 if (kept_took && desc_keep_mode() != 2) {
                     count_add(st_dk_taken, 1);
-                    dw().bufs.push_back({(VkBuffer)(uintptr_t)ke->out[0], ke->out[1], ke->out[2]});
+                    dwr.bufs.push_back({(VkBuffer)(uintptr_t)ke->out[0], ke->out[1], ke->out[2]});
                     continue;
                 }
                 // (EvilOOT) a table entry that is a bare pointer (its size word 0, as OoT's culling setup keeps them): bound up to
@@ -4789,10 +5240,10 @@ void build_descriptors(const NvnState& s, const Program& p, bool keep = false, b
                              "%#llx%s", (unsigned long long)p.key, ns, (unsigned)d.cbuf_index, off,
                              (unsigned long long)addr, (unsigned long long)size, d.is_written ? " (written)" : "");
                 }
-                dw().bufs.push_back(b ? VkDescriptorBufferInfo{b.buffer, b.offset, n}
+                dwr.bufs.push_back(b ? VkDescriptorBufferInfo{b.buffer, b.offset, n}
                                     : VkDescriptorBufferInfo{dev.null_descriptor ? VK_NULL_HANDLE : zero_buffer, 0,
                                                              dev.null_descriptor ? VK_WHOLE_SIZE : 16});
-                if (ke) buf_keep(*kp, jb + k, *ke, desc_keep::kSsbo, addr, size, kn, kept_took, (bool)b, dw().bufs.back());
+                if (ke) buf_keep(*kp, jb + k, *ke, desc_keep::kSsbo, addr, size, kn, kept_took, (bool)b, dwr.bufs.back());
                 {   // (RX_VK_LOG_WRITTEN=1: every storage buffer range a program writes, once, 300 of them)
                     static const bool on = getenv("RX_VK_LOG_WRITTEN") != nullptr;
                     if (on && d.is_written) {
@@ -4811,13 +5262,13 @@ void build_descriptors(const NvnState& s, const Program& p, bool keep = false, b
                     if (slow_desc_timing()) slow_descriptor(t1, "stamp", base, n);
                 }
             }
-            w.pBufferInfo = &dw().bufs[first];
-            dw().writes.push_back(w);
+            w.pBufferInfo = &dwr.bufs[first];
+            dwr.writes.push_back(w);
         }
         auto texel_views = [&](const auto& list, VkDescriptorType type, bool storage) {
             for (const auto& d : list) {
                 VkWriteDescriptorSet w = write(type, d.count);
-                const size_t first = dw().views.size();
+                const size_t first = dwr.views.size();
                 jn += d.count;   // ((Triforce) not kept: desc_keep.h)
                 for (uint32_t k = 0; k < d.count; k++) {
                     const uint32_t handle = handle_of(s, st, d, k);
@@ -4830,10 +5281,10 @@ void build_descriptors(const NvnState& s, const Program& p, bool keep = false, b
                         ParLock lk;
                         bv = texel_buffer_view(&t, has_view ? &v : nullptr, storage);
                     }
-                    dw().views.push_back(bv);
+                    dwr.views.push_back(bv);
                 }
-                w.pTexelBufferView = &dw().views[first];
-                dw().writes.push_back(w);
+                w.pTexelBufferView = &dwr.views[first];
+                dwr.writes.push_back(w);
             }
         };
         texel_views(info.texture_buffer_descriptors, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, false);
@@ -4841,7 +5292,7 @@ void build_descriptors(const NvnState& s, const Program& p, bool keep = false, b
         for (const auto& d : info.texture_descriptors) {
             FINE_SCOPE(FT_TEX);
             VkWriteDescriptorSet w = write(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, d.count);
-            const size_t first = dw().imgs.size();
+            const size_t first = dwr.imgs.size();
             const VkImageViewType vt = view_type(d.type);
             const size_t jb = jn;
             jn += d.count;
@@ -4859,7 +5310,7 @@ void build_descriptors(const NvnState& s, const Program& p, bool keep = false, b
                 // position or asks the size of, is made whole: vk_texture.cpp texture_want_whole)
                 if (tex && tex->detail_skip && !tex->whole_asked && shader_reads_exact(stage_exact_key(st), w.dstBinding))
                     texture_want_whole(tex);
-                if (dump_on()) dump_input('t', (uint32_t)(dw().imgs.size() - 0), handle, view ? tex : nullptr);
+                if (dump_on()) dump_input('t', (uint32_t)(dwr.imgs.size() - 0), handle, view ? tex : nullptr);
                 if (view && tex && trace_tex_wanted(tex)) trace_tex_hit = tex;
                 if (log_img_wanted(p.key)) {
                     static std::atomic<int> told{0};
@@ -4897,14 +5348,14 @@ void build_descriptors(const NvnState& s, const Program& p, bool keep = false, b
                     view = dummies.view[(int)vt], st_dummy_textures += handle != 0, st_dummy_known += handle != 0 && view_slot_known;
                     desc_dummies += handle != 0, desc_dummies_known += handle != 0 && view_slot_known;   // ((Triforce) desc_sig.h)
                 }
-                dw().imgs.push_back({smp, view, VK_IMAGE_LAYOUT_GENERAL});
+                dwr.imgs.push_back({smp, view, VK_IMAGE_LAYOUT_GENERAL});
             }
-            w.pImageInfo = &dw().imgs[first];
-            dw().writes.push_back(w);
+            w.pImageInfo = &dwr.imgs[first];
+            dwr.writes.push_back(w);
         }
         for (const auto& d : info.image_descriptors) {
             VkWriteDescriptorSet w = write(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, d.count);
-            const size_t first = dw().imgs.size();
+            const size_t first = dwr.imgs.size();
             const VkImageViewType vt = view_type(d.type);
             jn += d.count;   // ((Triforce) not kept: desc_keep.h)
             for (uint32_t k = 0; k < d.count; k++) {
@@ -4932,13 +5383,26 @@ void build_descriptors(const NvnState& s, const Program& p, bool keep = false, b
                              view ? "view made" : "NO view");
                 }
                 if (view && tex && d.is_written && (dump_on() || probe_on())) dump_written().push_back({tex, level});
-                if (dump_on()) dump_input(d.is_written ? 'W' : 'R', (uint32_t)dw().imgs.size(), handle, view ? tex : nullptr);
+                if (dump_on()) dump_input(d.is_written ? 'W' : 'R', (uint32_t)dwr.imgs.size(), handle, view ? tex : nullptr);
                 if (!view && !dev.null_descriptor) view = VK_NULL_HANDLE;
-                dw().imgs.push_back({VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL});
+                dwr.imgs.push_back({VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL});
             }
-            w.pImageInfo = &dw().imgs[first];
-            dw().writes.push_back(w);
+            w.pImageInfo = &dwr.imgs[first];
+            dwr.writes.push_back(w);
         }
+    }
+    // ((Triforce, 11-22, the performance audit's DESC-22; desc_counts.h) the guard: a build that went by kept counts and
+    // had one of the three move was short of room, and the writes above may point into storage that is gone. That program
+    // walks from here on (kNever), and this build is made again, walked, before anything reads the writes. It cannot
+    // happen while the counts are the walk's own; it is said once if it does)
+    if (desc_counts::moved(walked, bufs_at, dwr.bufs.data(), imgs_at, dwr.imgs.data(), views_at, dwr.views.data())) {
+        p.desc_n.store(desc_counts::kNever, std::memory_order_relaxed);
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true))
+            logf("vk: program %016llx: the descriptor counts kept with it (%zu buffers, %zu images, %zu texel views) were short of "
+                 "a build: its builds walk its stages again from here on, and this one is made again (RX_VK_DESC_COUNTS=0: every "
+                 "program's)", (unsigned long long)p.key, nbuf, nimg, nview);
+        build_descriptors(s, p, keep, scene);
     }
 }
 
@@ -4993,8 +5457,25 @@ void desc_report(double frames) {
 /// (hookshot) The pipeline cache the game's pipelines are kept in across runs (mkw_vk_pipelines.bin), for the back end's own
 /// pipelines made elsewhere (vk_fsr3.cpp, vk_aa.cpp); none before it is loaded. (Outside the unnamed namespace: vk_fsr3.cpp links
 /// to it.) (Triforce) The compute pipeline is made here, through the cache's gate: it may be let go in play (pcache_let_go)
+/// ((Triforce, 11-22, the performance audit's PIPE-95, after Source A's) And through the play cache, as a dispatch's pipeline
+/// is (cached_compute, pcache_play.h): the main cache asked without compiling, a miss compiled into the play cache, a driver
+/// fault caught (the pass is then not made, and its feature is off for the session). Made bare into the main cache, FSR 3.1's
+/// dozen passes, the anti-aliasing's and the texture converters' grew that cache by a little, which is written in play only
+/// after 64 MB of growth, so they waited for the exit's save of the whole main file (650 MB fresh, 2 to 3 GB with the stage
+/// libraries); an exit that cut that write short left the old file, and they were compiled again at the next start.
+/// RX_VK_PCACHE_OWN_PASSES=0: the bare creation into the main cache, as before (read once). Without a play cache (no
+/// pipelineCreationCacheControl, RX_VK_PCACHE_PLAY_FILE=0) only the guard is new
 VkResult shared_cache_compute(const VkComputePipelineCreateInfo* ci, VkPipeline* out) {
-    return vkCreateComputePipelines(dev.device, pcache_use().cache, 1, ci, nullptr, out);
+    static const bool own_passes = pcache_play::own_passes(getenv("RX_VK_PCACHE_OWN_PASSES"));
+    const auto use = pcache_use();   // (the gate held over the creation, as dispatch's)
+    if (!own_passes) return vkCreateComputePipelines(dev.device, use.cache, 1, ci, nullptr, out);
+    return cached_compute(use.cache, ci, out);
+}
+/// ((Triforce) RX_VK_TEX_PIPES_AHEAD) A start whose shader preparation was skipped at the build runs no precompile_run: the
+/// pipeline cache read here and the texture converters' pipelines made through it before the game all the same
+void texture_pipelines_unprepared() {
+    pcache_init();
+    texture_pipelines_warm();
 }
 void draw_skip_report(double frames) { skip_report_impl(frames), fine_report(frames), desc_report(frames); }
 /// (Triforce) how many texture bindings have sampled the dummy so far (a texture with no image yet: left for a later frame, not
@@ -5276,12 +5757,13 @@ bool push_write_template(VkCommandBuffer cmd, VkPipelineBindPoint bp, const Prog
 }
 
 bool bind_descriptors(VkCommandBuffer cmd, VkPipelineBindPoint bp, const Program& p) {
+    auto& dwr = dw();   // ((Triforce, 11-22, DESC-20) once a call: the thread's one DescWriter, reset in place, never swapped (TLS_OBJECT(dw))
     if (p.renodx) renodx_bind(cmd, bp, p.layout, p.renodx);
     if (renodx_tracing.load(std::memory_order_relaxed) && bp == VK_PIPELINE_BIND_POINT_GRAPHICS) renodx_trace_draw(p.frag_crc);   // (local, RenoDX port) set 1: its settings and state
-    if (dw().writes.empty()) return true;
+    if (dwr.writes.empty()) return true;
     // A failed sampler is retryable, but cannot be published to either descriptor path.
     // Check the entire array before updating the pushed-state cache or allocating a set.
-    for (const auto& w : dw().writes)
+    for (const auto& w : dwr.writes)
         if (w.descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
             for (uint32_t k = 0; k < w.descriptorCount; k++)
                 if (!w.pImageInfo[k].sampler) return false;
@@ -5289,24 +5771,24 @@ bool bind_descriptors(VkCommandBuffer cmd, VkPipelineBindPoint bp, const Program
     if (p.push) {
         static const bool whole = getenv("RX_VK_PUSH_ALL") != nullptr;   // (A/B: every binding every time)
         static const bool old_state = getenv("RX_VK_PUSH_STATE_OLD") != nullptr;   // (A/B: a vector of words a write, as before)
-        if (whole || ps.cmd != cmd || ps.layout != p.layout || ps.n != dw().writes.size()) {
+        if (whole || ps.cmd != cmd || ps.layout != p.layout || ps.n != dwr.writes.size()) {
             if (g_fine) {
-                fine_n[FC_PUSH_FULL]++, fine_n[FC_PUSH_WRITES] += (int64_t)dw().writes.size();
-                for (const VkWriteDescriptorSet& w : dw().writes) fine_n[FC_PUSH_DESCS] += w.descriptorCount;
+                fine_n[FC_PUSH_FULL]++, fine_n[FC_PUSH_WRITES] += (int64_t)dwr.writes.size();
+                for (const VkWriteDescriptorSet& w : dwr.writes) fine_n[FC_PUSH_DESCS] += w.descriptorCount;
             }
             {
                 FINE_SCOPE(FT_PUSHCALL);
                 if (!push_write_template(cmd, bp, p))   // ((Triforce) through the program's push template where it has one)
-                    vkCmdPushDescriptorSetKHR(cmd, bp, p.layout, 0, (uint32_t)dw().writes.size(), dw().writes.data());
+                    vkCmdPushDescriptorSetKHR(cmd, bp, p.layout, 0, (uint32_t)dwr.writes.size(), dwr.writes.data());
             }
-            count_add(st_push_full, 1), count_add(st_push_full_n, descs_of(dw().writes.data(), dw().writes.size()));   // ((Triforce) desc_report)
-            ps.cmd = cmd, ps.layout = p.layout, ps.n = dw().writes.size();
+            count_add(st_push_full, 1), count_add(st_push_full_n, descs_of(dwr.writes.data(), dwr.writes.size()));   // ((Triforce) desc_report)
+            ps.cmd = cmd, ps.layout = p.layout, ps.n = dwr.writes.size();
             if (old_state) {
-                ps.writes.resize(dw().writes.size());
-                for (size_t i = 0; i < dw().writes.size(); i++) write_words(dw().writes[i], ps.writes[i]);
+                ps.writes.resize(dwr.writes.size());
+                for (size_t i = 0; i < dwr.writes.size(); i++) write_words(dwr.writes[i], ps.writes[i]);
             } else {
                 ps.words.clear(), ps.at.clear();
-                for (const VkWriteDescriptorSet& w : dw().writes) ps.at.push_back((uint32_t)ps.words.size()), words_append(w, ps.words);
+                for (const VkWriteDescriptorSet& w : dwr.writes) ps.at.push_back((uint32_t)ps.words.size()), words_append(w, ps.words);
             }
             return true;
         }
@@ -5314,19 +5796,19 @@ bool bind_descriptors(VkCommandBuffer cmd, VkPipelineBindPoint bp, const Program
         static thread_local std::vector<uint64_t> words;
         changed.clear();
         if (old_state) {
-            for (size_t i = 0; i < dw().writes.size(); i++) {
-                write_words(dw().writes[i], words);
-                if (words != ps.writes[i]) changed.push_back(dw().writes[i]), ps.writes[i].swap(words);
+            for (size_t i = 0; i < dwr.writes.size(); i++) {
+                write_words(dwr.writes[i], words);
+                if (words != ps.writes[i]) changed.push_back(dwr.writes[i]), ps.writes[i].swap(words);
             }
         } else {   // (the same layout, so the same count of words in each write: compared and kept in place)
-            for (size_t i = 0; i < dw().writes.size(); i++) {
+            for (size_t i = 0; i < dwr.writes.size(); i++) {
                 const uint64_t* end = ps.words.data() + (i + 1 < ps.at.size() ? ps.at[i + 1] : ps.words.size());
-                const int same = words_same_store(dw().writes[i], ps.words.data() + ps.at[i], end);
+                const int same = words_same_store(dwr.writes[i], ps.words.data() + ps.at[i], end);
                 if (same < 0) {   // (not so: nothing is known of what is pushed; the whole set again)
                     ps.cmd = VK_NULL_HANDLE;
                     return bind_descriptors(cmd, bp, p);
                 }
-                if (!same) changed.push_back(dw().writes[i]);
+                if (!same) changed.push_back(dwr.writes[i]);
             }
         }
         if (!changed.empty()) {
@@ -5346,7 +5828,7 @@ bool bind_descriptors(VkCommandBuffer cmd, VkPipelineBindPoint bp, const Program
     ps.cmd = VK_NULL_HANDLE;   // (a set bound: what was pushed is not known to stay)
     if (g_fine) {
         fine_n[FC_POOL_SETS]++;
-        for (const VkWriteDescriptorSet& w : dw().writes) fine_n[FC_POOL_DESCS] += w.descriptorCount;
+        for (const VkWriteDescriptorSet& w : dwr.writes) fine_n[FC_POOL_DESCS] += w.descriptorCount;
     }
     // ((Triforce) the last set written alike for this layout here: bound again, not allocated and written (set_kept))
     if (const VkDescriptorSet again = set_kept(cmd, bp, p.layout)) {
@@ -5375,11 +5857,12 @@ bool bind_descriptors(VkCommandBuffer cmd, VkPipelineBindPoint bp, const Program
             return false;
         }
     }
+    pool_took(dwr.writes.data(), dwr.writes.size());   // ((Triforce, 11-22, DESC-33) for the "recording streams" line's peaks)
     if (!set_write_template(set, p)) {   // ((Triforce) through the program's update template where it has one)
-        for (auto& w : dw().writes) w.dstSet = set;
-        vkUpdateDescriptorSets(dev.device, (uint32_t)dw().writes.size(), dw().writes.data(), 0, nullptr);
+        for (auto& w : dwr.writes) w.dstSet = set;
+        vkUpdateDescriptorSets(dev.device, (uint32_t)dwr.writes.size(), dwr.writes.data(), 0, nullptr);
     }
-    count_add(st_set_new, 1), count_add(st_set_new_n, descs_of(dw().writes.data(), dw().writes.size()));
+    count_add(st_set_new, 1), count_add(st_set_new_n, descs_of(dwr.writes.data(), dwr.writes.size()));
     vkCmdBindDescriptorSets(cmd, bp, p.layout, 0, 1, &set, 0, nullptr);
     set_written(cmd, bp, p.layout, set);
     return true;
@@ -5865,6 +6348,11 @@ struct Pass {
     uint16_t sampled_targets = 0;          // (colour i bit i, depth bit 8: targets earlier draws sampled)
     uint16_t written = 0;                  // (its targets written so far: colour i bit i, depth bit 8)
 };
+// ((Triforce, 11-22, the performance audit's DESC-20, after Source A's) pass() likewise: begin_pass, dynamic_state,
+// draw_hazards, end_pass and draw take the thread's Pass once at their top (Pass& ps = pass();), where end_pass alone asked
+// 57 times. A thread has one Pass for its whole life: a new recording assigns into it (pass() = Pass{}, draw_begin_recording),
+// begin_pass and end_pass change its members, and nothing swaps the object behind the pointer, so the reference stays
+// good across the calls these functions make (end_pass from begin_pass, the carry's resume). tests/test_tls_once.py)
 TLS_OBJECT(pass, Pass)
 // ((Triforce) RX_VK_SPLIT_BARRIER, barrier_rules.h: the targets the open pass was begun with; and the pass a part's split ended, with
 // what its draws sampled and wrote, and its targets, carried into the next part, which begins it again: pass_carry_take, _resume)
@@ -6018,9 +6506,10 @@ bool full_screen_draw(const NvnState& s, const Targets& at, const DrawArgs& d) {
 }
 
 void begin_pass(VkCommandBuffer cmd, const Targets& at) {
-    bool same = pass().open && pass().depth == at.depth_view && pass().n == at.n && pass().width == at.width &&
-                pass().height == at.height;
-    for (int i = 0; i < at.n && same; i++) same = pass().color[i] == at.color_view[i];
+    Pass& ps = pass();   // ((Triforce, 11-22, DESC-20) once a call: the thread's one Pass, reset in place, never swapped (TLS_OBJECT(pass))
+    bool same = ps.open && ps.depth == at.depth_view && ps.n == at.n && ps.width == at.width &&
+                ps.height == at.height;
+    for (int i = 0; i < at.n && same; i++) same = ps.color[i] == at.color_view[i];
     if (same) return;
     end_pass(cmd);
     if (pass_resuming) pass_resume_barrier(cmd);   // ((Triforce) the pass a part's split ended, again: pass_carry_resume)
@@ -6037,12 +6526,12 @@ void begin_pass(VkCommandBuffer cmd, const Targets& at) {
         ca[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         ca[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        pass().color[i] = at.color_view[i];
-        pass().tex[i] = at.color[i], pass().level[i] = at.color_level[i], pass().layer[i] = at.color_layer[i];
+        ps.color[i] = at.color_view[i];
+        ps.tex[i] = at.color[i], ps.level[i] = at.color_level[i], ps.layer[i] = at.color_layer[i];
         texture_written(at.color[i], "a pass's colour target");
         texture_rendered(at.color[i]);
     }
-    for (int i = at.n; i < 8; i++) pass().color[i] = VK_NULL_HANDLE;
+    for (int i = at.n; i < 8; i++) ps.color[i] = VK_NULL_HANDLE;
     VkRenderingAttachmentInfo da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     if (at.depth) {
         da.imageView = at.depth_view;
@@ -6052,9 +6541,9 @@ void begin_pass(VkCommandBuffer cmd, const Targets& at) {
         texture_written(at.depth, "a pass's depth target");
         texture_rendered(at.depth);
     }
-    pass().depth = at.depth_view;
-    pass().depth_tex = at.depth, pass().depth_level = at.depth_level, pass().depth_layer = at.depth_layer;
-    pass().n = at.n, pass().width = at.width, pass().height = at.height;
+    ps.depth = at.depth_view;
+    ps.depth_tex = at.depth, ps.depth_level = at.depth_level, ps.depth_layer = at.depth_layer;
+    ps.n = at.n, ps.width = at.width, ps.height = at.height;
     VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
     ri.renderArea = {{0, 0}, {at.width, at.height}};
     ri.layerCount = 1;
@@ -6063,12 +6552,12 @@ void begin_pass(VkCommandBuffer cmd, const Targets& at) {
     if (at.depth && depth_aspect(at.depth_format)) ri.pDepthAttachment = &da;
     if (at.depth && has_stencil(at.depth_format)) ri.pStencilAttachment = &da;
     gprof_begin(cmd);
-    pass().draws = 0, pass().format0 = at.n ? at.color_format[0] : at.depth_format;
-    pass().wm_or = 0, pass().wm_n = 0;
-    pass().clears = 0, pass().first_prog = 0;
-    pass().sampled.clear(), pass().sampled_targets = 0, pass().written = 0;
+    ps.draws = 0, ps.format0 = at.n ? at.color_format[0] : at.depth_format;
+    ps.wm_or = 0, ps.wm_n = 0;
+    ps.clears = 0, ps.first_prog = 0;
+    ps.sampled.clear(), ps.sampled_targets = 0, ps.written = 0;
     vkCmdBeginRendering(cmd, &ri);
-    pass().open = true;
+    ps.open = true;
     st_passes++;
 }
 
@@ -6102,13 +6591,12 @@ thread_local bool last_dyn_valid = false;
 bool dyn_same(const float* fp, int nf, const uint32_t* up, int nu, const uint8_t* raw, int nb, const float* cfp,
               const uint32_t* cup, const uint8_t* craw) {
     if (nf <= 0 || nu <= 0 || nb <= 0) return false;
+    // ((Triforce, 11-22, the performance audit's DESC-06, after Source A's) the words and the bytes by one memcmp each: they
+    // were two loops of compares at every draw, 35 words and up to 160 bytes. The floats still one by one and by value, so
+    // that -0 is the same as 0 and a NaN the same as nothing, as before)
     for (int i = 0; i < nf; i++)
         if (fp[i] != cfp[i]) return false;
-    for (int i = 0; i < nu; i++)
-        if (up[i] != cup[i]) return false;
-    for (int i = 0; i < nb; i++)
-        if (raw[i] != craw[i]) return false;
-    return true;
+    return !std::memcmp(up, cup, (size_t)nu * sizeof *up) && !std::memcmp(raw, craw, (size_t)nb);
 }
 /// (Triforce) The face a draw culls, NVN's: the game's, or with RX_VK_FOLIAGE_SHADOW_CULL (on from layer 1 unless it is off) a mesh
 /// program's draw into the sun's far shadow cascades with one face culled (foliage_shadow.h). dyn_pack keeps it, so a draw into
@@ -6205,13 +6693,14 @@ int dyn_pack(const NvnState& s, const Targets& at, VkPrimitiveTopology topo, boo
 }
 
 void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, bool mesh) {
+    Pass& ps = pass();   // ((Triforce, 11-22, DESC-20) once a call: the thread's one Pass, reset in place, never swapped (TLS_OBJECT(pass))
     float df[kDynF];
     uint32_t du[kDynU];
     uint8_t db[160];
     const int nb = dyn_pack(s, at, topo, mesh, df, du, db);
     if (!dump_on() && last_dyn_valid && dyn_fast.on && dyn_fast.nb == nb &&
         dyn_same(df, kDynF, du, kDynU, db, nb, dyn_fast.fp, dyn_fast.up, dyn_fast.raw)) {
-        pass().wm_or |= dyn_fast.wm0, pass().wm_n = dyn_fast.wm_n;   // (the pass trace still sees the masks)
+        ps.wm_or |= dyn_fast.wm0, ps.wm_n = dyn_fast.wm_n;   // (the pass trace still sees the masks)
         FINE_N(FC_DYN_FAST, 1);
         return;
     }
@@ -6391,7 +6880,7 @@ void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, Vk
     std::memcpy(dyn_fast.up, du, sizeof du);
     std::memcpy(dyn_fast.raw, db, (size_t)nb);
     dyn_fast.wm0 = d.n ? (uint32_t)d.wm[0] : 0, dyn_fast.wm_n = (uint32_t)d.n;
-    pass().wm_or |= dyn_fast.wm0, pass().wm_n = dyn_fast.wm_n;
+    ps.wm_or |= dyn_fast.wm0, ps.wm_n = dyn_fast.wm_n;
 }
 #undef DYN_CHANGED
 
@@ -6529,6 +7018,7 @@ bool writes_sampled_target(uint16_t writes, uint16_t sampled_targets) {
 /// the targets' writes with each other only, not with the draws' texture reads of them. (A draw that samples a target
 /// it writes itself is left as it is.) Returns the targets the draw writes. RX_VK_NO_PASS_HAZARDS=1: not checked.
 uint16_t draw_hazards(VkCommandBuffer cmd, const Program& p, const NvnState& s, const Targets& at) {
+    Pass& ps = pass();   // ((Triforce, 11-22, DESC-20) once a call: the thread's one Pass, reset in place, never swapped (TLS_OBJECT(pass))
     uint16_t writes = 0;
     for (int i = 0; i < at.n; i++)
         if (at.color[i] && target_write_mask(p, s, i)) writes |= (uint16_t)(1u << i);
@@ -6549,9 +7039,9 @@ uint16_t draw_hazards(VkCommandBuffer cmd, const Program& p, const NvnState& s, 
             }
     }
     static const bool off = getenv("RX_VK_NO_PASS_HAZARDS") != nullptr;
-    if (off || !pass().open) return writes;
-    bool same = pass().depth == at.depth_view && pass().n == at.n && pass().width == at.width && pass().height == at.height;
-    for (int i = 0; i < at.n && same; i++) same = pass().color[i] == at.color_view[i];
+    if (off || !ps.open) return writes;
+    bool same = ps.depth == at.depth_view && ps.n == at.n && ps.width == at.width && ps.height == at.height;
+    for (int i = 0; i < at.n && same; i++) same = ps.color[i] == at.color_view[i];
     if (!same) return writes;   // (other targets: begin_pass ends this pass with a barrier anyway)
     auto slot_of = [&](const Texture* t) {
         for (int i = 0; i < at.n; i++)
@@ -6561,15 +7051,15 @@ uint16_t draw_hazards(VkCommandBuffer cmd, const Program& p, const NvnState& s, 
     const char* kind = nullptr;
     for (const Texture* t : gfx_sampled()) {
         const int k = slot_of(t);
-        if (k >= 0 && (pass().written >> k & 1) && !(writes >> k & 1)) { kind = "samples a target the pass wrote"; break; }
+        if (k >= 0 && (ps.written >> k & 1) && !(writes >> k & 1)) { kind = "samples a target the pass wrote"; break; }
     }
-    if (!kind && writes_sampled_target(writes, pass().sampled_targets))
+    if (!kind && writes_sampled_target(writes, ps.sampled_targets))
         kind = "writes a target an earlier draw sampled";
     if (!kind) return writes;
     static int logged;
     if (logged++ < 8)
         logf("vk: a draw (program %016llx) %s, after %d draws of the pass (%ux%u): a pass of its own", (unsigned long long)p.key,
-             kind, pass().draws, pass().width, pass().height);
+             kind, ps.draws, ps.width, ps.height);
     end_pass(cmd);
     note_pass_split(cmd);   // ((Triforce) a full barrier before the draw's pass: it may read the targets in its vertex or mesh stage)
     return writes;
@@ -6659,6 +7149,60 @@ void draw_flush_recording(int slot) {
     }
 }
 
+/// (ParLock held) A slot's reset for its next recording: its descriptor pool, the extra pools, and the streams the last
+/// recording grew into
+void slot_reset_locked(RecordingRes& r) {
+    // ((Triforce, 11-22, the performance audit's DESC-33, after Source A's; desc_pool_grow.h) a slot whose last recording ran
+    // out of its half pool (it has extra pools) gets a whole one here, where the extra pools go anyway: the half one destroyed,
+    // not reset. Only once the whole one is made, so the slot is never left without a pool
+    bool whole = false;
+    if (desc_pool_grow::remake(r.shift, r.extra.size())) {
+        if (const VkDescriptorPool made = make_pool(0)) {
+            vkDestroyDescriptorPool(dev.device, r.pool, nullptr);
+            r.pool = made, r.shift = 0, whole = true;
+            pools_whole++;
+            static int told;
+            if (told++ < 8)
+                logf("vk: a recording ran out of its slot's half descriptor pool: the slot has a whole one from here on (%llu slots "
+                     "so far; RX_VK_DESC_POOL_GROW=0: whole from the start)", (unsigned long long)pools_whole);
+        }
+    }
+    if (!whole) vkResetDescriptorPool(dev.device, r.pool, 0);
+    pools_added += r.extra.size();
+    for (VkDescriptorPool p : r.extra) vkDestroyDescriptorPool(dev.device, p, nullptr);
+    r.extra.clear();
+    // (the streams the last recording of the slot grew into: given back after 120 recordings that stayed in the first, the
+    // slot's last one being done (recording_wait). RX_VK_STREAM_KEEP=1: kept)
+    static const bool keep = getenv("RX_VK_STREAM_KEEP") != nullptr;
+    if (r.streams.size() > 1 && !keep) {
+        if (r.si > 0) r.idle = 0;
+        else if (++r.idle >= 120) {
+            for (size_t i = 1; i < r.streams.size(); i++) {
+                stream_extra -= r.streams[i].size;
+                destroy_buffer(r.streams[i].buffer, r.streams[i].alloc);
+            }
+            r.streams.resize(1);
+        }
+    }
+}
+/// ((Triforce, 11-21, the performance audit's REPLAY-04, after Source A's) A recording slot's reset made at the recording's
+/// start (vk_replay.cpp begin_recording), right after the slot's command pools are reset and before its first packet. With
+/// the recorder thread (RX_VK_RECORDER=thread) a descriptor pool's reset, a pool's destruction and a buffer's are boundaries:
+/// the replay waits there until the recorder has run every packet before them. Made in draw_begin_recording they came after
+/// the recording's first packets (the occlusion block's reset, the GPU timers, the checkpoint), so every recording began with
+/// a wait for the recorder. Right after the command pools' resets, themselves boundaries, there is nothing to wait for.
+/// A slot with no pool yet is left to draw_begin_recording, and a helper thread's segment, which makes its calls itself,
+/// never comes here. RX_VK_RECORDER_OWN=0: reset in draw_begin_recording, as before
+void draw_slot_reset(int slot) {
+    static const bool on = !(getenv("RX_VK_RECORDER_OWN") && atoi(getenv("RX_VK_RECORDER_OWN")) == 0);
+    if (!on) return;
+    ParLock lk;
+    if ((size_t)slot >= res.size()) return;
+    RecordingRes& r = res[slot];
+    if (!r.pool) return;
+    slot_reset_locked(r);
+    r.reset_ahead = true;
+}
 void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
     rec_cmd = cmd;
     rec_value = value;
@@ -6666,24 +7210,12 @@ void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
     if ((size_t)slot >= res.size()) res.resize((size_t)slot + 1);
     RecordingRes& r = res[slot];
     if (!r.pool) {
-        r.pool = make_pool();
+        r.shift = desc_pool_grow::first_shift(pool_grow_on());   // ((Triforce, 11-22, DESC-33) half, whole once a recording ran out)
+        r.pool = make_pool(r.shift);
+    } else if (r.reset_ahead) {
+        r.reset_ahead = false;   // ((Triforce, 11-21, REPLAY-04) made at the recording's start already: draw_slot_reset)
     } else {
-        vkResetDescriptorPool(dev.device, r.pool, 0);
-        for (VkDescriptorPool p : r.extra) vkDestroyDescriptorPool(dev.device, p, nullptr);
-        r.extra.clear();
-        // (the streams the last recording of the slot grew into: given back after 120 recordings that stayed in the first, the
-        // slot's last one being done (recording_wait). RX_VK_STREAM_KEEP=1: kept)
-        static const bool keep = getenv("RX_VK_STREAM_KEEP") != nullptr;
-        if (r.streams.size() > 1 && !keep) {
-            if (r.si > 0) r.idle = 0;
-            else if (++r.idle >= 120) {
-                for (size_t i = 1; i < r.streams.size(); i++) {
-                    stream_extra -= r.streams[i].size;
-                    destroy_buffer(r.streams[i].buffer, r.streams[i].alloc);
-                }
-                r.streams.resize(1);
-            }
-        }
+        slot_reset_locked(r);
     }
     if (r.streams.empty()) stream_insert(r, 0, kStream);
     if (!r.streams.empty()) {
@@ -6693,11 +7225,23 @@ void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
         r.si = 0, r.stream = VK_NULL_HANDLE, r.stream_alloc = nullptr, r.mapped = nullptr, r.size = 0;
     }
     if (r.before + r.used > stream_peak.load(std::memory_order_relaxed)) stream_peak.store(r.before + r.used, std::memory_order_relaxed);
+    desc_pool_grow::peak(pool_most, r.took);   // ((Triforce, 11-22, DESC-33) what the slot's last recording took of its pools)
+    r.took = {};
     static int64_t begun;
-    if (++begun % 3000 == 0)
+    if (++begun % 3000 == 0) {
         logf("vk: the recording streams: %zu of %llu MB, the most one held %llu KB; %llu made on demand (%llu MB kept now)", res.size(),
              (unsigned long long)(kStream >> 20), (unsigned long long)(stream_peak.load(std::memory_order_relaxed) >> 10),
              (unsigned long long)stream_grown.load(), (unsigned long long)(stream_extra.load() >> 20));
+        // ((Triforce, 11-22, DESC-33) and their descriptor pools: what a size is judged by)
+        size_t half = 0;
+        for (const RecordingRes& s : res) half += s.pool && s.shift ? 1 : 0;
+        logf("vk: the recording streams' descriptor pools: %zu of %zu slots at half size, %llu made whole, %llu extra pools made; the "
+             "most one recording took: %u sets, %u uniform and %u storage buffers, %u sampled and %u storage images, %u and %u texel views",
+             half, res.size(), (unsigned long long)pools_whole, (unsigned long long)pools_added, pool_most.sets,
+             pool_most.n[desc_pool_grow::kUniform], pool_most.n[desc_pool_grow::kStorage], pool_most.n[desc_pool_grow::kSampled],
+             pool_most.n[desc_pool_grow::kStorageImage], pool_most.n[desc_pool_grow::kUniformTexel],
+             pool_most.n[desc_pool_grow::kStorageTexel]);
+    }
     r.used = 0, r.before = 0;
     r.c1_at.reset();   // (its array kept: emptied at every recording's start, it fills again to about the same size)
     cur = &r;
@@ -6952,10 +7496,11 @@ namespace {
 TLS_OBJECT(dump_mesh_indirect, std::vector<std::pair<uint64_t, uint64_t>>)   // (program key, indirect address)
 } // namespace
 void end_pass(VkCommandBuffer cmd) {
-    if (!pass().open) return;
+    Pass& ps = pass();   // ((Triforce, 11-22, DESC-20) once a call: the thread's one Pass, reset in place, never swapped (TLS_OBJECT(pass))
+    if (!ps.open) return;
     if (occ_live) occ_pass_end(cmd);   // (Triforce, RX_VK_OCC_QUERY: a query begun in the pass ends in it)
     vkCmdEndRendering(cmd);
-    pass().open = false;
+    ps.open = false;
     note_pass_end(cmd);   // (before the dumps and probes below: they record work, and the next pass's barrier is then a full one)
     if (dump_on() && !dump_mesh_indirect().empty()) {
         for (const auto& [key, addr] : dump_mesh_indirect()) {
@@ -6967,52 +7512,52 @@ void end_pass(VkCommandBuffer cmd) {
         dump_mesh_indirect().clear();
     }
     if (probe_on())
-        for (int i = 0; i < pass().n; i++)
-            if (pass().color[i] && pass().tex[i]) probe_image(cmd, pass().tex[i], pass().level[i], pass().layer[i], pass().prog, 'p', pass().draws);
+        for (int i = 0; i < ps.n; i++)
+            if (ps.color[i] && ps.tex[i]) probe_image(cmd, ps.tex[i], ps.level[i], ps.layer[i], ps.prog, 'p', ps.draws);
     if (pass_trace_on()) {
         char sampled[160] = "";
         int k = 0;
-        for (size_t i = 0; i < pass().sampled.size() && i < 6 && k < 140; i++)
-            k += snprintf(sampled + k, sizeof sampled - k, " %#llx", (unsigned long long)pass().sampled[i]->gpu);
+        for (size_t i = 0; i < ps.sampled.size() && i < 6 && k < 140; i++)
+            k += snprintf(sampled + k, sizeof sampled - k, " %#llx", (unsigned long long)ps.sampled[i]->gpu);
         trace_line("pass %ux%u f%d %dc%s wm%x/%u: %d draws %d clears, c0 %#llx/%u, depth %#llx/%u, progs %016llx..%016llx, "
-                   "sampled%s", pass().width, pass().height, (int)pass().format0, pass().n, pass().depth ? "+d" : "", pass().wm_or, pass().wm_n, pass().draws,
-                   pass().clears, (unsigned long long)(pass().n && pass().tex[0] ? pass().tex[0]->gpu : 0), pass().layer[0],
-                   (unsigned long long)(pass().depth_tex ? pass().depth_tex->gpu : 0), pass().depth_layer,
-                   (unsigned long long)pass().first_prog, (unsigned long long)pass().prog, sampled);
+                   "sampled%s", ps.width, ps.height, (int)ps.format0, ps.n, ps.depth ? "+d" : "", ps.wm_or, ps.wm_n, ps.draws,
+                   ps.clears, (unsigned long long)(ps.n && ps.tex[0] ? ps.tex[0]->gpu : 0), ps.layer[0],
+                   (unsigned long long)(ps.depth_tex ? ps.depth_tex->gpu : 0), ps.depth_layer,
+                   (unsigned long long)ps.first_prog, (unsigned long long)ps.prog, sampled);
     }
     if (gprof_on()) {
         char label[160];
-        snprintf(label, sizeof label, "pass %ux%u f%d %dc%s, %s draws, first prog %016llx, last prog %016llx", pass().width, pass().height,
-                 (int)pass().format0, pass().n, pass().depth ? "+d" : "", pass().draws > 256 ? ">256" : pass().draws > 32 ? "33-256" : pass().draws > 4 ? "5-32" : "0-4",
-                 (unsigned long long)pass().first_prog, (unsigned long long)pass().prog);
-        gprof_end(cmd, label, pass().draws);
+        snprintf(label, sizeof label, "pass %ux%u f%d %dc%s, %s draws, first prog %016llx, last prog %016llx", ps.width, ps.height,
+                 (int)ps.format0, ps.n, ps.depth ? "+d" : "", ps.draws > 256 ? ">256" : ps.draws > 32 ? "33-256" : ps.draws > 4 ? "5-32" : "0-4",
+                 (unsigned long long)ps.first_prog, (unsigned long long)ps.prog);
+        gprof_end(cmd, label, ps.draws);
     }
     if (dump_on())
-        for (int i = 0; i < pass().n; i++)
-            if (pass().color[i] && pass().tex[i]) {
+        for (int i = 0; i < ps.n; i++)
+            if (ps.color[i] && ps.tex[i]) {
                 char what[64];
-                snprintf(what, sizeof what, "pass c%d prog %016llx", i, (unsigned long long)pass().prog);
-                dump_image(cmd, pass().tex[i], pass().level[i], pass().layer[i], what);
+                snprintf(what, sizeof what, "pass c%d prog %016llx", i, (unsigned long long)ps.prog);
+                dump_image(cmd, ps.tex[i], ps.level[i], ps.layer[i], what);
             }
-    if (dump_on() && pass().depth && pass().depth_tex) {
+    if (dump_on() && ps.depth && ps.depth_tex) {
         char what[64];
-        snprintf(what, sizeof what, "pass depth prog %016llx", (unsigned long long)pass().prog);
-        dump_image(cmd, pass().depth_tex, pass().depth_level, pass().depth_layer, what);
+        snprintf(what, sizeof what, "pass depth prog %016llx", (unsigned long long)ps.prog);
+        dump_image(cmd, ps.depth_tex, ps.depth_level, ps.depth_layer, what);
     }
     if (dump_on())
         for (Texture* t : dump_sampled()) {
             char what[64];
-            snprintf(what, sizeof what, "sampled by %016llx", (unsigned long long)pass().prog);
+            snprintf(what, sizeof what, "sampled by %016llx", (unsigned long long)ps.prog);
             static const bool all_layers = getenv("RX_VK_DUMP_ALL_LAYERS") != nullptr;   // (Triforce: every layer of an array)
             for (uint32_t l = 0; l < std::min<uint32_t>(t->layers, all_layers ? 256 : 2); l++) dump_image(cmd, t, 0, l, what);
             if (t->guest_size >= (8u << 20)) texture_log_guest(t);   // (and what the game's memory holds of it)
             for (uint32_t lv = 1; t->layers == 1 && lv < std::min<uint32_t>(t->levels, 8); lv++) {   // (every level)
-                snprintf(what, sizeof what, "sampled by %016llx level %u", (unsigned long long)pass().prog, lv);
+                snprintf(what, sizeof what, "sampled by %016llx level %u", (unsigned long long)ps.prog, lv);
                 dump_image(cmd, t, lv, 0, what);
             }
         }
     dump_sampled().clear();
-    pass().prog = 0;
+    ps.prog = 0;
 }
 
 bool pass_carry_take() {
@@ -7086,7 +7631,7 @@ void log_dump_draw(const NvnState& s, const Program& p, const DrawArgs& d) {
         const nvn_p_bind_buf& u = s.ubo[0][i];
         if (!u.addr) continue;
         float f[16] = {};
-        const bool upd = ub_overlay(u.addr, sizeof f, (uint8_t*)f, [](uint64_t) { return (uint64_t)0; }) != UINT64_MAX;
+        const bool upd = ub_overlay(u.addr, sizeof f, (uint8_t*)f, [](uint64_t, uint64_t) { return (uint64_t)0; }, 0) != UINT64_MAX;
         if (!upd) host->gpu_read(u.addr, f, sizeof f);
         n += snprintf(line + n, sizeof line - n, " C%d%s %#llx+%#llx [", i + 3, upd ? "*" : "", (unsigned long long)u.addr,
                       (unsigned long long)u.size);
@@ -7114,7 +7659,7 @@ void log_dump_draw(const NvnState& s, const Program& p, const DrawArgs& d) {
         if (!u.addr) continue;
         float f[16] = {};
         // (as the draw reads it: guest memory with the stream's uniform updates over it; '*': updated)
-        const bool upd = ub_overlay(u.addr, sizeof f, (uint8_t*)f, [](uint64_t) { return (uint64_t)0; }) != UINT64_MAX;
+        const bool upd = ub_overlay(u.addr, sizeof f, (uint8_t*)f, [](uint64_t, uint64_t) { return (uint64_t)0; }, 0) != UINT64_MAX;
         if (!upd) host->gpu_read(u.addr, f, sizeof f);
         n += snprintf(line + n, sizeof line - n, " c%d%s %#llx+%#llx [", i + 3, upd ? "*" : "", (unsigned long long)u.addr,
                       (unsigned long long)u.size);
@@ -8009,27 +8554,49 @@ bool fallback_buffers_of(const Program& p, FallbackBuffers*& out) {
     void* mapped = nullptr;
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                                      VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-    // (the records' header is the vertex stage's indirect draw and the mesh stage's indirect dispatch)
-    if (!create_buffer(records, usage | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, false, f.records, f.records_mem, &mapped)) return false;
-    f.records_address = fallback_buffer_address(f.records);
-    f.records_bytes = records;
-    if (!f.records_address) {
-        destroy_buffer(f.records, f.records_mem);
-        return false;
+    // ((Triforce, 11-21, the performance audit's MEM-154, after Source A's) A payload that fits no pair made a whole new
+    // pair, 64 MB of records with it, and the old pairs stay for the session. The records are the same size for every
+    // program, so the new pair takes the newest pair's and only the payload is made: shared for the reason all programs
+    // share one pair's already (a thread records its draws in order, each clears the slots it runs, and a barrier orders
+    // each dispatch after the draw before). RX_VK_FALLBACK_SHARED_RECORDS=0: a pair of its own, as before)
+    static const bool share = !(getenv("RX_VK_FALLBACK_SHARED_RECORDS") && atoi(getenv("RX_VK_FALLBACK_SHARED_RECORDS")) == 0);
+    const bool shared = share && !sets.empty() && sets.back().records && sets.back().records_bytes >= records;
+    if (shared) {
+        const FallbackBuffers& last = sets.back();
+        f.records = last.records, f.records_mem = last.records_mem;
+        f.records_address = last.records_address, f.records_bytes = last.records_bytes;
+    } else {
+        // (the records' header is the vertex stage's indirect draw and the mesh stage's indirect dispatch)
+        if (!create_buffer(records, usage | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, false, f.records, f.records_mem, &mapped)) return false;
+        f.records_address = fallback_buffer_address(f.records);
+        f.records_bytes = records;
+        if (!f.records_address) {
+            destroy_buffer(f.records, f.records_mem);
+            return false;
+        }
     }
+    // (records another pair holds too are not this one's to free)
+    const auto drop_records = [&] {
+        if (!shared) destroy_buffer(f.records, f.records_mem);
+    };
     if (payload) {
         if (!create_buffer(payload, usage, false, f.payload, f.payload_mem, &mapped)) {
-            destroy_buffer(f.records, f.records_mem);
+            drop_records();
             return false;
         }
         f.payload_address = fallback_buffer_address(f.payload);
         f.payload_bytes = payload;
         if (!f.payload_address) {
             destroy_buffer(f.payload, f.payload_mem);
-            destroy_buffer(f.records, f.records_mem);
+            drop_records();
             return false;
         }
     }
+    static std::atomic<int> told{0};
+    if (told++ < 16)
+        logf("vk: mesh fallback: a buffer pair for a recording thread: payload %llu MB, records %llu MB %s "
+             "(RX_VK_FALLBACK_SHARED_RECORDS=0: its own records each time)", (unsigned long long)(payload >> 20),
+             (unsigned long long)(f.records_bytes >> 20), shared ? "shared with the pair before" : "made");
     sets.push_back(f);
     out = &sets.back();
     return true;
@@ -8049,6 +8616,43 @@ bool fallback_compute_pipelines(Program& p) {
         std::lock_guard lk(mu);
         if (!p.fallback_compute.empty()) return true;
         if (failed.count({p.key, p.variant})) return false;
+    }
+    // ((Triforce, 11-22, the performance audit's PIPE-56, after Source A's) On RADV for GCN 1 to 4 and on Mesa's Intel driver,
+    // a program with a compute stage over the driver's size limit (fallback_size_policy.h: 50,000 phis on GCN; 20,000 phis or
+    // 200 calls on Mesa's Intel driver) is not handed to the driver at all: those builds took tens of GB and minutes and ended
+    // killed. It goes into the failed set as a refused build does, before any stage is built, and its draws are left out.
+    // RX_VK_FALLBACK_PHI_LIMIT / RX_VK_FALLBACK_CALL_LIMIT: the limits there, 0 none. Nothing is asked on any other driver
+    if (const fallback_size::Driver size_driver = fallback_size_driver(); size_driver != fallback_size::Driver::Other) {
+        static const fallback_size::Limits limits =
+            fallback_size::limits(size_driver, getenv("RX_VK_FALLBACK_PHI_LIMIT"), getenv("RX_VK_FALLBACK_CALL_LIMIT"));
+        for (size_t i = 0; i < p.stages.size(); i++) {
+            const Stage& st = p.stages[i];
+            if (st.vk_stage != VK_SHADER_STAGE_COMPUTE_BIT) continue;
+            const fallback_size::Size size = stage_size(st);
+            {   // (the largest stage seen, to measure the limits again: a line when it grows by a tenth, 16 at most)
+                static std::mutex seen_mu;
+                static fallback_size::Size largest;
+                static int seen_told = 0;
+                std::lock_guard lk(seen_mu);
+                const bool more = size.phis > largest.phis + largest.phis / 10 + 100 || size.calls > largest.calls + largest.calls / 10 + 10;
+                if (size.phis > largest.phis) largest.phis = size.phis;
+                if (size.calls > largest.calls) largest.calls = size.calls;
+                if (more && seen_told++ < 16)
+                    logf("vk: fallback: the largest compute stage so far: %u phis, %u calls (%016llx stage %zu; this driver's limits %u "
+                         "and %u, 0 none)", size.phis, size.calls, (unsigned long long)p.key, i, limits.phis, limits.calls);
+            }
+            if (!fallback_size::refused(limits, size)) continue;
+            {
+                std::lock_guard lk(mu);
+                failed.insert({p.key, p.variant});
+            }
+            static std::atomic<int> size_told{0};
+            if (size_told++ < 8)
+                logf("vk: fallback: stage %zu of %016llx has %u phis and %u calls, over this driver's limit of %u phis or %u calls "
+                     "(0: none; RX_VK_FALLBACK_PHI_LIMIT, RX_VK_FALLBACK_CALL_LIMIT): not built, its draws are left out",
+                     i, (unsigned long long)p.key, size.phis, size.calls, limits.phis, limits.calls);
+            return false;
+        }
     }
     std::vector<VkPipeline> made(p.stages.size(), VK_NULL_HANDLE);
     bool any = false;
@@ -8262,6 +8866,7 @@ void bind_index(VkCommandBuffer cmd, VkBuffer buffer, VkDeviceSize offset, VkInd
     const uint64_t b = (uint64_t)(uintptr_t)buffer;
     if (index_bind_same(b, (uint64_t)offset, (uint32_t)type, last_ib.buffer, last_ib.offset, last_ib.type, last_ib.on))
         return;
+    FINE_N(FC_IBIND_MADE, 1);
     vkCmdBindIndexBuffer(cmd, buffer, offset, type);
     last_ib = {b, (uint64_t)offset, (uint32_t)type, true};
 }
@@ -8458,9 +9063,16 @@ static bool fallback_list_held(uint64_t list) {
 
 static bool program_writes_memory(const Program& p);   // ((Triforce) writes_memory, kept per program: below draw())
 void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
+    Pass& ps = pass();   // ((Triforce, 11-22, DESC-20) once a call: the thread's one Pass, reset in place, never swapped (TLS_OBJECT(pass))
+    lab_ab::each(lab_ab::E_DRAW);   // ((Triforce, 11-22, REPLAY-51) the lab's e_draw: a wait at each draw, before the profile's clock
     PROF_HOT(PROF_DRAW);
     FINE_N(FC_DRAWS, 1);
     stats_tick();
+    {   // ((Triforce, 11-21, a lab measure only) RX_VK_LAB_NODRAW=1: every draw left out before its pass, pipeline, descriptors
+        // and commands: the picture is wrong, the frame rate says what the per-draw work costs the frame at most)
+        static const bool nodraw = getenv("RX_VK_LAB_NODRAW") && atoi(getenv("RX_VK_LAB_NODRAW")) == 1;
+        if (nodraw) SKIP_HERE();
+    }
     if (occ_live) occ_draw_enter();   // (Triforce, RX_VK_OCC_QUERY: a draw a samples-passed count wants; occ_draw_issued below)
     mesh_indirect_convert(cmd, d);   // (EvilOOT: before the pass opens; sets mesh_conv_buf for the mesh draw below)
     VkPrimitiveTopology topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -8636,7 +9248,26 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     };
     if (!cp->ready.load(std::memory_order_acquire)) {
         if (legacy_translation_skip && targets_persistent(at)) return left_out_pending(), void(st_pending_skips++);
-        wait_for(cp->ready, st_shader_wait_us);
+        // ((Triforce, 11-22, the performance audit's PIPE-30, after Source A's; translate_wait.h) RX_VK_TRANSLATE_WAIT_MS: into
+        // targets that hold an earlier frame, a program whose key is known to write no memory is waited for at most what the
+        // frame's budget has left, the job hurried but not run here, then left out; a spent budget leaves it out at once)
+        if (translate_wait_ms() && !always_wait) {
+            const uint64_t frame = texture_frame_no();
+            const translate_wait::Act a = translate_wait::choose(translate_wait_ms(), pass_kept(at, pipe_skip_new()),
+                                                                 translate_notes().clean(cp->key), translate_pool().left(frame));
+            if (a != translate_wait::Act::AsBefore) {
+                bool got = false;
+                if (a == translate_wait::Act::Bounded) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    got = jobs_wait_for(cp->ready, (int)std::max<int64_t>(1, translate_pool().left(frame) / pipe_wait::kMs));
+                    note_wait(t0, st_shader_wait_us);
+                    translate_pool().charge(frame, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+                    st_translate_bounded.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (!got) return st_translate_left.fetch_add(1, std::memory_order_relaxed), left_out_pending(), void(st_pending_skips++);
+            }
+        }
+        if (!cp->ready.load(std::memory_order_acquire)) wait_for(cp->ready, st_shader_wait_us);
     }
     if (exposure_log_on() && cp) exposure_note(s, *cp);
     if (cp->failed) SKIP_HERE();
@@ -8676,9 +9307,15 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         const bool full = kept && !writes && full_screen_draw(s, at, d);
         const bool held = full && hold_takes_frame();
         const uint64_t frame = texture_frame_no();
+        // ((Triforce, 11-22, PIPE-29) RX_VK_PIPE_DEPTH_BUDGET: a depth-tested draw into a pass drawn once, its shaders writing
+        // nothing, no samples-passed count open, not the icon capture's kept targets; one whose wait ran out: left out at once)
+        const bool depth_new = !always_wait && !kept && pipe_depth_budget() && at.depth && s.ds.dt && !targets_persistent(at) &&
+                               !writes_memory(p) && !occ_counting_now();
+        const bool depth_out = depth_new && pipe_depth_timed_out(pe);
         const pipe_wait::Choice c = always_wait ? pipe_wait::Choice{pipe_wait::Act::WaitAll}
+                                    : depth_out ? pipe_wait::Choice{pipe_wait::Act::Skip}
                                                 : pipe_wait::choose(rules, kept, writes, full, held, pipe_pool().left(frame),
-                                                                    pipe_last().left(frame));
+                                                                    pipe_last().left(frame), depth_new);
         if (!always_wait && !kept && targets_persistent(at)) st_pipe_new_waits++;   // (by the new colour target alone: RX_VK_PIPE_SKIP_NEW)
         if (c.act == pipe_wait::Act::WaitAll) {
             wait_for(pe->ready, st_pipe_wait_us);   // ((Triforce) a pipeline's wait, as pipe_wait_for's: the overlay's Pipeline waits)
@@ -8689,10 +9326,18 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
                 got = pipe_wait_for(pe->ready, c.ns);
                 const int64_t spent = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
                 (c.kind == pipe_wait::K_LAST ? pipe_last() : pipe_pool()).charge(frame, spent);
-                if (c.kind != pipe_wait::K_ONESHOT) st_pipe_full_waits++;
+                if (c.kind == pipe_wait::K_DEPTH) st_pipe_depth_waits.fetch_add(1, std::memory_order_relaxed);
+                else if (c.kind != pipe_wait::K_ONESHOT) st_pipe_full_waits++;
             }
             if (!got) {
                 if (full) (held ? st_pipe_full_held : st_pipe_full_left)++;
+                if (depth_new) {   // ((Triforce, 11-22, PIPE-29) ran out of time (or the pool was spent): left out at once from now on)
+                    pipe_depth_time_out(pe);
+                    const int64_t n = st_pipe_depth_left.fetch_add(1, std::memory_order_relaxed);
+                    if (n < 16)
+                        logf("vk: a depth-tested draw of %016llx into a pass drawn once is left out: its pipeline is not built "
+                             "within the frame's wait (RX_VK_PIPE_DEPTH_BUDGET)", (unsigned long long)p.key);
+                }
                 return left_out_pending(), void(st_pending_skips++);
             }
         }
@@ -8945,25 +9590,34 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         FINE_SCOPE(FT_HAZARD);
         begin_pass(cmd, at);
     }
-    probe_draw(s, p, pass().draws);   // (hookshot: RX_VK_PROBE)
+    probe_draw(s, p, ps.draws);   // (hookshot: RX_VK_PROBE)
     gprof_run(cmd, p.key);   // (RX_VK_PASS_TIMING=2)
-    pass().prog = p.key;
-    if (!pass().first_prog) pass().first_prog = p.key;
+    ps.prog = p.key;
+    if (!ps.first_prog) ps.first_prog = p.key;
     for (const Texture* t : gfx_sampled()) {
-        if (std::find(pass().sampled.begin(), pass().sampled.end(), t) != pass().sampled.end()) continue;
-        pass().sampled.push_back(t);
+        if (std::find(ps.sampled.begin(), ps.sampled.end(), t) != ps.sampled.end()) continue;
+        ps.sampled.push_back(t);
         int slot = -1;
         for (int i = 0; i < at.n; i++)
             if (at.color[i] == t) { slot = i; break; }
         if (slot < 0 && at.depth == t) slot = 8;
-        if (slot >= 0) pass().sampled_targets |= (uint16_t)(1u << slot);
+        if (slot >= 0) ps.sampled_targets |= (uint16_t)(1u << slot);
     }
-    pass().written |= writes;
+    ps.written |= writes;
     const bool bound = pl != last_pipeline;
     if (bound) {
         FINE_SCOPE(FT_BINDPL);
         FINE_N(FC_BIND_PIPE, 1);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl), last_pipeline = pl;
+        // ((Triforce, 11-22) a mesh pipeline has the vertex strides static (only the other pipelines have them dynamic,
+        // build_graphics' dyn): binding it leaves the strides undefined for the next pipeline that has them dynamic, as it does
+        // the topology (dyn_pack sets that again after a mesh draw). The next vertex draw binds all 16 streams again, strides
+        // too: the set already bound (vertex_set_same) and the streams that did not change (vertex_bind_range, 0.6.0) were left
+        // with whatever strides the driver kept. Off by default: in the lab it cost the Market about 3% (the replay's submit 8.5 ->
+        // 9.1 ms a frame, the mesh draws' binds coming between the vertex draws' all frame), and the tickets it may answer are not
+        // reproduced; RX_VK_MESH_VB_REBIND=1: on, for a player's test)
+        static const bool mesh_vb_rebind = getenv("RX_VK_MESH_VB_REBIND") && atoi(getenv("RX_VK_MESH_VB_REBIND")) != 0;
+        if (p.mesh && mesh_vb_rebind) last_vb_valid = false, vertex_set.on = false;
     }
     // ((Triforce) the pipeline has the shading rate dynamic: set right after its bind, before anything can leave the draw out, so
     // that a later draw that finds it bound finds the rate set too; draw_rate)
@@ -9057,7 +9711,13 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         }
     }
     StatsQuery stats_query(cmd, p.key, d);   // (EvilOOT, RX_VK_DRAW_STATS)
-    if (occ_live && pass().open) occ_draw_begin(cmd);   // (Triforce, RX_VK_OCC_QUERY: a count's first draw of the pass begins its query)
+    // ((Triforce, 11-22, the performance audit's GPUWORK-01, after Source A's) a draw that writes a colour target (its write
+    // mask, as draw_hazards made it: bit 8 is the depth's) is told to the count first: counted for the occlusion line, and
+    // with RX_VK_OCC_DEPTH_ONLY=1 the count is given up, its open query ended before this draw)
+    if (occ_live && ps.open && (writes & 0xFF)) occ_draw_colour(cmd);
+    if (occ_live && ps.open) occ_draw_begin(cmd);   // (Triforce, RX_VK_OCC_QUERY: a count's first draw of the pass begins its query)
+    // ((Triforce, 11-22, DESC-82) RX_VK_OCC_LEAN=3: a draw the open query counts that writes no colour, in the census)
+    if (occ_live && ps.open && !(writes & 0xFF) && occ_lean_census_on() && occ_counting()) occ_lean_note(p, s);
     if (stats_frame_now() && stats_prog_wanted(p.key)) {   // (and the wanted programs' buffers: a mesh draw's stages, fragment)
         for (const int stage : {6, 7, 1, 0}) stats_dump_stage(p.key, s, stage);
         // (and as the GPU holds them, after it: RX_VK_GPU_DUMP=1 only; its bindings can sync a pool's mirror mid-frame, and
@@ -9069,7 +9729,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         if (p.fallback) {   // (hookshot: the generated vertex stage reads the records; one vertex a corner)
             vkCmdDrawIndirect(cmd, fallback_draw_records, 0, 1, sizeof(VkDrawIndirectCommand));   // (its count: the records taken)
             st_mesh++;
-            st_draws++, pass().draws++;
+            st_draws++, ps.draws++;
             if (occ_live) occ_draw_issued();
             return;
         }
@@ -9156,7 +9816,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
                     vkCmdDrawMeshTasksIndirectEXT(cmd, mesh_conv_buf, mesh_conv_off, conv_n, 12);
                 mesh_conv_buf = VK_NULL_HANDLE;
                 st_mesh++;
-                st_draws++, pass().draws++;
+                st_draws++, ps.draws++;
                 if (occ_live) occ_draw_issued();
                 return;
             }
@@ -9188,7 +9848,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
                                   (uint32_t)std::max(d.groups[2], 1));
         }
         st_mesh++;
-        st_draws++, pass().draws++;
+        st_draws++, ps.draws++;
         if (occ_live) occ_draw_issued();
         return;
     }
@@ -9286,7 +9946,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         push_capture(cmd, p, s, d, at, topo, false);
         vkCmdDrawIndexed(cmd, quads * 6, (uint32_t)std::max(1, d.instances), 0, d.indexed ? d.base_vertex : 0,
                          (uint32_t)d.base_instance);
-        st_draws++, pass().draws++;
+        st_draws++, ps.draws++;
         if (occ_live) occ_draw_issued();
         return;
     }
@@ -9312,28 +9972,42 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     } else if (d.indexed) {
         const uint32_t unit = d.itype == 0 ? 1 : d.itype == 1 ? 2 : 4;
         BufferRef ib;
+        // ((Triforce, 11-21, the performance audit's DESC-12) the buffer bound at 0 and the draw's offset as its first index,
+        // so that draws at different offsets of one buffer bind it once: index_rebase.h. RX_VK_INDEX_REBASE=0: at the draw's
+        // own offset, first index 0, as before)
+        static const bool rebase_on = index_rebase::on(getenv("RX_VK_INDEX_REBASE"));
+        uint32_t first_index = 0;
         {
             FINE_SCOPE(FT_VERTEX);
             ib = gpu_buffer_bind(d.ibuf, (uint64_t)std::max(d.count, 1) * unit, false);
             if (!ib) SKIP_HERE();
             FINE_N(FC_IBIND, 1);
-            bind_index(cmd, ib.buffer, ib.offset, itype);
+            const bool rebased = rebase_on && index_rebase::rebase((uint64_t)ib.offset, unit, &first_index);
+            bind_index(cmd, ib.buffer, rebased ? 0 : ib.offset, itype);
         }
         push_capture(cmd, p, s, d, at, topo, true);
         FINE_SCOPE(FT_DRAWCALL);
-        vkCmdDrawIndexed(cmd, (uint32_t)d.count, (uint32_t)std::max(1, d.instances), 0, d.base_vertex, (uint32_t)d.base_instance);
+        vkCmdDrawIndexed(cmd, (uint32_t)d.count, (uint32_t)std::max(1, d.instances), first_index, d.base_vertex, (uint32_t)d.base_instance);
     } else {
         push_capture(cmd, p, s, d, at, topo, true);
         FINE_SCOPE(FT_DRAWCALL);
         vkCmdDraw(cmd, (uint32_t)d.count, (uint32_t)std::max(1, d.instances), (uint32_t)d.first, (uint32_t)d.base_instance);
     }
-    st_draws++, pass().draws++;
+    st_draws++, ps.draws++;
     if (occ_live) occ_draw_issued();
 }
 // ((Triforce, redrawn.h) asked at every draw: a walk of the stages' few descriptor lists. Not kept in the Program: a field
 // there changes sizeof(Program), which the program cache's stamp holds (vk_shader.cpp disk_stamp), and every player's
 // program and pipeline caches would be thrown away at the update (272 -> 280 bytes did that, 11-18))
 static bool program_writes_memory(const Program& p) { return writes_memory(p); }
+/// ((Triforce, 11-22, PIPE-30; translate_wait.h) A translated graphics program's key noted as writing memory or not, where
+/// RX_VK_TRANSLATE_WAIT_MS is set: graphics_pipeline's new entry and the precompile's loads. (In the unnamed namespace its
+/// declaration above graphics_pipeline is in)
+namespace {
+void translate_note(const Program& p) {
+    if (translate_wait_ms() && !p.failed && !p.compute) translate_notes().note(p.key, writes_memory(p));
+}
+}  // namespace
 
 /// A dispatch over 2 ms is logged, 60 times, and only while RX_VK_SLOW_DISPATCH is set. Off, the clock is not read.
 bool slow_dispatch_timing() {
@@ -9565,7 +10239,14 @@ bool upscale_stub(VkCommandBuffer cmd, const NvnState& s, uint64_t key) {
         if (a > in_area) in = t, in_area = a, in_h = s.tex[5][i];
     }
     if (!in_area) return declined("it samples no texture of its output's kind that it does not also write");
-    if (out_area <= in_area) return declined("its output is no larger than its input: not an upscale's last pass");
+    // ((Triforce, 11-22, the performance audit's GPUWORK-21, after Source B's and Source A's; stub_same_size.h) a gameplay
+    // network's output as large as its input is taken too: 9dc98871eb7fc101, the network of Render resolution 100%, where it
+    // was left out or did not translate. Declined, nothing wrote the picture: a black 3D under the HUD. Any other program of
+    // that shape is still declined. RX_VK_STUB_SAME_SIZE=0: declined, as before (read once)
+    static const bool same_size = stub_same_size::on(getenv("RX_VK_STUB_SAME_SIZE"));
+    const bool gameplay = gameplay_network(key);
+    if (!stub_same_size::sized(out_area, in_area, gameplay, same_size))
+        return declined("its output is no larger than its input: not an upscale's last pass");
     // (Triforce, the parallel replay: a segment's worker records this dispatch too, and the texture cache is the recording
     // lock's (ParLock), as for every other caller: texture_get may make a texture or upload one, which changes the cache's
     // tables and the staging arenas under any other worker's hands. Not held across the temporal upscaler below, which takes
@@ -9621,8 +10302,11 @@ bool upscale_stub(VkCommandBuffer cmd, const NvnState& s, uint64_t key) {
     }
     // Failed upscales can receive RGB9E5 bits in a shared R11 image, including the 75% gameplay TAAU.
     // Match the observed base-level 2D case only; other fallbacks keep their existing blit.
+    // ((Triforce, 11-22, GPUWORK-21) and the other gameplay network too: the typed upscale reads the scene as what it is and
+    // undoes the network's square-root encoding, where the blit below copies the encoded bits. RX_VK_STUB_SAME_SIZE=0: the
+    // 3/4 network alone, as before)
     const bool gameplay_taau = key == 0xfd029a317a9a4b94ull;
-    if ((!gameplay_network(key) || gameplay_taau) && in.d.format == NVN_FORMAT_RGB9E5F && out.d.format == NVN_FORMAT_R11G11B10F &&
+    if (stub_same_size::typed(gameplay, gameplay_taau, same_size) && in.d.format == NVN_FORMAT_RGB9E5F && out.d.format == NVN_FORMAT_R11G11B10F &&
         src->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && dst->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 &&
         (fd.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) &&
         src->type == VK_IMAGE_TYPE_2D && dst->type == VK_IMAGE_TYPE_2D && src->depth == 1 && dst->depth == 1 &&
@@ -9661,7 +10345,7 @@ bool upscale_stub(VkCommandBuffer cmd, const NvnState& s, uint64_t key) {
             }
         }
     }
-    if (gameplay_taau && in.d.format == NVN_FORMAT_RGB9E5F && out.d.format == NVN_FORMAT_R11G11B10F &&
+    if (stub_same_size::warns(gameplay, gameplay_taau, same_size) && in.d.format == NVN_FORMAT_RGB9E5F && out.d.format == NVN_FORMAT_R11G11B10F &&
         src->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && dst->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
         static std::atomic<bool> warned_gameplay_upscale{false};
         if (!warned_gameplay_upscale.exchange(true, std::memory_order_relaxed))
@@ -9690,6 +10374,13 @@ bool upscale_stub(VkCommandBuffer cmd, const NvnState& s, uint64_t key) {
     return true;
 }
 
+/// ((Triforce, 11-22, the performance audit's DESC-30) The lab's "diagold" phases (RX_VK_LAB_AB=diagold): a dispatch's
+/// diagnostics as they were before DESC-30, for measuring it inside one run: the keys written out as text and compared as
+/// text (taau_key, RX_VK_LOG_PUSH), a clock pair around every program pick, the first-pipeline clock read at every dispatch.
+/// Nothing reads it without that variable
+bool dispatch_diag_old() {
+    return lab_ab::on("diagold");
+}
 /// (hookshot) OoT's gameplay TAAU network (fd029a317a9a4b94) stood in for: its input upscaled into its output
 /// (shaders/taau_upscale.comp). The network's translation loses the blue channel, the yellow cast over every
 /// scene; with this the picture is right, without the network's temporal anti-aliasing.
@@ -9700,6 +10391,42 @@ bool taau_key(uint64_t key) {
     static const char* keys = getenv("RX_VK_TAAU_KEYS") ? getenv("RX_VK_TAAU_KEYS")
                               : Shader::Backend::SPIRV::mma_software || getenv("RX_VK_NO_F16")
                                     ? "fd029a317a9a4b94" : "-";   // (RX_VK_NO_F16: vk_shader.cpp leaves the network out)
+    // ((Triforce, 11-22, the performance audit's DESC-30, after Source A's and Source B's) The list parsed once into (value,
+    // mask) prefixes, as RX_VK_SKIP_PROG's is in draw(): this is asked several times at every compute dispatch, and each time
+    // the key was written out as text and the list walked. The same answers: an entry is up to 16 lower-case hex digits and
+    // matches the keys that begin with them; an empty one, one that begins with '-', one with any other character or more
+    // than 16 never matches (the text compare ran into the key's end, or met a character a key's text never has)
+    struct Prefix {
+        uint64_t value, mask;
+    };
+    static const std::vector<Prefix> prefixes = [] {
+        std::vector<Prefix> list;
+        for (const char* q = keys; *q;) {
+            const char* e = q;
+            while (*e && *e != ',') e++;
+            const size_t n = (size_t)(e - q);
+            uint64_t v = 0;
+            bool hex_only = n > 0 && n <= 16;
+            for (size_t i = 0; hex_only && i < n; i++) {
+                const char c = q[i];
+                if (c >= '0' && c <= '9') v = v << 4 | (uint64_t)(c - '0');
+                else if (c >= 'a' && c <= 'f') v = v << 4 | (uint64_t)(c - 'a' + 10);
+                else hex_only = false;
+            }
+            if (hex_only) {
+                const unsigned shift = 4 * (16 - (unsigned)n);
+                list.push_back({v << shift, ~0ull << shift});
+            }
+            q = *e ? e + 1 : e;
+        }
+        return list;
+    }();
+    if (!dispatch_diag_old()) {
+        for (const Prefix& p : prefixes)
+            if ((key & p.mask) == p.value) return true;
+        return false;
+    }
+    // (the lab's "diagold" phases: the text compare, as it was)
     char hex[24];
     snprintf(hex, sizeof hex, "%016llx", (unsigned long long)key);
     bool match = false;
@@ -9959,10 +10686,29 @@ static bool temporal_rejected_network(VkCommandBuffer cmd, uint64_t key, Texture
              (unsigned long long)key, src->width, src->height, dst->width, dst->height);
     return true;
 }
+/// ((Triforce, 11-22, the performance audit's GPUWORK-20, after Source A's) The upscaler Off: RX_VK_UPSCALE_OFF=1, or the
+/// lab's "upoff" phases. Every gameplay upscale network is left out and its input stretched into its output
+/// (upscale_off.h). It is reached only while the game's own upscaler draws: DLSS, FSR 3.1 and FSR 4 take the dispatch
+/// first (compute_dispatch's order). The compile skips keep asking taau_key alone, so the networks are made as before.
+static bool upscale_off_on() {
+    static const bool env = getenv("RX_VK_UPSCALE_OFF") && atoi(getenv("RX_VK_UPSCALE_OFF")) > 0;
+    return env || lab_ab::on("upoff");
+}
 bool taau_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
-    if (!taau_key(p.key) || !dev.push_descriptor || !vkCmdPushDescriptorSetKHR || p.stages.empty()) return false;
+    if (!dev.push_descriptor || !vkCmdPushDescriptorSetKHR || p.stages.empty()) return false;
     const Stage& st = p.stages[0];
+    const bool off = upscale_off_on();
+    const bool shaped = off && st.info.uses_cooperative_matrix && st.info.texture_descriptors.size() == 1 &&
+                        st.info.image_descriptors.size() == 1;
+    const upscale_off::Choice ch = upscale_off::choose(taau_key(p.key), off, gameplay_network(p.key), shaped);
+    if (!ch.stand_in) return false;
     if (st.info.texture_descriptors.empty() || st.info.image_descriptors.empty()) return false;
+    if (ch.by_shape) {   // (a network of that shape that is not a gameplay upscale, a movie's: its input is not the scene's format)
+        Texture* in = nullptr;
+        const uint32_t in_handle = handle_of(s, st, st.info.texture_descriptors[0], 0);
+        if (in_handle) texture_view_of(in_handle, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Sample, VK_FORMAT_UNDEFINED, &in);
+        if (!in || in->format != VK_FORMAT_E5B9G9R9_UFLOAT_PACK32) return false;
+    }
     size_t ntex = 0;   // (build_descriptors' image infos: the textures', then the images')
     for (const auto& d : st.info.texture_descriptors) ntex += d.count;
     if (dw().imgs.size() <= ntex || !dw().imgs[0].imageView || !dw().imgs[ntex].imageView) return false;
@@ -9973,11 +10719,11 @@ bool taau_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
     if (!handle) return false;
     texture_view_of(handle, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Storage, image_format(od.format), &out, &level);
     if (!out || out->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32) return false;
-    const char* keys = getenv("RX_VK_TAAU_KEYS") ? getenv("RX_VK_TAAU_KEYS") : "fd029a317a9a4b94";
+    const char* keys = !ch.temporal ? "the upscaler Off" : getenv("RX_VK_TAAU_KEYS") ? getenv("RX_VK_TAAU_KEYS") : "fd029a317a9a4b94";
     bool done;
     {
         ParLock lk;   // (Triforce: typed_upscale's pipeline and history images are shared by every recording thread: upscale_stub)
-        done = typed_upscale(cmd, dw().imgs[0].imageView, dw().imgs[ntex].imageView, out, level, p.key, keys, true);
+        done = typed_upscale(cmd, dw().imgs[0].imageView, dw().imgs[ntex].imageView, out, level, p.key, keys, ch.temporal);
     }
     if (done) hudless_after_dispatch(cmd, p.key);   // ((Triforce, FG-2) the picture it wrote in the network's place, before the HUD)
     return done;
@@ -10221,12 +10967,16 @@ constexpr uint32_t kWarmRecipe = 2;   // (2: the libraries are in our pipeline c
 // selects of AMD's older compiler, spv_nan_select.h: those modules are new to every cache of the driver's), kRateRecipe in the
 // driver's part where warm_libraries also makes the shading rate's libraries (pipeline_rate). Counted up as kWarmRecipe is)
 constexpr uint32_t kModulePatches = 1, kRateRecipe = 1;
+// ((Triforce, 11-21) and kMeshOptRecipe where the task and mesh pipelines are built with the optimizer by the RADV rule
+// (mesh_opt_recipe): RADV with native mesh shaders, RX_VK_MESH_OPT unset. Those pipelines are not what the driver's caches hold
+// from a build without it, so the driver's part is made again before the title, not met cold in play)
+constexpr uint32_t kMeshOptRecipe = 1;
 uint32_t module_patches() {
     static const bool nan_selects = spv_nan_select::on(getenv("RX_VK_NAN_SELECTS"));   // (as make_module reads it)
     // ((Triforce, 11-19) and 2: the water's simplification, v0.5.2's RX 470 .. 590 port, which came without a new stamp: shader_water_mode)
     return (dev.fixes.nan_bits && nan_selects ? 1u : 0u) | (shader_water_mode() ? 2u : 0u);
 }
-uint64_t warmed_stamp_of(bool libraries, uint32_t patches, bool rate) {
+uint64_t warmed_stamp_of(bool libraries, uint32_t patches, bool rate, bool mesh_opt) {
     uint64_t h = program_cache_stamp();
     const auto add = [&h](const void* d, size_t n) {
         for (size_t i = 0; i < n; i++) h = (h ^ ((const uint8_t*)d)[i]) * 1099511628211ull;
@@ -10240,28 +10990,29 @@ uint64_t warmed_stamp_of(bool libraries, uint32_t patches, bool rate) {
         add(p, sizeof p);
     }
     if (rate) add(&kRateRecipe, sizeof kRateRecipe);
+    if (mesh_opt) add(&kMeshOptRecipe, sizeof kMeshOptRecipe);
     return h;
 }
 /// What the pipelines built for the driver's caches are good for (the light precompile's record, the predicted pipelines')
 uint64_t warmed_stamp(bool libraries) {
-    return warmed_stamp_of(libraries, module_patches(), false);
+    return warmed_stamp_of(libraries, module_patches(), false, mesh_opt_recipe());
 }
 /// What the driver's part is good for (prepare_run, triforce_prepared.bin's second stamp): warmed_stamp's, and with the stage
 /// libraries on a device with dev.foliage_rate, the shading rate's libraries of the native mesh programs in it too (a folder
 /// warmed by a build that made none of them is warmed once more: the libraries it has come back from the cache)
 uint64_t libraries_stamp(bool libraries) {
-    return warmed_stamp_of(libraries, module_patches(), libraries && dev.foliage_rate);
+    return warmed_stamp_of(libraries, module_patches(), libraries && dev.foliage_rate, mesh_opt_recipe());
 }
 /// ((Triforce) What a pipeline cache file of this session's own holds pipelines for (<file>.own, pcache_own_mark): prepare_run's
 /// driver part's stamp
 uint64_t pcache_own_stamp() { return libraries_stamp(gpl_wanted() && !getenv("RX_VK_NO_WARM")); }
-/// ((Triforce) The skip list of the driver's part is its stamp's (gpl_rules.h skip_read). Where the stamp changed by the two
+/// ((Triforce) The skip list of the driver's part is its stamp's (gpl_rules.h skip_read). Where the stamp changed by the
 /// words above alone, it is the same driver with the same programs, and the variants it crashed on are left out still: carried
 /// over from the stamp it was, rather than met again in the driver's hands (one start lost to each)
 void warm_skip_carry(const std::string& skip, bool libraries, uint64_t now) {
     if (!gpl_rules::skip_read(skip, now).empty()) return;
-    for (int k = 0; k < 4; k++) {
-        const uint64_t was = warmed_stamp_of(libraries, k & 1 ? module_patches() : 0u, libraries && (k & 2));
+    for (int k = 0; k < 8; k++) {
+        const uint64_t was = warmed_stamp_of(libraries, k & 1 ? module_patches() : 0u, libraries && (k & 2), (k & 4) != 0);
         if (was == now) continue;
         const std::vector<gpl_rules::Id> ids = gpl_rules::skip_read(skip, was);
         if (ids.empty()) continue;
@@ -10748,7 +11499,7 @@ bool prepare_compute_pipeline(Program& p) {
     ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     ci.stage.module = p.stages[0].module;
     ci.stage.pName = "main";
-    pin_subgroup(ci.stage, p.workgroup[0]);
+    pin_compute(ci.stage, p);
     ci.layout = p.layout;
     if (getenv("RX_VK_NOOPT")) ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
     VkPipeline pl = VK_NULL_HANDLE;
@@ -10766,6 +11517,9 @@ bool prepare_compute_pipeline(Program& p) {
     if (built) {
         vkDestroyPipeline(dev.device, pl, nullptr);
         pcache_built_since_save++;
+        // ((Triforce, 11-22, PIPE-23) and for the main file's save: built straight into the main cache, it was counted nowhere
+        // a save looks, and a save with a play cache left the main file out (pcache_play.h save_what))
+        if (precompile_save::on(precompile_save_s())) pcache_main_built++;
     }
     if (p.layout) vkDestroyPipelineLayout(dev.device, p.layout, nullptr), p.layout = VK_NULL_HANDLE;
     if (p.set_layout) vkDestroyDescriptorSetLayout(dev.device, p.set_layout, nullptr), p.set_layout = VK_NULL_HANDLE;
@@ -10827,7 +11581,7 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
     const std::string path = prepared_path();
     PreparedFor prepared_for;
     double hash_ms = 0;
-    const PrepareWhy why = prepare_check(path, seed_path(), program_cache_stamp(), &prepared_for, &hash_ms);
+    PrepareWhy why = prepare_check(path, seed_path(), program_cache_stamp(), &prepared_for, &hash_ms);
     const bool libraries = gpl_wanted() && !getenv("RX_VK_NO_WARM");
     const uint64_t warmed = libraries_stamp(libraries);
     const std::string warming = path + ".warming";
@@ -10843,6 +11597,20 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
     // the compute pipelines the carried run built, again, from the program cache. The record says the shaders are translated
     // and their driver part is not made, so the stage libraries follow below, and nothing is translated again)
     if (!background && prepare_cs_again.exchange(false) && !warm_kept_computes(progress)) return false;
+    // ((Triforce, 11-22, after Casual Gamer's fix) recorded as prepared, but the program cache may have been made again since for
+    // another GPU or other settings: one of another stamp, or of its head alone, holds none of these shaders (prepare_again.h).
+    // Prepared again, the stale record removed first, so that a start closed in it goes on as from a first start)
+    static const bool recheck = prepare_again::on(getenv("RX_VK_PREPARE_RECHECK"));
+    if (why == PrepareWhy::None && !background && recheck && !getenv("RX_VK_NO_PROGRAM_CACHE")) {
+        const std::string programs = path.substr(0, path.find_last_of("\\/") + 1) + "triforce_programs.bin";
+        uint64_t size = 0;
+        if (prepare_again::programs_none_at(programs, program_cache_stamp(), &size)) {
+            logf("vk: the shaders are recorded as prepared, but the program cache (%llu KB) holds none of them (made again for another "
+                 "GPU or other settings since): preparing again (RX_VK_PREPARE_RECHECK=0: not)", (unsigned long long)(size >> 10));
+            remove(path.c_str());
+            why = PrepareWhy::First;
+        }
+    }
     if (why == PrepareWhy::None && !getenv("RX_VK_PREPARE_AGAIN")) {
         // (perf push 11-11: a shipped state list the notes were not made from, in a folder prepared already: its pipelines are
         // noted now, for the precompile that follows, as a prepare would have. See state_shipped_id)
@@ -10916,12 +11684,20 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
         // ((Triforce) with the stage libraries the part has a journal, and a start goes on with what the last one did not
         // end: warm_begin, gpl_rules.h. Without them it is as it was, below)
         if (!warm_begin(warming, warmed)) warm = warm_cs = false;
-    } else if (FILE* f = fopen(warming.c_str(), "rb")) {
-        fclose(f);
-        warm = warm_cs = false;
-        logf("vk: the last start did not finish the driver's part of the shaders: left out");
-    } else if (warm || warm_cs) {
-        if (FILE* w = fopen(warming.c_str(), "wb")) fclose(w);
+    } else {
+        // ((Triforce, 11-22, after Casual Gamer's fix) the mark holds what the part is made for (warmed: the GPU, the driver, the
+        // programs), as the libraries' journal does: another stamp's mark is another driver's, and the part goes on here. An empty
+        // one, an older build's, is this driver's as before (prepare_again.h; RX_VK_PREPARE_RECHECK=0: any mark, as before)
+        const prepare_again::Mark left = prepare_again::mark_left(warming, warmed, recheck);
+        if (left == prepare_again::Mark::Ours) {
+            warm = warm_cs = false;
+            logf("vk: the last start did not finish the driver's part of the shaders: left out");
+        } else {
+            if (left == prepare_again::Mark::Other)
+                logf("vk: the last start did not finish the driver's part of the shaders for another GPU, driver or programs: made "
+                     "for these now");
+            if (warm || warm_cs) prepare_again::mark_write(warming, warmed, recheck);
+        }
     }
     pcache_init();   // (once, here: the workers below build compute pipelines into it)
     std::atomic<size_t> next{0}, done{0}, made{0}, libs{0}, variants{0}, asking{0}, capped{0};
@@ -10940,8 +11716,22 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
     }
     // (hookshot) compute pipelines too, for the driver's own cache: built in play they stopped the game while the driver compiled
     // them, seconds each for the culling programs (53caac5f: 6.5 s, 41 s inlined), which looked like a hang
+    // ((Triforce, the Intel logs of 11-21) on Intel only the programs play dispatched (triforce_computes.bin) once there is a
+    // list: an Arc A750 spent 5175 s of this pass's 5858 s on compute pipelines, a tenth of which play asks for. warm_computes.h;
+    // RX_VK_WARM_COMPUTES=listed or all)
+    const bool cs_listed_only = warm_cs && warm_computes::listed_only(getenv("RX_VK_WARM_COMPUTES"), dev.props.vendorID);
+    const std::unordered_set<uint64_t> cs_listed = cs_listed_only ? computes_read() : std::unordered_set<uint64_t>{};
+    std::atomic<size_t> cs_left{0};
+    if (cs_listed_only)
+        logf("vk: the preparation's compute pipelines: %s (RX_VK_WARM_COMPUTES=all: every one, =listed: only those)",
+             cs_listed.empty() ? "every one, as no list of the programs play dispatched is there yet"
+                               : "only the programs play dispatched (triforce_computes.bin), the others when play first does");
     const auto warm_compute = [&](Program& p) {
         if (!warm_cs || taau_key(p.key)) return;
+        if (!warm_computes::build(cs_listed_only, cs_listed.empty(), cs_listed.count(p.key) != 0)) {
+            cs_left++;
+            return;
+        }
         // ((Triforce) named for the carry's rebuild, which builds it again into a fresh cache (warm_kept_computes); and not
         // built into a carried cache past what it may hold: that one is let go, pcache_carry.h)
         if (pcache_carried) {
@@ -10992,7 +11782,7 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
         }
     };
     std::vector<std::thread> threads;
-    const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
+    const unsigned cpus = std::max(1u, cpu_count());
     // (in play: a quarter of the CPUs, two to four, the game's own threads before them. Before the title nothing of the game
     // runs: prepare_workers, every processor where the PC's memory and the process's priority allow it; (Triforce) fewer on
     // AMD's driver for RDNA 1 and 2, prepare_translate_workers)
@@ -11027,6 +11817,9 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
     logf("vk: prepared %zu shader programs%s (%zu new, %lld failed, %zu compute pipelines; %zu compute variants, %zu programs with "
          "texture variants, %zu at the limit) in %.1f s", programs, background ? " in play" : "", made.load(), (long long)failed, libs.load(), variants.load(),
          asking.load(), capped.load(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    if (cs_left.load())
+        logf("vk: the preparation left %zu compute variants of programs play has not dispatched to their first dispatch "
+             "(%zu programs listed; RX_VK_WARM_COMPUTES=all builds them)", cs_left.load(), cs_listed.size());
     if (warm) {
         // (translated, whatever becomes of the libraries: a start that is closed in them goes on with them alone)
         prepared_for.warmed = 0;
@@ -11037,6 +11830,10 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
         }
     }
     if (!background) warm_end(warming);
+    // ((Triforce, 11-22, the performance audit's PIPE-23; precompile_save.h) a preparation without stage libraries built its
+    // compute pipelines into the main cache and ended without a save, where warm_libraries saves after its own: on the disk
+    // now, before the record says the part is made. The workers are joined. RX_VK_PRECOMPILE_SAVE_S=0: not, as before)
+    if (precompile_save::prepare_saves(precompile_save_s(), warm, background, libs.load())) pcache_saved_now();
     // (the driver's part left out, by a start that ended in it or in play, is not tried again for this driver: as before.
     // (Triforce) With the stage libraries that is after gpl_rules::kTries such starts in a row: warm_begin)
     prepared_for.warmed = warmed;
@@ -11175,6 +11972,20 @@ bool precompile_keeps_all() {
         uint64_t ws = 0, priv = 0;
         memory_process(&ws, &priv);
         // ((Triforce, 11-18) less what the pipeline cache's read added, but on AMD's driver: mem_parts.h own_for_keep)
+        // ((Triforce, 11-22, after Casual Gamer's fix) On a discrete GPU in a PC of under 20 GB, every pipeline is kept while the
+        // game is told its mapped pages are used (host/hos_mem.c query_used, HOS_MEM_QUERY_USED): it lets old areas go since,
+        // and the RAM the rule below spared costs less than the pipelines left to their first draw. A 16 GB laptop: ~0.6 GB more
+        // private memory, frames of 1 s or more 15 and 11 in two tours -> 3 and 6. Integrated GPUs keep the RAM rule (the
+        // pipelines' memory is the RAM the GPU has too); RX_VK_PRECOMPILE_KEEP=auto: the RAM rule, as before)
+        const bool discrete = dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+        const bool query_on =
+            mem_parts::query_used_on(getenv("HOS_MEM_QUERY_USED"), getenv("HOS_MEM_CENSUS"), getenv("HOS_MEM_GIVE_BACK"));
+        if (!e && mem_parts::keep_all_small_pc(discrete, ms.ullTotalPhys, query_on)) {
+            logf("vk: precompile: the pipelines it builds are kept for the session: a discrete GPU in a PC of %llu MB (under 20 GB), "
+                 "the game told its mapped pages are used (RX_VK_PRECOMPILE_KEEP=auto: by the RAM available, =0: never)",
+                 (unsigned long long)(ms.ullTotalPhys >> 20));
+            return true;
+        }
         const bool amd = dev.props.vendorID == 0x1002;
         const uint64_t cache_read = pcache_read_ws.load(), own = mem_parts::own_for_keep(ws, cache_read, amd);
         const bool keep = mem_parts::keep_all_pipelines(ms.ullTotalPhys, ms.ullAvailPhys, own);
@@ -11205,7 +12016,157 @@ void built_write(uint64_t stamp, const std::unordered_set<uint64_t>& keys) {
     all.insert(all.end(), keys.begin(), keys.end());
     if (FILE* f = fopen((pipe_notes_path() + ".built").c_str(), "wb")) fwrite(all.data(), 8, all.size(), f), fclose(f);
 }
+// ---- (Triforce, 11-22, the performance audit's PIPE-21, after Source A's and Source B's) Whether the caches still have what
+// <notes>.built says the light precompile built: built_check.h has why, the rules and what a start does when they do not ----
+int built_check_next = 0;   // (the strikes recorded once everything is built again: built_check::decide, built_check_made)
+VkComputePipelineCreateInfo compute_create_info(const Program& q);
+/// A light precompile's, at a start whose record (built, for stamp) is not empty, before it is trusted: up to
+/// built_check::kGraphics of the recorded notes asked of our caches as a draw asks, and with the record's compute key
+/// (computes_built) up to built_check::kComputes of the listed compute programs as a dispatch asks; without the flag that
+/// asks without compiling, the notes built twice and timed. True: cold, and everything is built again now, before the title
+/// (the caller forgets the record for this start). RX_VK_BUILT_CHECK=0: never looked at
+bool built_check_cold(const std::vector<std::unique_ptr<PipeNote>>& notes, const std::unordered_set<uint64_t>& built,
+                      uint64_t (*key_of)(const PipeNote&), bool computes_built, const std::vector<uint64_t>& computes_listed,
+                      uint64_t stamp) {
+    const int mode = built_check_mode();
+    if (!mode || built.empty()) return false;
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto ms = [](std::chrono::steady_clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
+    const bool ask = dev.vk13.pipelineCreationCacheControl;
+    std::vector<const PipeNote*> recorded;
+    for (const auto& n : notes)
+        if (built.count(key_of(*n))) recorded.push_back(n.get());
+    std::vector<built_check::Probe> probes;
+    const uint64_t seed = (uint64_t)t0.time_since_epoch().count() / 1000;
+    int graphics = 0, computes = 0;
+    for (const size_t i : built_check::spots(recorded.size(), (size_t)built_check::kLook, seed)) {
+        if (graphics >= built_check::kGraphics || prepare_stopped()) break;
+        const PipeNote& n = *recorded[i];
+        bool tried = false;
+        // (a copy of the program read for it and let go: the precompile has read none yet, and those in memory are not ours)
+        program_cache_borrow(n.prog, [&](Program& p) {
+            if (tried || p.variant != n.variant || p.failed || p.compute || p.stages.empty()) return;
+            tried = true;
+            ensure_layout(p);
+            built_check::Probe pr;
+            pr.asked = ask, pr.made = true;
+            for (int again = 0; again < (ask ? 1 : 2); again++) {
+                bool cold = false;
+                const auto b0 = std::chrono::steady_clock::now();
+                const VkPipeline pl = build_graphics(p, n.s, note_targets(n), (VkPrimitiveTopology)n.topo, -1, ask ? &cold : nullptr);
+                (again ? pr.again_ms : pr.first_ms) += ms(std::chrono::steady_clock::now() - b0);
+                if (pl) vkDestroyPipeline(dev.device, pl, nullptr);
+                else {   // (cold, or refused: neither says the caches have it)
+                    pr.answered_cold = cold, pr.made = false;
+                    break;
+                }
+            }
+            probes.push_back(pr);
+        });
+        graphics += tried;
+    }
+    // (the record's compute programs, asked as a dispatch asks: only where the caches can be asked without compiling)
+    if (computes_built && ask)
+        for (const size_t i : built_check::spots(computes_listed.size(), (size_t)built_check::kComputes, seed)) {
+            if (prepare_stopped()) break;
+            bool tried = false;
+            program_cache_borrow(computes_listed[i], [&](Program& p) {
+                if (tried || p.failed || !p.compute || p.stages.empty()) return;
+                tried = true;
+                ensure_layout(p);
+                VkComputePipelineCreateInfo ci = compute_create_info(p);
+                ci.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+                VkPipeline pl = VK_NULL_HANDLE;
+                built_check::Probe pr;
+                pr.asked = true;
+                const auto b0 = std::chrono::steady_clock::now();
+                const VkResult r = cached_compute(pcache_use().cache, &ci, &pl);
+                pr.first_ms = ms(std::chrono::steady_clock::now() - b0);
+                if (r == VK_SUCCESS && pl) pr.made = true, vkDestroyPipeline(dev.device, pl, nullptr);
+                else pr.answered_cold = r == VK_PIPELINE_COMPILE_REQUIRED;
+                probes.push_back(pr);
+            });
+            computes += tried;
+        }
+    const built_check::Tally t = built_check::tally(probes);
+    const built_check::Verdict v = built_check::verdict(t);
+    const std::string state = pipe_notes_path() + ".built.check";
+    const built_check::State had = built_check::state_read(state);
+    const built_check::Do d = built_check::decide(v, had, stamp, mode == 2, &built_check_next);
+    const double took = ms(std::chrono::steady_clock::now() - t0);
+    if (d == built_check::Do::Again) {
+        logf("vk: precompile's record: %d of %d pipelines asked of the caches were not there (%d graphics, %d compute asked; %s) "
+             "in %.0f ms, though the record lists them as built: the caches lost them (the pipeline cache's files gone or "
+             "refused, the driver's own cache cleared or full). Everything is built again now, before the title%s "
+             "(RX_VK_BUILT_CHECK=0: not looked at)", t.cold, t.got, graphics, computes,
+             ask ? "asked without compiling" : "each built twice and timed", took, mode == 2 ? " (RX_VK_BUILT_CHECK=2)" : "");
+        return true;
+    }
+    if (v == built_check::Verdict::Unknown) {
+        logf("vk: precompile's record: %d answers of the caches, too few to tell whether they still have what it lists (%.0f ms)",
+             t.got, took);
+    } else if (v == built_check::Verdict::Warm) {
+        if (had.found) remove(state.c_str());   // (kept this time: a strike of an earlier loss is forgotten)
+        logf("vk: precompile's record: the caches have what it lists (%d of %d asked were not there; %d graphics, %d compute "
+             "asked) in %.0f ms (RX_VK_BUILT_CHECK=0: not looked at)", t.cold, t.got, graphics, computes, took);
+    } else {
+        logf("vk: precompile's record: the caches lost what it lists again (%d of %d asked) right after it was built again: "
+             "they do not keep it on this PC, and those pipelines are left to their first draws, as before. The driver's own "
+             "shader cache may be too small for them (on NVIDIA: the control panel's Shader Cache Size). Remove %s to try "
+             "again", t.cold, t.got, state.c_str());
+    }
+    return false;
+}
+/// precompile_run's, after built_check_cold said cold and everything was built and recorded again: so that a start that
+/// finds them cold again right after leaves them to the draws (built_check::decide)
+void built_check_made(uint64_t stamp) {
+    const std::string state = pipe_notes_path() + ".built.check";
+    if (!built_check::state_write(state, stamp, built_check_next)) logf("vk: %s cannot be written", state.c_str());
+}
+/// The end of a light precompile that went by its record: the record's keys and, when it lists them, the compute programs,
+/// for the counter of play builds (built_play_build). Once
+void built_play_publish(const std::unordered_set<uint64_t>& built, uint64_t computes_key, const std::vector<uint64_t>& computes_listed) {
+    if (!built_check_mode() || built.empty() || built_play_keys.load(std::memory_order_acquire)) return;
+    std::vector<uint64_t> all(built.begin(), built.end());
+    if (built.count(computes_key)) all.insert(all.end(), computes_listed.begin(), computes_listed.end());
+    const std::vector<uint64_t>* keys = new std::vector<uint64_t>(built_check::sorted(std::move(all)));
+    const std::vector<uint64_t>* none = nullptr;
+    if (!built_play_keys.compare_exchange_strong(none, keys)) delete keys;
+}
 
+/// ((Triforce, 11-22, the performance audit's PIPE-23, after Source A's; precompile_save.h) The end of a precompile that
+/// keeps its pipelines, after build_s seconds of building: from RX_VK_PRECOMPILE_SAVE_S seconds (30) the pipeline cache is
+/// saved now, before the title, and the log says what that wrote or why nothing was. It was first saved in play, at
+/// present 300 after 32 more builds, on Intel only at a clean close: a crash or a kill before that cost the whole build
+/// again. The play file alone while there is a play cache (pcache_play_only_now); never while workers still build
+/// (gone_on), after a stop, or in a start that only prepares, which save by themselves
+void precompile_end_save(double build_s, bool gone_on) {
+    const int save_s = precompile_save_s();
+    if (!precompile_save::long_build(build_s, save_s)) return;
+    const bool stopped = prepare_stopped(), prepare_only = prepare_only_start();
+    if (!pcache || !precompile_save::due(build_s, save_s, gone_on, stopped, prepare_only)) {
+        logf("vk: precompile: %.0f s of building: %s (RX_VK_PRECOMPILE_SAVE_S)", build_s,
+             precompile_save::said(precompile_save::why_not(gone_on, stopped, prepare_only, pcache != VK_NULL_HANDLE)));
+        return;
+    }
+    const size_t main_was = pcache_saved_size.load(), play_was = pcache_play_saved.load();
+    const auto from = std::chrono::steady_clock::now();
+    {
+        struct Now {   // (pipeline_cache_save's play-only save on this thread: pcache_play_only_now)
+            Now() { pcache_play_only_now = true; }
+            ~Now() { pcache_play_only_now = false; }
+        } now;
+        pipeline_cache_save(true);
+    }
+    const size_t main_now = pcache_saved_size.load(), play_now = pcache_play_saved.load();
+    const size_t wrote = (main_now != main_was ? main_now : 0) + (play_now != play_was ? play_now : 0);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - from).count();
+    if (wrote)
+        logf("vk: precompile: %.0f s of building: %s (%zu KB in %.0f ms; RX_VK_PRECOMPILE_SAVE_S=0: not)", build_s,
+             precompile_save::said(precompile_save::Outcome::Saved), wrote >> 10, ms);
+    else
+        logf("vk: precompile: %.0f s of building: %s", build_s, precompile_save::said(precompile_save::Outcome::Nothing));
+}
 void precompile_run(void (*progress)(size_t done, size_t total)) {
     const auto t0 = std::chrono::steady_clock::now();
     // (a start that dies in here would die in here every time, the notes being what it builds from: a player saw the console reach
@@ -11228,6 +12189,9 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
     if (FILE* f = fopen(running.c_str(), "wb")) fprintf(f, "%d\n", ended_inside + 1), fclose(f);
     struct Done { const std::string& path; ~Done() { remove(path.c_str()); } } done_marker{running};
     pcache_init();
+    // ((Triforce) the texture converters' pipelines first, inside the marker: a driver that crashes making them counts as a start
+    // that did not get through, and the second such start plays without them, as before. RX_VK_TEX_PIPES_AHEAD)
+    texture_pipelines_warm();
     uint64_t ws0 = 0, priv0 = 0;   // ((Triforce) what its programs and pipelines cost the RAM: the memory line after it)
     memory_process(&ws0, &priv0);
     std::vector<uint32_t> note_at;   // ((Triforce) each note's record in the file, for the warm: warm_index_set)
@@ -11269,10 +12233,15 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
     const auto built_key = [](const PipeNote& n) {
         return dev.foliage_rate && n.n == 0 && depth_aspect((VkFormat)n.depth_format) ? mix(n.key, kRateLibrary) : n.key;
     };
+    bool rebuilt = false;   // ((Triforce, 11-22, PIPE-21) the record not trusted this start: built_check_cold)
     if (light) {
         built = built_read(built_stamp);
         computes_built = built.count(computes_key) != 0;
-        std::erase_if(notes, [&](const std::unique_ptr<PipeNote>& n) { return built.count(built_key(*n)) != 0; });
+        // ((Triforce, 11-22, the performance audit's PIPE-21) unless the caches lost it since, which a sample says
+        // (built_check.h). Cold, nothing is left out below: everything noted and listed is built again, and recorded anew)
+        if (!built.empty() && built_check_cold(notes, built, built_key, computes_built, computes_listed, built_stamp))
+            built.clear(), computes_built = false, rebuilt = true;
+        std::erase_if(notes,[&](const std::unique_ptr<PipeNote>& n) { return built.count(built_key(*n)) != 0; });
         logf("vk: precompile: RAM spared (RX_VK_PRECOMPILE_KEEP=1: as before): %zu of %zu noted pipelines were built by "
              "an earlier start and are left to their first draw%s", noted_n - notes.size(), noted_n,
              computes_built ? ", the compute programs' too" : "");
@@ -11293,6 +12262,7 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
     std::vector<Program*> computes, fallbacks;
     const size_t programs_n = program_cache_load_some(wanted, [&](Program& p) {
         ensure_layout(p);
+        translate_note(p);   // ((Triforce, 11-22, PIPE-30) whether its key writes memory, for the bounded wait)
         if (p.compute) computes.push_back(&p);
         else if (p.fallback) fallbacks.push_back(&p);   // (hookshot: the mesh fallback's compute pipelines too, before play)
     }, all_computes, true);
@@ -11350,7 +12320,7 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
                 ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
                 ci.stage.module = p.stages[0].module;
                 ci.stage.pName = "main";
-                pin_subgroup(ci.stage, p.workgroup[0]);
+                pin_compute(ci.stage, p);
                 ci.layout = p.layout;
                 VkPipeline made = VK_NULL_HANDLE;
                 const auto built_from = std::chrono::steady_clock::now();
@@ -11413,7 +12383,8 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
         }
     };
     std::vector<std::thread> threads;
-    const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
+    const unsigned cpus = std::max(1u, cpu_count());
+    const auto build_from = std::chrono::steady_clock::now();   // ((Triforce, 11-22, PIPE-23) how long it builds: precompile_end_save)
     for (unsigned i = 0; i < std::min(cpus, 64u); i++) threads.emplace_back(worker);
     static const int stall_s = getenv("RX_VK_PRECOMPILE_STALL_S") ? atoi(getenv("RX_VK_PRECOMPILE_STALL_S")) : 30;
     size_t last_done = 0;
@@ -11460,11 +12431,21 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
             built.insert(computes_key);
             pipeline_cache_save(true);
             built_write(built_stamp, built);
+            if (rebuilt) built_check_made(built_stamp);   // ((Triforce, 11-22, PIPE-21) built again: recorded for the strikes)
         }
+        // ((Triforce, 11-22, PIPE-21) what the record says is in the caches, for the counter of play builds)
+        if (light && !prepare_stopped()) built_play_publish(built, computes_key, computes_listed);
     }
+    // ((Triforce, 11-22, the performance audit's PIPE-23) a precompile that keeps its pipelines saved nothing here: after a
+    // long build the cache is saved before the title (precompile_end_save). The light one saved above, as before)
+    if (!light) precompile_end_save(std::chrono::duration<double>(std::chrono::steady_clock::now() - build_from).count(), gone_on);
     logf("vk: precompile: %zu programs, %zu graphics and %zu compute pipelines, %zu mesh fallback programs in %.0f ms (%.0f ms "
          "of it the caches opened, the notes and programs read)", programs_n, graphics_n, computes_n, fallbacks_n,
          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), read_ms);
+    // ((Triforce, 11-22, PIPE-52) how the rule fell so far, where it is asked at all (not with RX_VK_COMPUTE_PIN "all")
+    if (compute_pin_mode() != compute_pin::Mode::All)
+        logf("vk: precompile: compute pipelines held to 32 lanes: %lld, left to the driver's choice: %lld (RX_VK_COMPUTE_PIN=%s)",
+             (long long)st_pin_pinned.load(), (long long)st_pin_free.load(), compute_pin::name(compute_pin_mode()));
     {
         uint64_t ws1 = 0, priv1 = 0;
         int64_t modules = 0, module_bytes = 0, packed = 0, packed_bytes = 0;
@@ -11554,13 +12535,27 @@ void predicted_done(uint64_t stamp, uint64_t key) {
 }
 }   // namespace
 
+// ((Triforce, 11-22, the performance audit's PIPE-44, after Source A's; predict_types.h) A program's predictions can give
+// the same pipeline twice: two layouts that differ only in what is dynamic (a stride). Each is built once now, by its key as
+// play keys it (pipeline_key): the same pipelines, fewer builds. And counted for the lines: the ones built once already, and
+// the programs the programs' file did not lend (a load took their records off its list: their predictions are not built).
+// RX_VK_PREDICT_TYPES=0: every one built, as before
+std::atomic<int64_t> st_predict_twice{0}, st_predict_unlent{0};
+/// Whether predicted pipeline n of program variant p is still to build: seen, this program's keys so far
+bool predict_first(std::unordered_set<uint64_t>& seen, const Program& p, const PipeNote& n) {
+    static const bool once = predict_types::once(predict_types::mode(getenv("RX_VK_PREDICT_TYPES")));
+    if (!once || seen.insert(pipeline_key(p, n.s, note_targets(n), (VkPrimitiveTopology)n.topo)).second) return true;
+    st_predict_twice.fetch_add(1, std::memory_order_relaxed);
+    return false;
+}
 void predict_run(void (*progress)(size_t done, size_t total)) {
     const auto t0 = std::chrono::steady_clock::now();
     const std::vector<std::unique_ptr<PipeNote>> notes = pipe_notes_read();
     if (notes.empty() || getenv("RX_VK_NO_PREDICT")) return;
     size_t programs = 0;
     std::vector<PredictPlan> plan;
-    const std::vector<std::unique_ptr<PipeNote>> predicted = predict_pipelines(notes, &programs, &plan);
+    PredictCounts left;   // ((Triforce, 11-22, PIPE-44) what the prediction left out, for its line)
+    const std::vector<std::unique_ptr<PipeNote>> predicted = predict_pipelines(notes, &programs, &plan, &left);
     plan_write(plan);   // (for predict_background: after the precompile the programs' file cannot be gone through whole)
     std::unordered_map<uint64_t, std::vector<const PipeNote*>> by_program;
     for (const auto& n : predicted) by_program[n->prog].push_back(n.get());
@@ -11588,19 +12583,23 @@ void predict_run(void (*progress)(size_t done, size_t total)) {
             const size_t i = next++;
             if (i >= keys.size()) return;
             const auto& list = by_program[keys[i]];
+            std::unordered_set<uint64_t> seen;   // ((Triforce, 11-22, PIPE-44) each pipeline once: predict_first)
+            bool lent = false;
             program_cache_borrow(keys[i], [&](Program& p) {
+                lent = true;
                 ensure_layout(p);
                 for (const PipeNote* n : list)
-                    if (n->variant == p.variant)
+                    if (n->variant == p.variant && predict_first(seen, p, *n))
                         if (const VkPipeline pl = build_graphics(p, n->s, note_targets(*n), (VkPrimitiveTopology)n->topo))
                             vkDestroyPipeline(dev.device, pl, nullptr), made++;
             });
+            if (!lent) st_predict_unlent.fetch_add(1, std::memory_order_relaxed);
             predicted_done(pstamp, keys[i]);
             done += list.size();
         }
     };
     std::vector<std::thread> threads;
-    const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
+    const unsigned cpus = std::max(1u, cpu_count());
     for (unsigned i = 0; i < std::clamp(cpus / 2, 1u, 32u); i++) threads.emplace_back(worker);
     while (next.load() < keys.size() + threads.size() && !prepare_stopped() && !out_of_time.load()) {
         if (progress) progress(done.load(), predicted.size());
@@ -11610,6 +12609,10 @@ void predict_run(void (*progress)(size_t done, size_t total)) {
     logf("vk: predicted %zu pipelines from %zu notes for %zu program variants no note names: %zu made in %.1f s%s", predicted.size(),
          notes.size(), programs, made.load(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
          out_of_time.load() ? " (the time budget, RX_VK_PREDICT_S, ran out: the rest are built behind the game)" : "");
+    logf("vk: predicted pipelines: %lld left out as built already for their program, %lld programs the programs' file did not "
+         "lend, %zu notes of variants it has no shaders for, %zu vertex layouts that do not fit their program's inputs "
+         "(RX_VK_PREDICT_TYPES: unset, built once; 1, and the type check; 0, as before)", (long long)st_predict_twice.load(),
+         (long long)st_predict_unlent.load(), left.no_face, left.misfits);
     if (!out_of_time.load() && !prepare_stopped()) predicted_done(pstamp, kPredictedAll);
 }
 
@@ -11659,6 +12662,105 @@ void frame_shown_note(int draws) {
     frame_shown_ms.store(bg_now_ms(), std::memory_order_relaxed);
 }
 
+/// ((Triforce, 11-22, the performance audit's PIPE-68) The plan's programs for the counter of predicted_play_build: set once
+void predict_plan_keys_publish(const std::vector<PredictPlan>& plan) {
+    if (!predict_check_mode() || predict_plan_keys.load(std::memory_order_acquire)) return;
+    const std::vector<uint64_t>* keys = new std::vector<uint64_t>(predict_check::programs(plan));
+    const std::vector<uint64_t>* none = nullptr;
+    if (!predict_plan_keys.compare_exchange_strong(none, keys)) delete keys;
+}
+/// ((Triforce, 11-22, the performance audit's PIPE-68, after Source B's and Source A's; predict_check.h has why and the rules)
+/// At a start whose record says every predicted program is built for this driver: whether the driver still has them. Up to
+/// predict_check::kSample of the plan's pipelines, from another place of the plan each start, each built for the driver's
+/// cache alone, timed, and built once more as the warm reference; as the builder, only while the frame shown is a light one.
+/// True: cold, and the record is removed: the caller builds them all again. On predict_background's idle thread
+bool predict_check_cold(uint64_t pstamp) {
+    const int mode = predict_check_mode();
+    if (!mode) return false;
+    std::vector<PredictPlan> plan;
+    if (!plan_read(&plan) || plan.empty()) return false;
+    predict_plan_keys_publish(plan);   // (the counter of play builds, whether or not this start checks)
+    const std::string state_path = predicted_path() + ".check";
+    const predict_check::State had = predict_check::state_read(state_path);
+    if (!predict_check::runs(mode, had, pstamp)) return false;
+    {   // (a start whose predict_run built them has them in the driver's memory, which says nothing of what its disk kept)
+        std::lock_guard lk(predicted_mu);
+        if (predicted_file) return false;
+    }
+    const std::vector<size_t> at = predict_check::spots(plan.size(), (size_t)predict_check::kLook, (uint64_t)bg_now_ms());
+    std::vector<uint64_t> want;
+    for (const size_t i : at) want.push_back(plan[i].vertex_note), want.push_back(plan[i].output_note);
+    FILE* f = fopen(pipe_notes_path().c_str(), "rb");
+    if (!f) return false;
+    struct Close {
+        FILE* f;
+        ~Close() { fclose(f); }
+    } close{f};
+    const std::unordered_map<uint64_t, uint32_t> rec = predict_check::find(f, program_cache_stamp(), sizeof(PipeNote), want);
+    const auto v = std::make_unique<PipeNote>(), o = std::make_unique<PipeNote>(), n = std::make_unique<PipeNote>();
+    std::vector<predict_check::Probe> probes;
+    const auto ms = [](std::chrono::steady_clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
+    for (const size_t i : at) {
+        if (predict_check::decided(predict_check::tally(probes))) break;
+        // (the builder's rule: not while the game is in play. A build is tens of ms inside the driver when it compiles)
+        while (!prepare_stopped() && bg_game_in_play()) Sleep(50);
+        if (prepare_stopped()) return false;
+        const PredictPlan& e = plan[i];
+        const auto rv = rec.find(e.vertex_note), ro = rec.find(e.output_note);
+        if (rv == rec.end() || ro == rec.end() || !pipe_note_at(f, rv->second, *v) || !pipe_note_at(f, ro->second, *o)) continue;
+        predicted_into(*n, *v, *o, e.prog, e.variant);
+        predict_check::Probe probe;
+        bool tried = false;
+        program_cache_borrow(e.prog, [&](Program& p) {
+            if (p.variant != e.variant || tried) return;
+            tried = true;
+            ensure_layout(p);
+            driver_cache_only = true;   // (as the builder's workers: for the driver's own cache, not into ours)
+            const auto b0 = std::chrono::steady_clock::now();
+            const VkPipeline first = build_graphics(p, n->s, note_targets(*n), (VkPrimitiveTopology)n->topo);
+            const auto b1 = std::chrono::steady_clock::now();
+            const VkPipeline again = first ? build_graphics(p, n->s, note_targets(*n), (VkPrimitiveTopology)n->topo) : VK_NULL_HANDLE;
+            const auto b2 = std::chrono::steady_clock::now();
+            driver_cache_only = false;
+            if (first) vkDestroyPipeline(dev.device, first, nullptr);
+            if (again) vkDestroyPipeline(dev.device, again, nullptr);
+            probe.made = first && again, probe.first_ms = ms(b1 - b0), probe.again_ms = ms(b2 - b1);
+        });
+        if (tried) probes.push_back(probe);
+    }
+    const predict_check::Tally t = predict_check::tally(probes);
+    const predict_check::Verdict verdict = predict_check::verdict(t);
+    int next = 0;
+    const predict_check::Do what = predict_check::decide(verdict, had, pstamp, &next);
+    if (verdict == predict_check::Verdict::Unknown) {
+        logf("vk: predicted pipelines: the check of the driver's cache says nothing: %d of %zu sampled could be built "
+             "(RX_VK_PREDICT_CHECK)", t.got, at.size());
+        return false;
+    }
+    if (verdict == predict_check::Verdict::Warm) {
+        if (had.found) remove(state_path.c_str());   // (kept: a strike of an earlier loss is forgotten)
+        logf("vk: predicted pipelines: the driver still has them: %d of %d sampled were compiled again (a first build %.1f ms, "
+             "a second %.1f ms at the median) (RX_VK_PREDICT_CHECK=0: not checked)", t.cold, t.got, t.first_median, t.again_median);
+        return false;
+    }
+    predict_check::state_write(state_path, pstamp, next);
+    if (what == predict_check::Do::Stop) {
+        logf("vk: predicted pipelines: the driver has lost them again right after they were built again (%d of %d sampled "
+             "compiled, a first build %.1f ms against %.1f ms): this driver does not keep them, and they are left to their first "
+             "draw (not checked again for these shaders and this driver; RX_VK_PREDICT_CHECK=2: at every start)", t.cold, t.got,
+             t.first_median, t.again_median);
+        return false;
+    }
+    {   // (the record of what is built: gone, so the builder below and the next starts' build every predicted program again)
+        std::lock_guard lk(predicted_mu);
+        if (predicted_file) fclose(predicted_file), predicted_file = nullptr;
+        remove(predicted_path().c_str());
+    }
+    logf("vk: predicted pipelines: the driver no longer has them (%d of %d sampled were compiled again: a first build %.1f ms, a "
+         "second %.1f ms at the median), though the record said all were built: the record is removed and they are built again "
+         "behind the game (RX_VK_PREDICT_CHECK=0: not checked)", t.cold, t.got, t.first_median, t.again_median);
+    return true;
+}
 /// (Triforce) The predicted pipelines predict_run did not get to, built behind the game: see above
 void predict_background() {
     static std::atomic<bool> started{false};
@@ -11671,26 +12773,56 @@ void predict_background() {
         if (prepare_stopped()) return;
         const auto t0 = std::chrono::steady_clock::now();
         const uint64_t pstamp = warmed_stamp(gpl_wanted());
-        const std::unordered_set<uint64_t> had = predicted_read(pstamp);
-        if (had.count(kPredictedAll)) return;   // (all built for this driver: the programs' file is not read for it again)
-        const std::vector<std::unique_ptr<PipeNote>> notes = pipe_notes_read();
-        if (notes.empty()) return;
-        std::vector<PredictPlan> plan;
-        if (!plan_read(&plan)) {
-            logf("vk: predicted pipelines: no plan for these shaders yet (predict_plan_ensure makes it before the precompile)");
-            return;
+        std::unordered_set<uint64_t> had = predicted_read(pstamp);
+        // (all built for this driver: the programs' file is not read for it again. (Triforce, 11-22, the performance audit's
+        // PIPE-68) Unless the driver has lost them since, which a sample says: predict_check_cold. Cold, the record is gone
+        // and every predicted program is built again below)
+        if (had.count(kPredictedAll)) {
+            if (!predict_check_cold(pstamp)) return;
+            had.clear();
         }
-        const std::vector<std::unique_ptr<PipeNote>> predicted = predict_rebuild(notes, plan);
+        // ((Triforce, 11-21, the performance audit's PIPE-83, after Source B's) The builder held every note (~27 KB each) and
+        // a full note of every predicted pipeline until it ended, and it rests through play: about 1 GB for much of a session
+        // on the starts after a translator or driver update. Now the notes file is gone through once for each key's record,
+        // the plan kept as record numbers (predict_stream.h, 16 bytes a pipeline), and a worker reads a pipeline's two notes
+        // through its own handle when it builds it, as the draws, the read-ahead and the warm do (pipe_note_at).
+        // RX_VK_PREDICT_BG_STREAM=0: all of them held, as before)
+        static const bool stream = !(getenv("RX_VK_PREDICT_BG_STREAM") && !atoi(getenv("RX_VK_PREDICT_BG_STREAM")));
+        const auto no_plan = [] {
+            logf("vk: predicted pipelines: no plan for these shaders yet (predict_plan_ensure makes it before the precompile)");
+        };
+        std::vector<predict_stream::Program> groups;                           // (the programs to build, their notes' records)
+        std::vector<std::unique_ptr<PipeNote>> notes, predicted;               // (RX_VK_PREDICT_BG_STREAM=0: as before)
         std::unordered_map<uint64_t, std::vector<const PipeNote*>> by_program;
-        for (const auto& n : predicted) by_program[n->prog].push_back(n.get());
         std::vector<uint64_t> keys;
-        for (const auto& kv : by_program)
-            if (!had.count(kv.first)) keys.push_back(kv.first);
+        if (stream) {
+            std::unordered_map<uint64_t, uint32_t> at;
+            if (FILE* f = fopen(pipe_notes_path().c_str(), "rb")) {
+                const auto rec = std::make_unique<PipeNote>();
+                at = predict_stream::index(f, program_cache_stamp(), sizeof(PipeNote), rec.get(), [&] { return note_sane(*rec); });
+                fclose(f);
+            }
+            if (at.empty()) return;
+            std::vector<PredictPlan> plan;
+            if (!plan_read(&plan)) return no_plan();
+            predict_plan_keys_publish(plan);   // ((Triforce, 11-22, PIPE-68) for the counter of play builds: predicted_play_build)
+            groups = predict_stream::group(plan, at, had);   // (the index and the plan end here: freed before the workers start)
+            for (const predict_stream::Program& g : groups) keys.push_back(g.prog);
+        } else {
+            notes = pipe_notes_read();
+            if (notes.empty()) return;
+            std::vector<PredictPlan> plan;
+            if (!plan_read(&plan)) return no_plan();
+            predicted = predict_rebuild(notes, plan);
+            for (const auto& n : predicted) by_program[n->prog].push_back(n.get());
+            for (const auto& kv : by_program)
+                if (!had.count(kv.first)) keys.push_back(kv.first);
+        }
         if (keys.empty()) {
             predicted_done(pstamp, kPredictedAll);
             return;
         }
-        const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
+        const unsigned cpus = std::max(1u, cpu_count());
         static const unsigned nthreads = getenv("RX_VK_PREDICT_BG_THREADS")
             ? (unsigned)std::clamp(atoi(getenv("RX_VK_PREDICT_BG_THREADS")), 1, 32) : std::clamp(cpus / 6, 1u, 3u);
         static const int in_play = getenv("RX_VK_PREDICT_BG_PLAY") ? std::clamp(atoi(getenv("RX_VK_PREDICT_BG_PLAY")), 0, 2) : 0;
@@ -11705,6 +12837,17 @@ void predict_background() {
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
             driver_cache_only = true;
             int64_t rest_until = 0;   // (in play, RX_VK_PREDICT_BG_PLAY=1: this thread's rest after a program)
+            // ((Triforce, 11-21, PIPE-83) this thread's own handle on the notes file, and its three notes: the two read for a
+            // pipeline and the predicted one made of them)
+            struct Notes {
+                FILE* f = nullptr;
+                std::unique_ptr<PipeNote> v, o, n;
+                ~Notes() { if (f) fclose(f); }
+            } in;
+            if (stream) {
+                in.f = fopen(pipe_notes_path().c_str(), "rb");
+                in.v = std::make_unique<PipeNote>(), in.o = std::make_unique<PipeNote>(), in.n = std::make_unique<PipeNote>();
+            }
             for (;;) {
                 if (prepare_stopped()) return;
                 // (the game in play: see above. Looked at before each program; one already inside the driver finishes)
@@ -11727,14 +12870,31 @@ void predict_background() {
                 const int64_t b0 = bg_now_ms();
                 const size_t i = next++;
                 if (i >= keys.size()) return;
-                const auto& list = by_program[keys[i]];
+                const std::vector<const PipeNote*>* list = stream ? nullptr : &by_program.find(keys[i])->second;
+                std::unordered_set<uint64_t> seen;   // ((Triforce, 11-22, PIPE-44) each pipeline once: predict_first)
+                bool lent = false;
                 program_cache_borrow(keys[i], [&](Program& p) {
+                    lent = true;
                     ensure_layout(p);
-                    for (const PipeNote* n : list)
-                        if (n->variant == p.variant)
-                            if (const VkPipeline pl = build_graphics(p, n->s, note_targets(*n), (VkPrimitiveTopology)n->topo))
-                                vkDestroyPipeline(dev.device, pl, nullptr), made++;
+                    const auto build = [&](const PipeNote* n) {
+                        if (!predict_first(seen, p, *n)) return;
+                        if (const VkPipeline pl = build_graphics(p, n->s, note_targets(*n), (VkPrimitiveTopology)n->topo))
+                            vkDestroyPipeline(dev.device, pl, nullptr), made++;
+                    };
+                    if (stream) {
+                        for (const predict_stream::Entry& e : groups[i].entries) {
+                            if (e.variant != p.variant || !in.f) continue;
+                            // (a note gone or no longer sane: that pipeline is not built, as one whose note the plan lost)
+                            if (!pipe_note_at(in.f, e.vertex_rec, *in.v) || !pipe_note_at(in.f, e.output_rec, *in.o)) continue;
+                            predicted_into(*in.n, *in.v, *in.o, keys[i], e.variant);
+                            build(in.n.get());
+                        }
+                        return;
+                    }
+                    for (const PipeNote* n : *list)
+                        if (n->variant == p.variant) build(n);
                 });
+                if (!lent) st_predict_unlent.fetch_add(1, std::memory_order_relaxed);
                 predicted_done(pstamp, keys[i]);
                 if (in_play == 1 && bg_game_in_play()) rest_until = bg_now_ms() + 3 * (bg_now_ms() - b0);
                 if (++programs_done % 2000 == 0)
@@ -11751,6 +12911,8 @@ void predict_background() {
              "play%s", made.load(), programs_done.load(),
              std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), rested_ms.load() / 1000.0,
              all ? ": every predicted program is built for this driver now" : " (stopped: the rest at the next start)");
+        logf("vk: predicted pipelines: %lld left out as built already for their program, %lld programs the programs' file did "
+             "not lend (RX_VK_PREDICT_TYPES)", (long long)st_predict_twice.load(), (long long)st_predict_unlent.load());
     }).detach();
 }
 
@@ -11767,7 +12929,7 @@ VkComputePipelineCreateInfo compute_create_info(const Program& q) {
     ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     ci.stage.module = q.stages[0].module;
     ci.stage.pName = "main";
-    pin_subgroup(ci.stage, q.workgroup[0]);
+    pin_compute(ci.stage, q);
     ci.layout = q.layout;
     static const bool noopt = getenv("RX_VK_NOOPT") != nullptr;
     if (noopt) ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
@@ -11775,6 +12937,7 @@ VkComputePipelineCreateInfo compute_create_info(const Program& q) {
 }
 
 void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t z, uint64_t indirect) {
+    lab_ab::each(lab_ab::E_DISPATCH);   // ((Triforce, 11-22, REPLAY-51) the lab's e_dispatch: a wait at each dispatch, before the clocks
     PROF(PROF_DISPATCH);
     DispatchClock dclock;
     s.grid[0] = indirect ? 1 : x, s.grid[1] = indirect ? 1 : y, s.grid[2] = indirect ? 1 : z;
@@ -11784,9 +12947,19 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
     }
     checkpoint_grid[0] = s.grid[0], checkpoint_grid[1] = s.grid[1], checkpoint_grid[2] = s.grid[2];
     const uint8_t types[8]{};
-    const auto t_pick = std::chrono::steady_clock::now();
+    // ((Triforce, 11-22, the performance audit's DESC-30, after Source A's) The pick's time for the stall line without a clock
+    // of its own: its slow path (a translation, a cache read: program_pick) is timed by PROF_EXACT, which adds to the thread's
+    // prof_t.exact, so the change of that across the call is the time, and a pick the memo answers reads no clock and adds
+    // nothing. It was two clock reads and a sequentially consistent add at every dispatch. With every scope timed
+    // (prof_full: RX_VK_PROF_ALL=1, RX_VK_SLOW_LOG, RX_VK_BENCH) and in the lab's "diagold" phases, the clock pair as before
+    const bool pick_clocked = prof_full.load(std::memory_order_relaxed) != 0 || dispatch_diag_old();
+    const auto t_pick = pick_clocked ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const int64_t x_pick = prof_t.exact;
     const Program* cp = program_for(s, ProgramKind::Compute, types);
-    st_disp_pick_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_pick).count();
+    if (pick_clocked)
+        st_disp_pick_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_pick).count();
+    else if (const int64_t dx = prof_t.exact - x_pick)
+        st_disp_pick_ns.fetch_add(dx, std::memory_order_relaxed);
     dclock.t_prog = slow_dispatch_timing() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // (a program still being translated is waited for, as a draw's is: a dispatch left out is work never done again.
     // MKW updates its terrain height clipmaps a region at a time as the camera moves, and makes its sky's tables
@@ -11884,15 +13057,20 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
     {   // (hookshot, RX_VK_LOG_PUSH=<key prefix>: once, that program's push constants and the c0 words it reads)
         static const char* want = getenv("RX_VK_LOG_PUSH");
         static bool done;
-        char hex[24];
-        snprintf(hex, sizeof hex, "%016llx", (unsigned long long)cp->key);
-        if (want && !done && !strncmp(hex, want, strlen(want))) {
-            done = true;
-            char line[1600];
-            int n = snprintf(line, sizeof line, "vk: program %s: %u bytes pushed; c0:", hex, s.cs_push_n);
-            for (uint32_t off = 0; off < 0x100 && n < (int)sizeof line - 16; off += 4)
-                n += snprintf(line + n, sizeof line - n, " %08x", driver_bank_word(s, 0, 5, off));
-            logf("%s", line);
+        // ((Triforce, 11-22, the performance audit's DESC-06 and DESC-30, after Source A's) the key's text only while the
+        // switch is set and its line not written: it was formatted at every dispatch for a switch nobody had set. (And in
+        // the lab's "diagold" phases, for what that cost)
+        if ((want && !done) || dispatch_diag_old()) {
+            char hex[24];
+            snprintf(hex, sizeof hex, "%016llx", (unsigned long long)cp->key);
+            if (want && !done && !strncmp(hex, want, strlen(want))) {
+                done = true;
+                char line[1600];
+                int n = snprintf(line, sizeof line, "vk: program %s: %u bytes pushed; c0:", hex, s.cs_push_n);
+                for (uint32_t off = 0; off < 0x100 && n < (int)sizeof line - 16; off += 4)
+                    n += snprintf(line + n, sizeof line - n, " %08x", driver_bank_word(s, 0, 5, off));
+                logf("%s", line);
+            }
         }
     }
     Program& p = const_cast<Program&>(*cp);
@@ -11905,7 +13083,12 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
             on = false;
         }
         ~PipeClock() { stop(); }   // (a dispatch left out while its pipeline compiles: until there)
-    } pipe_clock{std::chrono::steady_clock::now(), !p.compute_pipeline || !p.layout};
+    };
+    // ((Triforce, 11-22, the performance audit's DESC-30) the clock only for a dispatch that has a layout or a pipeline to
+    // make: it was read at every dispatch and the reading thrown away. (The lab's "diagold" phases read it as before)
+    const bool pipe_timed = !p.compute_pipeline || !p.layout;
+    PipeClock pipe_clock{pipe_timed || dispatch_diag_old() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{},
+                         pipe_timed};
     if (!p.dispatched.load(std::memory_order_relaxed) && (p.compute_pipeline || !p.compute_state.load(std::memory_order_relaxed)))
         (p.compute_pipeline ? st_disp_ready : st_disp_made)++;   // (once: a dispatch left out while it compiles asks again)
     if (!p.layout) {
@@ -11934,6 +13117,9 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
             VkPipeline cached = VK_NULL_HANDLE;
             // ((Triforce) these through the play cache once the preparation is done: cached_create, pcache_play.h)
             if (dev.vk13.pipelineCreationCacheControl && cached_compute(pcache_use().cache, &asked, &cached) != VK_SUCCESS) cached = VK_NULL_HANDLE;
+            // ((Triforce, 11-22, PIPE-21) one the light precompile's record lists, not found: counted, built_play_build)
+            if (!cached && dev.vk13.pipelineCreationCacheControl && built_play_keys.load(std::memory_order_relaxed))
+                built_play_build(p.key, 0, true);
             auto build = [job, info] {
                 Program& q = const_cast<Program&>(*job);
                 VkComputePipelineCreateInfo ci = info(q);
@@ -11983,7 +13169,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
         ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         ci.stage.module = p.stages[0].module;
         ci.stage.pName = "main";
-        pin_subgroup(ci.stage, p.workgroup[0]);
+        pin_compute(ci.stage, p);
         ci.layout = p.layout;
         {   // (local) RX_VK_NOOPT=1, as for graphics pipelines above
             static const bool noopt = getenv("RX_VK_NOOPT") != nullptr;
@@ -12459,6 +13645,48 @@ int64_t draw_left_out_take() {
              "colour target drawn for the first time (RX_VK_PIPE_SKIP_NEW=0: left out)", (long long)now[0], (long long)now[1],
              (long long)now[2], (long long)now[3]);
     }
+    if (pipe_ahead_window()) {   // ((Triforce, 11-22, PIPE-81) where the first-drawn pipelines stood, when it grew, every 600 presents)
+        static uint64_t a_told = 0;
+        static int64_t a_was = 0;
+        const int64_t none = st_ahead[0].load(), within = st_ahead[1].load(), further = st_ahead[2].load(), behind = st_ahead[3].load();
+        const int64_t placed = within + further + behind;
+        if (calls >= a_told + 600 && none + placed != a_was) {
+            a_told = calls, a_was = none + placed;
+            logf("vk: pipelines first drawn, by their place in the order: %lld within %lld places ahead of where the draws are "
+                 "(%lld of them linked by the warm), %lld further ahead, %lld behind, %lld not in it: a builder of whole "
+                 "pipelines just ahead %s (RX_VK_PIPE_AHEAD)", (long long)within, (long long)pipe_ahead_window(),
+                 (long long)st_ahead_warm.load(), (long long)further, (long long)behind, (long long)none,
+                 pipe_ahead::worth(within, placed + none) ? "would meet a third of them or more" : "would meet under a third of them");
+        }
+    }
+    if (pipe_depth_budget()) {   // ((Triforce, 11-22, PIPE-29) the depth budget's counts, and its left-out entries let go)
+        static uint64_t d_told = 0;
+        static int64_t d_was[2] = {0, 0};
+        const int64_t d_now[2] = {st_pipe_depth_waits.load(), st_pipe_depth_left.load()};
+        if (calls >= d_told + 600) {
+            d_told = calls;
+            {
+                std::lock_guard lk(pipe_depth_mu);
+                pipe_depth_out.clear();
+            }
+            if (std::memcmp(d_now, d_was, sizeof d_now)) {
+                std::memcpy(d_was, d_now, sizeof d_was);
+                logf("vk: depth-tested draws into passes drawn once, so far: %lld waited from the frame's pool, %lld left out "
+                     "(RX_VK_PIPE_DEPTH_BUDGET)", (long long)d_now[0], (long long)d_now[1]);
+            }
+        }
+    }
+    if (translate_wait_ms()) {   // ((Triforce, 11-22, PIPE-30) the bounded wait's, when it changed, at most every 600 presents)
+        static uint64_t t_told = 0;
+        static int64_t t_was[2] = {0, 0};
+        const int64_t t_now[2] = {st_translate_bounded.load(), st_translate_left.load()};
+        if (calls >= t_told + 600 && std::memcmp(t_now, t_was, sizeof t_now)) {
+            t_told = calls;
+            std::memcpy(t_was, t_now, sizeof t_was);
+            logf("vk: programs still translating, so far: %lld draws waited from the frame's %d ms, %lld left out "
+                 "(RX_VK_TRANSLATE_WAIT_MS)", (long long)t_now[0], translate_wait_ms(), (long long)t_now[1]);
+        }
+    }
     return hold_pipelines() ? n : 0;
 }
 void draw_hold_mode(int mode) {
@@ -12678,6 +13906,7 @@ void pipeline_cache_save(bool force) {
     auto save = [force] {
         struct Done { ~Done() { busy = false; } } done;
         const bool checkpoint = force && pcache_checkpoint_now;   // ((Triforce) warm_checkpoint.h: pcache_checkpoint_save's)
+        const bool play_only = force && pcache_play_only_now;     // ((Triforce, 11-22, PIPE-23) precompile_end_save's)
         // ((Triforce, handoff §8) the exit waits for this save (2 s at most: a cut one leaves the old files, .tmp and .part
         // are put in place whole), and none begins once it has begun: file_writers.h
         const file_writers::Writing writing;
@@ -12687,6 +13916,14 @@ void pipeline_cache_save(bool force) {
             // below only when the preparation built into its cache since its last save, there is no play cache, or a
             // preparation saves now (the warm's pcache_saved_now asks the file below for what it built)
             const int64_t main_built = pcache_main_built.load();
+            // ((Triforce, 11-22, the performance audit's PIPE-23; precompile_save.h) the save before the title after a long
+            // precompile: the play file alone while there is a play cache, which took its compiles. The main cache's hits
+            // count as built too (cached_create), so the rule below would write the whole main file, 2 to 3 GB, before the
+            // title. With no play cache the main file is what there is: saved below, as any forced save
+            if (play_only && pcache_play_cache) {
+                pcache_play_save(0);
+                return;
+            }
             if (!pcache_play_save(main_built) && pcache_preparing.load() == 0) return;
             // ((Triforce) through the cache's gate: let go for the PC's RAM (pcache_let_go), it is not saved again this session,
             // and the file keeps its last save)

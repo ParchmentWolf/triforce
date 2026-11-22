@@ -12,6 +12,9 @@
     <Nullable>enable</Nullable>
     <InvariantGlobalization>true</InvariantGlobalization>
     <Version>1.0.0</Version>
+    <!-- ((Triforce) 11-20) the name Windows shows for the exe (pinned taskbar button, Task Manager), not its file name -->
+    <AssemblyTitle>Triforce</AssemblyTitle>
+    <Product>Triforce</Product>
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(TargetFramework)' == 'net10.0-windows'">

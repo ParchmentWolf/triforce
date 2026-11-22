@@ -18,6 +18,9 @@ struct VendorFacts {
     VkDriverId driver_id{};
     VkPhysicalDeviceType device_type = VK_PHYSICAL_DEVICE_TYPE_OTHER;
     const char* driver_info = "";   // (VkPhysicalDeviceDriverProperties::driverInfo)
+    // ((Triforce, 11-22, MEM-23) VkPhysicalDeviceVulkan11Features::storageInputOutput16. True until the device says otherwise,
+    // so facts made without it name no GCN card: radv_gcn)
+    bool storage_io16 = true;
 };
 
 struct VendorFixes {
@@ -45,6 +48,14 @@ struct VendorFixes {
 /// bits are for it (nan_bits), and on Windows the task + mesh draws through the compute fallback (vk_main.cpp)
 inline bool amd_older_compiler(const VendorFacts& f) {
     return f.driver_id == VK_DRIVER_ID_AMD_PROPRIETARY && f.driver_info && std::strstr(f.driver_info, "proprietary shader compiler");
+}
+
+/// ((Triforce, 11-22, the performance audit's MEM-23 and PIPE-56, after Source A's) AMD's GCN 1 to 4 GPUs under Mesa's RADV
+/// (GFX6 to GFX8: the HD 7000 cards to the RX 400 and 500 ones), told by the one thing RADV reports differently there: no
+/// 16-bit storage input and output, which Vega and every later GPU has. Never true under another driver (AMD's own
+/// Windows driver on the same cards is not RADV), nor for NVIDIA or Intel. It names the cards; it changes nothing by itself
+inline bool radv_gcn(const VendorFacts& f) {
+    return f.driver_id == VK_DRIVER_ID_MESA_RADV && !f.storage_io16;
 }
 
 inline VendorFixes vendor_fixes(const VendorFacts& f) {

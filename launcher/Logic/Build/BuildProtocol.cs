@@ -111,7 +111,7 @@ public static class BuildProtocol
 }
 
 /// <summary>The build's state as its lines come (old Shell.cs Line/Ended; the Tk builder's parser): the stage it is in, that
-/// stage's progress, when each stage began, the plan, the time left the compile said, the folder @@done named, the last
+/// stage's progress (and how it moved), when each stage began, the plan, the time left the compile said, the folder @@done named, the last
 /// @@error. Fed line by line by BuildRunner, or by a test from a transcript.</summary>
 public sealed class BuildTracker
 {
@@ -149,10 +149,20 @@ public sealed class BuildTracker
                 Stage = s.Id;
                 StageStarted = t;
                 StageProgress = 0;
+                lock (Gate) { recent.Clear(); recent.Add((t, 0)); }
                 if (s.Id != "compile") EtaSeconds = null;
                 StageChanged?.Invoke(was, s.Id);
                 break;
-            case BuildEvent.Progress p: StageProgress = p.Fraction; break;
+            case BuildEvent.Progress p:
+                StageProgress = p.Fraction;
+                lock (Gate)
+                {
+                    if (recent.Count == 0) recent.Add((StageStarted, 0));
+                    if (p.Fraction < recent[^1].Progress) { recent.Clear(); recent.Add((now(), p.Fraction)); }   // (it went back: start over)
+                    else if (p.Fraction > recent[^1].Progress) recent.Add((now(), p.Fraction));
+                    if (recent.Count > KeepSamples) recent.RemoveRange(0, recent.Count - KeepSamples / 2);
+                }
+                break;
             case BuildEvent.Plan p: Plan = (p.Changed, p.Total); break;
             case BuildEvent.FileBuilt f when f.How is "new" or "again": FilesBuilt++; break;
             case BuildEvent.Eta x: EtaSeconds = x.Seconds; break;
@@ -177,4 +187,15 @@ public sealed class BuildTracker
 
     public TimeSpan Elapsed => now() - Started;
     public TimeSpan InStage => Stage == null ? TimeSpan.Zero : now() - StageStarted;
+    public DateTime Now => now();
+
+    /// <summary>This stage's progress as it moved: (when, how far), from (the stage's start, 0), a sample each time it went up (the
+    /// last 2000), for BuildClock's rate over the last minutes.</summary>
+    public IReadOnlyList<(DateTime At, double Progress)> Recent { get { lock (Gate) return recent.ToArray(); } }
+
+    const int KeepSamples = 2000;
+    readonly List<(DateTime At, double Progress)> recent = new();
+    /// <summary>The time left last shown and when (BuildClock.Remaining's smoothing), under Gate: the App asks from more than one thread.</summary>
+    internal (double Seconds, DateTime At)? Shown;
+    internal readonly object Gate = new();
 }

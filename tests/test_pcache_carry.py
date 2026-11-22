@@ -321,9 +321,10 @@ def check_source():
         "pcache_bound::carried(pcache_same,",
         "if (resumed && carry_refused) {",
         "} else if (!pcache_same && !pcache_carried && !carried) {",
-        "pcache_bound::read(pcache_path.c_str(), 32, pcache_bound_bytes, data, &len)",
-        # (the device's header is checked on a carried file as on any: another device's or driver's data is dropped)
-        "dev.props.pipelineCacheUUID",
+        "pcache_bound::read(pcache_path.c_str(), 32, pcache_bound_bytes, data, &len,",
+        # (the device's header is checked on a carried file as on any: another device's or driver's data is dropped; its
+        # header before the rest is read, test_pcache_head_read.py)
+        "!pcache_head_ok(data.data(), data.size())",
         "data.clear();",
         "vkCreatePipelineCache(dev.device, &ci, nullptr, &pcache)",
         "if (!with_data) pcache_carried = false;",
@@ -462,7 +463,7 @@ def check_source():
     if "seed_compute" in kept or "seed_program" in kept or "translate" in kept.replace("nothing translated", ""):
         raise SystemExit("warm_kept_computes translates again")
     build = between(draw, "bool prepare_compute_pipeline(Program& p) {", "\n}\n")
-    need("vk_draw.cpp prepare_compute_pipeline", build, ["pin_subgroup(ci.stage, p.workgroup[0]);",
+    need("vk_draw.cpp prepare_compute_pipeline", build, ["pin_compute(ci.stage, p);",
                                                           "guarded_compute(pcache, &ci, &pl)",
                                                           'if (getenv("RX_VK_NOOPT")) ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;'])
     rebuild = between(draw, "bool pcache_carry_rebuild() {", "\n}\n")

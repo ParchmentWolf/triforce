@@ -143,7 +143,7 @@ def main():
     automatic = top.index("if (replay_threads_at_start == replay_threads::kRowAutomatic) return replay_threads_automatic();")
     check(order[1] < automatic < order[2], "par_threads_max: Automatic is not asked after the switches, before the fixed counts")
     auto = function(replay, "int replay_threads_automatic() {")
-    check("replay_threads::automatic(logical, amd_older)" in auto and "std::thread::hardware_concurrency()" in auto and
+    check("replay_threads::automatic(logical, amd_older)" in auto and "cpu_count()" in auto and
           "amd_older_compiler(facts)" in auto and "facts.driver_info = drv.driverInfo;" in auto,
           "replay_threads_automatic no longer asks the rule with the processors and the driver")
     check('logf("vk: replay helper threads: Automatic gives this PC %d (%u logical processors: %s). %s"' in auto and

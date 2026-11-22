@@ -15,6 +15,7 @@
 #include <span>
 
 #include "common/alignment.h"
+#include "../vk/cpu_count.h"   // ((Triforce, 11-22, OS-49) the threads to size by: HOS_SIM_CPU
 #include "common/div_ceil.h"
 #include "video_core/texture_cache/format_lookup_table.h"
 #include "video_core/textures/astc.h"
@@ -766,7 +767,7 @@ std::unique_ptr<Image> decode(const TICEntry& tic, const TexInfo& info_in, uint6
             copy_layers >= 4 && level_size.depth == 1 && (size_t)level_size.width * level_size.height * 4 <= (8u << 20)) {
             const Extent3D block = AdjustMipBlockSize(tiles, li.block, level, li.num_levels);
             const u32 stride_alignment = StrideAlignment(tiles, info.block, gob, li.bpp_log2);
-            const unsigned nthreads = std::max(1u, std::min<unsigned>(copy_layers, std::thread::hardware_concurrency() - 1));
+            const unsigned nthreads = std::max(1u, std::min<unsigned>(copy_layers, cpu_count() - 1));
             std::atomic<u32> next_layer{0};
             static std::atomic<int64_t> t_swz, t_dec, t_up;
             auto work = [&] {

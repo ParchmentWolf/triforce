@@ -27,6 +27,7 @@ build's last step, the shaders' preparation, was skipped or failed and is left t
 import argparse
 import atexit
 import contextlib
+import errno
 import filecmp
 import hashlib
 import importlib.util
@@ -838,8 +839,98 @@ def stop_stray_compilers(work, default_work):
             print("stopped %d process(es) an earlier build left running on this work folder: %s"
                   % (len(doomed), " ".join(sorted(set(doomed.values())))), flush=True)
             time.sleep(2)
+        return len(doomed)   # (lock_work waits for a stopped build's lock: Windows frees it late)
     except Exception as e:   # (not finding them is no reason to stop)
         print("could not look for an earlier build's processes: %s" % e, flush=True)
+
+
+# (Triforce, 11-22, the performance audit's IO-47, after Source A's) One build at a time per work folder: make_game.py
+# holds an OS lock on <work>/make_game.lock for as long as it runs. A second build on the folder stopped nothing on Linux
+# (two builders, a builder beside the launcher, AppRun --cli): both compiled the same objects and raced on the staged
+# game folder. On Windows stop_stray_compilers still stops an earlier build first, and the lock is what is left when it
+# finds none. The lock is the operating system's and ends with its process, so a build that crashed never blocks the
+# next one. The first byte is the locked one; the holder's process id is written after it, for the refusal to name.
+# HOOKSHOT_WORK_LOCK=0: no lock, as before.
+WORK_LOCK = "make_game.lock"
+WORK_LOCK_HELD = (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES, getattr(errno, "EDEADLOCK", errno.EDEADLK))
+_work_lock = None   # ((the open file, its work folder) while this process holds one)
+
+
+def _lock_first_byte(f):
+    """The OS lock itself, without waiting: an OSError of WORK_LOCK_HELD when another process holds it"""
+    if os.name == "nt":
+        import msvcrt
+        f.seek(0)
+        msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def work_lock_holder(path):
+    """The process id the holder of a work folder's lock wrote after the locked byte, or None"""
+    try:
+        with open(path, "rb") as f:
+            f.seek(1)
+            return int(f.read(32).split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def lock_work(work, wait=0.0):
+    """Takes the work folder's lock for this process, or stops the build (fail) when another build holds it. wait: the
+    seconds to keep trying first, for after stop_stray_compilers stopped a build (Windows frees a killed process's lock
+    a little late). Asked again for the same folder it does nothing; for another folder the old lock is let go first.
+    Only "held by another" refuses: any other error is said and the build goes on without the lock, as before"""
+    global _work_lock
+    if os.environ.get("HOOKSHOT_WORK_LOCK") == "0":
+        return False
+    work = os.path.abspath(work)
+    if _work_lock:
+        if os.path.normcase(_work_lock[1]) == os.path.normcase(work):
+            return True
+        release_work()
+    path = os.path.join(work, WORK_LOCK)
+    try:   # (made when it is not there, never emptied: the holder's process id stays readable)
+        f = os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o666), "r+b")
+    except OSError as e:
+        print("could not open %s (%s): this build runs without the work folder's lock" % (path, e), flush=True)
+        return False
+    until = time.monotonic() + wait
+    while True:
+        try:
+            _lock_first_byte(f)
+            break
+        except OSError as e:
+            if e.errno not in WORK_LOCK_HELD:
+                f.close()
+                print("could not lock %s (%s): this build runs without the work folder's lock" % (path, e), flush=True)
+                return False
+            if time.monotonic() >= until:
+                f.close()
+                pid = work_lock_holder(path)
+                fail("Another build is already working in %s%s. Wait for it to finish, or stop it, then build again."
+                     % (work, " (process %d)" % pid if pid else ""))
+            time.sleep(0.2)
+    try:   # (after the locked byte, where another process may read on Windows)
+        f.seek(1)
+        f.truncate()
+        f.write(b"%d\n" % os.getpid())
+        f.flush()
+    except OSError:
+        pass
+    _work_lock = (f, work)
+    return True
+
+
+def release_work():
+    """Lets this process's work folder lock go (the file stays): for a lock on another folder, and for the tests that run
+    main() in temporary folders. A build never calls it: its lock ends with the process"""
+    global _work_lock
+    if _work_lock:
+        f, _work_lock = _work_lock[0], None
+        with contextlib.suppress(OSError, ValueError):
+            f.close()   # (closing the file frees its lock, on Windows and with flock alike)
 
 
 def makefile_words(text):
@@ -1176,9 +1267,117 @@ def copy_writable(src, dst):
     shutil.copyfile(src, dst)
 
 
+# (Triforce, 11-22, the performance audit's IO-45, after Source A's) What the finish put into the game folder, noted in
+# the folder: for each file it installed, the SHA-1 of the source it was copied from and the installed file's size,
+# modification time, file number and mode right after the swap. The next finish passes over a file whose source hashes
+# the same and whose installed copy still has that size, time, number and mode: every build copied and swapped every
+# file, image.bin and the prebuilt DLLs included, and the installed file is never read to find out (a cold read of the
+# exe is seconds). Anything not noted, not readable or not as noted is copied as before, and so is everything on a file
+# system that gives no file number (FAT, exFAT). HOOKSHOT_FINISH_COPY_ALL=1: every file copied and swapped, no note.
+INSTALLED_NOTE = ".triforce_installed.json"
+
+
+def file_sha1(path):
+    """The SHA-1 of a file's bytes, as hex; None when it cannot be read"""
+    h = hashlib.sha1()
+    try:
+        with open(path, "rb") as f:
+            for piece in iter(lambda: f.read(1 << 20), b""):
+                h.update(piece)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+def installed_stat(path):
+    """What tells an installed file is still the one the finish put there, without reading it: [size, modification time
+    in ns, file number, mode]. None when it is not there, is no plain file, or the file system gives no file number"""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode) or st.st_ino == 0:
+        return None
+    return [st.st_size, st.st_mtime_ns, st.st_ino, st.st_mode]
+
+
+def read_installed(out):
+    """The game folder's note: {a file's path under the folder, with /: {"sha1": its source's, "stat": installed_stat's}}.
+    Empty when there is none or it is not what write_installed writes (then everything is copied)"""
+    try:
+        with open(os.path.join(out, INSTALLED_NOTE), encoding="utf-8") as f:
+            note = json.load(f)
+        files = note["files"] if note.get("format") == 1 else {}
+        if not isinstance(files, dict):
+            return {}
+        return {k: v for k, v in files.items()
+                if isinstance(v, dict) and isinstance(v.get("sha1"), str) and isinstance(v.get("stat"), list)}
+    except (OSError, ValueError, KeyError, AttributeError, TypeError):
+        return {}
+
+
+def installed_name(out, dst):
+    """An installed file's name in the note: its path under the game folder, with / between the parts"""
+    return os.path.relpath(dst, out).replace(os.sep, "/")
+
+
+def installed_same(note, out, dst, digest):
+    """Whether dst in the game folder is still the copy of a source with this SHA-1 that the note says the finish
+    installed: the note's hash is this one and the file's size, time, number and mode are the noted ones"""
+    was = note.get(installed_name(out, dst))
+    now = installed_stat(dst)
+    return bool(digest and was and now and was["sha1"] == digest and was["stat"] == now)
+
+
+def write_installed(out, files):
+    """The note, whole: written beside itself and moved in, so a build stopped here leaves the old note or the new one.
+    A note that cannot be written is said and costs the next build its copies, nothing more"""
+    path = os.path.join(out, INSTALLED_NOTE)
+    try:
+        with open(path + ".new", "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"format": 1, "files": files}, f, indent=1, sort_keys=True)
+        os.replace(path + ".new", path)
+    except OSError as e:
+        print("could not note what was installed in %s (%s): the next build copies every file again" % (out, e), flush=True)
+        with contextlib.suppress(OSError):
+            os.remove(path + ".new")
+
+
 def refuse_dump_links(folder):
     """An extracted dump holds only files and folders: a link in it was followed, and hard-linked or copied the file it
-    names (anywhere on this PC) into the game folder. The folder itself may be one. (Walked as a long path: #1468)"""
+    names (anywhere on this PC) into the game folder. The folder itself may be one. (Walked as a long path: #1468)
+
+    (Triforce, 11-21, the performance audit's IO-41, after Source A's) From the folders' listings: os.scandir gives each
+    entry's kind and, on Windows, its attributes with the listing itself (the reparse-point bit is in them), so no file is
+    opened or asked about one by one. An os.lstat per entry took 36 to 49 s over the game's 186,583 files where the
+    listings take 1.3 to 1.5 s (Source A's, Windows 11, NTFS). And a folder that cannot be listed stops the build: os.walk
+    passed over it silently, and what it held was never looked at. HOOKSHOT_DUMP_LINKS_LSTAT=1: an os.lstat each, as before"""
+    if os.environ.get("HOOKSHOT_DUMP_LINKS_LSTAT", "") not in ("", "0"):
+        return refuse_dump_links_lstat(folder)
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    stack = [long_path(folder)]
+    while stack:
+        d = stack.pop()
+        try:
+            listing = os.scandir(d)
+        except OSError as e:
+            fail("Could not read the game files at %s (%s: %s)." % (folder, d, e.strerror or e))
+        with listing:
+            for entry in listing:
+                try:
+                    link = entry.is_symlink() or getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0) & reparse
+                    folder_too = not link and entry.is_dir(follow_symlinks=False)
+                except OSError as e:
+                    fail("Could not read the game files at %s (%s: %s)." % (folder, entry.path, e.strerror or e))
+                if link:
+                    fail("The game files at %s contain a link (%s): copy them without links and choose that folder."
+                         % (folder, entry.path))
+                if folder_too:
+                    stack.append(entry.path)
+
+
+def refuse_dump_links_lstat(folder):
+    """(HOOKSHOT_DUMP_LINKS_LSTAT=1) refuse_dump_links as it was: os.walk, an os.lstat per entry"""
     for d, dirs, files in os.walk(long_path(folder)):
         for name in dirs + files:
             path = os.path.join(d, name)
@@ -1214,31 +1413,43 @@ def long_path(p):
 
 
 def link_or_copy(src, dst):
-    """the romfs by hard links where the disk allows: 26 GB not written twice"""
+    """the romfs by hard links where the disk allows: 26 GB not written twice
+
+    (Triforce, 11-21, the performance audit's IO-41, after Source A's) One walk; each folder made once, not asked for at
+    every file of it; and no os.path.exists before each link: os.link says FileExistsError itself for a file a retry left,
+    which is passed over. The staged copy, for a disk that cannot link, is as it was"""
     src, dst = long_path(src), long_path(dst)
-    files = [os.path.join(d, f) for d, _, fs in os.walk(src) for f in fs]
-    for i, s in enumerate(files):
-        t = os.path.join(dst, os.path.relpath(s, src))
-        os.makedirs(os.path.dirname(t), exist_ok=True)
-        if not os.path.exists(t):
+    walked = [(d, fs) for d, _, fs in os.walk(src)]
+    total, i = sum(len(fs) for _, fs in walked), 0
+    for d, fs in walked:
+        rel = os.path.relpath(d, src)
+        # (the top folder is dst itself: an extended-length path keeps "dst\\." as it is written, a folder named ".")
+        to = dst if rel == os.curdir else os.path.join(dst, rel)
+        os.makedirs(to, exist_ok=True)
+        for f in fs:
+            s, t = os.path.join(d, f), os.path.join(to, f)
             try:
                 os.link(s, t)
+            except FileExistsError:
+                pass   # (a retry: what an earlier try put there stays)
             except OSError:
-                # A retry skips existing targets, so publish the copy only after it is complete.
-                fd, staged = tempfile.mkstemp(prefix=".romfs-", dir=os.path.dirname(t))
-                try:
-                    os.close(fd)
-                    shutil.copy2(s, staged)
-                    os.replace(staged, t)
-                except BaseException:
-                    with contextlib.suppress(FileNotFoundError):
-                        if os.name == "nt":
-                            # copy2 can carry the source's read-only attribute over.
-                            os.chmod(staged, stat.S_IWRITE)
-                        os.unlink(staged)
-                    raise
-        if i % 500 == 0:
-            say("progress", "%.3f" % (i / max(1, len(files))))
+                if not os.path.exists(t):
+                    # A retry skips existing targets, so publish the copy only after it is complete.
+                    fd, staged = tempfile.mkstemp(prefix=".romfs-", dir=to)
+                    try:
+                        os.close(fd)
+                        shutil.copy2(s, staged)
+                        os.replace(staged, t)
+                    except BaseException:
+                        with contextlib.suppress(FileNotFoundError):
+                            if os.name == "nt":
+                                # copy2 can carry the source's read-only attribute over.
+                                os.chmod(staged, stat.S_IWRITE)
+                            os.unlink(staged)
+                        raise
+            if i % 500 == 0:
+                say("progress", "%.3f" % (i / max(1, total)))
+            i += 1
 
 
 def shader_census_cmd(romfs, out):
@@ -1266,24 +1477,111 @@ def compile_alone_failed(lines):
         elif "link FAILED" in line:
             return False
     return bool(failed)
+
+
+LIFT_KEPT_ONCE = ".lift_kept_after_failure"   # (in <work>/sa, not in sa/gen, whose files gen_print vouches for: the lift was kept after a failed compile, once)
+
+
+def failed_only_own_sources(lines, work):
+    """(Triforce, 11-22, the performance audit's LIFT-27, after Source A's) Whether a build that failed in its compile
+    (compile_alone_failed) failed only in the program's own sources, host/ and the renderers, and in nothing the lift
+    wrote: then the translated game is not what failed, and its key can stay, so that the next build does not translate
+    the game again (a compiler out of memory on a renderer's file cost the retry the whole lift, a minute to several).
+    lines: build.py's own, "FAILED <file> (...)" for each file that failed alone too and "compiled in Ns, K failed".
+    False unless every one of the K files is named, none is a lifted file (code_*) and none is a file of the lift's
+    folder or of the build's generated one (<work>/sa/gen, <work>/sa/build/gen): a lifted file cut short or left by
+    another builder fails there or at the link (issues 1197, 1176), and the lift is then forgotten as before"""
+    names, count = [], None
+    for line in lines:
+        m = re.match(r"FAILED (\S+) \(", line)
+        if m:
+            names.append(m.group(1))
+        m = re.match(r"compiled in \d+s, (\d+) failed", line)
+        if m:
+            count = int(m.group(1))
+    if not names or count != len(names):
+        return False
+    made = (os.path.join(work, "sa", "gen"), os.path.join(work, "sa", "build", "gen"))
+    return not any(n.startswith("code_") or any(os.path.exists(os.path.join(d, n)) for d in made) for n in names)
+
+
+def keep_lift_after_failure(lines, work, environ=None):
+    """Whether a failed build keeps the lift's key: HOOKSHOT_KEEP_LIFT is not 0, the compile alone failed, only the
+    program's own sources failed (failed_only_own_sources), and the build before this one did not keep it the same way.
+    That last: a generated header cut short fails the program's own files, which name nothing of the lift; kept twice,
+    such a lift would fail at every try, so the second failure in a row forgets it, as every failure did before.
+    Leaves LIFT_KEPT_ONCE in <work>/sa when it says yes and removes it when it says no (main removes it after a build
+    that compiled)"""
+    environ = os.environ if environ is None else environ
+    mark = os.path.join(work, "sa", LIFT_KEPT_ONCE)
+    again = os.path.exists(mark)
+    keep = environ.get("HOOKSHOT_KEEP_LIFT", "1") != "0" and not again and compile_alone_failed(lines) and \
+        failed_only_own_sources(lines, work)
+    try:
+        if keep:
+            open(mark, "w").close()
+        elif again:
+            os.remove(mark)
+    except OSError:
+        keep = False   # (the mark cannot be kept: not twice in a row cannot be told, so the lift is forgotten)
+    return keep
 PROMPT_KEY = ".made_from"   # (in <out>/prompts: prompts_key of what that folder was made from)
 
 
-def prompts_key(out):
+def prompt_game_files(romfs):
+    """((Triforce, 11-21, the performance audit's IO-43) The game's files nx2/prompt_assets.py reads, as names under the
+    romfs, each once and in a fixed order: the zstd dictionaries' pack, the font, the textures, the layouts, the camera's
+    pack, the resource size table and every language's messages. None when the tool's own names cannot be had.
+    tests/test_prompts_background.py holds this list against what the tool opens"""
+    try:
+        import prompt_assets
+    except Exception:   # (the tool is not beside this one, or does not load: the prompts are made at every build, as before)
+        return None
+    names = ["Pack/ZsDic.pack.zs", prompt_assets.FONT, prompt_assets.TEXTURES, prompt_assets.LAYOUTS, prompt_assets.CAMERA]
+    try:   # (the first by name, as prompt_assets.read_size_table takes it)
+        names += ["System/Resource/" + n for n in sorted(os.listdir(os.path.join(romfs, "System", "Resource")))
+                  if n.startswith("ResourceSizeTable.") and n.endswith(".rsizetable.zs")][:1]
+    except OSError:
+        pass
+    try:
+        names += [prompt_assets.MALS + "/" + n for n in sorted(os.listdir(os.path.join(romfs, prompt_assets.MALS)))
+                  if n.endswith(".sarc.zs")]
+    except OSError:
+        pass
+    return names
+
+
+def prompts_key(out, romfs=None):
     """What the button prompts of other controllers are made from, as one hash: the tools that draw them (nx2/prompt_*.py,
     the faces' drawings and parts in nx2/prompt_faces, the icon fonts in third_party/kenney_input), the packages they are
     drawn with (nx2/prompt_requirements.txt) and the game's files, by the unpack's stamp (.triforce_romfs: the .nup's name
-    and size). None when the romfs has no such stamp (the player's own folders, linked in): its prompts are made at every
-    build, as before. (Triforce) The keyboard and mouse face's too: nx2/prompt_keys.py, which draws it, and the font its
-    labels are set in (third_party/fonts/libertinus: that one file, the menus' other fonts are not the prompts')"""
+    and size). (Triforce) The keyboard and mouse face's too: nx2/prompt_keys.py, which draws it, and the font its
+    labels are set in (third_party/fonts/libertinus: that one file, the menus' other fonts are not the prompts')
+
+    (Triforce, 11-21, the performance audit's IO-43, after Source A's) A romfs with no such stamp (the player's own
+    folders, linked in) had no key, and its prompts were drawn at every build and every update, 60 to 87 s each time:
+    its key is now the content of the game's files the tool reads (prompt_game_files, about 100 MB hashed). And for
+    every game the key holds host/prompts.c, which reads what is drawn, and the release these tools are (version.txt or
+    VERSION; a checkout has neither). None, the prompts made at every build as before: with no stamp and no romfs given,
+    when the tool's names cannot be had, or with HOOKSHOT_PROMPTS_FOLDER_KEY=0"""
     stamp = os.path.join(out, ".triforce_romfs")
+    game = []   # (the game's files by content, where no stamp says which dump they are)
     if not os.path.isfile(stamp):
-        return None
+        if not romfs or os.environ.get("HOOKSHOT_PROMPTS_FOLDER_KEY", "") == "0":
+            return None
+        names = prompt_game_files(romfs)
+        if names is None:
+            return None
+        game = [("romfs/" + n, os.path.join(long_path(romfs), *n.split("/"))) for n in names]
+        stamp = None
     # (each file under a name that does not depend on where the tools are installed)
     files = [("nx2/" + n, os.path.join(HERE, n))
              for n in ("prompt_assets.py", "prompt_draw.py", "prompt_faces.py", "prompt_requirements.txt", "prompt_keys.py")]
     labels = "third_party/fonts/libertinus/LibertinusSans-Bold.ttf"
     files.append((labels, os.path.join(ROOT, *labels.split("/"))))
+    # ((Triforce, 11-21, IO-43) what reads the drawn files in the game, and which release these tools are)
+    files.append(("host/prompts.c", os.path.join(ROOT, "host", "prompts.c")))
+    files += [("release/" + n, os.path.join(ROOT, n)) for n in ("version.txt", "VERSION")]
     for name, root in (("nx2/prompt_faces", os.path.join(HERE, "prompt_faces")),
                        ("third_party/kenney_input", os.path.join(ROOT, "third_party", "kenney_input"))):
         for folder, dirs, names in os.walk(root):
@@ -1291,13 +1589,19 @@ def prompts_key(out):
             files += [(name + "/" + os.path.relpath(os.path.join(folder, n), root).replace(os.sep, "/"), os.path.join(folder, n))
                       for n in sorted(names)]
     h = hashlib.sha1()
-    with open(stamp, "rb") as f:
-        h.update(f.read())
-    for name, path in files:
+    if stamp:
+        with open(stamp, "rb") as f:
+            h.update(f.read())
+    else:
+        h.update(b"the game's files, by content\n")
+    for name, path in game + files:
         if os.path.isfile(path):
             h.update(name.encode())
             with open(path, "rb") as f:
-                h.update(f.read())
+                for piece in iter(lambda: f.read(1 << 20), b""):
+                    h.update(piece)
+        elif (name, path) in game:
+            h.update(name.encode() + b": none\n")   # (a file the tool would miss: not the key of a romfs that has it)
     return h.hexdigest()
 
 
@@ -1355,7 +1659,7 @@ class Prompts:
 
     def __init__(self, romfs, out, work):
         self.out, self.folder, self.new = out, os.path.join(out, "prompts"), os.path.join(out, "prompts.new")
-        self.key = prompts_key(out)
+        self.key = prompts_key(out, romfs)   # ((Triforce, 11-21, IO-43) the romfs: its files' content where it has no stamp)
         self.proc = self.log = None
         self.state = "no fontTools" if importlib.util.find_spec("fontTools") is None else None
         if self.state:
@@ -1418,7 +1722,12 @@ class Prompts:
 # the lift can import and to what its files name.
 LIFT_KEY_NOT = ("make_game.py", "build.py", "nup.py", "version.py", "shader_census.py", "prompt_assets.py", "prompt_draw.py",
                 "prompt_faces.py", "prompt_requirements.txt", "prompt_keys.py",
-                "code_mods.py")   # (the mods' code patches: what it does to the game's code is in the key, the exefs's files)
+                "code_mods.py",   # (the mods' code patches: what it does to the game's code is in the key, the exefs's files)
+                # ((Triforce, 11-22, the performance audit's LIFT-27) the last release's shader translation stamp, which
+                # build.py alone reads (RELEASED_STAMP): a release that changed the shader translator lifted the game again.
+                # HOOKSHOT_KEEP_LIFT=0 puts it back in the key: lift_key)
+                "released_translation_stamp.json",
+                "cold_parts.py")   # ((Triforce, 11-22, LIFT-17) the compile's parts of a -O2 chunk: nx2/build.py's alone
 
 
 def lift_key_file(rel):
@@ -1437,13 +1746,18 @@ def lift_key(exefs, work, env, chunks=True):
     import standalone
     h = hashlib.sha1(sys.version.encode(), usedforsecurity=False)
     h.update(" ".join(sorted(standalone.implemented())).encode())
+    # ((Triforce, 11-22, the performance audit's LIFT-27, after Source A's) HOOKSHOT_KEEP_LIFT=0: the key as it was, with
+    # every A64_, OOT_ and RX_ variable and the paths in it, and the release's translation stamp among its files. Read
+    # here, inside the function, like COMPILE_ONLY_ENV below)
+    key_as_before = os.environ.get("HOOKSHOT_KEEP_LIFT", "1") == "0"
     # (each file named from its own base: the exefs and the work folder may be on another drive than the source, which relpath refuses)
     files = [(exefs, os.path.join(exefs, f)) for f in sorted(os.listdir(exefs))]
     for top in (HERE, os.path.join(ROOT, "third_party", "a64-kit")):
         for d, dirs, fs in os.walk(top):
             dirs[:] = sorted(x for x in dirs if x != "__pycache__")
             files += [(ROOT, os.path.join(d, f)) for f in sorted(fs) if f.endswith((".py", ".c", ".h", ".cpp", ".hpp", ".txt", ".json"))
-                      and (top != HERE or lift_key_file(os.path.relpath(os.path.join(d, f), HERE).replace(os.sep, "/")))]
+                      and (top != HERE or lift_key_file(os.path.relpath(os.path.join(d, f), HERE).replace(os.sep, "/"))
+                           or (key_as_before and d == HERE and f == "released_translation_stamp.json"))]
     files.append((work, os.path.join(work, "hot_funcs.txt")))
     if chunks:
         files.append((work, os.path.join(work, "image", "chunks.txt")))
@@ -1453,6 +1767,19 @@ def lift_key(exefs, work, env, chunks=True):
             with open(f, "rb") as src:
                 h.update(hashlib.sha1(src.read(), usedforsecurity=False).digest())
     lift_env = dict(env, **{k: v for k, v in os.environ.items() if k.startswith(("A64_", "OOT_", "RX_"))})
+    # ((Triforce, 11-21, LIFT-10) what only the compile after the lift reads: the renderer's profile translates no game code.
+    # Named here, inside the function: tests/test_lift_key_files.py and test_spawn_emit.py run lift_key cut out by itself)
+    COMPILE_ONLY_ENV = ("RX_VK_PGO", "RX_VK_PGO_FILE")
+    for name in COMPILE_ONLY_ENV:
+        lift_env.pop(name, None)
+    # ((Triforce, 11-22, LIFT-27) only what shapes the C: the lifter's own switches (A64_*: nx2/fastvec.py and the kit's
+    # a64_lift.py read no others) and the target (RX_TARGET: the kit's toolchain.windows). The rest that the lift's files
+    # read are folders (OOT_WORK, OOT_DUMP, OOT_EXEFS, OOT_ROMFS: the files there are hashed above by their contents),
+    # job counts and where the compiler is, and what the compile after the lift reads (RX_RELEASE, the profile's path):
+    # a build from another folder, or one more variable in the environment, lifted the same C again.
+    # tests/test_lift_key_env.py holds the lift's files to that list)
+    if not key_as_before:
+        lift_env = {k: v for k, v in lift_env.items() if k.startswith("A64_") or k == "RX_TARGET"}
     h.update(repr(sorted(lift_env.items())).encode())
     return h.hexdigest()
 
@@ -1843,7 +2170,9 @@ def main(a=None):
     check_cpu()   # (no game read yet: the AppImage on a CPU without AVX2 stops here)
     if not LINUX:
         check_windows_sdk()
-    stop_stray_compilers(work, a.default_work)
+    stopped = stop_stray_compilers(work, a.default_work)
+    # ((Triforce, 11-22, the performance audit's IO-47) after the stop, so that Windows still replaces a build left running)
+    lock_work(work, wait=10 if stopped else 0)
     drop_stale_objects(work)
     if getattr(a, "fetch_ngx_sdk", False):
         fetch_ngx_sdk(a)
@@ -1853,9 +2182,9 @@ def main(a=None):
         os.environ["HOOKSHOT_FSR"] = "1"
         fetch_fsr_runtime(work)   # (AMD's two libraries, for the game folder: place_fsr_runtime at the end)
         open(os.path.join(out, FSR_MARK), "w").close()
-        if os.environ.get("HOOKSHOT_VK_PREBUILT"):   # (the AppImage's back end, built without FSR 4)
-            print("--fsr: this build uses the prebuilt Vulkan back end (HOOKSHOT_VK_PREBUILT), which has no AMD FSR 4: the "
-                  "Upscaler row will not offer it", flush=True)
+        if os.environ.get("HOOKSHOT_VK_PREBUILT"):   # (the AppImage's back end: built with FSR 4 since 11-20, appimage.sh)
+            print("--fsr: this build uses the prebuilt Vulkan back end (HOOKSHOT_VK_PREBUILT), which has AMD FSR 4 built in "
+                  "already: the Upscaler row offers it once amd_fidelityfx_upscaler_vk.so is in the game folder", flush=True)
     else:
         os.environ.pop("HOOKSHOT_FSR", None)
         if os.path.isfile(os.path.join(out, FSR_MARK)):
@@ -1966,7 +2295,8 @@ def main(a=None):
     code_patches = _code_mods.build_step(exefs, out, say=lambda line: print(line, flush=True))
 
     # (made once on the development PC: lists of addresses and counts, no game code)
-    for name in ("hot_funcs.txt", "hot_order.txt", "hookshot_pieces.prof", "hookshot.res"):
+    # ((Triforce, 11-21, the performance audit's LIFT-10) and the renderer's play profile, triforce_vk.profdata)
+    for name in ("hot_funcs.txt", "hot_order.txt", "hookshot_pieces.prof", "triforce_vk.profdata", "hookshot.res"):
         src = os.path.join(ROOT, "work", name)
         dst = os.path.join(work, name)
         # (copied only when it differs: a compiler still ending from a cancelled build keeps the profile mapped, WinError 1224)
@@ -1982,6 +2312,11 @@ def main(a=None):
         env["A64_HOT_FUNCS"] = os.path.join(work, "hot_funcs.txt")
     if os.path.exists(os.path.join(work, "hookshot_pieces.prof")) and profile_readable(os.path.join(work, "hookshot_pieces.prof")):
         env["RX_PGO"] = os.path.join(work, "hookshot_pieces.prof")
+    # ((Triforce, 11-21, LIFT-10) the renderer's own code with the shipped profile, unless RX_VK_PGO says what to do (gen, a
+    # file, 0) or this compiler cannot read it: nx2/build.py vk_pgo_flags)
+    vk_profile = os.path.join(work, "triforce_vk.profdata")
+    if "RX_VK_PGO" not in os.environ and os.path.exists(vk_profile) and profile_readable(vk_profile):
+        env["RX_VK_PGO"] = vk_profile
 
     prompts = Prompts(romfs, out, work)   # (drawn beside the lift and the compile: finish() below)
     atexit.register(prompts.stop)   # (a build that stops for any reason takes its drawing with it)
@@ -2060,7 +2395,8 @@ def main(a=None):
     said = []   # (build.py's lines about how its compile and its links went: compile_alone_failed)
 
     def compiled(line):
-        if line.startswith("compiled in ") or "link FAILED" in line:
+        # ((Triforce, 11-22, LIFT-27) and which files failed, "FAILED <file> (...": failed_only_own_sources)
+        if line.startswith("compiled in ") or "link FAILED" in line or line.startswith("FAILED "):
             said.append(line)
         m = re.match(r"(\d+) files, ", line)
         if m:
@@ -2093,13 +2429,21 @@ def main(a=None):
         # (hookshot) a compile or link that failed forgets the lift: the next build translates the game again. A lifted file cut short
         # (an antivirus, a full disk, a stopped run: "g_module_b" for g_module_base, issue 1197) or lifted C another builder left (20
         # undefined game functions at the link, issue 1176) otherwise failed the same way at every try, the key still matching
+        # ((Triforce, 11-22, the performance audit's LIFT-27, after Source A's) but for a compile that failed only in the
+        # program's own sources, once: the translated game is not what failed. keep_lift_after_failure; HOOKSHOT_KEEP_LIFT=0:
+        # forgotten after every failed build, as before)
+        lift_kept = keep_lift_after_failure(said, work)
         key_file = os.path.join(work, "sa", "gen", LIFT_KEY)
-        if os.path.exists(key_file):
+        if os.path.exists(key_file) and not lift_kept:
             os.remove(key_file)
         # (and its compiled objects go too: a cached runtime object from another version linked with every object "compiled in 0s"
         # and a64_dirty, a64_icall, a64_lookup, recomp_cntpct undefined, at every try (issue 1197, Linux, v2.0.10))
         # (Triforce: but not when the compile alone failed, before any link: compile_alone_failed)
-        if compile_alone_failed(said):
+        if lift_kept:
+            print("the build failed in its compile, in the program's own files only: the translated game and the files that "
+                  "did compile are kept, and the next build compiles only the rest (a second failure like it translates the "
+                  "game again)", flush=True)
+        elif compile_alone_failed(said):
             print("the build failed in its compile: the files that did compile are kept, and the next build translates the game "
                   "again and compiles only the rest", flush=True)
         else:
@@ -2108,6 +2452,8 @@ def main(a=None):
             print("the build failed: the next one translates and compiles the game again (nothing of this one is reused)", flush=True)
         prompts.stop()
         raise
+    with contextlib.suppress(OSError):   # ((Triforce, 11-22, LIFT-27) a build that compiled: no failure in a row any more)
+        os.remove(os.path.join(work, "sa", LIFT_KEPT_ONCE))
     compile_seconds = time.time() - compile_started
 
     say("stage", "finish", "Putting the game folder together")
@@ -2137,6 +2483,25 @@ def main(a=None):
     staged.append((os.path.join(work, "sa", "image", "image.bin"), os.path.join(out, "image.bin")))
     if launcher:
         staged.append((launcher, os.path.join(out, BESIDE[0])))
+    # ((Triforce, 11-22, the performance audit's IO-45) a file the folder already has from the same source is passed
+    # over: INSTALLED_NOTE above. What is left in staged is copied and swapped as before)
+    copy_all = os.environ.get("HOOKSHOT_FINISH_COPY_ALL", "0") not in ("", "0")
+    installed_note = {} if copy_all else read_installed(out)
+    installed_now, wanted, there = {}, staged, []
+    staged = []
+    for src, dst in wanted:
+        digest = None if copy_all else file_sha1(src)
+        if installed_same(installed_note, out, dst, digest):
+            installed_now[installed_name(out, dst)] = installed_note[installed_name(out, dst)]
+            there.append(installed_name(out, dst))
+            with contextlib.suppress(OSError):   # (a <name>.new an interrupted build left: gone when it can go, never unlocked)
+                os.remove(dst + ".new")
+        else:
+            staged.append((src, dst))
+            installed_now[installed_name(out, dst)] = {"sha1": digest, "stat": None}
+    if there:
+        print("the game folder has %d of this build's %d files already (%s): not copied again"
+              % (len(there), len(wanted), ", ".join(there)), flush=True)
     for src, dst in staged:
         try:
             if os.path.exists(dst + ".new"):
@@ -2152,6 +2517,16 @@ def main(a=None):
         except PermissionError:
             fail("Could not replace %s. Close any running copy of Triforce and check that the file and folder are writable, then retry. "
                  "Staged replacements remain beside the installed files; the compiled source remains at %s." % (dst, src))
+    # ((Triforce, 11-22, IO-45) noted only now, with every swap done: each file just installed as it is in the folder)
+    if copy_all:
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(out, INSTALLED_NOTE))
+    else:
+        for src, dst in staged:
+            installed_now[installed_name(out, dst)]["stat"] = installed_stat(dst)
+        installed_now = {k: v for k, v in installed_now.items() if v["sha1"] and v["stat"]}
+        if installed_now != installed_note:   # (nothing installed and nothing gone: the note is the one there)
+            write_installed(out, installed_now)
     if launcher:   # (a folder built before the launcher: its libraries left the folder for bin\; hookshot is the launcher now)
         stale = [] if LINUX else sorted(f for f in os.listdir(out) if f.endswith(".dll") and f.startswith(("av", "sw")))
         for n in BESIDE[1:] + stale + ["Triforce.map", "hookshot.map", "hookshot-game.exe"]:

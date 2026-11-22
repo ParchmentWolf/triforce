@@ -1,6 +1,8 @@
 /* Guest memory map: the system region (our own objects), the heap, address regions.
    The whole 4 GB window is committed up front (hos_main.c), so "mapping" here is only bookkeeping and zeroing. */
 #include "hos.h"
+#include "heap_commit.h"   /* ((Triforce, 11-21, MEM-09) the heap committed as it is touched) */
+#include "stall_host.h"   /* ((Triforce, 11-22, OS-51) the host's part of a long frame, counted where it is spent) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -166,6 +168,57 @@ static void pages_mark_used_locked(uint64_t addr, uint64_t size) {
     for (uint64_t p = addr >> 12; p < (addr + size + 0xFFF) >> 12 && p < (1ULL << 20); p++) pages_used[p >> 6] |= 1ULL << (p & 63);
 }
 
+/* ((Triforce, 11-22, the performance audit's MEM-13) HOS_MEM_ZERO_MARK=1: hos_guest_fill (hos.h) marks what it fills as
+   written. Read once, off unless set */
+int hos_mem_zero_mark(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("HOS_MEM_ZERO_MARK");
+        const int v = e && *e && atoi(e) != 0;
+        if (v) hos_log("mem: freed pages zeroed under an import are marked written for the renderer (HOS_MEM_ZERO_MARK=1)");
+        on = v;
+    }
+    return on;
+}
+
+/* (Triforce, 11-22, the performance audit's OS-40, after Source A's) Whether a thread keeps its virtual core while it
+   discards. A discard is milliseconds in the kernel for a region of some MB, and before it the lazy write-back's pages
+   there are paid and pages a GPU import holds are zeroed; all the while the thread runs no guest code and the game
+   threads allowed only on its core wait. Source A gives the core up before a freed region's discard and takes it back
+   once, after the region is unlisted: at its Market the core waits of 50 ms and more went from 287 to 19 (275 of them
+   loader threads'), the longest from 177 to 45 ms, with the frames unchanged; the freeing thread once waited 124 ms for
+   its core back, in a load.
+   HOS_DISCARD_KEEP_CORE, read once:
+   - not set: as before. The core is given up for the discard's own kernel call, and only with the limit on
+     (HOS_MEM_LIMIT), where that was measured; hos_region_free itself gives nothing up;
+   - 0: Source A's. hos_region_free gives the core up before the whole of its discard (the write-back's payment and the
+     import's zero-fill too) and takes it back once the region is unlisted, never under the regions' lock; the discard's
+     own call gives it up as well, limit or not, which is what FreeMemoryPages' discard then has (under a region's
+     give-up it finds the core gone already and does nothing);
+   - 1 (any other number): the core kept through every discard, with the limit too.
+   Not the default: it reverses the choice made here to stay on upstream's path without the limit, it changes when a game
+   thread waits, and it was not measured here */
+enum { DISCARD_CORE_AS_BEFORE, DISCARD_CORE_GIVEN_UP, DISCARD_CORE_KEPT };
+static int discard_core_rule(const char *env) {
+    if (!env || !*env) return DISCARD_CORE_AS_BEFORE;
+    return atoi(env) != 0 ? DISCARD_CORE_KEPT : DISCARD_CORE_GIVEN_UP;
+}
+/* (a freed region's give-up around its whole discard; and the discard call's own) */
+static int discard_core_region_away(int mode) { return mode == DISCARD_CORE_GIVEN_UP; }
+static int discard_core_call_away(int mode, int limit_on) {
+    return mode == DISCARD_CORE_GIVEN_UP || (mode == DISCARD_CORE_AS_BEFORE && limit_on);
+}
+static int discard_core(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        mode = discard_core_rule(getenv("HOS_DISCARD_KEEP_CORE"));
+        if (mode != DISCARD_CORE_AS_BEFORE)
+            hos_log("mem: a thread %s while it discards freed memory (HOS_DISCARD_KEEP_CORE)",
+                    mode == DISCARD_CORE_GIVEN_UP ? "gives its virtual core up for the whole of a freed region's discard" : "keeps its virtual core");
+    }
+    return mode;
+}
+
 static void discard_pages(uint64_t addr, uint64_t size) {
     if (!hos_guest_range(addr, size)) return;   /* (hookshot: guest pages only; Linux's discard zeroes what it is given) */
     const uint64_t lo = (addr + 0xFFF) & ~0xFFFULL, hi = (addr + size) & ~0xFFFULL;
@@ -181,12 +234,16 @@ static void discard_pages(uint64_t addr, uint64_t size) {
        (QueryMemoryInfo above), with the game's frames waiting on it (Hyrule Field 34 fps, Castle Town 15). Zeroed: the pages
        read as zero, as freed pages; the census keeps them for the give-back once no import holds them) */
     extern int rx_guest_imported(uint64_t lo, uint64_t hi);
+    const int64_t stall0 = stall_host_begin();   /* ((Triforce, OS-51) the host's part of a long frame: stall_host.h) */
     {
         const int io = hos_guest_io_begin(GP(lo), hi - lo);
         const int held = rx_guest_imported(lo, hi);
-        if (held) memset(GP(lo), 0, (size_t)(hi - lo)), hos_mem_note(HOS_MEM_ZEROED, lo, hi - lo);
+        if (held) hos_guest_fill(lo, 0, hi - lo), hos_mem_note(HOS_MEM_ZEROED, lo, hi - lo);   /* ((Triforce, 11-22, MEM-13) marked with HOS_MEM_ZERO_MARK=1) */
         hos_guest_io_end(io);
-        if (held) return;   /* (lab tour: 5.2 GB zeroed in 0.47 s in all) */
+        if (held) {   /* (lab tour: 5.2 GB zeroed in 0.47 s in all) */
+            stall_host_end(STALL_HOST_ZERO, stall0, hi - lo);
+            return;
+        }
     }
     /* (Triforce, the census: let go and still committed. Not the large pages above, left as they were, nor Linux's below,
        noted zeroed or decommitted there) */
@@ -203,9 +260,11 @@ static void discard_pages(uint64_t addr, uint64_t size) {
        in which the thread runs no guest code and cannot see a better thread's ask for its core (hos_thread.c vc_kick). Held to
        its memory (HOS_MEM_LIMIT) the game frees regions by the hundred while an area loads, on its Resource Memory thread.
        Only with the limit on, where it was measured: without it the game frees few regions and the path is upstream's) */
-    const int away = hos_mem_limit() ? hos_vcore_away() : 0;
+    /* ((Triforce, 11-22, OS-40) HOS_DISCARD_KEEP_CORE: 0 gives it up without the limit too, 1 never: discard_core above) */
+    const int away = discard_core_call_away(discard_core(), hos_mem_limit() != 0) ? hos_vcore_away() : 0;
     if (!discard || discard(GP(lo), (SIZE_T)(hi - lo)) != ERROR_SUCCESS)
         VirtualAlloc(GP(lo), (SIZE_T)(hi - lo), MEM_RESET, PAGE_READWRITE);
+    stall_host_end(STALL_HOST_DISCARD, stall0, hi - lo);   /* ((Triforce, OS-51) with its write-back wait, not the wait for the core) */
     if (away) hos_vcore_back();
     hos_guest_io_end(io);
 #elif !defined(__EMSCRIPTEN__)
@@ -213,15 +272,18 @@ static void discard_pages(uint64_t addr, uint64_t size) {
     extern int rx_guest_imported(uint64_t lo, uint64_t hi);
     /* (pages a dma-buf import holds stay where they are, zeroed: a hole punched under one would leave the GPU on
        the old pages and the game on new ones) */
-    if (rx_guest_imported(lo, hi)) memset(GP(lo), 0, (size_t)(hi - lo)), hos_mem_note(HOS_MEM_ZEROED, lo, hi - lo);
+    if (rx_guest_imported(lo, hi)) hos_guest_fill(lo, 0, hi - lo), hos_mem_note(HOS_MEM_ZEROED, lo, hi - lo);   /* ((Triforce, 11-22, MEM-13) as above) */
     else hos_posix_guest_discard(GP(lo), (size_t)(hi - lo)), hos_mem_note(HOS_MEM_DECOMMITTED, lo, hi - lo);
 #endif
 }
 
 static int64_t region_frees_bare;   /* ((Triforce) regions freed without a discard: hos_region_discard_needed; the refusal line's) */
+/* ((Triforce, 11-22, OS-40) the frees that gave their core up for the discard (HOS_DISCARD_KEEP_CORE=0), and how long the
+   longest waited for its core back; a line every 1,000) */
+static int64_t region_frees_away, region_back_longest_ns;
 void hos_region_free(uint64_t addr) {
     uint64_t freed_size = 0;
-    int game = 0;
+    int game = 0, away = 0;
     LOCK();
     for (int i = 0; i < nregions; i++) {
         if (regions[i].addr == addr && !regions[i].freeing) {
@@ -244,6 +306,9 @@ void hos_region_free(uint64_t addr) {
        region is discarded, as upstream does) */
     const uint64_t game_pages = addr + freed_size <= GC_SPACE ? gc_count(&census, GC_GAME, addr, addr + freed_size) : ~0ULL;
     if (hos_region_discard_needed(game && hos_mem_limit(), hos_mem_census_on(), game_pages)) {
+        /* ((Triforce, 11-22, OS-40) HOS_DISCARD_KEEP_CORE=0: the core given up from here, with the region still listed and
+           marked, and taken back below once it is unlisted. A bare free, which makes no kernel call, keeps it) */
+        if (discard_core_region_away(discard_core())) away = hos_vcore_away();
         discard_pages(addr, freed_size);
     } else {
         hos_mem_note(HOS_MEM_DISCARDED, addr, freed_size);
@@ -258,6 +323,20 @@ void hos_region_free(uint64_t addr) {
         }
     }
     UNLOCK();
+    /* ((Triforce, 11-22, OS-40) the core back, after the lock is let go: a thread that queued for its core with the lock
+       held could wait on one that holds a core and waits for the lock) */
+    if (away) {
+        const int64_t t0 = hos_now_ns();
+        hos_vcore_back();
+        const int64_t waited = hos_now_ns() - t0;
+        int64_t longest = __atomic_load_n(&region_back_longest_ns, __ATOMIC_RELAXED);
+        while (waited > longest &&
+               !__atomic_compare_exchange_n(&region_back_longest_ns, &longest, waited, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+        const int64_t n = __atomic_add_fetch(&region_frees_away, 1, __ATOMIC_RELAXED);
+        if (n % 1000 == 0)
+            hos_log("mem: %lld freed regions discarded with the thread's virtual core given up; the longest waited %.1f ms for it "
+                    "back (HOS_DISCARD_KEEP_CORE)", (long long)n, __atomic_exchange_n(&region_back_longest_ns, 0, __ATOMIC_RELAXED) / 1e6);
+    }
 }
 
 /* ---- nn::os memory -------------------------------------------------------------------------------------- */
@@ -299,7 +378,24 @@ HLE(_ZN2nn2os17SetMemoryHeapSizeEm) {
         for (uint64_t a = HOS_HEAP_BASE + hos_heap_size; a < HOS_HEAP_BASE + size; a += 4096) *(volatile uint8_t *)GP(a) = 0;
         hos_log("heap: %llu MB prefaulted in %.0f ms", (unsigned long long)((size - hos_heap_size) >> 20), (hos_now_ns() - t0) / 1e6);
     }
-    if (size > hos_heap_size) hos_commit(HOS_HEAP_BASE + hos_heap_size, size - hos_heap_size);
+    /* ((Triforce, 11-21, the performance audit's MEM-09, after Source A's) Windows: the heap is left reserved and committed
+       as it is touched (mkw_glue.c commit_on_touch), not all at once: the game asks for ~6.9 GB and touches a part of it, and
+       committed, all of it counted against RAM plus the page file. heap_commit.h has the rule and what it needed first.
+       HOS_HEAP_COMMIT=1: whole, as before; and in large pages (HOS_LARGE_PAGES), reserved committed) */
+    {
+        extern uint64_t hos_large_hi;
+#if defined(_WIN32)
+        const int windows = 1;
+#else
+        const int windows = 0;
+#endif
+        const int whole = heap_commit_whole(getenv("HOS_HEAP_COMMIT"), hos_large_hi != 0, windows);
+        if (size > hos_heap_size && whole) hos_commit(HOS_HEAP_BASE + hos_heap_size, size - hos_heap_size);
+        if (size > hos_heap_size && !whole) {
+            hos_heap_on_touch = 1;   /* (the kernel calls on guest memory touch their buffers first: hos_guest_touch) */
+            hos_log("heap: left reserved, committed as it is touched (HOS_HEAP_COMMIT=1: all of it now, as before)");
+        }
+    }
     hos_heap_size = size;
     hos_log("heap: %llu MB at %#llx", (unsigned long long)(size >> 20), (unsigned long long)HOS_HEAP_BASE);
     RET(0);
@@ -433,9 +529,11 @@ HLE(_ZN2nn2os15FreeMemoryPagesEmm) {
            still maps them, and decommitted pages under an import faulted the device. Read as zero, as freed pages) */
         extern int rx_guest_imported(uint64_t lo, uint64_t hi);
         /* (Triforce: zeroed or decommitted: the lazy write-back's pages there first, rx_backend.c) */
+        const int64_t stall0 = hi > lo ? stall_host_begin() : 0;   /* ((Triforce, OS-51) the host's part of a long frame) */
         const int io = hi > lo ? hos_guest_io_begin(GP(lo), hi - lo) : 0;
         /* ((Triforce) the census: zeroed pages stay committed, kept for the give-back once no import holds them) */
-        if (hi > lo && rx_guest_imported(lo, hi)) memset(GP(lo), 0, (size_t)(hi - lo)), hos_mem_note(HOS_MEM_ZEROED, lo, hi - lo);
+        /* ((Triforce, 11-22, MEM-13) hos_guest_fill: the zeros marked written with HOS_MEM_ZERO_MARK=1) */
+        if (hi > lo && rx_guest_imported(lo, hi)) hos_guest_fill(lo, 0, hi - lo), hos_mem_note(HOS_MEM_ZEROED, lo, hi - lo);
 #if defined(_WIN32)
         else if (hi > lo) VirtualFree(GP(lo), (SIZE_T)(hi - lo), MEM_DECOMMIT), hos_mem_note(HOS_MEM_DECOMMITTED, lo, hi - lo);
 #else
@@ -446,6 +544,7 @@ HLE(_ZN2nn2os15FreeMemoryPagesEmm) {
         }
 #endif
         hos_guest_io_end(io);
+        stall_host_end(STALL_HOST_DECOMMIT, stall0, hi > lo ? hi - lo : 0);
         RET(0);
         return;
     }
@@ -736,7 +835,9 @@ int64_t hos_mem_give_back(uint64_t max_bytes) {
     uint64_t runs = 0, refused = 0;
     /* (from 4 GB up: below it AllocateMemoryPages zeroes pages without committing them, and a host call handed one that was
        given back would fail on it without a fault) */
+    const int64_t stall0 = stall_host_begin();   /* ((Triforce, OS-51) the host's part of a long frame: stall_host.h) */
     const uint64_t given = gc_give_back(&census, 1ULL << 32, &cursor, 16ULL << 20, max_bytes, 64, census_offer, NULL, &runs, &refused);
+    stall_host_end(STALL_HOST_GIVE_BACK, stall0, given);
     census_given += given, census_given_runs += runs, census_refused += refused;
     return census_unsupported && !given ? -1 : (int64_t)given;
 }

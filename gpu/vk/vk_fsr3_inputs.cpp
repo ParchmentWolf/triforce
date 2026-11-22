@@ -22,6 +22,7 @@
 
 #include "dlss_checks.h"     // ((Triforce) scene_size_fits: the scenes the gameplay upscale's output can come from)
 #include "dlss_math.h"
+#include "fg_motion.h"   // ((Triforce, 11-22) DLSS frame generation given the camera's motion alone: the owner's flicker)
 #include "framegen_rows.h"   // ((Triforce) pose_of, camera_cut: a camera cut starts a new history)
 #include "vk_draw.h"   // (descriptors_disturbed)
 #include "vk_fsr3.h"
@@ -454,6 +455,10 @@ bool made_this_frame() {
 bool chain_motion(VkCommandBuffer cmd, VkImage motion, uint32_t width, uint32_t height) {
     // (RX_VK_FG_OWN_MOTION=0: the camera's motion alone, as before, for comparing)
     static const bool off = env_switch("RX_VK_FG_OWN_MOTION") == 0;
+    // ((Triforce, 11-22) and NVIDIA DLSS frame generation the camera's alone too, by default: with the chain's motion the
+    // owner's flicker of 11-20 came back, with the camera's it did not (fg_motion.h says what was run).
+    // RX_VK_DLSSG_OWN_MOTION=1: the chain's for it as well, as before)
+    if (!fg_motion::chain(dlssg::active(), getenv("RX_VK_FG_OWN_MOTION"), getenv("RX_VK_DLSSG_OWN_MOTION"))) return false;
     State& s = st();
     std::lock_guard lk(s.mu);
     if (off || !cmd || !motion || !s.have_frame || s.frame.frame != texture_frame_no() || !s.motion.image ||

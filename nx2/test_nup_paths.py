@@ -207,10 +207,11 @@ class ExtractionPaths(unittest.TestCase):
                     with self.assertRaisesRegex(SystemExit, "^" + re.escape("unsafe path in the package: %r" % name) + "$"):
                         self.extract([name])
                     self.assertEqual(attempts, [])
-                    # In this exact context, a valid name must pass validation and reach a write.
-                    with self.assertRaisesRegex(WriteAttempt, "^os\\.makedirs$"):
+                    # In this exact context, a valid name must pass validation and reach a write (the part's folder,
+                    # made once by nup.Destination since the performance audit's IO-51).
+                    with self.assertRaisesRegex(WriteAttempt, "^os\\.mkdir$"):
                         self.extract(["valid.bin"])
-                    self.assertEqual(attempts, ["os.makedirs"])
+                    self.assertEqual(attempts, ["os.mkdir"])
                 self.assertEqual(before, snapshot(self.root))
 
     def test_write_guards_block_alternative_io(self):
@@ -255,7 +256,9 @@ class ExtractionPaths(unittest.TestCase):
         self.assertEqual((self.out / "romfs" / "file.bin").read_bytes(), b"authored fixture")
         self.assertFalse(partial.exists())
 
-    def test_failed_member_keeps_previous_file_and_can_be_retried(self):
+    def test_failed_member_is_removed_and_can_be_retried(self):
+        # (the performance audit's IO-51: a member is written straight to its name, so a file of another size that was
+        # there is unlinked first and a write that fails leaves nothing; before, the previous file stayed)
         target = self.out / "romfs" / "file.bin"
         target.parent.mkdir()
         partial = target.with_name("file.bin.part")
@@ -266,18 +269,16 @@ class ExtractionPaths(unittest.TestCase):
             output.write(b"some bytes")
             raise OSError(errno.ENOSPC, "authored disk-full failure")
 
-        failures = (
-            (patch.object(package, "copy_to", side_effect=out_of_space), errno.ENOSPC),
-            (patch.object(nup.os, "replace", side_effect=PermissionError(errno.EACCES, "authored replacement failure")),
-             errno.EACCES),
-        )
-        for failure, code in failures:
+        def refused(record, output, name):
+            raise PermissionError(errno.EACCES, "authored write failure")
+
+        for failure, code in ((out_of_space, errno.ENOSPC), (refused, errno.EACCES)):
             with self.subTest(error=code):
                 target.write_bytes(b"previous file")
-                with failure, self.assertRaises(OSError) as error:
+                with patch.object(package, "copy_to", side_effect=failure), self.assertRaises(OSError) as error:
                     nup.extract(package, title, str(self.out), only="romfs", quiet=True)
                 self.assertEqual(error.exception.errno, code)
-                self.assertEqual(target.read_bytes(), b"previous file")
+                self.assertFalse(target.exists())
                 self.assertFalse(partial.exists())
                 self.assertEqual(nup.extract(package, title, str(self.out), only="romfs", quiet=True),
                                  (1, len(package.data)))
@@ -317,18 +318,23 @@ class ExtractionPaths(unittest.TestCase):
             self.fail("Cannot create the file-link fixture: %s" % error)
         self.reject(["file.bin"], "extraction path is a link or reparse point: ")
 
-    def test_temporary_link_cannot_truncate_an_outside_file(self):
-        (self.out / "romfs").mkdir()
-        try:
-            os.symlink(self.sentinel, self.out / "romfs" / "file.bin.part")
-        except OSError as error:
-            self.fail("Cannot create the file-link fixture: %s" % error)
-        self.reject(["file.bin"], "extraction path is a link or reparse point: ")
-
-    def test_temporary_hard_link_cannot_truncate_an_outside_file(self):
-        (self.out / "romfs").mkdir()
-        os.link(self.sentinel, self.out / "romfs" / "file.bin.part")
-        self.reject(["file.bin"], "extraction temporary file has other hard links: ")
+    def test_stale_temporary_link_is_removed_without_touching_an_outside_file(self):
+        # (the performance audit's IO-51: no <member>.part is written any more, so one an older run left, a link or a
+        # hard link included, is only unlinked, which never reaches what it points at; before, both were refused)
+        for kind, make in (("link", os.symlink), ("hard link", os.link)):
+            with self.subTest(kind=kind):
+                folder = self.out / "romfs" / kind.replace(" ", "_")
+                folder.mkdir(parents=True)
+                partial = folder / "file.bin.part"
+                try:
+                    make(self.sentinel, partial)
+                except OSError as error:
+                    self.fail("Cannot create the file-link fixture: %s" % error)
+                name = folder.name + "/file.bin"
+                self.assertEqual(self.extract([name]), (1, len(b"authored fixture")))
+                self.assertEqual((folder / "file.bin").read_bytes(), b"authored fixture")
+                self.assertFalse(os.path.lexists(partial))
+                self.assertEqual(self.sentinel.read_bytes(), b"keep outside data")
 
     def test_heal_missing_module_and_resume(self):
         (self.out / "exefs").mkdir()

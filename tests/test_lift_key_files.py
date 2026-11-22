@@ -137,7 +137,9 @@ class LiftKeyFiles(unittest.TestCase):
             (exefs / "main").write_bytes(b"game code")
             names = ["lift.py", "chunks.py", "make_game.py", "build.py", "nup.py", "version.py", "shader_census.py",
                      "prompt_assets.py", "prompt_draw.py", "prompt_faces.py", "prompt_requirements.txt", "prompt_keys.py",
-                     "test_nup_paths.py", "prompt_faces/readme.txt", "code_mods.py"]
+                     "test_nup_paths.py", "prompt_faces/readme.txt", "code_mods.py",
+                     # ((11-22, the performance audit's LIFT-27) the release's shader translation stamp: build.py's alone)
+                     "released_translation_stamp.json"]
             for n in names:
                 (here / n).write_text("# %s\n" % n, encoding="utf-8")
             (root / "third_party" / "a64-kit" / "a64_lift.py").write_text("# kit\n", encoding="utf-8")

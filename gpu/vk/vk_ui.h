@@ -14,6 +14,8 @@
 #include <cfloat>
 #include <cmath>
 #include <cstring>
+#include <string>
+#include <vector>
 
 #include "imgui.h"
 #include "vk_imgui.h"
@@ -114,6 +116,43 @@ inline void text_mid_centre(Ctx& c, ImFont* font, float px, float cx, float y, I
 }
 inline void text_mid_right(Ctx& c, ImFont* font, float px, float x, float y, ImU32 col, const char* t) {
     text_mid(c, font, px, x - size_of(font, px, t).x, y, col, t);
+}
+/// A line cut to w: as it is, or its longest whole characters with "..." that fit (a utf-8 sequence is never
+/// split). out is what to draw; the width drawn (0: nothing fits)
+inline float fit_text(const char* t, ImFont* font, float px, float w, std::string* out) {
+    out->clear();
+    if (!t || !*t || w <= 0) return 0;
+    const float full = size_of(font, px, t).x;
+    if (full <= w) { *out = t; return full; }
+    const size_t n = strlen(t);
+    std::vector<size_t> starts;   // (every character's first byte: a cut never falls inside a utf-8 sequence)
+    for (size_t i = 0; i < n; i++)
+        if (((unsigned char)t[i] & 0xC0) != 0x80) starts.push_back(i);
+    // (the longest prefix that with an ellipsis fits: measured at the boundaries' halves, not one by one, since this
+    // runs for every line drawn every frame)
+    size_t lo = 0, hi = starts.size();
+    while (lo < hi) {
+        const size_t mid = (lo + hi + 1) / 2;
+        *out = std::string(t, starts[mid - 1]) + "\xE2\x80\xA6";
+        if (size_of(font, px, out->c_str()).x <= w) lo = mid; else hi = mid - 1;
+    }
+    if (!lo) { out->clear(); return 0; }
+    *out = std::string(t, starts[lo - 1]) + "\xE2\x80\xA6";
+    return size_of(font, px, out->c_str()).x;
+}
+/// text, its one line fitted to w (an ellipsis when it does not fit)
+inline float text_fit(Ctx& c, ImFont* font, float px, ImVec2 p, ImU32 col, const char* t, float w) {
+    std::string s;
+    fit_text(t, font, px, w, &s);
+    if (s.empty()) return 0;
+    return text(c, font, px, p, col, s.c_str());
+}
+/// text_mid, its one line fitted to w
+inline float text_mid_fit(Ctx& c, ImFont* font, float px, float x, float y, ImU32 col, const char* t, float w) {
+    std::string s;
+    fit_text(t, font, px, w, &s);
+    if (s.empty()) return 0;
+    return text_mid(c, font, px, x, y, col, s.c_str());
 }
 inline void text_centre(Ctx& c, ImFont* font, float px, ImVec2 p, ImU32 col, const char* t) {
     text(c, font, px, ImVec2(p.x - size_of(font, px, t).x * 0.5f, p.y), col, t);

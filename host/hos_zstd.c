@@ -3,12 +3,16 @@
    calls the lifted code makes at the head of those functions (nx2/oot_patches.py patch_host_zstd).
 
    HOS_HOST_ZSTD, read once at the first call:
-     unset or 0   the game's own decoder, exactly as before (the calls answer 0 and its code runs; after the first call
+     unset or 1   the host decodes what host_zstd.h takes, the game's code the rest
+     0            the game's own decoder, exactly as before (the calls answer 0 and its code runs; after the first call
                   the lifted code no longer makes them)
-     1            the host decodes what host_zstd.h takes, the game's code the rest
      2            check: the game's code decodes everything and its results stand; the host decodes beside it and every
-                  difference is logged ("zstd check: ... MISMATCH"). The log's "zstd:" lines count what was compared
-   Off by default: nobody has run it in Triforce's game. A wrong answer here damages every file the game loads. */
+                  difference is logged ("zstd check: ... MISMATCH", "wrote past the end"). The log's "zstd:" lines count
+                  what was compared
+   ((Triforce, 11-21, the performance audit's IO-01, after Source A's) On by default since the host is given the
+   content's exact size to write into and check mode ran clean in the game: host_zstd.h hz_room. A wrong answer here
+   damages every file the game loads, so 0 stays, and 2 is the way to look. HOS_HOST_ZSTD_AWAY (0, 1, 2): which decodes
+   give their virtual core up, host_zstd.h hz_away_mode.) */
 #include "hos.h"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -37,8 +41,11 @@ static int mode(void) {
     LONG v = m;
     if (v < 0) {
         const char *e = getenv("HOS_HOST_ZSTD");
-        v = e && *e ? atoi(e) : 0;
+        v = e && *e ? atoi(e) : 1;   /* ((Triforce, 11-21, IO-01) not set: on */
         v = v == 1 || v == 2 ? v : 0;
+        const char *a = getenv("HOS_HOST_ZSTD_AWAY");
+        const int away = a && *a ? atoi(a) : 1;
+        hz_away_mode = away == 0 || away == 2 ? away : 1;
         /* (only the build the addresses are for: nx2/oot_patches.py puts the calls into no other, and this says so twice) */
         if (v && strncmp(hos_main_build_id, "e0f3ccfa", 8)) {
             hos_log("zstd: HOS_HOST_ZSTD is for game build e0f3ccfa, this is %.8s: the game's own decoder", hos_main_build_id);
@@ -50,8 +57,11 @@ static int mode(void) {
         }
         if (InterlockedCompareExchange(&m, v, -1) == -1 && v)
             hos_log(v == 2 ? "zstd: check mode (HOS_HOST_ZSTD=2): the game's decoder decodes, the host's beside it, differences are logged"
-                           : "zstd: the game's files are decoded by the host's zstd %s (HOS_HOST_ZSTD=1; =2 checks it against the game's)",
-                    ZSTD_versionString());
+                           : "zstd: the game's files are decoded by the host's zstd %s (HOS_HOST_ZSTD=0: the game's own decoder; =2 "
+                             "checks the host's against it); whole buffers %s (HOS_HOST_ZSTD_AWAY)",
+                    v == 2 ? "" : ZSTD_versionString(),
+                    hz_away_mode == 1 ? "of 128 KB give their virtual core up, streams keep it"
+                    : hz_away_mode == 2 ? "and stream feeds of 64 KB give their virtual core up" : "and streams keep their virtual core");
         v = m;
         hos_host_zstd = (int)v;
     }

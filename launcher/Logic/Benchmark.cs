@@ -71,9 +71,11 @@ public sealed class Benchmark : IBenchmarkRunner
 
     // the options file's keys (gpu/vk/vk_menu.cpp ini_key; values gpu/vk/vk_menu.h, upscaler_rows.h, fps_cap.h)
     public const string KCap = "frame_rate_cap", KVsync = "vsync", KSteady = "steady_frame_rate", KUpscaler = "dlss",
-        KResolution = "resolution", KPreset = "quality_preset", KFrameGen = "frame_generation";
+        KResolution = "resolution", KFrameGen = "frame_generation";
     // frame_rate_cap: 0 60, 1 90, 2 120, 3 144, 4 165, 5 240, 6 the monitor's. dlss (the Upscaler row): 0 the game's, 1 DLSS,
-    // 3 FSR 3.1, 4 FSR 4. resolution: 3 = 67 % (Quality), 5 = 58 % (Balanced), 4 = 50 % (Performance). quality_preset 0 Custom.
+    // 3 FSR 3.1, 4 FSR 4. resolution: 3 = 67 % (Quality), 5 = 58 % (Balanced), 4 = 50 % (Performance). ((Triforce, options_version 8)
+    // steady_frame_rate and frame_generation are the saved values of the merged Frame pacing and Frame generation rows; the
+    // Quality preset is gone: the game drops its line)
     static readonly (int value, int fps)[] Caps = { (0, 60), (2, 120), (3, 144), (5, 240) };
     public const int UpGame = 0, UpDlss = 1, UpFsr3 = 3, ResQuality = 3, ResBalanced = 5, CapUncapped = 5;
     public const int SteadyRefreshSteps = 2;   // (fps_cap.h: 0 Off, 1 Any rate, 2 Refresh steps)
@@ -172,7 +174,7 @@ public sealed class Benchmark : IBenchmarkRunner
         try
         {
             var keys = new Dictionary<string, int> { [KCap] = CapUncapped, [KVsync] = 0, [KSteady] = 0, [KFrameGen] = 0 };
-            if (upscaler is { } u) { keys[KUpscaler] = u.upscaler; keys[KResolution] = ResQuality; keys[KPreset] = 0; }
+            if (upscaler is { } u) { keys[KUpscaler] = u.upscaler; keys[KResolution] = ResQuality; }
             BenchIni.Set(ini, keys);
             var si = new ProcessStartInfo(exe) { UseShellExecute = false, WorkingDirectory = game, RedirectStandardError = true, RedirectStandardOutput = true };
             foreach (var a in new[] { Path.Combine(game, "image.bin"), "--romfs", Path.Combine(game, "romfs"), "--user", userCopy }) si.ArgumentList.Add(a);
@@ -297,8 +299,6 @@ public sealed class Benchmark : IBenchmarkRunner
         recs.Add(new SettingChange(KSteady, "Steady frame rate", Now(KSteady, 0), uneven ? SteadyRefreshSteps : Now(KSteady, 0)));
         // frame generation: never turned on by this (DESIGN 12: only below 60 with DLSS-G / FSR 4 FG, not measured yet)
         recs.Add(new SettingChange(KFrameGen, "Frame generation", Now(KFrameGen, 0), Now(KFrameGen, 0)));
-        if (recs.Any(r => r.Changes && (r.Key == KUpscaler || r.Key == KResolution)))
-            recs.Add(new SettingChange(KPreset, "Quality preset", Now(KPreset, 0), 0));
         return recs;
     }
 

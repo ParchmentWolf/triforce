@@ -21,5 +21,35 @@ int main() {
     CHECK("less than an eighth is not", !shifted_over(a, a + 8 * 4096, 100, a + 7 * 4096 + 1, a + 20 * 4096, 101));
     CHECK("apart is not", !shifted_over(a, a + size, 100, a + size, a + 2 * size, 101));
     CHECK("empty ranges are not", !shifted_over(a, a, 100, a - 1, a + size, 101) && !shifted_over(a, a + size, 100, b, b, 101));
+    {   // ((Triforce, 11-21, TEX-30) the others' parts added up, each byte once
+        using mkwvk::target_overlap::ShiftedOver;
+        const uint64_t p = 4096, t = a, n = 16 * p;   // (a target of 16 pages)
+        ShiftedOver s{t, t + n, 100};
+        s.add(t - 4 * p, t + p, 101);                 // (a sixteenth over its head)
+        CHECK("a sixteenth alone is not an eighth", !s.an_eighth() && s.covered() == p);
+        CHECK("nor is it one by one", !shifted_over(t, t + n, 100, t - 4 * p, t + p, 101) && !shifted_over(t, t + n, 100, t + 15 * p, t + 20 * p, 101));
+        s.add(t + 15 * p, t + 20 * p, 101);           // (and a sixteenth over its tail)
+        CHECK("a sixteenth over the head and one over the tail make an eighth", s.an_eighth() && s.covered() == 2 * p);
+        ShiftedOver o{t, t + n, 100};
+        o.add(t - p, t + p, 101), o.add(t - p / 2, t + p + p / 2, 105);   // (two over its head, half a page of them shared)
+        CHECK("parts that overlap count once", o.covered() == p + p / 2 && !o.an_eighth());
+        o.add(t + 15 * p + p / 2, t + 20 * p, 101);   // (and half a page over its tail)
+        CHECK("and a part elsewhere adds to them", o.covered() == 2 * p && o.an_eighth());
+        ShiftedOver w{t, t + n, 100};
+        w.add(t - p, t + 8 * p, 100), w.add(t - p, t + 8 * p, 40);
+        CHECK("one written by its last use counts nothing", w.covered() == 0 && !w.an_eighth());
+        w.add(t, t + 8 * p, 101);
+        CHECK("the same start is drawn_over's case", w.covered() == 0);
+        w.add(t + p, t + 9 * p, 101);
+        CHECK("a view inside it is not a new target", w.covered() == 0);
+        w.add(t + n, t + 2 * n, 101);
+        CHECK("apart is not", w.covered() == 0 && !w.an_eighth());
+        ShiftedOver whole{t + p, t + n, 100};
+        whole.add(t, t + 2 * n, 101);
+        CHECK("one covering it whole is", whole.an_eighth() && whole.covered() == n - p);
+        ShiftedOver empty{t, t, 100};
+        empty.add(t - p, t + p, 101);
+        CHECK("an empty range is not", !empty.an_eighth());
+    }
     std::puts("target overlap: all checks passed");
 }

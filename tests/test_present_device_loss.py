@@ -54,6 +54,7 @@ struct { int device=1, queue=2, present_queue=3, swapchain=4; } dev;
 struct { int done=5, acquired=6, pool=7, cmd=8; } f;
 int bi=0, si=0, pi=0, index=0;
 uint64_t acquire_timeout=UINT64_MAX;
+bool fenced=false; int fence=0;   // ((Triforce) RX_VK_ACQUIRE_FENCE: the acquire's fence or semaphore)
 int result=VK_SUCCESS, calls=0, reports=0, continued=0;
 struct Lost {};
 [[noreturn]] void device_lost() { ++reports; throw Lost{}; }

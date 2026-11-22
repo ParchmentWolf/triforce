@@ -25,7 +25,9 @@ assert 'uint32_t index = o.index;' in out and 'const PresentOut out{index, smoot
 signal = re.search(r'    signal\.semaphore = [^;]+;', present)[0]
 wait = re.search(r'    pi\.pWaitSemaphores = [^;]+;', out)[0]
 acquire_wait = re.search(r'    waits\[0\]\.semaphore = [^;]+;', present)[0]
-assert 'acquire_timeout, f.acquired, VK_NULL_HANDLE, &index)' in present
+# ((Triforce) RX_VK_ACQUIRE_FENCE: the acquire signals the frame's semaphore only when it has no fence; tests/test_present_image_free.py
+# runs the fence's way)
+assert 'acquire_timeout, fenced ? VK_NULL_HANDLE : f.acquired, fence, &index)' in present
 # Include the actual creation attempt: passing oldSwapchain retires it even on failure.
 start = main.index('    ci.oldSwapchain = dev.swapchain;')
 end = main.index('    logf("vk: swapchain', start)
@@ -99,6 +101,11 @@ void vkDeviceWaitIdle(int) {idle=true;}
 // (vk_replay.cpp's helper: held submits out, then the device idle; the real one also takes the present queue's own lock)
 void device_wait_idle_locked() {queue_flush_locked();vkDeviceWaitIdle(dev.device);}
 void swap_views_drop() {}   // (hookshot: the overlays' views, vk_main.cpp)
+// ((Triforce, 11-22, the performance audit's PRESENT-45) a lost surface's handling: none is lost here, and
+// tests/test_present_surface_lost.py runs it against a driver that loses one)
+std::atomic<bool> surface_lost_noted{false};
+bool surface_recover(int) {return false;}
+void invalidate_lost_surface() {}
 bool recreate() {
     uint32_t n=0,width=640,height=480; struct {int format=1;} fmt;
     CreateInfo ci;int mode=0;VkResult result;

@@ -1,0 +1,16 @@
+#version 460
+// (Triforce, 11-22, the performance audit's OS-49, after Source B's) RX_VK_SIM_GPU_SLOW's burn (gpu/vk/sim_gpu.h): one
+// invocation runs a chain of dependent multiply-adds `loops` times, so that a dispatch takes a time the loop count sets; the
+// result goes to a word nothing reads, so that the chain is not left out.
+// glslangValidator -V --target-env vulkan1.3 --vn SIM_GPU_BURN_COMP_SPV -o sim_gpu_burn_comp_spv.h sim_gpu_burn.comp
+layout(local_size_x = 1) in;
+layout(push_constant) uniform P {
+    uint loops;
+    float seed;
+} pc;
+layout(std430, set = 0, binding = 0) buffer Sink { float v; } sink;
+void main() {
+    float x = pc.seed;
+    for (uint i = 0u; i < pc.loops; i++) x = x * 0.99999994 + 0.5;
+    sink.v = x;
+}

@@ -93,6 +93,36 @@ inline void unjitter(float m[16], const float jitter[2]) {
     }
 }
 
+/// ((Triforce, 11-20) the owner's "DLSS flicker": the whole picture and the shadows, while the camera moves, with NVIDIA
+/// DLSS frame generation on, and not without it.) Streamline's camera matrices are in the clip space of the depth buffer it
+/// is given: its depth value is that clip space's z over w, 1 at the near plane with depthInverted. The game's projection
+/// is NVN's, clip z from -1 at the near plane to 1 at the far one, and the depth frame generation gets is FSR's copy
+/// (vk_fsr3_inputs.cpp): d = (1 - ndc z) / 2 where the game's buffer has 0 at the near plane (flipped: Camera::flip_depth),
+/// (ndc z + 1) / 2 where it is reversed already. Given the game's own matrices with that depth, a depth read as clip z put
+/// what is far a fifth of a metre from the camera and what is near at the far plane, so whatever Streamline works out from
+/// the depth and the camera's move was wrong as soon as the camera moved, and right while it stood. Only DLSS frame
+/// generation takes matrices (FSR takes the near and far planes and the field of view), so nothing else showed it.
+/// The depth's clip space is the game's with z' = (w - z) / 2 (flipped) or (w + z) / 2: Z * clip, Z the identity but for
+/// its z row, (0 0 -1/2 1/2) or (0 0 1/2 1/2).
+/// A projection (or a view-projection) into the depth's clip space: Z * m, row major (clip = M * position)
+inline void depth_clip_projection(const float m[16], bool flipped, float out[16]) {
+    const float s = flipped ? -0.5f : 0.5f;
+    for (int i = 0; i < 16; i++) out[i] = m[i];
+    for (int c = 0; c < 4; c++) out[2 * 4 + c] = s * m[2 * 4 + c] + 0.5f * m[3 * 4 + c];
+}
+/// A clip-to-clip matrix of the game's (this frame's clip space to the frame before's: reprojection) between the depth's
+/// clip spaces: Z * m * inverse(Z), inverse(Z)'s z row (0 0 -2 1) or (0 0 2 -1). The identity stays the identity
+inline void depth_clip_reprojection(const float m[16], bool flipped, float out[16]) {
+    const float k = flipped ? -2.0f : 2.0f, t = flipped ? 1.0f : -1.0f;
+    float r[16];
+    for (int row = 0; row < 4; row++) {   // (m * inverse(Z): the z column scaled, and added to the w column)
+        r[row * 4 + 0] = m[row * 4 + 0], r[row * 4 + 1] = m[row * 4 + 1];
+        r[row * 4 + 2] = k * m[row * 4 + 2];
+        r[row * 4 + 3] = m[row * 4 + 3] + t * m[row * 4 + 2];
+    }
+    depth_clip_projection(r, flipped, out);   // (Z * that)
+}
+
 /// A jitter in clip space as DLSS takes it: in render pixels, x right and y down (clip y is up)
 inline void jitter_to_pixels(const float clip[2], unsigned width, unsigned height, float out[2]) {
     out[0] = clip[0] * 0.5f * (float)width;

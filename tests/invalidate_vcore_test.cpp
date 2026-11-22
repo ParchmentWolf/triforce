@@ -64,13 +64,24 @@ static void renderer(uint64_t gpu, uint64_t size) {
 }
 static void vulkan_invalidate(uint64_t gpu, uint64_t size) { vulkan_calls++; renderer(gpu, size); }
 static void wgr_nvn_invalidate(uint64_t gpu, uint64_t size) { fallback_calls++; renderer(gpu, size); }
+// ((Triforce, THREAD-25) the back end's answer to "has this invalidate nothing to wait for?" (mkwvk_invalidate_quick, found by name
+// in the product): asked with the caller's core still held, before anything is given up
+static int quick_calls, quick_answer;
+static int quick(uint64_t gpu, uint64_t size) {
+    quick_calls++;
+    CHECK(gpu == want_gpu && size == want_size);
+    CHECK(!callback_active);
+    if (cur && enabled) CHECK(cur->vc_held == 1 && cur->releases == 0);
+    return quick_answer;
+}
+static int (*volatile invalidate_quick_fn)(uint64_t, uint64_t);
 
 #include "actual_invalidate.inc"
 
 int main(int argc, char** argv) {
     CHECK(argc == 2);
     const char* name = argv[1];
-    const bool fallback = !std::strcmp(name, "fallback") || !std::strcmp(name, "fallback-immediate");
+    const bool fallback = !std::strcmp(name, "fallback") || !std::strcmp(name, "fallback-immediate") || !std::strcmp(name, "quick-fallback");
     const bool already_away = !std::strcmp(name, "already-away");
     const bool non_guest = !std::strcmp(name, "non-guest");
     enabled = std::strcmp(name, "disabled") != 0;
@@ -78,6 +89,11 @@ int main(int argc, char** argv) {
     // A separate case demonstrates producer starvation on the original wrapper, beyond the entry invariant.
     require_no_lease = std::strcmp(name, "producer") != 0;
     if (!std::strcmp(name, "zero")) want_gpu = want_size = 0;
+    // ((Triforce, THREAD-25) quick: the back end says there is nothing to wait for: no call, no release, no take. quick-declined: it
+    // says there may be: everything as before. quick-fallback: no Vulkan back end is running: it is not asked)
+    const bool quick_yes = !std::strcmp(name, "quick"), quick_no = !std::strcmp(name, "quick-declined");
+    const bool quick_fallback = !std::strcmp(name, "quick-fallback");
+    if (quick_yes || quick_no || quick_fallback) invalidate_quick_fn = quick, quick_answer = !quick_no;
     MkwVkRenderer backend{};
     backend.nvn_invalidate = vulkan_invalidate;
     vk = fallback ? nullptr : &backend;
@@ -111,11 +127,12 @@ int main(int argc, char** argv) {
     }
     rx_nvn_invalidate(want_gpu, want_size);
     if (worker.joinable()) worker.join();
-    CHECK(vulkan_calls == (fallback ? 0 : 1));
+    CHECK(vulkan_calls == (fallback || quick_yes ? 0 : 1));
     CHECK(fallback_calls == (fallback ? 1 : 0));
+    CHECK(quick_calls == (quick_yes || quick_no ? 1 : 0));
     const bool owned_on_entry = cur && enabled && !already_away;
-    CHECK(caller.releases - before_release == (owned_on_entry ? 1 : 0));
-    CHECK(caller.takes - before_take == (owned_on_entry ? 1 : 0));
+    CHECK(caller.releases - before_release == (owned_on_entry && !quick_yes ? 1 : 0));
+    CHECK(caller.takes - before_take == (owned_on_entry && !quick_yes ? 1 : 0));
     CHECK(caller.vc_held == (owned_on_entry ? 1 : 0));
     CHECK(owner == (owned_on_entry ? &caller : nullptr));
     if (need_producer) CHECK(producer_done && producer.takes == 1 && producer.releases == 1 && !producer.vc_held);

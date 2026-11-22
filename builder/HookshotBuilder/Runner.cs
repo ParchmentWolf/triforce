@@ -130,7 +130,12 @@ sealed class Runner
                 process = p;
                 p.ErrorDataReceived += (_, e) => { if (e.Data != null) Line?.Invoke(e.Data); };
                 p.BeginErrorReadLine();
-                try { p.PriorityClass = ProcessPriorityClass.BelowNormal; } catch (Exception) { }
+                // (Triforce, 11-22, the performance audit's OS-57, after Source A's) The build tools run at normal priority;
+                // below normal, as every build was before, only with HOOKSHOT_LOW_PRIORITY=1. Source A's reason, a report
+                // it did not measure: below normal, Windows kept the steps that are one process (the read, the lift) on a
+                // hybrid Intel CPU's efficiency cores while the performance cores idled.
+                if (Environment.GetEnvironmentVariable("HOOKSHOT_LOW_PRIORITY") == "1")
+                    try { p.PriorityClass = ProcessPriorityClass.BelowNormal; } catch (Exception) { }
                 while (p.StandardOutput.ReadLine() is { } line)
                 {
                     if (line.StartsWith("@@error ")) error = line[8..];

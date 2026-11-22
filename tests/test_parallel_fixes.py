@@ -213,7 +213,7 @@ def main():
         build_and_run(args.cxx, tmp, "dry_copies", fixture,
                       ["t2t", "t2t-unmarked", "clear", "clear-unmarked", "clear-drawn", "b2t", "b2t-unmarked", "skips", "bc1", "b2t-cpu"])
         fixture = (ROOT / "tests/parallel_table_order_test.cpp").read_text(encoding="utf-8").replace("/* ACTUAL */", table)
-        build_and_run(args.cxx, tmp, "table_order", fixture, ["segments", "segments-unreconciled", "serial", "direct"])
+        build_and_run(args.cxx, tmp, "table_order", fixture, ["segments", "segments-unreconciled", "serial", "direct"], ("-I", str(VK)))
         lines = build_and_run(args.cxx, tmp, "touch_quick", (ROOT / "tests/parallel_touch_quick_test.cpp").read_text(encoding="utf-8"),
                               [None], ("-Werror", "-I", str(VK)))
     for line in lines[:-1]:

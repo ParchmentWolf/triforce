@@ -88,7 +88,7 @@ def fixture_of(source):
     # ((Triforce) a whole push tries the push template first, the write structs when it gives none; the changed bindings by theirs)
     full = bind[:bind.index("static thread_local std::vector<VkWriteDescriptorSet> changed")]
     if not re.search(r"if \(!push_write_template\(cmd, bp, p\)\)[^\n]*\n\s*vkCmdPushDescriptorSetKHR\(cmd, bp, p\.layout, 0, "
-                     r"\(uint32_t\)dw\(\)\.writes\.size\(\), dw\(\)\.writes\.data\(\)\);", full):
+                     r"\(uint32_t\)dwr\.writes\.size\(\), dwr\.writes\.data\(\)\);", full):
         raise SystemExit("a whole push does not try the push template first, with the write structs when it gives none")
     if "push_write_template(" in bind[len(full):]:
         raise SystemExit("a push of the changed bindings only goes through the push template")

@@ -60,6 +60,7 @@ uint64_t gpu_bind_stamp() { return bind_stamp; }
 struct RecordingRes { VkDescriptorPool pool{}; std::vector<VkDescriptorPool> extra; } recording;
 RecordingRes* cur = &recording;
 VkDescriptorPool make_pool() { return handle<VkDescriptorPool>(0x77); }
+void pool_took(const VkWriteDescriptorSet*, size_t) {}   // ((Triforce, 11-22, DESC-33) vk_draw.cpp: the sets a recording took, counted)
 void vkDestroyDescriptorPool(VkDevice, VkDescriptorPool, const VkAllocationCallbacks*) {}
 
 // ---- the fake driver: each set's descriptors, (binding, element) -> (type, the handles and numbers that make it) ----

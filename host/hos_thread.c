@@ -6,7 +6,9 @@
    +0x1F8, so lifted SDK code that reads it inline finds the same thread the HLE knows. */
 #include "hos.h"
 #include "hos_x3d.h"
+#include "hos_sim_cpu.h"   /* ((Triforce, 11-22, OS-49) HOS_SIM_CPU, a lab switch: fewer of the PC's cores */
 #include "pace_wait.h"   /* ((Triforce) hos_sleep_until_ns: the frame wait to its time) */
+#include "short_sleep.h" /* ((Triforce, 11-21) how sleeps under a millisecond wait, by the PC's processors) */
 #include <stdio.h>
 #include <stdlib.h>
 #define WIN32_LEAN_AND_MEAN
@@ -29,6 +31,7 @@ struct HosThread {
     uint64_t core_mask;
     uint64_t tls_slots[HOS_TLS_SLOTS];
     char name[48];
+    int serial;   /* ((Triforce, OS-33) a thread the frame waits on, by its name: short_sleep.h short_sleep_serial_name) */
     HANDLE handle;
     int started;
     int bg_kind; int64_t bg_since;   /* (HOS_BG_THROTTLE: bg_throttle) */
@@ -40,6 +43,8 @@ struct HosThread {
     int vc_held, vc_last, vc_queued;
     volatile int vc_kick;
     int64_t vc_since, vc_grant_at;
+    /* (HOS_CORE_COUNT, TICK-062 A10) calls that ask for the core number (HLE, svc 0x10), waits for a virtual core and their time */
+    int64_t cc_hle, cc_svc, cc_vcw, cc_vcw_ns;
     CONDITION_VARIABLE vc_cv;
     /* (hookshot) fibers: the context running now (NULL: ctx, the thread's own), the thread's host fiber once it
        switched to a guest fiber */
@@ -49,6 +54,7 @@ struct HosThread {
 
 /* The SDK's own mutexes (InternalCriticalSection) tag a lock word with the owner's handle, read from
    ThreadType+0x1B0 through TLR+0x1F8 (sdk+0x13186c). Every thread gets a unique handle there. */
+static void thread_gen_bump(void);
 #define TT_HANDLE 0x1B0
 static volatile LONG next_handle = 0x10000;
 uint32_t hos_thread_handle(HosThread *t) { return t->kernel_handle; }
@@ -59,10 +65,13 @@ void hos_thread_adopt_guest(HosThread *t) {
     uint64_t tt = G64(t->tlr + 0x1F8);
     if (tt && tt != t->guest_tt) {
         t->guest_tt = tt;
+        thread_gen_bump();
         G32(tt + TT_HANDLE) = t->kernel_handle;
     }
 }
 int hos_thread_prio(HosThread *t) { return t->priority; }
+/* ((Triforce, 11-22, the performance audit's OS-33) set where the thread is named, read by its own short sleeps) */
+int hos_thread_serial(HosThread *t) { return __atomic_load_n(&t->serial, __ATOMIC_RELAXED); }
 
 int hos_trace;
 extern const uint64_t hos_thread_start_hook, hos_thread_exit_hook;   /* gen/hos_image.c */
@@ -136,7 +145,12 @@ int hos_thread_priority(HosThread *t, int set, int value) {
     return old;
 }
 
-#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
+/* (Triforce, 11-22, the performance audit's THREAD-56, after Source A's) The log's writer thread on Linux too: it was
+   built for Windows only, so on Linux and the Steam Deck every hos_log wrote stderr in the thread that logged, a game
+   thread with its virtual core held (Source A saw a 717 ms frame: the audio thread waited 321 ms for a core whose
+   thread sat in such a write). Everything the writer calls is in the POSIX shim (host/posix/windows.h). Only the web
+   build has no writer. HOS_LOG_SYNC=1: each line written by the thread that logs it, as Linux did */
+#if !defined(__EMSCRIPTEN__)
 static SRWLOCK log_lock = SRWLOCK_INIT, log_write_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE log_cv = CONDITION_VARIABLE_INIT;
 static char *log_q[2048];
@@ -271,6 +285,10 @@ static int log_queue(const char *line) {
             if (on && !CreateThread(NULL, 0, log_main, NULL, 0, NULL)) on = 0;
             if (on) log_prev_filter = SetUnhandledExceptionFilter(log_crash_filter);
             if (on) atexit(log_flush);
+#ifndef _WIN32
+            /* ((Triforce, 11-22) THREAD-56: the shim's ExitProcess is quick_exit, which runs these and not atexit's) */
+            if (on) at_quick_exit(log_flush);
+#endif
             log_async = on;
         }
         ReleaseSRWLockExclusive(&log_lock);
@@ -398,6 +416,7 @@ static void setup_guest(HosThread *t) {
 static void track(HosThread *t) {
     AcquireSRWLockExclusive(&threads_lock);
     if (nthreads < 1024) threads[nthreads++] = t;
+    thread_gen_bump();
     ReleaseSRWLockExclusive(&threads_lock);
 }
 
@@ -483,12 +502,32 @@ void hos_thread_wait(HosThread *t, int64_t timeout_ns, int *timed_out) {
 }
 void hos_thread_wake(HosThread *t) { SetEvent(t->wake); }
 
-HosThread *hos_thread_of(uint64_t guest_tt) {
+/* TICK-062 B2: hos_thread_of is a linear scan of every thread under a shared lock. HOS_THREAD_OF_CACHE=1: each thread keeps
+   a few (ThreadType, thread) pairs, valid while thread_gen has not changed. thread_gen is bumped by everything that can
+   change what the scan returns: a thread added (track) or removed (hos_thread_destroy), or a guest_tt rewritten (adopt).
+   A reader takes the generation BEFORE the scan and stores the pair under it: a change during the scan leaves the pair
+   stale at once, never served. The answer is then the scan's own (the first matching thread in the table), and a cached
+   pointer to a destroyed thread cannot be served (destroy bumps the generation before the free). */
+static volatile LONG thread_gen;
+static void thread_gen_bump(void) { InterlockedIncrement(&thread_gen); }
+static HosThread *thread_of_scan(uint64_t guest_tt) {
     HosThread *r = NULL;
     AcquireSRWLockShared(&threads_lock);
     for (int i = 0; i < nthreads; i++)
         if (threads[i]->guest_tt == guest_tt) { r = threads[i]; break; }
     ReleaseSRWLockShared(&threads_lock);
+    return r;
+}
+HosThread *hos_thread_of(uint64_t guest_tt) {
+    static int on = -1;
+    if (on < 0) on = !(getenv("HOS_THREAD_OF_CACHE") && atoi(getenv("HOS_THREAD_OF_CACHE")) == 0);   /* ((Triforce) on by default since 11-21, lab +5.8%; =0: off */
+    if (!on) return thread_of_scan(guest_tt);
+    static _Thread_local struct { uint64_t tt; HosThread *t; LONG gen; } cache[8];
+    const unsigned i = (unsigned)((guest_tt >> 4) * 0x9E3779B1u >> 7) & 7;
+    const LONG g = *(volatile LONG *)&thread_gen;
+    if (cache[i].tt == guest_tt && cache[i].gen == g && cache[i].t) return cache[i].t;
+    HosThread *r = thread_of_scan(guest_tt);
+    cache[i].tt = guest_tt, cache[i].t = r, cache[i].gen = g;
     return r;
 }
 
@@ -502,6 +541,7 @@ Ctx *hos_boot_main_thread(uint64_t stack_size) {
     t->ideal_core = 0;
     t->started = 1;
     snprintf(t->name, sizeof t->name, "MainThread");
+    __atomic_store_n(&t->serial, short_sleep_serial_name(t->name), __ATOMIC_RELAXED);
     DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &t->handle, 0, FALSE,
                     DUPLICATE_SAME_ACCESS);   /* a real handle, for the profiler */
     SetThreadDescription(GetCurrentThread(), L"MainThread");   /* (HOS_SAMPLE finds threads by it) */
@@ -604,6 +644,7 @@ void hos_thread_destroy(HosThread *t) {
     AcquireSRWLockExclusive(&threads_lock);
     for (int i = 0; i < nthreads; i++)
         if (threads[i] == t) { threads[i] = threads[--nthreads]; break; }
+    thread_gen_bump();
     ReleaseSRWLockExclusive(&threads_lock);
     if (t->handle) CloseHandle(t->handle);
     if (t->wake) CloseHandle(t->wake);
@@ -612,6 +653,7 @@ void hos_thread_destroy(HosThread *t) {
 
 void hos_thread_set_name(HosThread *t, const char *name) {
     snprintf(t->name, sizeof t->name, "%s", name);
+    __atomic_store_n(&t->serial, short_sleep_serial_name(t->name), __ATOMIC_RELAXED);
     if (t->handle) {
         wchar_t w[48];
         MultiByteToWideChar(CP_UTF8, 0, t->name, -1, w, 48);
@@ -680,7 +722,10 @@ static uint64_t pick_reserved_core(const uint64_t *masks, const unsigned char *c
    finds such a die; everywhere else 0, and nothing changes. HOS_X3D=0: off there too. Other threads of the process (the
    driver's, the shader workers) stay where Windows puts them. Windows only: Linux as before.
    NX2navi keeps the whole process on the die and reserves no core there; here the replay's core stays, on the die, as
-   the replay is pinned to it by default (gpu/vk/vk_replay.cpp ReplayPin). HOS_RESERVE_CORE=0 keeps none, as ever */
+   the replay is pinned to it by default (gpu/vk/vk_replay.cpp ReplayPin). HOS_RESERVE_CORE=0 keeps none, as ever.
+   (Triforce, 11-22, the performance audit's THREAD-49, after Source A's) That holds where the die's cores have two
+   logical processors each. With SMT off no core of the die is kept unless HOS_RESERVE_CORE=1 asks for one or the replay
+   has a thread of its own (RX_VK_ASYNC=1): hos_x3d.h hos_x3d_keep_replay_core has the rule and Source A's numbers */
 #if defined(_WIN32)
 /* (hos_x3d_pick over what Windows lists for the calling thread's processor group) */
 static uint64_t x3d_detect(HosX3d *out) {
@@ -738,7 +783,7 @@ static uint64_t hos_x3d_cpus(void) {
                     (unsigned long long)x.die, (unsigned long long)(x.big >> 20), (unsigned long long)(x.small >> 20), x.cores,
                     x.why == HOS_X3D_FEW ? "fewer than 8, so the game's threads are not kept there"
                     : off ? "not used (HOS_X3D=0)"
-                    : "the game's threads and the replay's core are kept there (HOS_X3D=0: as before)");
+                    : "the game's threads are kept there, and the replay's core when one is kept (HOS_X3D=0: as before)");
 #endif
     }
     const uint64_t m = mask;
@@ -746,6 +791,8 @@ static uint64_t hos_x3d_cpus(void) {
     return m;
 }
 
+/* ((Triforce, 11-22, the performance audit's OS-49) the mask HOS_SIM_CPU holds the process to, 0: none (hos_sim_cpu.h) */
+static uint64_t sim_cpu_mask;
 #if defined(_WIN32)
 /* (pick_reserved_core over the calling thread's group's cores; *cores: how many, 0 when they could not be read) */
 static uint64_t last_fastest_core(int *cores) {
@@ -765,7 +812,8 @@ static uint64_t last_fastest_core(int *cores) {
             const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *e = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)(buf + at);
             if (!e->Size) break;
             if (e->Relationship == RelationProcessorCore && e->Processor.GroupCount && e->Processor.GroupMask[0].Group == group &&
-                (!die || ((uint64_t)e->Processor.GroupMask[0].Mask & die))) {
+                (!die || ((uint64_t)e->Processor.GroupMask[0].Mask & die)) &&
+                (!sim_cpu_mask || ((uint64_t)e->Processor.GroupMask[0].Mask & sim_cpu_mask))) {   /* ((Triforce, OS-49) inside it) */
                 masks[n] = (uint64_t)e->Processor.GroupMask[0].Mask;
                 classes[n] = e->Processor.EfficiencyClass;
                 n++;
@@ -777,15 +825,72 @@ static uint64_t last_fastest_core(int *cores) {
     return pick_reserved_core(masks, classes, n);
 }
 #endif
+int rx_async_replay(void);   /* (host/rx_backend.c: the replay on a thread of its own, RX_VK_ASYNC=1) */
+/* ((Triforce, 11-22, the performance audit's OS-49, after Source B's) HOS_SIM_CPU=<cores>/<threads>, a lab switch: the process
+   held to that many of the PC's cores (hos_sim_cpu.h), from host/hos_main.c before any thread. Not applied (unset, a value that
+   cannot be read, as many cores as the PC has, or the call refused): the variable is cleared, so that the renderer's pools
+   (gpu/vk/cpu_count.h) size by the whole PC too. Windows only: elsewhere the variable is left and the renderer reads it there
+   as nothing */
+void hos_sim_cpu_apply(void) {
+#if defined(_WIN32)
+    const char *e = getenv("HOS_SIM_CPU");
+    if (!e || !*e) return;
+    HosSimCpu s;
+    uint64_t mask = 0;
+    int n = 0;
+    if (hos_sim_cpu_parse(e, &s)) {
+        static uint64_t masks[256];
+        static unsigned char classes[256];
+        GROUP_AFFINITY ga;
+        const WORD group = GetThreadGroupAffinity(GetCurrentThread(), &ga) ? ga.Group : 0;
+        DWORD len = 0;
+        if (!GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len) && GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+            char *buf = (char *)malloc(len);
+            if (buf && GetLogicalProcessorInformationEx(RelationProcessorCore, (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)buf, &len))
+                for (DWORD at = 0; at < len && n < 256;) {
+                    const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *x = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)(buf + at);
+                    if (!x->Size) break;
+                    if (x->Relationship == RelationProcessorCore && x->Processor.GroupCount && x->Processor.GroupMask[0].Group == group) {
+                        masks[n] = (uint64_t)x->Processor.GroupMask[0].Mask;
+                        classes[n] = x->Processor.EfficiencyClass;
+                        n++;
+                    }
+                    at += x->Size;
+                }
+            free(buf);
+        }
+        mask = hos_sim_cpu_mask(masks, classes, n, hos_x3d_cpus(), s.cores);
+        if (mask && !SetProcessAffinityMask(GetCurrentProcess(), (DWORD_PTR)mask)) mask = 0;
+    }
+    if (!mask) {
+        hos_log("cpu: HOS_SIM_CPU=%s not applied (<cores>/<threads>, fewer cores than the %d here): the whole PC, as without it", e, n);
+        SetEnvironmentVariableA("HOS_SIM_CPU", NULL);
+        _putenv("HOS_SIM_CPU=");
+        return;
+    }
+    sim_cpu_mask = mask;
+    hos_log("cpu: HOS_SIM_CPU=%s (a lab switch): the process held to logical processors %#llx, %d of the %d cores; the renderer's "
+            "pools sized for %d threads", e, (unsigned long long)mask, s.cores, n, s.threads);
+#endif
+}
 uint64_t hos_reserved_cpus(void) {
     static uint64_t mask = ~0ull;
     if (mask != ~0ull) return mask;
     mask = 0;
-    if (getenv("HOS_RESERVE_CORE") && !atoi(getenv("HOS_RESERVE_CORE"))) return mask;
+    const char *e = getenv("HOS_RESERVE_CORE");
+    const int asked = e ? atoi(e) != 0 : -1;   /* ((Triforce, THREAD-49) -1: not set) */
+    if (!asked) return mask;
 #if defined(_WIN32)
     {
         int cores = 0;
         const uint64_t fast = last_fastest_core(&cores);
+        /* ((Triforce, 11-22, the performance audit's THREAD-49, after Source A's) on the cache die of a two-die X3D with
+           SMT off none is kept: hos_x3d.h. cores: the die's, where there is one) */
+        const uint64_t die = hos_x3d_cpus();
+        if (cores && fast && !hos_x3d_reserved(fast, die, cores, asked, rx_async_replay())) {
+            hos_log("cpu: no core kept for the replay on the cache die (HOS_RESERVE_CORE=1: one is)");
+            return mask;
+        }
         if (cores) return mask = fast;
     }
 #endif
@@ -853,19 +958,38 @@ int64_t hos_now_ns(void) {
     return (int64_t)((now.QuadPart / freq.QuadPart) * 1000000000LL + (now.QuadPart % freq.QuadPart) * 1000000000LL / freq.QuadPart);
 }
 
-static void sleep_ns(int64_t ns);
-/* (virtual cores: a sleep gives the core up, SleepThread(0) offers it to a waiter as good) */
-void hos_sleep_ns(int64_t ns) {
+static void sleep_for(int64_t ns, int guest);
+/* ((Triforce, 11-22, the performance audit's OS-33) the game threads yielding through a short sleep now, and the short
+   sleeps that took the timer because the cap's worth already were: short_sleep.h, HOS_SHORT_SLEEP_POLLERS) */
+static int short_pollers;
+static int64_t short_capped;
+/* ((Triforce, 11-21, the performance audit's OS-31) the logical processors this process may run on (its affinity mask, as
+   the game starts with it): Windows with one processor group; 0, not known (more than one group, where the mask is one
+   group's and not the process's, or elsewhere) */
+static int process_threads(void) {
+    int threads = 0;
+#if defined(_WIN32)
+    DWORD_PTR proc = 0, sys = 0;
+    if (GetActiveProcessorGroupCount() == 1 && GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys))
+        threads = __builtin_popcountll((uint64_t)proc);
+#endif
+    return threads;
+}
+/* (virtual cores: a sleep gives the core up, SleepThread(0) offers it to a waiter as good) guest: the game's own sleep */
+static void sleep_away(int64_t ns, int guest) {
     if (ns <= 0) {
         hos_vcore_yield();
         SwitchToThread();
         return;
     }
     const int away = hos_vcore_away();
-    sleep_ns(ns);
+    sleep_for(ns, guest);
     if (away) hos_vcore_back();
 }
-static void sleep_ns(int64_t ns) {
+void hos_sleep_ns(int64_t ns) { sleep_away(ns, 0); }
+/* (the host's own sleep, as pace_wait_until takes it) */
+static void sleep_ns(int64_t ns) { sleep_for(ns, 0); }
+static void sleep_for(int64_t ns, int guest) {
     /* A high-resolution waitable timer (one per thread) sleeps to within ~0.5 ms without spinning; Sleep() rounds to
        the timer resolution, so without one the last millisecond is spun (threads that sleep in short steps, the
        vibration thread for one, used 15% of a core spinning). */
@@ -893,13 +1017,57 @@ static void sleep_ns(int64_t ns) {
     return;
 #endif
     /* Under a millisecond: yielded away until the time (the timer's ~0.5 ms granularity made TOTK's 20 us waits for
-       its job workers 25x longer, ~2000 a second on the frame's critical path). HOS_SHORT_SLEEP_TIMER=1: as before */
-    static int short_timer = -1;
-    if (short_timer < 0) short_timer = getenv("HOS_SHORT_SLEEP_TIMER") != NULL;
-    if (ns < 1000000 && !short_timer) {
-        while (hos_now_ns() < until)
-            if (!SwitchToThread()) YieldProcessor();
-        return;
+       its job workers 25x longer, ~2000 a second on the frame's critical path). ((Triforce, 11-21, OS-31) Not the game's
+       own sleeps where the processors are few: short_sleep.h. HOS_SHORT_SLEEP_TIMER=1: the timer always; 0: never; not
+       set: by the processors on Windows. Chosen once. (Triforce, 11-22, OS-33) The same word holds the cap on the game
+       threads that yield at once, HOS_SHORT_SLEEP_POLLERS: 0, no limit, unless that switch asks for one) */
+    static volatile LONG how_now = -1;
+    int word = (int)InterlockedCompareExchange(&how_now, -1, -1);
+    if (word < 0) {
+        const int threads = process_threads();
+        /* ((Triforce, 11-22, the performance audit's OS-32, after Source A's) off Windows the processors are not counted:
+           with the switch not set, short_sleep.h's SHORT_SLEEP_ELSEWHERE (all yield, as before, until a Steam Deck A/B).
+           HOS_SHORT_SLEEP_TIMER=game: the game's own on the timer at any count, on any system) */
+#if defined(_WIN32)
+        const int windows = 1;
+#else
+        const int windows = 0;
+#endif
+        const int how = short_sleep_timer_os(getenv("HOS_SHORT_SLEEP_TIMER"), threads, windows, SHORT_SLEEP_ELSEWHERE);
+        const int cap = short_sleep_pollers(getenv("HOS_SHORT_SLEEP_POLLERS"), getenv("HOS_SHORT_SLEEP_TIMER"), how, threads);
+        word = short_sleep_word(how, cap);
+        if (InterlockedCompareExchange(&how_now, word, -1) == -1) {
+            hos_log("sleep: sleeps under 1 ms: %s (%d logical processors for this process%s; HOS_SHORT_SLEEP_TIMER=1: all on the "
+                    "timer, game: the game's own on the timer, 0: all yield%s)", how == SHORT_SLEEP_ALL_TIMER ? "all on the timer"
+                    : how == SHORT_SLEEP_GUEST_TIMER ? "the game's own on the timer, the host's yield" : "all yield until their time",
+                    threads, threads ? "" : ": not known",
+                    windows ? "" : SHORT_SLEEP_ELSEWHERE == SHORT_SLEEP_GUEST_TIMER ? "; not set, off Windows: the game's own on the timer"
+                                                                                   : "; not set, off Windows: all yield");
+            if (cap)
+                hos_log("sleep: at most %d game threads yield through a short sleep at once, the next waits on the timer; the "
+                        "main and presentation threads always yield (HOS_SHORT_SLEEP_POLLERS)", cap);
+        } else word = (int)InterlockedCompareExchange(&how_now, -1, -1);   /* (another thread chose first: its choice) */
+    }
+    const int how = short_sleep_how(word);
+    if (short_sleep_yields(ns, how, guest)) {
+        /* ((Triforce, OS-33) the cap's gate: a counted sleeper over the cap takes the timer below, its count given back) */
+        int took;
+        if (short_sleep_poll_enter(&short_pollers, short_sleep_cap(word), guest, cur ? hos_thread_serial(cur) : 0, &took)) {
+            /* TICK-062 B4, HOS_SHORT_SLEEP_PAUSE=1: one yield, then a PAUSE loop to the deadline (SwitchToThread in a loop
+               keeps calling into the kernel and bounces the SMT sibling's work) */
+            static int pause_spin = -1;
+            if (pause_spin < 0) pause_spin = !(getenv("HOS_SHORT_SLEEP_PAUSE") && atoi(getenv("HOS_SHORT_SLEEP_PAUSE")) == 0);   /* ((Triforce) on by default since 11-21, lab +5.8%; =0: off */
+            if (pause_spin) {
+                if (hos_now_ns() < until) SwitchToThread();
+                while (hos_now_ns() < until) { YieldProcessor(); YieldProcessor(); YieldProcessor(); YieldProcessor(); }
+            } else {
+                while (hos_now_ns() < until)
+                    if (!SwitchToThread()) YieldProcessor();
+            }
+            short_sleep_poll_leave(&short_pollers, took);
+            return;
+        }
+        __atomic_add_fetch(&short_capped, 1, __ATOMIC_RELAXED);
     }
     if (!tried) {
         tried = 1;
@@ -988,13 +1156,56 @@ HLE(_ZN2nn2os20ChangeThreadPriorityEPNS0_10ThreadTypeEi) {
     RET((uint32_t)hos_thread_priority(thread_arg(c, ARG(0)), 1, (int)ARG(1)));
 }
 
+/* (Triforce, 11-22, the performance audit's GAME-22, after Source B's) What the game asks for, in the log: a mask that
+   names two or more cores, which is what HOS_VCORE_WIDE=1 widens (vc_allowed), always; every mask when that switch is set
+   to anything or with the trace. Whether the switch can do anything in a game is read here: with no such line no thread
+   has a mask of more than one core and it changes nothing. The first 64 */
+static void core_mask_note(HosThread *t, int ideal, uint64_t mask) {
+    static volatile LONG logged;
+    static int every = -1;
+    if (every < 0) every = getenv("HOS_VCORE_WIDE") != NULL;
+    const int cores = hos_cores() > 8 ? 8 : hos_cores();
+    const int named = __builtin_popcountll(mask & ((1ull << cores) - 1));
+    if (named < 2 && !every && !hos_trace) return;
+    if (InterlockedIncrement(&logged) > 64) return;
+    hos_log("vcores: %s (priority %d) asks for ideal core %d and core mask %#llx, %d of the %d cores%s", t->name, t->priority,
+            ideal, (unsigned long long)mask, named, cores, named > 1 ? " (HOS_VCORE_WIDE=1: any core)" : "");
+}
 /* nn::os::SetThreadCoreMask(ThreadType*, int idealCore, unsigned long mask) */
 HLE(_ZN2nn2os17SetThreadCoreMaskEPNS0_10ThreadTypeEim) {
     HosThread *t = thread_arg(c, ARG(0));
     hos_thread_affinity(t, (int)ARG(1), ARG(2));
+    core_mask_note(t, (int)ARG(1), ARG(2));
 }
 
-HLE(_ZN2nn2os20GetCurrentCoreNumberEv) { RET((uint32_t)hos_thread_core(cur)); }
+/* TICK-062 A10, HOS_CORE_COUNT=1 (diagnostic, no behaviour change): per guest thread, the calls that ask for the core number
+   (nn::os::GetCurrentCoreNumber, svc 0x10) and the waits for a virtual core, logged every 5 s (cumulative) */
+int hos_core_count_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("HOS_CORE_COUNT") != NULL;
+    return on;
+}
+void hos_core_count_svc(void) { if (cur) cur->cc_svc++; }
+static void core_count_log(void) {
+    static volatile LONG64 last;
+    const int64_t now = hos_now_ns();
+    const int64_t l = last;
+    if (now - l < 5000000000LL || InterlockedCompareExchange64(&last, now, l) != l) return;
+    if (!l) return;
+    AcquireSRWLockShared(&threads_lock);
+    for (int i = 0; i < nthreads; i++) {
+        const HosThread *t = threads[i];
+        if (t->cc_hle + t->cc_svc + t->cc_vcw)
+            hos_log("corecount: %-24s core-number calls %lld (hle %lld, svc %lld), virtual-core waits %lld (%.1f ms)", t->name,
+                    (long long)(t->cc_hle + t->cc_svc), (long long)t->cc_hle, (long long)t->cc_svc, (long long)t->cc_vcw,
+                    t->cc_vcw_ns / 1e6);
+    }
+    ReleaseSRWLockShared(&threads_lock);
+}
+HLE(_ZN2nn2os20GetCurrentCoreNumberEv) {
+    if (hos_core_count_on()) { cur->cc_hle++; core_count_log(); }
+    RET((uint32_t)hos_thread_core(cur));
+}
 HLE(_ZN2nn2os26GetThreadAvailableCoreMaskEv) { RET((1u << hos_cores()) - 1); }   /* cores 0-2: what an application gets */
 
 HLE(_ZN2nn2os19GetCurrentStackInfoEPmS1_) {
@@ -1002,9 +1213,28 @@ HLE(_ZN2nn2os19GetCurrentStackInfoEPmS1_) {
     if (ARG(1)) G64(ARG(1)) = cur->stack_size;
 }
 
+/* (Triforce, 11-22, the performance audit's THREAD-41, after Source A's) The game's job system yields after every job
+   and actor callback, thousands of times a second. A yield is answered twice: hos_vcore_yield hands the virtual core to
+   a waiting game thread of equal or better priority, which is the console's yield, and SwitchToThread then gives the
+   processor up as well, a call into the kernel each time. Source A, with the game held to 4 processors, found half of
+   its six executors' CPU time inside that call and dropped it (mean frame 0.26 to 0.34 ms shorter there, nothing with
+   16); Windows still takes the processor from a thread at the end of its time slice.
+   HOS_OS_YIELD=0 drops the call here. Off unless asked for: not set or 1, both answers as before. It changes how the
+   game's threads wait and was not measured here, and a thread that yields in a loop for one waiting on its processor
+   then keeps it to the end of its slice, the stall to watch with 2 to 4 processors. Without virtual cores (HOS_VCORES=0)
+   the processor's yield is the only one, so it stays whatever the switch says. SleepThread(0) (sleep_away) and the
+   short sleeps' yields are not this and keep theirs. Read once */
+static int os_yield(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("HOS_OS_YIELD");
+        on = e && *e ? atoi(e) != 0 : 1;
+    }
+    return on;
+}
 HLE(_ZN2nn2os11YieldThreadEv) {
     hos_vcore_yield();
-    SwitchToThread();
+    if (os_yield() || !hos_vcores_on()) SwitchToThread();
 }
 /* HOS_SLEEP_LOG=1 (diagnostic): guest sleeps by caller (LR) every 5 s: count, asked, slept */
 void hos_sleep_logged(int64_t ns, uint64_t lr) {
@@ -1020,9 +1250,9 @@ void hos_sleep_logged(int64_t ns, uint64_t lr) {
     if (poll_cap && ns > poll_cap && ns <= 100000) ns = poll_cap;
     static int on = -1;
     if (on < 0) on = getenv("HOS_SLEEP_LOG") != NULL;
-    if (!on) { hos_sleep_ns(ns); return; }
+    if (!on) { sleep_away(ns, 1); return; }   /* ((Triforce, 11-21, OS-31) the game's own sleep: short_sleep.h) */
     const int64_t t0 = hos_now_ns();
-    hos_sleep_ns(ns);
+    sleep_away(ns, 1);
     const int64_t took = hos_now_ns() - t0;
     static SRWLOCK lk = SRWLOCK_INIT;
     static struct { uint64_t lr; int64_t n, asked, slept; } tab[64];
@@ -1044,6 +1274,11 @@ void hos_sleep_logged(int64_t ns, uint64_t lr) {
                 hos_log("sleep: lr %#llx: %lld calls, asked %.2f ms, slept %.2f ms (%.1f us each)",
                         (unsigned long long)tab[k].lr, (long long)tab[k].n, tab[k].asked / 1e6, tab[k].slept / 1e6,
                         tab[k].slept / 1e3 / tab[k].n);
+        /* ((Triforce, OS-33) the short sleeps that took the timer over the cap, HOS_SHORT_SLEEP_POLLERS) */
+        const int64_t capped = __atomic_exchange_n(&short_capped, 0, __ATOMIC_RELAXED);
+        if (capped)
+            hos_log("sleep: %lld short sleeps took the timer, the cap's worth of game threads yielding already "
+                    "(HOS_SHORT_SLEEP_POLLERS)", (long long)capped);
         memset(tab, 0, sizeof tab);
     }
     ReleaseSRWLockExclusive(&lk);
@@ -1342,6 +1577,10 @@ static struct {
        sleep (NX2navi's "core grant to run", runtime/kernel.c grant_at) */
     int64_t spun, slept, spin_ns, spin_capped, run_spin_ns, run_spin_n, run_sleep_ns, run_sleep_n, run_max_ns;
 } vc_st;
+/* ((Triforce, 11-22, the performance audit's OS-51) the waits since the last present, beside vc_st's 5 s: their time summed
+   over the threads, how many, the longest. Added to with vc_lock held, taken by the present's look without it
+   (hos_vcore_waits_take; host/stall_host.h has the line) */
+static struct { int64_t ns, n, longest; } vc_gap;
 
 int hos_vcores_on(void) {
     static int on = -1;
@@ -1364,7 +1603,17 @@ static unsigned vc_allowed(HosThread *t) {
     static int any = -1;
     if (any < 0) any = getenv("HOS_VCORE_ANY") && atoi(getenv("HOS_VCORE_ANY")) != 0;
     if (any) return all;
+    /* (Triforce, 11-22, the performance audit's GAME-22, after Source B's) HOS_VCORE_WIDE=1: a thread whose mask names two
+       or more cores takes any free core. Source B's reason: the game's two main threads may run on two of three cores
+       only, where per-core job workers of better priority preempt them while the other cores stand idle a third of the
+       time. A one-core mask, which is what guards the game's lock-free per-core data, stays as it is, and so does a
+       thread with no mask. Off unless set: a widened thread runs under core numbers the console never gives it (the
+       risk HOS_VCORE_ANY has for every thread), Source B never measured it, and neither was it here. Whether any thread
+       has such a mask is in the log (core_mask_note). Read once */
+    static int wide = -1;
+    if (wide < 0) wide = getenv("HOS_VCORE_WIDE") && atoi(getenv("HOS_VCORE_WIDE")) != 0;
     unsigned m = (unsigned)(t->core_mask & all);
+    if (wide && __builtin_popcount(m) > 1) return all;
     if (!m) m = 1u << hos_thread_core(t);
     return m;
 }
@@ -1449,7 +1698,8 @@ static int vc_spin_max(void) {
         const char *e = getenv("HOS_VCORE_SPIN_MAX");
         SYSTEM_INFO si;
         GetSystemInfo(&si);
-        const int n = e ? atoi(e) : vc_spin_most((int)si.dwNumberOfProcessors);
+        /* ((Triforce, 11-22, OS-49) by the processors HOS_SIM_CPU leaves the process, when it holds it) */
+        const int n = e ? atoi(e) : vc_spin_most(sim_cpu_mask ? hos_sim_cpu_count(sim_cpu_mask) : (int)si.dwNumberOfProcessors);
         most = n < 0 ? 0 : n;
     }
     return most;
@@ -1568,6 +1818,8 @@ static void vc_acquire(HosThread *t) {
     const int64_t now = hos_now_ns(), waited = now - t0;
     vc_st.wait_ns += waited;
     if (waited > vc_st.max_ns) vc_st.max_ns = waited;
+    __atomic_add_fetch(&vc_gap.ns, waited, __ATOMIC_RELAXED), __atomic_add_fetch(&vc_gap.n, 1, __ATOMIC_RELAXED);   /* ((Triforce, OS-51)) */
+    if (waited > __atomic_load_n(&vc_gap.longest, __ATOMIC_RELAXED)) __atomic_store_n(&vc_gap.longest, waited, __ATOMIC_RELAXED);
     if (ended) vc_st.spun++;   /* ((Triforce) every wait ends in the spin or after a sleep) */
     else if (slept) vc_st.slept++;
     if (t->vc_grant_at) {   /* ((Triforce) granted by a release: from the grant until it runs) */
@@ -1577,6 +1829,7 @@ static void vc_acquire(HosThread *t) {
         if (run > vc_st.run_max_ns) vc_st.run_max_ns = run;
         t->vc_grant_at = 0;
     }
+    t->cc_vcw++, t->cc_vcw_ns += waited;   /* (HOS_CORE_COUNT) */
     vc_stats_locked(now);
     ReleaseSRWLockExclusive(&vc_lock);
 }
@@ -1623,6 +1876,13 @@ void hos_vcore_back(void) {
     HosThread *t = cur;
     if (hos_vcores_on() && t && !t->vc_held) vc_acquire(t);
 }
+/* ((Triforce, 11-22, the performance audit's OS-51) the waits for a core since the last take: their summed time, how many,
+   the longest; all left at zero. No lock: a wait that ends meanwhile is in this take or the next) */
+void hos_vcore_waits_take(int64_t *ns, int64_t *count, int64_t *longest) {
+    *ns = __atomic_exchange_n(&vc_gap.ns, 0, __ATOMIC_RELAXED);
+    *count = __atomic_exchange_n(&vc_gap.n, 0, __ATOMIC_RELAXED);
+    *longest = __atomic_exchange_n(&vc_gap.longest, 0, __ATOMIC_RELAXED);
+}
 /* Lifted code calls this from its interrupt polls with the loop's guest registers still in host registers (a64_poll_cur,
    mkw_glue.c: the poll hands over no context, so the compiler need not spill them). It, and everything it calls, must never
    read or write the thread's guest context (Ctx) or run guest code: what it would see there may be older than the loop. A
@@ -1662,6 +1922,15 @@ void hos_vcore_yield(void) {
     HosThread *t = cur;
     if (hos_vcores_on() && t) vc_yield(t, 0);
 }
+/* ((Triforce, 11-21) a waiter asked the calling thread for its core (vc_kick): nn_os_sync.c's spins before a sleep stop at once
+   then, where they spun on with the core held for up to HOS_SPIN_US (20 us) while the waiter could not run. HOS_SPIN_YIELD=0:
+   the spins never look, as before */
+int hos_vcore_asked(void) {
+    static int on = -1;
+    if (on < 0) on = !(getenv("HOS_SPIN_YIELD") && atoi(getenv("HOS_SPIN_YIELD")) == 0);
+    HosThread *t = cur;
+    return on && t && t->vc_held && t->vc_kick;
+}
 /* SleepConditionVariableSRW for guest threads: the core given up for the wait; after it the lock is let go while a
    core is taken again (waiting for a core while holding it could stall the thread that will wake the next waiter),
    so callers see a spurious wake-up and look at their condition again, as they do anyway */
@@ -1679,6 +1948,7 @@ int hos_cv_sleep(void *cv, void *lk, unsigned ms) {
 int hos_vcores_on(void) { return 0; }
 int hos_vcore_away(void) { return 0; }
 void hos_vcore_back(void) {}
+void hos_vcore_waits_take(int64_t *ns, int64_t *count, int64_t *longest) { *ns = *count = *longest = 0; }
 void hos_vcore_checkpoint(void) {}
 void hos_vcore_yield(void) {}
 int hos_cv_sleep(void *cv, void *lk, unsigned ms) {

@@ -43,6 +43,7 @@
 #include <vector>
 
 #include "vk_dlssg.h"
+#include "cpu_count.h"   // ((Triforce, 11-22, OS-49) the threads to size by: HOS_SIM_CPU
 #include "vk_pace.h"      // (Triforce: who holds the frames, for the rows that hand them to another limiter)
 #include "vk_bugshot.h"   // (Triforce: a bug capture's picture, taken before the overlays are drawn)
 #include "vk_paths.h"
@@ -70,6 +71,7 @@
 #include "vk_reflex.h"
 #include "vk_antilag.h"
 #include "upscaler_rows.h"
+#include "first_start.h"   // ((Triforce, 11-22, PRESENT-46) the Render resolution of a first start on a weak card: menu_first_start)
 #include "vk_present_rect.h"   // ((Triforce, options_version 7) where the picture goes in the window: the filter it takes)
 #include "text_spread.h"   // ((Triforce, 11-19) the title entry's shadow and glow as the game's entries'
 #include "game_grid.h"   // ((Triforce, 11-19) where the game's layouts are in the window: the Mods entry on its list)
@@ -84,9 +86,11 @@
 #include "vk_xr.h"          // ((Triforce VR) vk_xr_cfg)
 #include "menu_restart.h"
 #include "mod_cheat_rows.h"   // (Triforce: the System tab's rows for the cheats of the mods' cheat files)
+#include "achievement_rows.h"   // (Triforce: the achievements the host names, their notice and their page)
 #include "menu_sound_events.h"   // (Triforce: the options' own sounds: which one a tick asks for, and their queue to the host)
 #include "mods_entry_anim.h"     // ((Triforce, 11-19) the Mods entry under the title's list: the game's entries' animations)
 #include "focus_anim.h"          // ((Triforce, 11-19) Mods and Quit under the System list, Quit's dialog: the game's buttons' and dialogs')
+#include "mods_page_anim.h"      // ((Triforce, 11-20) the Mods screen as it opens: its In)
 #include "vk_mods.h"   // (Triforce: the Mods page's engine, GameBanana's list and the installs)
 #include "vk_salesman.h"   // (Triforce: the Happy Mask Salesman beside the cards)
 #include "imgui_internal.h"   // (RegisterUserTexture: the mods' pictures)
@@ -415,6 +419,9 @@ const char* tx_dlss_model(int v) {
         else snprintf(b, sizeof b, "NVIDIA default (RX_VK_DLSS_PRESET)");
         return b;
     }
+    // ((Triforce, 11-22, the performance audit's PRESENT-36, after Source A's) with RX_VK_DLSS_CNN_VRAM=1 the K row on a card
+    // under 7 GB draws with NVIDIA's CNN model, preset E, and says so: what DLSS asks for, vk_dlss.cpp wanted_preset)
+    if (ur::cnn_for_vram(v, dlss_cnn_vram())) return "CNN (E)";
     return t[std::clamp(v, 0, ur::kModels - 1)];
 }
 /// The DLSS model: the value chosen; variant 1: set for this run by RX_VK_DLSS_PRESET. ((Triforce, options_version 7) The row
@@ -427,8 +434,11 @@ const char* hn_dlss_model(int v, int variant) {
         "Lets DLSS's runtime pick for each mode: what it picks can change with a runtime update.",
     };
     static const char* const env = "Set for this run by RX_VK_DLSS_PRESET.";
-    if (variant < 0) variant = dlss_preset_env() ? 1 : 0;
+    // ((Triforce, 11-22, PRESENT-36) variant 2, the K row's alone: preset E for this card (RX_VK_DLSS_CNN_VRAM=1))
+    static const char* const cnn = "Chosen for this card's video memory (under 7 GB): less GPU time than K.";
+    if (variant < 0) variant = dlss_preset_env() ? 1 : ur::cnn_for_vram(v, dlss_cnn_vram()) ? 2 : 0;
     if (variant == 1) return env;
+    if (variant == 2) return v == ur::MODEL_K ? cnn : nullptr;
     return variant == 0 ? t[std::clamp(v, 0, ur::kModels - 1)] : nullptr;
 }
 const char* tx_aniso(int v) {   // (Triforce: the Texture filtering row)
@@ -987,6 +997,20 @@ bool is_merged(const int* v) { return v == &merged.hdr || v == &merged.framegen 
 // the group's title under it (ui::heading). The selection steps over it, the mouse has nothing on it, and it is hidden while
 // every row of its group is (row_shown). The Debug tab has its own layout and its one heading, Developer (debug_rows)
 #define MENU_HEADING(tab, title) {tab, title, nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true}
+// (Triforce) Achievements (host/achievements.c keeps them, on unless HOS_ACHIEVEMENTS=0, and names them for the menu:
+// menu_option_set, HOS_OPT_ACH_*; achievement_rows.h has the list). The System tab's Achievements row opens their page,
+// kAchPage: every one with its icon, earned or not. The row is not shown until the host has named them (row_shown). One
+// earned while the game runs has a notice at the top of the screen for a moment, draw_ach_notice
+achievement_rows::List ach_list;
+achievement_rows::View ach_view;
+constexpr int kAchPage = 10;                // (page: see kModsPage)
+constexpr char kAchRow[] = "Achievements";  // (the row's name in the table below: is_ach_row tells it by it)
+constexpr int64_t kAchNoticeMs = 4000;      // (how long a notice stays: host/achievements.c waits a little longer between two)
+int ach_columns = 2, ach_capacity = 8;      // (the page's cards as last drawn: the keys move by them)
+int ach_notice = -1;                        // (the achievement the notice shows, -1 none)
+int64_t ach_notice_at = 0;                  // (and since when, prof_now)
+/// The System tab's Achievements row: confirm opens their page
+bool is_ach_row(const Row& r) { return r.tab == TAB_SYSTEM && !r.value && !strcmp(r.name, kAchRow); }
 
 Row rows[] = {
     // ---- Display ----
@@ -1176,6 +1200,9 @@ Row rows[] = {
     {TAB_SYSTEM, "Bug capture (F8)", nullptr, 0, 0, 0, nullptr,
      "Writes what a problem report needs into a folder of its own under captures in the game folder: a picture, your "
      "settings, the end of the log and your save. F8 does the same while you play."},
+    // (Triforce: host/achievements.c's list, on a page of its own; shown once the host has named it)
+    {TAB_SYSTEM, "Achievements", nullptr, 0, 0, 0, nullptr,   // (kAchRow)
+     "Every achievement, and the ones you have earned in this game folder. They are earned as you play; nothing is set here."},
     MENU_HEADING(TAB_SYSTEM, "Online"),
     {TAB_SYSTEM, "Discord status", &opts.discord, 0, 1, 1, tx_onoff,
      "Shows \"Playing Triforce\" and the time played in your Discord status, while Discord runs on this PC.", nullptr, false,
@@ -1508,6 +1535,7 @@ int mods_btn = 0;                          // (a dialog's button chosen: 0 the u
 // over the game's list (the game's input is ours then, and the host lets its cursor go); A opens kModsPage
 constexpr int kModsRowPage = 9;
 std::atomic<int> mods_list_bits{0};        // (HOS_MODS_LIST_*, as the last report had them)
+std::atomic<int> mods_list_alpha{-1};      // ((Triforce, 11-20) HOS_OPT_MODS_ALPHA: the game's own buttons' alpha, thousandths; -1 not told)
 std::atomic<int> mods_box[5];              // (the last button's box and the pitch, the layout's units: x0 x1 y0 y1 pitch)
 std::atomic<int64_t> mods_list_ns{0};      // (prof_now at the last report)
 std::atomic<int64_t> mods_list_frame{0};   // ((Triforce, 11-19) and game_frames then: a slow game frame is not a list gone)
@@ -1528,6 +1556,9 @@ int quit_sel = 0;                          // (its choice: 0 Quit Game, 1 Restar
 // the System list's own buttons do (focus_anim.h: PaCommonBtnThin_00's Select and UnSelect), and Quit's dialog opens and
 // closes as the game's SystemWindow_00 (In, Out), its buttons as the same part; it takes input once its In has played)
 focus_anim::Focus mods_focus[2];           // (Mods, Quit)
+// ((Triforce, 11-20) the owner: "Mod menu fade in". The Mods screen came whole on the frame after the press; it fades in as
+// the game's lists and windows do (mods_page_anim.h), stepped by menu_tick, and takes input once that has played)
+mods_page::Page mods_screen;
 focus_anim::Focus quit_focus[3];           // (the dialog's buttons)
 int64_t quit_open_ns = 0;                  // (prof_now when the dialog opened: its In; 0 shut)
 int64_t quit_shut_ns = 0;                  // (when B or Cancel closed it: its Out; 0 none playing)
@@ -1555,6 +1586,14 @@ int64_t mods_list_age() {
     return frames >= 0 && frames <= 2 ? 0 : prof_now() - t;
 }
 bool mods_list_fresh() { return mods_list_age() < 150000000LL; }
+/// ((Triforce, 11-20) the owner: "the mods button ... should be synced with the timing of the other button ui so it
+/// seamlessly moves and disappears with them". How much of its own list's buttons the game shows this frame, 0 to 1, as
+/// the host reads it from the game (host/oot_menu.c, HOS_OPT_MODS_ALPHA); under 0 while it has not said (an older host)
+float mods_list_shown() {
+    const int a = mods_list_alpha.load(std::memory_order_relaxed);
+    // (as the overlay has to draw it to look as the game's own buttons at that alpha: mods_entry_anim.h list_amount)
+    return a < 0 ? -1.0f : mods_entry::list_amount((float)a / 1000.0f, dev.hdr);
+}
 // ((Triforce, 11-19) the title's list, the owner: "make it the same as the other options, with the green filigree, the same
 // animations: when you select it, it just pops in". The entry is drawn as the game's own entries (draw_title_mods, with
 // mods_entry_anim.h's times): it fades with the list, and A on it plays the game's Decide before the Mods screen opens)
@@ -2002,6 +2041,8 @@ bool row_shown(int i) {
            (rows[i].value != &opts.language || lang_count > 1) &&
            // (Triforce: the mods' cheats: as many rows as the host named, and their heading with them)
            (!rows[i].heading || strcmp(rows[i].name, kModCheatHeading) || mod_cheats.shown() > 0) &&
+           // (Triforce: the Achievements row once the host has named them: off, or none, and there is no such row)
+           (strcmp(rows[i].name, kAchRow) || rows[i].tab != TAB_SYSTEM || ach_list.shown() > 0) &&
            (mod_cheat_slot(rows[i].name) < 0 || mod_cheat_slot(rows[i].name) < mod_cheats.shown()) &&
            (!rows[i].heading || rows[i].tab == TAB_DEBUG || group_shown(i));
 }
@@ -2735,6 +2776,13 @@ void dim_page(ui::Ctx& c, ImU32 col);
 // (the caption's texts: PaGuideKey's 48 units for the help, a little smaller for the line about the value)
 // (the game's caption is 54 units, 65 as drawn; ours say more than its one line, so a little smaller: 57 and 50)
 constexpr float kHelpPt = 19.0f, kHintPt = 16.6f;
+constexpr float kModsDescPt = 15.2f;   // ((Triforce, 11-18) the Mods description: a step under the hints, more of it in the panel)
+// ((Triforce, 11-18) a page's floor: the caption's plate stops this far above the prompt bar, for a page with something of
+// its own at the foot (the Mods page's Salesman). Set while that page draws, 0 for every other
+float caption_floor = 0;
+// (...and its margin: the plate's right end stays this far inside the window's edge while the Mods page draws; 0, every
+// other page: the plate runs off the screen as the game's own caption plate does)
+float caption_edge = 0;
 
 /// The tallest help a row of the options can have, in pixels at width: its help and the tallest line any of its values can
 /// have: the help box keeps that height whichever row is selected and whatever its value
@@ -2843,7 +2891,12 @@ void help_box(ui::Ctx& c, float x0, float x1, float y0, const char* title, const
     float tall = std::max(min_h, content + 2 * pad_y);
     if (y0 + tall > y_max) y0 = std::max(y_min, y_max - tall);
     const float y1 = std::min(y0 + tall, y_max);
-    ui::box(c, ImVec2(x0, y0), ImVec2(x1 + bleed, y1));
+    // ((Triforce, 11-18) on the Mods page (caption_edge) the plate's bleed stops short of the window's edge: at a large menu
+    // unit hx1 is 3770 of a 3840 column and the bleed ran off the screen; flush with the edge read as on it (his "fix the
+    // search bar being on the edge of the 16:9 window"), so it keeps a margin there. Never short of the text's own end, x1.
+    // The options' own pages keep the plate off the screen, as the game's caption plate is)
+    const float plate_x1 = caption_edge > 0 ? std::max(x1, std::min(x1 + bleed, (float)c.w - caption_edge)) : x1 + bleed;
+    ui::box(c, ImVec2(x0, y0), ImVec2(plate_x1, y1));
     c.d->PushClipRect(ImVec2(x0, y0), ImVec2(x1, y1), true);
     float y = std::max(y0 + pad_y * 0.5f, (y0 + y1 - content) * 0.5f);
     if (title) ui::text(c, c.f.strong, 21.6f * s, ImVec2(x0 + pad_x, y), ui::kInk, title), y += 34 * s;
@@ -2892,7 +2945,8 @@ void caption(ui::Ctx& c, float hx0, float hx1, const char* title, const char* he
     const float y0 = std::max(hh + 14 * s, mid - tall * 0.5f);
     // ((Triforce, 11-17) the plate's right end where the game's own ends on a window wider than 16:9 (measured at 3440 x 1440:
     // 51 pixels short of ours), off a 16:9 screen as before. Only the plate: the text keeps its width, hx0 to hx1)
-    help_box(c, hx0, hx1, y0, title, help, hint, gold_line, tall, after_restart, hh + 14 * s, bar_top - 8 * s, ui::lu(c, 252));
+    help_box(c, hx0, hx1, y0, title, help, hint, gold_line, tall, after_restart, hh + 14 * s, bar_top - 8 * s - caption_floor,
+             ui::lu(c, 252));
 }
 /// A row's name on its plate; pending: a change that applies after a restart, the game's corner mark at its top left in
 /// gold (the help says it in words). The selected row's plate is as the others': the game's cursor alone marks it
@@ -3578,6 +3632,8 @@ void draw_inventory(ui::Ctx& c) {
     const int first = begin + inventory_page * inventory_capacity;
     const float width = (right - left + gap) / inventory_columns;
     c.d->PushClipRect(ImVec2(left - 12 * s, top - 12 * s), ImVec2(right + 12 * s, grid_bottom + 12 * s));
+    ImVec2 glow_a{}, glow_b{};   // ((Triforce, 11-18) the chosen one's cursor, drawn after every item: the next one's
+    bool glow_have = false;     // plate covered part of it, which read as the highlight clipped)
     for (int i = first; i < std::min(end, first + inventory_capacity); ++i) {
         const int cell = i - first;
         const ImVec2 a(left + (cell % inventory_columns) * width, top + (cell / inventory_columns) * pitch);
@@ -3600,9 +3656,10 @@ void draw_inventory(ui::Ctx& c) {
             ui::text_mid(c, c.f.body, 15 * s, a.x + 13 * s, ly, owned ? ui::kAccent : kCardOff, amount);
         }
         c.d->PopClipRect();
-        if (selected) ui::glow(c, a, b);
+        if (selected) glow_a = a, glow_b = b, glow_have = true;
         if (a.y < grid_bottom) hits.add(a.x, a.y, b.x, std::min(b.y, grid_bottom), menu_hit::kListLine, i);
     }
+    if (glow_have) ui::glow(c, glow_a, glow_b);
     c.d->PopClipRect();
     if (detail >= top) {   // (the page: its arrows, Page n of m and the range; the selected item's action at the right)
         c.d->AddLine(ImVec2(left, detail), ImVec2(right, detail), ui::alpha(ui::kEdge, 0.8f));
@@ -3715,6 +3772,8 @@ void draw_teleport(ui::Ctx& c) {
         c.d->AddLine(ImVec2(left + tw + 14 * s, hy + s), ImVec2(right - nw - 12 * s, hy + s), ui::alpha(ui::kAccent, 0.45f),
                      std::max(1.0f, s));
     }
+    ImVec2 glow_a{}, glow_b{};   // ((Triforce, 11-18) the chosen one's cursor, drawn after every item: the next one's
+    bool glow_have = false;     // plate covered part of it, which read as the highlight clipped)
     for (int i = 0; i < kTeleports; ++i) {
         const int k = teleport_section_of(i), cell = i - teleport_sections[k].first;
         const ImVec2 a(left + cell % cols * width, top + card_y(i) - at);
@@ -3727,9 +3786,10 @@ void draw_teleport(ui::Ctx& c) {
         c.d->PushClipRect(a, ImVec2(name_end, b.y), true);
         ui::text_mid(c, c.f.body, 17 * s, a.x + 16 * s, (a.y + b.y) * 0.5f, ui::kInk, teleport_names[i]);
         c.d->PopClipRect();
-        if (selected) ui::glow(c, a, b);
+        if (selected) glow_a = a, glow_b = b, glow_have = true;
         hits.add(a.x, std::max(a.y, top), b.x, std::min(b.y, bottom), menu_hit::kListLine, i);
     }
+    if (glow_have) ui::glow(c, glow_a, glow_b);
     c.d->PopClipRect();
     if (detail >= top) {   // (the selection, its section and note, and Travel: what Enter does)
         c.d->AddLine(ImVec2(left, detail), ImVec2(right, detail), ui::alpha(ui::kEdge, 0.8f));
@@ -3838,6 +3898,8 @@ void draw_names(ui::Ctx& c) {
     const int first = p.first(), last = p.last();
     const float width = (right - left + gap) / p.columns;
     c.d->PushClipRect(ImVec2(left - 12 * s, top - 12 * s), ImVec2(right + 12 * s, grid_bottom + 12 * s));
+    ImVec2 glow_a{}, glow_b{};   // ((Triforce, 11-18) the chosen one's cursor, drawn after every item: the next one's
+    bool glow_have = false;     // plate covered part of it, which read as the highlight clipped)
     for (int i = first; i < last; ++i) {
         const int cell = i - first;
         const ImVec2 a(left + (cell % p.columns) * width, top + (cell / p.columns) * pitch);
@@ -3863,9 +3925,10 @@ void draw_names(ui::Ctx& c) {
             ui::text_mid(c, c.f.body, 15 * s, a.x + 13 * s, a.y + 37 * s, st == '1' ? ui::kAccent : st == '0' ? ui::kSoft : kCardOff,
                          st == '1' ? "Set" : st == '0' ? "Not set" : st == '-' ? "Not in this save" : "Not known");
         c.d->PopClipRect();
-        if (selected) ui::glow(c, a, b);
+        if (selected) glow_a = a, glow_b = b, glow_have = true;
         if (a.y < grid_bottom) hits.add(a.x, a.y, b.x, std::min(b.y, grid_bottom), menu_hit::kListLine, i);
     }
+    if (glow_have) ui::glow(c, glow_a, glow_b);
     c.d->PopClipRect();
     if (detail >= top) {   // (the page: its arrows, Page n of m and the range; the chosen name's action at the right)
         c.d->AddLine(ImVec2(left, detail), ImVec2(right, detail), ui::alpha(ui::kEdge, 0.8f));
@@ -4087,11 +4150,14 @@ void salesman_says(ui::Ctx& c, float x0, float x1, float y1, const char* line) {
 /// ((Triforce) 11-17) The search's text in a..b at px, its end kept in view when it is longer; a caret after it while sel
 void mods_query_text(ui::Ctx& c, ImVec2 a, ImVec2 b, float px, bool sel, const char* empty_hint) {
     const float my = (a.y + b.y) * 0.5f, room = b.x - a.x;
-    c.d->PushClipRect(a, b, true);
+    // ((Triforce, 11-18) the clip keeps the caret's whole line: drawn on the clip's first pixel, half of it was cut, which
+    // read as the highlight clipped (the hint starts clear of it too))
+    c.d->PushClipRect(ImVec2(a.x - 2 * c.s, a.y), ImVec2(b.x + 2 * c.s, b.y), true);
+    const float caret_x = a.x + 1.5f * c.s;
     if (mods_query.empty()) {
-        ui::text_mid(c, c.f.body, px * 0.92f, a.x, my, ui::alpha(ui::kSoft, 0.55f), empty_hint);
+        ui::text_mid(c, c.f.body, px * 0.92f, sel ? caret_x + 7 * c.s : a.x, my, ui::alpha(ui::kSoft, 0.55f), empty_hint);
         if (sel && (prof_now() / 500000000LL) % 2 == 0)
-            c.d->AddLine(ImVec2(a.x, my - px * 0.55f), ImVec2(a.x, my + px * 0.55f), ui::kInk, std::max(1.5f, 1.6f * c.s));
+            c.d->AddLine(ImVec2(caret_x, my - px * 0.55f), ImVec2(caret_x, my + px * 0.55f), ui::kInk, std::max(1.5f, 1.6f * c.s));
     } else {
         const float w = ui::size_of(c.f.body, px, mods_query.c_str()).x;
         const float x = w + 6 * c.s > room ? b.x - w - 6 * c.s : a.x;
@@ -4117,8 +4183,11 @@ void mods_search_bar(ui::Ctx& c, ImVec2 a, ImVec2 b, const std::string& searched
         else if (feed == mods::Feed::Loading && !n) found = "Searching...";
         else found = (n == 1 ? std::string("1 found") : std::to_string(n) + (more ? "+ found" : " found"));
     }
-    const float found_w = found.empty() ? 0 : ui::size_of(c.f.body, 15 * s, found.c_str()).x + 16 * s;
-    if (!found.empty()) ui::text_mid_right(c, c.f.body, 15 * s, b.x - 14 * s, my, ui::kAccent, found.c_str());
+    // ((Triforce, 11-18) the count capped at two fifths of the bar, so the field keeps its room)
+    const float found_max = std::max(0.0f, (b.x - a.x) * 0.4f);
+    std::string found_fit;
+    const float found_w = found.empty() ? 0 : ui::fit_text(found.c_str(), c.f.body, 15 * s, found_max, &found_fit) + 16 * s;
+    if (!found_fit.empty()) ui::text_mid_right(c, c.f.body, 15 * s, b.x - 14 * s, my, ui::kAccent, found_fit.c_str());
     mods_query_text(c, ImVec2(a.x + 46 * s, a.y), ImVec2(b.x - 14 * s - found_w, b.y), 18 * s, sel && !mods_kbd,
                     sel ? "Type to search, or press Confirm for a keyboard" : "Search mods");
     if (sel && !mods_kbd) ui::glow(c, a, b);
@@ -4139,6 +4208,8 @@ void mods_keyboard(ui::Ctx& c) {
     ui::value_plate(c, fa, fb, false);
     mods_query_text(c, ImVec2(fa.x + 14 * s, fa.y), ImVec2(fb.x - 14 * s, fb.y), 20 * s, true, "Type a word to search for");
     const float ky = fb.y + 16 * s;
+    ImVec2 glow_a{}, glow_b{};   // ((Triforce, 11-18) the chosen one's cursor, drawn after every item: the next one's
+    bool glow_have = false;     // plate covered part of it, which read as the highlight clipped)
     for (int row = 0; row < 5; row++) {
         const int keys = row < 4 ? 10 : 4;
         for (int k = 0; k < keys; k++) {
@@ -4151,9 +4222,22 @@ void mods_keyboard(ui::Ctx& c) {
             const char* t = row < 4 ? label : kKbdWide[k];
             const ImU32 ink = on ? ui::kValueOnInk : row == 4 && k == 3 ? ui::kGoldHi : ui::kInk;
             ui::text_mid_centre(c, row < 4 ? c.f.strong : c.f.body, (row < 4 ? 21 : 17) * s, (ka.x + kb.x) * 0.5f, (ka.y + kb.y) * 0.5f, ink, t);
-            if (on) ui::glow(c, ka, kb);
+            if (on) glow_a = ka, glow_b = kb, glow_have = true;
             hits.add(ka.x, ka.y, kb.x, kb.y, menu_hit::kKey, row * 10 + col0);
         }
+    }
+    if (glow_have) {
+        // ((Triforce, 11-18) his "the highlight left and right inside showing black bars": the cursor's opening stands a
+        // few units off the key's plate and the dark box showed between them. The chosen key's own plate is drawn a
+        // little larger under the cursor, its letter with it, so the gold runs to the frame on every side)
+        const float g = ui::lu(c, 13);
+        ui::value_plate(c, ImVec2(glow_a.x - g, glow_a.y - g), ImVec2(glow_b.x + g, glow_b.y + g), true);
+        const int row = mods_kbd_row, col = mods_kbd_col;
+        char label[2] = {row < 4 ? (char)toupper((unsigned char)kKbdRows[row][col]) : 0, 0};
+        const char* t = row < 4 ? label : kKbdWide[kbd_wide(col)];
+        ui::text_mid_centre(c, row < 4 ? c.f.strong : c.f.body, (row < 4 ? 21 : 17) * s,
+                            (glow_a.x + glow_b.x) * 0.5f, (glow_a.y + glow_b.y) * 0.5f, ui::kValueOnInk, t);
+        ui::glow(c, glow_a, glow_b);
     }
 }
 
@@ -4168,11 +4252,20 @@ void draw_mods(ui::Ctx& c) {
     // (the Salesman's corner: the right of the cards' column, by the details; the cards narrower while he is there)
     if (salesman::state() == salesman::State::Idle && host && host->romfs_dir) salesman::start(host->romfs_dir());
     const bool salesman_on = salesman::state() != salesman::State::Failed && mods::available();
-    // ((Triforce) 11-17, layout A: the list at the left with the category tabs over it, the details at the right, the
-    // Salesman small at the list's foot with his line beside him)
+    // ((Triforce) 11-17, layout A: the list at the left with the category tabs over it, the details at the right)
     const float tabs_h = mods::available() && mods::accepted() ? 44 * s : 0;
-    const float sales_h = salesman_on && mods::accepted() ? 214 * s : 0;
-    const float left = cx0 + 34 * s, right = cx1 - 34 * s, top = hh + 18 * s + tabs_h, bottom = bar - 10 * s - sales_h;
+    // ((Triforce, 11-18) the mods expanded out, more of them on screen: the cards run to the prompt bar, and the Salesman has
+    // a band of his own at the right column's foot, under its plate, with his line beside him, over nothing)
+    // ((Triforce, 11-18) his band, but never over a quarter of the page: at a large menu unit 258 * s took almost all of a
+    // 2160-high window's room and the details panel had none left)
+    const float sales_h = salesman_on && mods::accepted() ? std::max(0.0f, std::min(300 * s, (bar - hh) * 0.26f)) : 0;
+    // (the caption plates stop above his band, and short of the window's edge, while this page draws, wherever it returns from)
+    struct CaptionFor {
+        float floor_was, edge_was;
+        CaptionFor(float floor, float edge) : floor_was(caption_floor), edge_was(caption_edge) { caption_floor = floor, caption_edge = edge; }
+        ~CaptionFor() { caption_floor = floor_was, caption_edge = edge_was; }
+    } const caption_for(sales_h, 16 * s);
+    const float left = cx0 + 34 * s, right = cx1 - 34 * s, top = hh + 18 * s + tabs_h, bottom = bar - 10 * s;
     const float search_h = 50 * s, list_top = top + search_h + 12 * s;   // ((Triforce) the search bar over the cards)
     if (tabs_h > 0) {   // (the categories: a strip of tabs over the list, the chosen one light on dark as the game's own tabs)
         const float ty = hh + 14 * s, th = 32 * s, gap = 8 * s, px = 15 * s;
@@ -4253,6 +4346,8 @@ void draw_mods(ui::Ctx& c) {
             list[i].texture = nullptr, list[i].thumb_state = 0;
         }
     }
+    ImVec2 glow_a{}, glow_b{};   // ((Triforce, 11-18) the chosen one's cursor, drawn after every item: the next one's
+    bool glow_have = false;     // plate covered part of it, which read as the highlight clipped)
     for (int k = 0; k < n; k++) {
         const int i = vis[k];
         const ImVec2 a(left, list_top + k * pitch - at), b(right, a.y + card_h);
@@ -4274,17 +4369,19 @@ void draw_mods(ui::Ctx& c) {
         float tag_w = 0;
         if (m.installed) tag_w = card_tag(c, b.x - 12 * s, a.y + 20 * s, m.update ? "Update" : "Installed") + 10 * s;
         c.d->PushClipRect(ImVec2(tx, a.y), ImVec2(b.x - 12 * s - tag_w, b.y), true);
-        ui::text_mid(c, c.f.strong, 19 * s, tx, a.y + 22 * s, ui::kInkBright, m.name.c_str());
+        // ((Triforce, 11-18) each line cut on whole characters with an ellipsis where it does not fit, not by the clip alone)
+        ui::text_mid_fit(c, c.f.strong, 19 * s, tx, a.y + 22 * s, ui::kInkBright, m.name.c_str(), b.x - 12 * s - tag_w - tx);
         c.d->PopClipRect();
         c.d->PushClipRect(ImVec2(tx, a.y), ImVec2(b.x - 12 * s, b.y), true);
         const std::string by = "by " + m.author + (m.category.empty() ? "" : "  \xC2\xB7  " + m.category) + mods_kind(m);
-        ui::text_mid(c, c.f.body, 15 * s, tx, a.y + 48 * s, ui::kSoft, by.c_str());
+        ui::text_mid_fit(c, c.f.body, 15 * s, tx, a.y + 48 * s, ui::kSoft, by.c_str(), b.x - 12 * s - tx);
         const std::string counts = mods_count(m.likes) + " likes  \xC2\xB7  " + mods_count(m.views) + " views";
-        ui::text_mid(c, c.f.body, 13.5f * s, tx, a.y + 70 * s, ui::alpha(ui::kSoft, 0.72f), counts.c_str());
+        ui::text_mid_fit(c, c.f.body, 13.5f * s, tx, a.y + 70 * s, ui::alpha(ui::kSoft, 0.72f), counts.c_str(), b.x - 12 * s - tx);
         c.d->PopClipRect();
-        if (sel) ui::glow(c, a, b);
+        if (sel) glow_a = a, glow_b = b, glow_have = true;
         hits.add(a.x, std::max(a.y, list_top), b.x, std::min(b.y, bottom), menu_hit::kListLine, i);
     }
+    if (glow_have) ui::glow(c, glow_a, glow_b);
     if (n && (more || feed == mods::Feed::Loading)) {   // ((Triforce) 11-18, the foot of the list: the pages come by themselves)
         const float y = list_top + n * pitch - at + 16 * s;
         if (y < bottom) ui::text_mid_centre(c, c.f.body, 15 * s, (left + right) * 0.5f, y, feed == mods::Feed::Failed ? ui::kAccent : ui::kDim,
@@ -4322,50 +4419,88 @@ void draw_mods(ui::Ctx& c) {
         can_install = m.details_state == 2 && files > 0;
         install_label = m.update ? "Update" : m.installed ? "Reinstall" : "Install";
         if (m.kit) install_label = m.update ? "Update and start" : m.installed ? "Start" : "Install and start";
-        const float x0 = hx0, x1 = hx1, pad = ui::lu(c, 64), y0 = top, y1 = bar - 8 * s;
+        const float x0 = hx0, x1 = hx1, pad = ui::lu(c, 64), y0 = top, y1 = bar - 8 * s - sales_h;   // ((Triforce, 11-18) his band kept clear)
         ui::box(c, ImVec2(x0, y0), ImVec2(x1, y1));
         c.d->PushClipRect(ImVec2(x0, y0), ImVec2(x1, y1), true);
         const float w = x1 - x0 - 2 * pad;
         float y = y0 + pad * 0.6f;
-        const ImVec2 pa(x0 + pad, y), pb(x0 + pad + w, y + w * 9 / 16);
-        mods_picture(c, m, pa, pb, &made);
-        y = pb.y + 16 * s;
-        y += ui::para(c, c.f.strong, 20 * s, ImVec2(x0 + pad, y), ui::kInk, m.name.c_str(), w) + 4 * s;
-        const std::string by = "by " + m.author + (m.category.empty() ? "" : "  \xC2\xB7  " + m.category) + mods_kind(m);
-        ui::text(c, c.f.body, 15 * s, ImVec2(x0 + pad, y), ui::kAccent, by.c_str());
+        // (the file chosen, its line, and a kit's note: measured for the header before they are drawn)
+        static const char* const kit_note = "A program of its own: it goes into the kits folder beside the game and starts in a window of "
+                                            "its own, where it shows its steps. No restart.";
+        const mods::File* file = m.details_state == 2 && files ? &m.files[std::clamp(m.file_choice, 0, files - 1)] : nullptr;
+        const std::string file_line = !file ? std::string()
+                                            : (files > 1 ? "File " + std::to_string(m.file_choice + 1) + " of " + std::to_string(files) + ":  " : std::string("File:  ")) +
+                                                  file->name + "  (" + mods_size(file->bytes) + ")";
+        float file_h = 0;
+        if (file) {
+            file_h = ui::para(c, c.f.strong, 14 * s, ImVec2(), 0, file_line.c_str(), w - 16 * s, false) + 2 * s;
+            if (!file->description.empty()) file_h += ui::para(c, c.f.body, 13.5f * s, ImVec2(), 0, file->description.c_str(), w - 16 * s, false);
+            if (m.kit) file_h += ui::para(c, c.f.body, 13.5f * s, ImVec2(), 0, kit_note, w - 16 * s, false) + 2 * s;
+            file_h += 8 * s;
+        }
+        // ((Triforce, 11-18) his "the actual mod detail preview windows information to be compacted and actually be
+        // readable in that window size": the header's own height is measured at this menu's unit, the description keeps
+        // three lines, and the picture is a 16:9 box of what is left over (none when that is nothing: the words matter
+        // more), so nothing the panel holds is cut whatever the window and the unit do)
+        const float panel_h = y1 - y0;
+        const float title_max = 2 * 1.3f * 20 * s;   // ((Triforce, 11-18) a long name is two lines at most)
+        const float title_h = std::min(ui::para(c, c.f.strong, 20 * s, ImVec2(), 0, m.name.c_str(), w, false), title_max) + 4 * s;
+        // (under the picture: 16, the name, the author's and the counts' lines (24 each), the file, the rule's 12)
+        const float header_h = 16 * s + title_h + 48 * s + file_h + 12 * s;
+        const float desc_need = 3 * kModsDescPt * s * 1.5f;
+        const float pic_room = panel_h - pad * 1.2f - header_h - desc_need;
+        const float pic_h = pic_room > 60 * s ? std::min(pic_room, std::min(panel_h * 0.42f, 420 * s)) : 0.0f;
+        const float pic_w = pic_h > 0 ? std::min(w, pic_h * 16.0f / 9.0f) : 0.0f;
+        const ImVec2 pa(x0 + pad, y), pb(x0 + pad + pic_w, y + pic_h);
+        {   // (what the panel measured: once for each mod chosen, for a run's log)
+            static int64_t told_for = -2;
+            if (told_for != mods_choice)
+                told_for = mods_choice, logf("menu: mods details: panel %.0f..%.0f (%.0f tall), picture %.0fx%.0f at %.0f, "
+                                             "files %d, details %d, window %ux%u, unit %.3f, header %.0f, description %.0f, search %.0f..%.0f x %.0f..%.0f",
+                                             y0, y1, panel_h, pic_w, pic_h, pa.x, files, m.details_state, (unsigned)c.w, (unsigned)c.h, s,
+                                             header_h, panel_h - pad * 1.2f - header_h - pic_h, left, right, top, top + search_h);
+        }
+        if (pic_h > 0) mods_picture(c, m, pa, pb, &made);
+        y = (pic_h > 0 ? pb.y : y) + 16 * s;
+        {   // ((Triforce, 11-18) drawn in the room the header was measured with: the rest is cut, not pushed down)
+            c.d->PushClipRect(ImVec2(x0 + pad, y), ImVec2(x1 - pad, y + title_max), true);
+            ui::para(c, c.f.strong, 20 * s, ImVec2(x0 + pad, y), ui::kInk, m.name.c_str(), w);
+            c.d->PopClipRect();
+            y += title_h;
+        }
+        // ((Triforce, 11-18) no blank "by " line: the category alone without an author, the kind alone without either)
+        std::string by = m.author.empty() ? m.category : "by " + m.author + (m.category.empty() ? "" : "  \xC2\xB7  " + m.category);
+        if (const std::string kind = mods_kind(m); !kind.empty()) by += by.empty() ? kind.substr(6) : kind;   // (6: its "  ·  " in front)
+        if (!by.empty()) ui::text_fit(c, c.f.body, 15 * s, ImVec2(x0 + pad, y), ui::kAccent, by.c_str(), w);
         y += 24 * s;
         std::string counts = mods_count(m.likes) + " likes  \xC2\xB7  " + mods_count(m.views) + " views";
         if (m.downloads >= 0) counts += "  \xC2\xB7  " + mods_count(m.downloads) + " downloads";
-        ui::text(c, c.f.body, 14 * s, ImVec2(x0 + pad, y), ui::kSoft, counts.c_str());
+        ui::text_fit(c, c.f.body, 14 * s, ImVec2(x0 + pad, y), ui::kSoft, counts.c_str(), w);
         y += 24 * s;
-        if (m.details_state == 2 && files) {
-            const mods::File& f = m.files[std::clamp(m.file_choice, 0, files - 1)];
-            std::string line = (files > 1 ? "File " + std::to_string(m.file_choice + 1) + " of " + std::to_string(files) + ":  " : std::string("File:  ")) +
-                               f.name + "  (" + mods_size(f.bytes) + ")";
+        if (file) {
             ui::diamond(c, ImVec2(x0 + pad + 5 * s, y + 9 * s), 4 * s, ui::kGoldHi);
-            y += ui::para(c, c.f.strong, 14 * s, ImVec2(x0 + pad + 16 * s, y), ui::kGoldHi, line.c_str(), w - 16 * s) + 2 * s;
-            if (!f.description.empty()) y += ui::para(c, c.f.body, 13.5f * s, ImVec2(x0 + pad + 16 * s, y), ui::kSoft, f.description.c_str(), w - 16 * s);
+            y += ui::para(c, c.f.strong, 14 * s, ImVec2(x0 + pad + 16 * s, y), ui::kGoldHi, file_line.c_str(), w - 16 * s) + 2 * s;
+            if (!file->description.empty()) y += ui::para(c, c.f.body, 13.5f * s, ImVec2(x0 + pad + 16 * s, y), ui::kSoft, file->description.c_str(), w - 16 * s);
             if (m.kit)   // ((Triforce) 11-18) a program of its own, not a mod in the game's mods folder
-                y += ui::para(c, c.f.body, 13.5f * s, ImVec2(x0 + pad + 16 * s, y + 2 * s), ui::kAccent,
-                              "A program of its own: it goes into the kits folder beside the game and starts in a window of its own, "
-                              "where it shows its steps. No restart.", w - 16 * s) + 2 * s;
+                y += ui::para(c, c.f.body, 13.5f * s, ImVec2(x0 + pad + 16 * s, y + 2 * s), ui::kAccent, kit_note, w - 16 * s) + 2 * s;
             y += 8 * s;
         }
         c.d->AddLine(ImVec2(x0 + pad, y), ImVec2(x1 - pad, y), ui::alpha(ui::kEdge, 0.8f), std::max(1.0f, s));
         y += 12 * s;
         const char* text = m.details_state == 2 ? m.text.c_str() : m.details_state == 3 ? "The details could not be read from GameBanana." : "Loading the details...";
         if (m.details_state == 2 && !files) text = "This mod has no file to download on GameBanana.";
+        if (m.details_state == 2 && files && m.text.empty()) text = "No description on GameBanana.";   // ((Triforce, 11-18))
         {   // ((Triforce) 11-17) the description in its own window down to the panel's foot, scrolled by the right stick or the wheel
             const float dtop = y, dbot = y1 - pad * 0.6f;
             if (mods_desc_for != mods_choice) mods_desc_for = mods_choice, mods_desc_px = 0;
-            const float th = ui::para(c, c.f.body, kHintPt * s, ImVec2(x0 + pad, dtop), ui::kInk, text, w, false);
+            const float th = ui::para(c, c.f.body, kModsDescPt * s, ImVec2(x0 + pad, dtop), ui::kInk, text, w, false);   // ((Triforce, 11-18) smaller)
             const float room = std::max(0.0f, dbot - dtop), most = std::max(0.0f, th - room);
             if (menu_pad_raw >> HOS_PAD_RS_DOWN & 1) mods_desc_px += 10 * s;
             if (menu_pad_raw >> HOS_PAD_RS_UP & 1) mods_desc_px -= 10 * s;
             if (mods_desc_wheel) mods_desc_px -= mods_desc_wheel * 60 * s, mods_desc_wheel = 0;
             mods_desc_px = std::clamp(mods_desc_px, 0.0f, most);
             c.d->PushClipRect(ImVec2(x0, dtop), ImVec2(x1, dbot), true);
-            ui::para(c, c.f.body, kHintPt * s, ImVec2(x0 + pad, dtop - mods_desc_px), ui::kInk, text, w);
+            ui::para(c, c.f.body, kModsDescPt * s, ImVec2(x0 + pad, dtop - mods_desc_px), ui::kInk, text, w);
             c.d->PopClipRect();
             if (most > 0) scroll_bar(c, x1 - pad * 0.45f, dtop, dbot, (int)th, (int)room, mods_desc_px);
             mods_desc_x0 = x0;
@@ -4383,8 +4518,12 @@ void draw_mods(ui::Ctx& c) {
     if (ask_details >= 0) mods::want_details(ask_details);
     for (int i : ask_thumbs) mods::want_thumb(i);
     if (salesman_on) {   // (him, and a line now and then: a new one when the choice moves, not more than every 9 s)
-        const float sy0 = bottom + 10 * s, sy1 = bar - 8 * s;
-        salesman_picture(c, ImVec2(left, sy0), ImVec2(left + 170 * s, sy1));
+        // ((Triforce, 11-18) his "move the text box ... not covering the mods and make the model ... not cover mods either":
+        // in the details column's foot, under its plate, where nothing is drawn, with his line beside him to the left: the
+        // cards keep the list's whole height and neither he nor his box is over them)
+        const float sy1 = bar - 8 * s, sy0 = sy1 - sales_h;
+        const float sx1 = hx1, sx0 = hx1 - sales_h * 0.82f;   // ((Triforce, 11-18) his width follows the band: he keeps his shape)
+        salesman_picture(c, ImVec2(sx0, sy0), ImVec2(sx1, sy1));
         const int64_t now = prof_now();
         static int last_choice = -1;
         if (last_choice != mods_choice && now - salesman_line_at > 9000000000LL) {
@@ -4392,7 +4531,7 @@ void draw_mods(ui::Ctx& c) {
             salesman_line = (salesman_line + 1) % (int)(sizeof salesman_lines / sizeof *salesman_lines);
         }
         if (salesman::state() == salesman::State::Ready && inst.job == mods::Job::None)
-            salesman_says(c, left + 178 * s, right, bar - 14 * s, salesman_lines[salesman_line]);
+            salesman_says(c, hx0, sx0 - 10 * s, bar - 14 * s, salesman_lines[salesman_line]);
     }
     // (the install under way, or its end: over the page)
     if (inst.job == mods::Job::Downloading || inst.job == mods::Job::Unpacking) {
@@ -4563,7 +4702,7 @@ constexpr ImU32 kTitleGlow = ui::rgba(120, 140, 255);
 mods_entry::Anim title_anim;
 void draw_title_mods(ui::Ctx& c, bool sel, float cx, float cy, float k, float pitch) {
     const int64_t now = prof_now(), age = mods_list_age();
-    title_anim.step(now, sel, std::min<int64_t>(age, mods_entry::kListShownNs));
+    title_anim.step(now, sel, std::min<int64_t>(age, mods_entry::kListShownNs), mods_list_shown());
     const float show = title_anim.shown, f = title_anim.focus;
     const ImVec2 m = ui::at(c, cx, cy);
     const char* const label = "Mods";
@@ -4660,6 +4799,7 @@ void draw_mods_row(ui::Ctx& c, bool sel) {
         static const char* const names[2] = {"Mods", "Quit"};
         static const bool still = getenv("RX_VK_UI_STILL") != nullptr;   // (pictures that compare: as it stands)
         const int64_t now = prof_now();
+        const int vtx_row = c.d->VtxBuffer.Size;
         for (int i = 0; i < 2; i++) {
             const float y = cy - pitch * i;
             const ImVec2 a = ui::at(c, cx - 336, y + 72), b = ui::at(c, cx + 336, y - 72);
@@ -4668,6 +4808,10 @@ void draw_mods_row(ui::Ctx& c, bool sel) {
             hits.add(a.x, a.y, b.x, b.y, menu_hit::kButton, i);
             if (i == 0) mods_entry_px[0] = a.x, mods_entry_px[1] = a.y, mods_entry_px[2] = b.x, mods_entry_px[3] = b.y;
         }
+        // ((Triforce, 11-20) Mods and Quit as much there as the game's own buttons above them are (mods_list_shown): they
+        // come and go with the System page, not a frame before or after)
+        if (const float list = mods_list_shown(); list >= 0 && list < 1)
+            for (int v = vtx_row; v < c.d->VtxBuffer.Size; v++) c.d->VtxBuffer[v].col = ui::alpha(c.d->VtxBuffer[v].col, list);
         mods_entry_px[4] = ui::lu(c, pitch);
         return;
     }
@@ -4740,6 +4884,194 @@ void end_game(bool restart) {
     memory_trial_orderly_end();
     logf(restart ? "menu: Restart Game" : "menu: Quit Game");
     if (const HWND window = app_window()) PostMessageA(window, restart ? WM_APP + 9 : WM_CLOSE, 0, 0);
+}
+
+/// (Triforce) 11-18, his "if you can draw these in game style can you not do that for the achievements too?": the game's own
+/// picture for an achievement's icon, where it has one (vk_game_tex.h takes them from his game's files when they are there):
+/// a Spiritual Stone and a medallion by their colours, as the load list's plate has them (DataFileImportantIcon_00 to _08:
+/// the stones of the forest, of fire, of water; the medallions of light, forest, fire, water, spirit, shadow); a song's icon
+/// for a note; a Gold Skulltula's mark for a token, and a rupee for the green one. nullptr: none, the drawn icon
+const char* ach_art_name(int icon) {
+    namespace ar = achievement_rows;
+    const int tone = ar::tone_of(icon);
+    switch (ar::shape_of(icon)) {
+    case ar::kGem:
+        return tone == ar::kGreen ? "DataFileImportantIcon_00" : tone == ar::kRed ? "DataFileImportantIcon_01" : tone == ar::kBlue ? "DataFileImportantIcon_02" : nullptr;
+    case ar::kMedal:
+        return tone == ar::kYellow ? "DataFileImportantIcon_03" : tone == ar::kGreen ? "DataFileImportantIcon_04" : tone == ar::kRed ? "DataFileImportantIcon_05" :
+               tone == ar::kBlue ? "DataFileImportantIcon_06" : tone == ar::kOrange ? "DataFileImportantIcon_07" : tone == ar::kPurple ? "DataFileImportantIcon_08" : nullptr;
+    case ar::kNote: return "OcarinaMelodyIcon_00";
+    case ar::kToken: return tone == ar::kGreen ? "RupeeIconNew_00" : "MapIconCollectSkullSign_00";
+    }
+    return nullptr;
+}
+/// (Triforce) An achievement's icon: the game's own picture of what it is about where there is one (ach_art_name), else
+/// drawn: a dark disc with a ring, and on it one of achievement_rows.h's shapes in one of its tones. One not earned in grey.
+/// m its middle, r its radius
+void ach_icon(ui::Ctx& c, ImVec2 m, float r, int icon, bool earned) {
+    namespace ar = achievement_rows;
+    if (const char* const name = ach_art_name(icon)) {
+        if (const ui::Art* t = ui::art(name)) {
+            static const ImU32 tints[ar::kTones] = {ui::rgba(232, 184, 74),  ui::rgba(96, 196, 104),  ui::rgba(226, 92, 76),   ui::rgba(92, 158, 236),
+                                                    ui::rgba(168, 112, 226), ui::rgba(238, 146, 62),  ui::rgba(246, 228, 128), ui::rgba(200, 208, 218)};
+            // (a picture as it is, a mask in the icon's tone; one not earned dark and half there)
+            const ImU32 col = !earned ? ui::rgba(96, 90, 78, 150) : t->mask ? tints[ar::tone_of(icon)] : IM_COL32_WHITE;
+            const float hw = r * 1.2f, hh = hw * t->h / t->w;
+            ui::image(c, t, ImVec2(m.x - hw, m.y - hh), ImVec2(m.x + hw, m.y + hh), col);
+            return;
+        }
+    }
+    static const ImU32 tones[ar::kTones] = {ui::rgba(232, 184, 74),  ui::rgba(96, 196, 104),  ui::rgba(226, 92, 76),   ui::rgba(92, 158, 236),
+                                            ui::rgba(168, 112, 226), ui::rgba(238, 146, 62),  ui::rgba(246, 228, 128), ui::rgba(200, 208, 218)};
+    const ImU32 tone = earned ? tones[ar::tone_of(icon)] : ui::rgba(112, 106, 92), dark = ui::rgba(20, 15, 9, 245);
+    const ImU32 cut = ui::alpha(dark, 0.6f);   // (a line drawn on a shape: its facets)
+    const float line = std::max(1.5f, r * 0.09f), g = r * 0.56f;
+    c.d->AddCircleFilled(m, r, dark, 48);
+    c.d->AddCircle(m, r - line * 0.5f, earned ? tone : ui::alpha(tone, 0.7f), 48, line);
+    const auto p = [&](float x, float y) { return ImVec2(m.x + x * g, m.y + y * g); };   // (a place of the shape: -1 to 1 each way, y down)
+    switch (ar::shape_of(icon)) {
+    case ar::kSword: {   // (point up and to the right: the blade and its point, the guard across, the grip and its pommel)
+        c.d->AddLine(p(-0.28f, 0.28f), p(0.62f, -0.62f), tone, g * 0.30f);
+        c.d->AddTriangleFilled(p(0.50f, -0.74f), p(0.74f, -0.50f), p(0.96f, -0.96f), tone);
+        c.d->AddLine(p(-0.72f, -0.10f), p(0.10f, 0.72f), tone, g * 0.20f);
+        c.d->AddLine(p(-0.31f, 0.31f), p(-0.78f, 0.78f), tone, g * 0.18f);
+        c.d->AddCircleFilled(p(-0.84f, 0.84f), g * 0.15f, tone, 16);
+        break;
+    }
+    case ar::kGem: {
+        const ImVec2 pts[] = {p(-0.55f, -0.80f), p(0.55f, -0.80f), p(0.95f, -0.22f), p(0, 0.95f), p(-0.95f, -0.22f)};
+        c.d->AddConvexPolyFilled(pts, 5, tone);
+        c.d->AddLine(p(-0.95f, -0.22f), p(0.95f, -0.22f), cut, line * 0.8f);
+        c.d->AddLine(p(-0.38f, -0.22f), p(0, 0.95f), cut, line * 0.8f), c.d->AddLine(p(0.38f, -0.22f), p(0, 0.95f), cut, line * 0.8f);
+        c.d->AddLine(p(-0.38f, -0.22f), p(-0.20f, -0.80f), cut, line * 0.8f), c.d->AddLine(p(0.38f, -0.22f), p(0.20f, -0.80f), cut, line * 0.8f);
+        break;
+    }
+    case ar::kMedal:
+        c.d->AddCircleFilled(m, g * 0.92f, tone, 32);
+        c.d->AddCircle(m, g * 0.62f, cut, 32, line);
+        ui::diamond(c, m, g * 0.26f, cut);
+        break;
+    case ar::kNote:   // (its head, its stem, its flag)
+        c.d->AddCircleFilled(p(-0.28f, 0.55f), g * 0.36f, tone, 24);
+        c.d->AddLine(p(0, 0.55f), p(0, -0.85f), tone, g * 0.17f);
+        c.d->AddLine(p(0, -0.80f), p(0.62f, -0.42f), tone, g * 0.22f);
+        c.d->AddLine(p(0.62f, -0.42f), p(0.46f, 0.02f), tone, g * 0.14f);
+        break;
+    case ar::kToken:
+        c.d->AddCircle(m, g * 0.72f, tone, 32, g * 0.30f);
+        c.d->AddCircleFilled(m, g * 0.22f, tone, 16);
+        break;
+    case ar::kShield: {
+        const ImVec2 pts[] = {p(-0.78f, -0.85f), p(0.78f, -0.85f), p(0.78f, 0.05f), p(0, 0.95f), p(-0.78f, 0.05f)};
+        c.d->AddConvexPolyFilled(pts, 5, tone);
+        c.d->AddLine(p(0, -0.85f), p(0, 0.95f), cut, line), c.d->AddLine(p(-0.78f, -0.25f), p(0.78f, -0.25f), cut, line);
+        break;
+    }
+    default: {   // (a star: its five points about a pentagon)
+        ImVec2 in[5], out[5];
+        for (int i = 0; i < 5; i++) {
+            const float a = -1.5707963f + i * 1.2566371f, h = a + 0.6283185f;
+            out[i] = p(cosf(a), sinf(a)), in[i] = p(0.42f * cosf(h), 0.42f * sinf(h));
+        }
+        c.d->AddConvexPolyFilled(in, 5, tone);
+        for (int i = 0; i < 5; i++) c.d->AddTriangleFilled(in[(i + 4) % 5], out[i], in[i], tone);
+    }
+    }
+}
+
+/// (Triforce) The Achievements page (kAchPage): a card for each the host named, its icon, its name and whether it is earned,
+/// in pages; the chosen one's line about it in the caption. Nothing is set here: they are earned in the game
+void draw_achievements(ui::Ctx& c) {
+    const float s = c.s;
+    const int n = ach_list.shown();
+    char count_text[48];
+    snprintf(count_text, sizeof count_text, "%d of %d earned", ach_list.earned_count(), n);
+    const float hh = title_banner(c, "Achievements", count_text);
+    const ui::Prompt prompts[] = {{ui::kUpDown, "Move"}, {ui::kLeftRight, "Move"}, {ui::kTabs, "Page"}, {ui::kBack, "Back"}};
+    float cx0, cx1, hx0, hx1;
+    bool narrow;
+    columns(c, &cx0, &cx1, &hx0, &hx1, &narrow);
+    column(c, cx0, cx1, hh);
+    const float bar = ui::prompt_bar_top(c);
+    const float left = cx0 + 24 * s, right = cx1 - 24 * s, gap = 10 * s;
+    const float top = hh + 22 * s, pitch = 74 * s;
+    const float strip = 58 * s, detail = bar - 14 * s - strip, grid_bottom = std::max(top, detail - 8 * s);
+    ach_columns = right - left >= 620 * s ? 2 : 1;
+    ach_capacity = ach_columns * std::max(1, (int)((grid_bottom - top + gap) / pitch));
+    ach_view.keep(n, ach_capacity);
+    const int choice = ach_view.choice;
+    if (n > 0) {
+        const bool got = ach_list.is_earned(choice);
+        char when[48] = "Earned";
+        if (got && ach_list.days[choice][0]) snprintf(when, sizeof when, "Earned on %s", ach_list.days[choice]);
+        caption(c, hx0, hx1, ach_list.names[choice], ach_list.abouts[choice][0] ? ach_list.abouts[choice] : nullptr,
+                got ? nullptr : "Not earned yet.", got ? when : nullptr);
+    }
+    const int first = ach_view.page * ach_capacity, last = std::min(n, first + ach_capacity);
+    const float width = (right - left + gap) / ach_columns;
+    c.d->PushClipRect(ImVec2(left - 12 * s, top - 12 * s), ImVec2(right + 12 * s, grid_bottom + 12 * s));
+    for (int i = first; i < last; ++i) {
+        const int cell = i - first;
+        const ImVec2 a(left + (cell % ach_columns) * width, top + (cell / ach_columns) * pitch);
+        const ImVec2 b(a.x + width - gap, a.y + pitch - gap);
+        const bool earned = ach_list.is_earned(i);
+        ui::plate(c, a, b, earned);
+        const float r = 23 * s, tx = a.x + 14 * s + 2 * r + 13 * s;
+        ach_icon(c, ImVec2(a.x + 14 * s + r, (a.y + b.y) * 0.5f), r, ach_list.icons[i], earned);
+        c.d->PushClipRect(ImVec2(tx, a.y), b - ImVec2(8 * s, 0), true);
+        ui::text_mid(c, c.f.strong, 15.5f * s, tx, a.y + 21 * s, earned ? ui::kInkBright : ui::kSoft, ach_list.names[i]);
+        char line[40] = "Locked";
+        if (earned && ach_list.days[i][0]) snprintf(line, sizeof line, "Earned %s", ach_list.days[i]);
+        else if (earned) snprintf(line, sizeof line, "Earned");
+        ui::text_mid(c, c.f.body, 14 * s, tx, a.y + 43 * s, earned ? ui::kAccent : kCardOff, line);
+        c.d->PopClipRect();
+        if (i == choice) ui::glow(c, a, b);
+        if (a.y < grid_bottom) hits.add(a.x, a.y, b.x, std::min(b.y, grid_bottom), menu_hit::kListLine, i);
+    }
+    c.d->PopClipRect();
+    if (detail >= top && n > 0) {   // (the page: its arrows, Page n of m and the range, as the Inventory's)
+        c.d->AddLine(ImVec2(left, detail), ImVec2(right, detail), ui::alpha(ui::kEdge, 0.8f));
+        const int pages = achievement_rows::View::pages(n, ach_capacity), at = ach_view.page;
+        const float my = detail + strip * 0.5f + 2 * s, side = 32 * s;
+        float px0 = left;
+        if (pages > 1) {
+            page_arrow(c, ImVec2(px0, my - side * 0.5f), side, 0, at > 0);
+            hits.add(px0, my - side * 0.5f, px0 + side, my + side * 0.5f, menu_hit::kButton, 2);
+            char page_text[32];
+            snprintf(page_text, sizeof page_text, "Page %d of %d", at + 1, pages);
+            const float tw = ui::size_of(c.f.strong, 17 * s, page_text).x;
+            ui::text_mid(c, c.f.strong, 17 * s, px0 + side + 12 * s, my, ui::kInkBright, page_text);
+            const float nx = px0 + side + 24 * s + tw;
+            page_arrow(c, ImVec2(nx, my - side * 0.5f), side, 1, at + 1 < pages);
+            hits.add(nx, my - side * 0.5f, nx + side, my + side * 0.5f, menu_hit::kButton, 3);
+            px0 = nx + side + 18 * s;
+        }
+        char range[64];
+        snprintf(range, sizeof range, "%d\xe2\x80\x93%d of %d", first + 1, last, n);
+        ui::text_mid(c, c.f.body, 15 * s, px0, my, ui::kSoft, range);
+    }
+    ui::prompt_bar(c, prompts, (int)(sizeof prompts / sizeof prompts[0]));
+}
+
+/// (Triforce) The notice of an achievement earned: a plate at the top of the screen, its icon, "Achievement earned" and its
+/// name, slid in from above and out again (achievement_rows.h notice_in). Over the game and over the options alike
+void draw_ach_notice(ui::Ctx& c) {
+    const int slot = ach_notice;
+    if (slot < 0 || slot >= ach_list.shown()) return;
+    const float k = achievement_rows::notice_in((prof_now() - ach_notice_at) / 1000000, kAchNoticeMs);
+    if (k <= 0) return;
+    const float s = c.s, in = 1 - (1 - k) * (1 - k), r = 26 * s, pad = 16 * s;
+    const float text_w = std::max(ui::size_of(c.f.strong, 21 * s, ach_list.names[slot]).x, ui::size_of(c.f.strong, 13.5f * s, "Achievement earned").x);
+    const float w = pad + 2 * r + 16 * s + text_w + 28 * s, h = 76 * s;
+    const ImVec2 a((c.w - w) * 0.5f, -h + (h + 34 * s) * in), b(a.x + w, a.y + h);
+    // ((Triforce) 11-18: the game's own plate, as the file select's cards and the Achievements page's, with a gold rim; it was a
+    // dark rounded box of the menu's own)
+    ui::plate(c, a, b, true);
+    c.d->AddRect(a, b, ui::alpha(ui::kGoldHi, 0.9f), 0, 0, std::max(1.5f, 1.6f * s));
+    ach_icon(c, ImVec2(a.x + pad + r, (a.y + b.y) * 0.5f), r, ach_list.icons[slot], true);
+    const float tx = a.x + pad + 2 * r + 16 * s;
+    ui::text_mid(c, c.f.strong, 13.5f * s, tx, a.y + 25 * s, ui::kGoldHi, "Achievement earned");
+    ui::text_mid(c, c.f.strong, 21 * s, tx, a.y + 51 * s, ui::kInkBright, ach_list.names[slot]);
 }
 
 void draw_ask(ui::Ctx& c) {
@@ -4863,6 +5195,13 @@ void prebake(const ui::Ctx& c) {
     memcpy(scrolled_to, saved_to, sizeof scrolled_to);
 }
 
+/// ((Triforce, 11-20) how much of the Mods screen shows now, as its In plays (mods_page_anim.h); 1 on every other page, and
+/// in a still (no window's frames stepping the easing, or RX_VK_UI_STILL for pictures that compare): as it stands
+float mods_screen_alpha() {
+    static const bool still = getenv("RX_VK_UI_STILL") != nullptr;
+    return page == kModsPage ? mods_screen.alpha(prof_now(), !ease_live || still) : 1.0f;
+}
+
 /// The menu: the game dimmed across the whole window, the pages in a column as wide as a 16:9 screen of this height, in the
 /// middle (a window of 16:9 or narrower: the whole of it). The pages draw from 0 as on 16:9; their vertices and clip
 /// rectangles are moved over after, and menu_tick moves the mouse back through menu_map before it tests the hits. (Triforce)
@@ -4871,6 +5210,16 @@ void prebake(const ui::Ctx& c) {
 /// its list is: game_grid.h)
 void draw_menu(ui::Ctx& c, bool perf_under) {
     const bool row = page == kModsRowPage;   // ((Triforce) the Mods entry has the cursor: over the game's list, nothing dimmed)
+    // ((Triforce, 11-20) the Mods screen's In: while it plays, the entries that opened it (Mods, and Quit under it) are still
+    // drawn under it, on the game's list, and go as the screen comes; without them the list stood a frame without its Mods
+    // entry before the screen covered it)
+    const float mods_in = mods_screen_alpha();
+    if (mods_in < 1 && (mods_list_fresh() || mods_title_fading())) {
+        const int vtx_under = c.d->VtxBuffer.Size;
+        draw_mods_row_shut(c);
+        for (int i = vtx_under; i < c.d->VtxBuffer.Size; i++) c.d->VtxBuffer[i].col = ui::alpha(c.d->VtxBuffer[i].col, 1 - mods_in);
+    }
+    const int vtx_page = c.d->VtxBuffer.Size;   // (from here the page: its background, its column and all it draws)
     // (the game behind: inside its own Options screen its own background, untouched; over play the System screens' own
     // (ui::system_bg), or dimmed flat without its textures)
     if (!embed_open && !row && !ui::system_bg(c)) c.d->AddRectFilled(ImVec2(0, 0), ImVec2(c.w, c.h), ui::rgba(8, 5, 2, ui::kDimAlpha));
@@ -4927,6 +5276,7 @@ void draw_menu(ui::Ctx& c, bool perf_under) {
     else if (page == 4) draw_inventory(k);
     else if (page == 6) draw_names(k);   // ((Triforce) Game flags, Cutscenes, Scan amiibo)
     else if (page == kModsPage) draw_mods(k);
+    else if (page == kAchPage) draw_achievements(k);   // ((Triforce) the System tab's Achievements)
     else draw_options(k);
     if (on_game) c.d->PopClipRect();
     int perf0 = 0, perf1 = 0;   // (the Full panel's vertices: in the window's pixels already)
@@ -4934,6 +5284,10 @@ void draw_menu(ui::Ctx& c, bool perf_under) {
         panel_between(c.d);
         perf0 = panel_wait.v0, perf1 = panel_wait.v1;
     }
+    // ((Triforce, 11-20) the Mods screen fades in whole: the background, the column, the cards, the details, the Salesman's
+    // picture and the prompts; not the Full panel, which was there before it)
+    for (int i = vtx_page; mods_in < 1 && i < c.d->VtxBuffer.Size; i++)
+        if (i < perf0 || i >= perf1) c.d->VtxBuffer[i].col = ui::alpha(c.d->VtxBuffer[i].col, mods_in);
     if (menu_map.ox <= 0 && menu_map.oy <= 0 && menu_map.kx == 1) return;
     // (a clip rectangle of the column's: moved with it; the whole window's (the dim's, and the draw list's own) stays, as it
     // holds the column wherever it is)
@@ -5267,7 +5621,10 @@ void startup_screen(const StartupView* view) {
 
 int hdr_at_start = 0;
 int renodx_at_start = 0, upscale_pre_at_start = 0;
-int tex_bc1_at_start = 0;
+// ((Triforce, 11-21, the performance audit's TEX-50) the row's own default, not 0: with no options file (a first start)
+// nothing set it, and the textures stayed BC3 although the row said On
+int tex_bc1_at_start = Options().tex_bc1;
+static_assert(Options().tex_bc1 == 1, "Opaque textures as BC1 is on by default: a first start takes it");
 int tex_detail_at_start = 0;
 int replay_threads_at_start = replay_threads::kDefaultRow;
 static_assert(Options().replay_threads == replay_threads::kDefaultRow, "the row's default is replay_threads.h's");
@@ -5275,6 +5632,9 @@ bool renodx_chosen() {
     static const char* const e = getenv("RX_VK_RENODX");
     return e && *e ? atoi(e) != 0 : renodx_at_start != 0;
 }
+
+// ((Triforce, 11-22, the performance audit's PRESENT-46) menu_init found no options file: a first start, menu_first_start)
+static bool first_start_no_file = false;
 
 void menu_init() {
     static bool done;
@@ -5370,6 +5730,7 @@ void menu_init() {
     // low-VRAM hardware without requiring the menu to render first. ((Triforce, options_version 7) What the Quality preset's
     // Minimum set, without the preset: the 3D at 50%, the handheld profile's output, the smallest textures, frames shown
     // evenly; the memory budgets are the card's own)
+    first_start_no_file = !has_options;   // ((Triforce, 11-22, PRESENT-46) for menu_first_start, once the card is known)
     if (!has_options && getenv("RX_VK_LOW_SPEC") && atoi(getenv("RX_VK_LOW_SPEC")) != 0) {
         opts.resolution = ur::snap(upscaler(), 4), opts.output_res = merged_rows::kHandheldOutput, opts.tex_detail = 3;
         opts.pace = 1, opts.realtime = 1, opts.sharpness = 0;
@@ -5389,6 +5750,41 @@ void menu_init() {
     lang_load();   // (Triforce: the Game language row, from language.txt)
     merged_sync();   // ((Triforce, options_version 7) the merged rows from what was read)
     restart_init();   // (what this run started with: the rows that take a restart differ from it once changed)
+}
+
+/// (Triforce, 11-22, the performance audit's PRESENT-46, after Source A's) A first start sized to the card, with
+/// RX_VK_FIRST_START_AUTO (off unless set: first_start.h): with no options file, RX_VK_LOW_SPEC not asked and no switch
+/// setting the Render resolution, a weak card (an integrated GPU, no mesh shaders, 4.5 GB of video memory or less) starts
+/// with the Render resolution row at 50%, or at 33% for an integrated GPU beside 4 threads or fewer, in place of Auto.
+/// Only that row: the upscaler, the textures and the output stay as they are, and nothing is saved, so every start chooses
+/// again until the player saves options of their own. Called once the device is made (vk_main.cpp mkwvk_init: menu_init
+/// runs before the card is known), before the host's one read of the row
+void menu_first_start() {
+    static bool done;
+    if (done) return;
+    done = true;
+    const int64_t asked = first_start::switch_mb(getenv("RX_VK_FIRST_START_AUTO"));
+    const bool low_spec = getenv("RX_VK_LOW_SPEC") && atoi(getenv("RX_VK_LOW_SPEC")) != 0;
+    if (!first_start::applies(!first_start_no_file, low_spec, getenv("HOS_DYNRES") != nullptr, asked)) return;
+    first_start::Card card;
+    card.integrated = dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+    card.mesh_shaders = dev.mesh_shader;
+    card.vram_mb = asked > 0 ? (uint64_t)asked : device_vram_bytes() >> 20;
+    card.threads = cpu_count();
+    const first_start::Choice choice = first_start::choose(card);
+    if (!choice.row) {
+        logf("menu: first start: no change (%s: %llu MB of video memory%s, mesh shaders %s; RX_VK_FIRST_START_AUTO)",
+             first_start::why_text(choice.why), (unsigned long long)card.vram_mb, asked > 0 ? " asked" : "",
+             card.mesh_shaders ? "yes" : "no");
+        return;
+    }
+    opts.resolution = ur::snap(upscaler(), choice.row);
+    // (the row takes a restart: what this run starts with is this, not menu_init's)
+    for (const Row& r : rows)
+        if (r.value == &opts.resolution) restart_state.restart_value(restart_slot_of(r), restart_value_of(r));
+    logf("menu: first start: tier 1 (%s, %llu MB of video memory%s, %u threads): Render resolution %s "
+         "(RX_VK_FIRST_START_AUTO; nothing is saved)", first_start::why_text(choice.why), (unsigned long long)card.vram_mb,
+         asked > 0 ? " asked" : "", card.threads, tx_resolution(opts.resolution));
 }
 
 // ((Triforce VR) the VR tab's Render resolution over the Graphics tab's while VR is on: read once, at the start, as both are)
@@ -5504,12 +5900,24 @@ static menu_sound::State sound_state() {
     } else if (page == 6) {
         s.cursor = names_page[names_kind].choice, s.group = names_page[names_kind].group;
         s.mode = names_edit ? menu_sound::kModeEdit : menu_sound::kModeNone;
+    } else if (page == kAchPage) {
+        s.cursor = ach_view.choice, s.group = ach_view.page;
     }
     return s;
 }
 int menu_take_sound() { return sound_queue.take(prof_now()); }   // (the options' next sound, for the host's sound thread)
 void mods_sound(int id) { if (opts.menu_sounds > 0) sound_queue.put(id, prof_now()); }   // ((Triforce) the Mods entry's and screen's own sounds
 int menu_mods_selected() { return open_now.load(std::memory_order_relaxed) && (page == kModsRowPage || page == kModsPage); }
+/// ((Triforce, 11-20) the owner: "have the in game mods menu in the title screen play the shop theme quietly in the
+/// background ... it mutes the title screen music's audio while in the mod menu and fades in/out". What the host's sound
+/// thread asks each block (host/mods_music.c): 2 while the Mods screen is open from the title's list, 1 while that list is
+/// there with its entry (the tune is read then, ahead of the screen), 0 otherwise: the pause menu's Mods screen keeps the
+/// music of where the player is
+int menu_mods_music() {
+    if (!mods_title_list()) return 0;
+    if (open_now.load(std::memory_order_relaxed) && page == kModsPage) return 2;
+    return mods_list_fresh() || mods_title_fading() ? 1 : 0;
+}
 int menu_text_wanted() { return mods_text_wanted.load(std::memory_order_relaxed) ? 1 : 0; }   // ((Triforce) the Mods screen's search)
 int menu_bug_shot() { return bugshot_state(); }
 
@@ -5776,7 +6184,15 @@ void menu_option_set(int id, int value) {
         mods_box[id - HOS_OPT_MODS_X0].store(value, std::memory_order_relaxed);
         return;
     }
+    if (id == HOS_OPT_MODS_ALPHA) {   // ((Triforce, 11-20) how much of its own buttons the game shows: the entry's too)
+        mods_list_alpha.store(std::clamp(value, 0, 1000), std::memory_order_relaxed);
+        return;
+    }
     if (id == HOS_OPT_MODS_LIST) {
+        if (!(value & HOS_MODS_LIST_SHOWN)) {   // ((Triforce, 11-20) the list is no longer the entry's: gone at once, not after 150 ms)
+            mods_list_ns.store(0, std::memory_order_release);
+            return;
+        }
         mods_list_bits.store(value, std::memory_order_relaxed);
         mods_list_frame.store(game_frames.load(std::memory_order_relaxed), std::memory_order_relaxed);
         mods_list_ns.store(prof_now(), std::memory_order_release);
@@ -5802,6 +6218,19 @@ void menu_option_set(int id, int value) {
     if (id == HOS_OPT_GAME_OPTIONS) {   // (Triforce: the game's own Options screen runs: each frame it does)
         game_options_ns.store(value ? prof_now() : 0, std::memory_order_relaxed);
         game_options_from_pause.store(value == 2, std::memory_order_relaxed);
+        return;
+    }
+    // (Triforce: the achievements, named by the host once this renderer answers, and each one earned as it is:
+    // host/achievements.c, one call at a time)
+    if (id == HOS_OPT_ACH_TEXT) return ach_list.text(value);
+    if (id == HOS_OPT_ACH_ADD) return ach_list.add(value);
+    if (id == HOS_OPT_ACH_COUNT) {
+        ach_list.done(value);
+        menu_refresh = true;
+        return;
+    }
+    if (id == HOS_OPT_ACH_EARNED) {
+        if (ach_list.earn(value)) menu_refresh = true;
         return;
     }
     // (Triforce: the cheats of the mods' cheat files, named by the host at the first frame: host/mod_cheats.c. A cheat may not
@@ -6055,15 +6484,20 @@ void mods_tick(bool* press, bool tab_left, bool tab_right, bool mouse, bool move
         if (!dialog && mods_kbd) {   // ((Triforce) the on-screen keyboard: a key pointed at is chosen, a click types it; a click off it shuts it)
             if (hit.part == menu_hit::kKey && (moved || ptr.pressed)) {
                 const int r = hit.index / 10, col = hit.index % 10;
-                if (r != mods_kbd_row || col != mods_kbd_col) mods_kbd_row = r, mods_kbd_col = col, changed = true;
+                if (r != mods_kbd_row || col != mods_kbd_col) {
+                    mods_kbd_row = r, mods_kbd_col = col, changed = true;
+                    if (ptr.pressed & HOS_MOUSE_LEFT) mods_sound(HOS_MENU_SOUND_CURSOR);   // (a click; hover alone is quiet)
+                }
             }
             const bool inside = mx >= mods_kbd_box[0] && mx <= mods_kbd_box[2] && my >= mods_kbd_box[1] && my <= mods_kbd_box[3];
             if ((ptr.pressed & HOS_MOUSE_LEFT) && hit.part == menu_hit::kKey) press[7] = true, kbd_click = true;
             else if ((ptr.pressed & HOS_MOUSE_LEFT) && hit.part != menu_hit::kSearch && !inside) mods_kbd = false, changed = true;
         } else if (!dialog) {
-            if (hit.part == menu_hit::kListLine && (moved || ptr.pressed) && hit.index != mods_choice) mods_choice = hit.index, mods_follow = true, changed = true;
+            if (hit.part == menu_hit::kListLine && (moved || ptr.pressed) && hit.index != mods_choice)
+                mods_choice = hit.index, mods_follow = true, changed = true, mods_sound(HOS_MENU_SOUND_CURSOR);
             if (hit.part == menu_hit::kSearch && (moved || ptr.pressed) && mods_choice != -1) mods_choice = -1, mods_follow = true, changed = true;
-            if ((ptr.pressed & HOS_MOUSE_LEFT) && hit.part == menu_hit::kSearch) mods_kbd = true, mods_kbd_row = 1, mods_kbd_col = 0, changed = true;
+            if ((ptr.pressed & HOS_MOUSE_LEFT) && hit.part == menu_hit::kSearch)
+                mods_kbd = true, mods_kbd_row = 1, mods_kbd_col = 0, changed = true, mods_sound(HOS_MENU_SOUND_DECIDE);
             if (ptr.pressed & HOS_MOUSE_LEFT) {
                 if (hit.part == menu_hit::kTabPrev) tab_left = true;
                 else if (hit.part == menu_hit::kTabNext) tab_right = true;
@@ -6080,39 +6514,41 @@ void mods_tick(bool* press, bool tab_left, bool tab_right, bool mouse, bool move
         return;
     }
     if (!mods::accepted()) {   // (the warning: I understand, or Not now)
-        if (press[1] || press[2] || press[3] || press[4]) mods_btn ^= 1, changed = true;
+        if (press[1] || press[2] || press[3] || press[4]) mods_btn ^= 1, changed = true, mods_sound(HOS_MENU_SOUND_CURSOR);
         if (press[7] && mods_btn == 0) {
             mods::accept();
             logf("mods: the warning accepted");
             mods_open_page();
-            changed = true;
+            changed = true, mods_sound(HOS_MENU_SOUND_DECIDE);
         } else if (press[5] || press[7]) {   // (Not now: back to the game's list)
+            mods_sound(HOS_MENU_SOUND_CANCEL);
             mods_back(changed);
         }
         return;
     }
     if (busy) {   // (only Cancel)
-        if (press[5] || press[7]) mods::cancel(), changed = true;
+        if (press[5] || press[7]) mods::cancel(), changed = true, mods_sound(HOS_MENU_SOUND_CANCEL);
         return;
     }
     if (ended) {
         if (inst.job == mods::Job::Done && inst.kit) {   // ((Triforce) 11-18) a kit started: OK alone
-            if (press[5] || press[7]) mods::clear_done(), mods_btn = 0, changed = true;
+            if (press[5] || press[7]) mods::clear_done(), mods_btn = 0, changed = true, mods_sound(HOS_MENU_SOUND_DECIDE);
         } else if (inst.job == mods::Job::Done) {
-            if (press[1] || press[2] || press[3] || press[4]) mods_btn ^= 1, changed = true;
+            if (press[1] || press[2] || press[3] || press[4]) mods_btn ^= 1, changed = true, mods_sound(HOS_MENU_SOUND_CURSOR);
             if (press[7] && mods_btn == 0) {   // (Restart Now: as the restart question's, everything saved first)
                 logf("mods: restart now, to load %s", inst.mod_name.c_str());
                 mods::clear_done();
+                mods_sound(HOS_MENU_SOUND_DECIDE);
                 save();
                 pipeline_cache_save(true);
                 memory_trial_orderly_end();
                 open_now = false, page = 0, changed = true;
                 PostMessageA(app_window(), WM_APP + 9, 0, 0);
             } else if (press[5] || press[7]) {
-                mods::clear_done(), mods_btn = 0, changed = true;
+                mods::clear_done(), mods_btn = 0, changed = true, mods_sound(HOS_MENU_SOUND_CANCEL);
             }
         } else if (press[5] || press[7]) {
-            mods::clear_done(), mods_btn = 0, changed = true;
+            mods::clear_done(), mods_btn = 0, changed = true, mods_sound(HOS_MENU_SOUND_CANCEL);
         }
         return;
     }
@@ -6125,6 +6561,8 @@ void mods_tick(bool* press, bool tab_left, bool tab_right, bool mouse, bool move
         else if (cp == 127) edited |= !mods_query.empty(), mods_query.clear();
         else if (cp >= 0x20 && mods_query.size() < 100) utf8_add(mods_query, cp), edited = true;
     }
+    if (edited && !mods_kbd) mods_sound(HOS_MENU_SOUND_CURSOR);   // ((Triforce, 11-18) a character typed; the host's
+                                                                  // cursor gap keeps fast typing from stacking)
     if (edited && !mods_kbd && mods_choice != -1) mods_choice = -1, mods_follow = true;   // (typing: the cursor on the bar)
     if (mods_kbd && !pad_last && !kbd_click && (press[7] || press[5])) {
         if (press[7]) search_now = true;
@@ -6141,7 +6579,7 @@ void mods_tick(bool* press, bool tab_left, bool tab_right, bool mouse, bool move
             if (mods_kbd_row == 4) mods_kbd_col = kKbdWideAt[(kbd_wide(mods_kbd_col) + (press[4] ? 1 : 3)) % 4];
             else mods_kbd_col = (mods_kbd_col + (press[4] ? 1 : 9)) % 10;
         }
-        if (mods_kbd_row != was_row || mods_kbd_col != was_col) changed = true;
+        if (mods_kbd_row != was_row || mods_kbd_col != was_col) changed = true, mods_sound(HOS_MENU_SOUND_CURSOR);
         if (press[7]) {
             if (mods_kbd_row < 4) {
                 if (mods_query.size() < 100) utf8_add(mods_query, kKbdRows[mods_kbd_row][mods_kbd_col]), edited = true;
@@ -6152,12 +6590,12 @@ void mods_tick(bool* press, bool tab_left, bool tab_right, bool mouse, bool move
                 else if (k == 2) edited |= !mods_query.empty(), mods_query.clear();
                 else if (k == 3) search_now = true, mods_kbd = false;
             }
-            changed = true;
+            changed = true, mods_sound(search_now ? HOS_MENU_SOUND_DECIDE : HOS_MENU_SOUND_CURSOR);   // (a key pressed)
         }
         if (press[5]) {   // (Back: a character off; with none left the keyboard shut)
             if (!mods_query.empty()) edited |= utf8_pop(mods_query);
             else mods_kbd = false;
-            changed = true;
+            changed = true, mods_sound(mods_kbd ? HOS_MENU_SOUND_CURSOR : HOS_MENU_SOUND_CANCEL);
         }
         press[7] = press[5] = false;
         for (int i = 1; i <= 4; i++) press[i] = false;
@@ -6210,11 +6648,12 @@ void mods_tick(bool* press, bool tab_left, bool tab_right, bool mouse, bool move
         else if (press[16]) at = n - 1;
         else at = std::clamp(at + (press[2] - press[1]) + (press[14] - press[13]) * mods_page_rows, -1, std::max(n - 1, -1));
         mods_choice = at >= 0 ? vis[at] : -1;
-        if (mods_choice != was) mods_follow = true, changed = true;
+        if (mods_choice != was) mods_follow = true, changed = true, mods_sound(HOS_MENU_SOUND_CURSOR);
         if (mods_choice >= 0) {
             mods::Mod& m = mods::list()[mods_choice];
             const int files = (int)m.files.size();
-            if ((press[3] || press[4]) && files > 1) m.file_choice = (m.file_choice + files + (press[4] ? 1 : -1)) % files, changed = true;
+            if ((press[3] || press[4]) && files > 1)
+                m.file_choice = (m.file_choice + files + (press[4] ? 1 : -1)) % files, changed = true, mods_sound(HOS_MENU_SOUND_CURSOR);
             if (press[7] && m.details_state == 2 && files) install = mods_choice;
         } else if (press[7]) {   // (Confirm on the bar: tried again after a failure; else the on-screen keyboard (a pad), or the results)
             if (feed == mods::Feed::Failed) retry = true;   // ((Triforce) 11-18: also a list that stopped with cards in it)
@@ -6225,14 +6664,14 @@ void mods_tick(bool* press, bool tab_left, bool tab_right, bool mouse, bool move
     mods::unlock();
     if (install >= 0) {
         mods::install(install);
-        mods_btn = 0, changed = true;
+        mods_btn = 0, changed = true, mods_sound(HOS_MENU_SOUND_DECIDE);
     } else if (retry) {   // (try again: the search, or the list; (Triforce) 11-18: a list that stopped on a page goes on from it)
         if (searching) mods_retire(mods::search(mods::search_text()));
         else if (n_all) mods::load_more();
         else mods_retire(mods::open());
-        changed = true;
+        changed = true, mods_sound(HOS_MENU_SOUND_CURSOR);
     } else if (keyboard) {
-        mods_kbd = true, mods_kbd_row = 1, mods_kbd_col = 0, changed = true;
+        mods_kbd = true, mods_kbd_row = 1, mods_kbd_col = 0, changed = true, mods_sound(HOS_MENU_SOUND_DECIDE);
     }
     // ((Triforce) 11-18) the next pages: asked for by the engine one after another (vk_mods.cpp fetch_page), not by the cursor
     if (feed == mods::Feed::Loading) changed = true;   // (drawn again as it comes)
@@ -6478,6 +6917,8 @@ void menu_tick() {
         snprintf(notice_text, sizeof notice_text, "%s", share_lines[HOS_SHARE_NOTICE].c_str());
         notice_until = prof_now() + 4000000000LL;
     }
+    // ((Triforce) an achievement earned: its notice, from now for kAchNoticeMs)
+    if (const int earned = ach_list.take_fresh(); earned >= 0) ach_notice = earned, ach_notice_at = prof_now();
     if (cur_tab == TAB_DEBUG && !debug_shown()) cur_tab = TAB_DISPLAY;
     {   // (Triforce) presses the host passed on while the Mods entry or its screen has the cursor (a test's scripted ones)
         const int mp = mods_press.exchange(0, std::memory_order_relaxed);
@@ -6840,6 +7281,19 @@ void menu_tick() {
             else teleport_choice = std::clamp(teleport_step_rows(teleport_choice, rows) + (press[4] - press[3]), 0, kTeleports - 1);
             if (teleport_choice != was) teleport_follow = true, changed = true;
         }
+    } else if (open_now.load() && page == kAchPage) {   // (Triforce) the Achievements page: nothing to set, the choice moves
+        const int n = ach_list.shown();
+        if (mouse) {   // (a card chosen by a click, the page arrows, the wheel a page; a right click goes back)
+            const menu_hit::Hit hit = hits.at((float)mx, (float)my);
+            if ((ptr.pressed & HOS_MOUSE_LEFT) && hit.part == menu_hit::kListLine) changed |= ach_view.choose(hit.index, n);
+            else if ((ptr.pressed & HOS_MOUSE_LEFT) && hit.part == menu_hit::kButton && (hit.index == 2 || hit.index == 3))
+                press[hit.index == 2 ? 13 : 14] = true;
+            if (ptr.pressed & HOS_MOUSE_RIGHT) press[5] = true;
+            if (ptr.wheel) changed |= ach_view.turn(-ptr.wheel, n, ach_capacity);
+        }
+        if (press[5] || !n) page = 0, changed = true;   // (to the System tab, Achievements still selected)
+        else changed |= ach_view.move(press[4] - press[3], press[2] - press[1], (press[14] - press[13]) + (tab_right ? 1 : 0) - (tab_left ? 1 : 0),
+                                      press[15], press[16], n, ach_columns, ach_capacity);
     } else if (open_now.load() && page == kModsRowPage && mods_decide_ns) {   // ((Triforce, 11-19) the title's entry's Decide plays
         // (its sound with the press; no input meanwhile, as the game takes none during its own; the Mods screen at its end)
         if (!mods_list_fresh()) mods_decide_ns = 0, open_now = false, page = 0, changed = true;
@@ -6900,7 +7354,9 @@ void menu_tick() {
             open_now = false, page = 0, mods_row_sel = 0, changed = true;
         }
     } else if (open_now.load() && page == kModsPage) {   // (Triforce) the Mods page
-        mods_tick(press, tab_left, tab_right, mouse, moved, ptr, mx, my, changed);
+        // ((Triforce, 11-20) it takes input once its In has played, as the game's screens and Quit's dialog: what comes
+        // before is not kept)
+        if (mods_screen.ready(prof_now())) mods_tick(press, tab_left, tab_right, mouse, moved, ptr, mx, my, changed);
     } else if (open_now.load()) {
         if (mouse) {   // (the mouse: see the top of this file)
             const menu_hit::Hit hit = hits.at((float)mx, (float)my);
@@ -6998,6 +7454,7 @@ void menu_tick() {
         // rows that act by their name or open a page: a cheat's name is the file's)
         else if (mod_cheat_slot(r.name) >= 0) changed |= mod_cheats.press(mod_cheat_slot(r.name), press[3], press[4], press[7]);
         else if (press[7] && share_row(r)) share_press(share_row(r)), press[7] = false, changed = true;   // (Triforce: the host does it)
+        else if (press[7] && is_ach_row(r)) page = kAchPage, ach_view.reveal(ach_capacity), press[7] = false, changed = true;
         else if (press[7] && is_motion_row(r)) cur_tab = TAB_MOTION, tab_selected[TAB_MOTION] = 0, press[7] = false, changed = true;
         else if (press[7] && !r.value && can_bind()) page = 1, csel = 0, ccol = 0, changed = true;
         if ((press[3] || press[4] || press[7]) && r.value) {   // (Enter, or A, as Right)
@@ -7045,6 +7502,7 @@ void menu_tick() {
     // (Triforce) the Salesman's thread draws only while the Mods page shows him
     salesman::show(open_now.load() && page == kModsPage && mods::available() && mods::accepted(), salesman_w, salesman_h);
     if (open_now.load() && page == kModsPage) changed = true;   // (he moves: drawn again)
+    mods_screen.step(prof_now(), open_now.load() && page == kModsPage);   // ((Triforce, 11-20) its In from the tick it came at)
     {   // (hookshot) the window lets the mouse go while the menu is open, and takes it back after (host/display.c)
         static bool told = false;
         const bool now_open = open_now.load();
@@ -7180,7 +7638,8 @@ void menu_record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h) {
     const bool game_tab = !open && !start && embed_allowed() && game_seen && prof_now() - game_seen < 250000000LL && embed_since;
     const bool mods_row = !open && !start && (mods_list_fresh() || mods_title_fading());   // ((Triforce) the Mods entry under the game's list)
     perf_rect[2] = 0;   // ((Triforce VR) drawn again below, or not this frame)
-    if (!start && !fps && !open && !note && !game_tab && !mods_row && !bench_on) {   // (nothing shows: no ImGui frame, no render pass)
+    const bool earned = !start && ach_notice >= 0 && prof_now() - ach_notice_at < kAchNoticeMs * 1000000;   // ((Triforce) an achievement's notice)
+    if (!start && !fps && !open && !note && !game_tab && !mods_row && !bench_on && !earned) {   // (nothing shows: no ImGui frame, no render pass)
         // (but a new window size or Menu size since the last bake: one frame with nothing drawn that bakes the menu's glyphs
         // and measures its page for the new size, so the next open has no hitch whatever was resized while nothing showed)
         if (prebake_needed(w, h) && ui::begin(w, h)) {
@@ -7222,6 +7681,7 @@ void menu_record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h) {
     if (full && over_row) draw_perf(c);
     if (fps && !full) draw_fps(c, (open && page != kModsRowPage) || game_tab);   // ((Triforce) the Mods entry: the counter stays where the game list has it)
     if (note) draw_notice(c);
+    if (earned) draw_ach_notice(c);
     if (bench_on) {   // ((Triforce) benchmark mode's panel, in the overlay's own fonts, over the rest
         ui::Ctx bc = ui_ctx(w, h);
         draw_bench(bc, bench);
@@ -7238,7 +7698,8 @@ void menu_record_image(VkCommandBuffer cmd, VkImage image, VkImageView view, uin
     const bool mods_row = !open && (mods_list_fresh() || mods_title_fading());
     static MkwVkBench bench;   // ((Triforce) benchmark mode's panel, in the shots too)
     const bool bench_on = bench_now(&bench);
-    if (!open && !fps && !note && !game_tab && !mods_row && !bench_on) return;
+    const bool earned = ach_notice >= 0 && prof_now() - ach_notice_at < kAchNoticeMs * 1000000;   // ((Triforce) as menu_record)
+    if (!open && !fps && !note && !game_tab && !mods_row && !bench_on && !earned) return;
     if (!ui::begin(w, h)) return;
     // ((Triforce) a still: with no window's frames stepping the easing (menu_record), the lists stand where the selection asks.
     // Before, a headless shot, and tests/ui_preview.cpp's pictures, showed every list at its top whatever was selected)
@@ -7255,6 +7716,7 @@ void menu_record_image(VkCommandBuffer cmd, VkImage image, VkImageView view, uin
     if (full && over_row) draw_perf(c);
     if (fps && !full) draw_fps(c, (open && page != kModsRowPage) || game_tab);   // ((Triforce) the Mods entry: the counter stays where the game list has it)
     if (note) draw_notice(c);
+    if (earned) draw_ach_notice(c);
     if (bench_on) {
         ui::Ctx bc = ui_ctx(w, h);
         draw_bench(bc, bench);

@@ -16,6 +16,7 @@
 // No ImGui and no Vulkan: tests/test_mods_entry_anim.py compiles it alone.
 #pragma once
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 
 namespace mods_entry {
@@ -69,6 +70,16 @@ inline int64_t in_at(float amount) {
     return (int64_t)((double)hi * (double)kFrameNs);
 }
 
+/// ((Triforce, 11-20) the game's own alpha of its buttons as the amount the entry is drawn with. The game blends its
+/// buttons in linear light; the overlay blends in the window's code values unless the window is HDR. A white word at alpha
+/// a over a dark picture is a^(1/2.2) of the way to white in code values when blended in linear light: drawn at a itself
+/// in code values, the entry was dimmer than the game's buttons all through a fade (a quarter of the way where they were
+/// half way), though it began and ended with them. linear: the overlay blends in linear light too (HDR): a itself)
+inline float list_amount(float game_alpha, bool linear) {
+    const float a = std::clamp(game_alpha, 0.0f, 1.0f);
+    return linear ? a : std::pow(a, 1.0f / 2.2f);
+}
+
 /// The entry's state from one drawing to the next: how chosen it looks (focus) and how much of it shows with the list
 struct Anim {
     bool sel = false;          // (it had the cursor at the last step)
@@ -78,8 +89,12 @@ struct Anim {
     int64_t list_ns = 0;       // (when the list came)
     float gone_from = 0;       // (shown when the list went)
     float focus = 0, shown = 0;
-    /// One drawing at now: whether the entry has the cursor, how long since the host last told of the list
-    void step(int64_t now, bool selected, int64_t list_age_ns) {
+    /// One drawing at now: whether the entry has the cursor, how long since the host last told of the list.
+    /// ((Triforce, 11-20) list_alpha: how much of its own buttons the game shows now (0 to 1, the host's word each frame:
+    /// HOS_OPT_MODS_ALPHA); the entry shows as much while the list is there, so it comes and goes with them, frame for
+    /// frame, whatever animation the game plays (the title's opening, a second long, after a second and a half of
+    /// nothing; the 15 frames as the list comes back). Under 0: not told, the list's In by this clock, as before)
+    void step(int64_t now, bool selected, int64_t list_age_ns, float list_alpha = -1.0f) {
         if (!since_ns || selected != sel) from = since_ns ? focus : (selected ? 1.0f : 0.0f), sel = selected, since_ns = now;
         const float f = frames(now - since_ns);
         focus = sel ? std::max(from, curve(kSelect, f)) : from * curve(kUnSelect, f);
@@ -87,7 +102,8 @@ struct Anim {
         if (seen && !there) list_ns = now - in_at(shown);   // ((Triforce, 11-19) from where it is: no blink to nothing)
         if (!seen && there) gone_from = shown;
         there = seen;
-        shown = seen ? curve(kListIn, frames(now - list_ns)) : gone_from * curve(kUnSelect, frames(list_age_ns - kListGoneNs));
+        shown = !seen ? gone_from * curve(kUnSelect, frames(list_age_ns - kListGoneNs))
+                      : list_alpha >= 0 ? list_alpha : curve(kListIn, frames(now - list_ns));
         shown = std::clamp(shown, 0.0f, 1.0f), focus = std::clamp(focus, 0.0f, 1.0f);
     }
     /// LoopRandom's value now (it runs from the cursor's coming)

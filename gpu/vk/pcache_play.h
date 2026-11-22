@@ -22,6 +22,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 
 namespace pcache_play {
 
@@ -31,6 +32,13 @@ inline constexpr uint64_t kFoldMb = 64;   // (NX2navi's NX2NAVI_PIPELINE_CACHE_P
 /// and no preparation under way (it builds into the main cache)
 inline bool routes(bool main_cache, bool play_cache, bool preparing) {
     return main_cache && play_cache && !preparing;
+}
+
+/// ((Triforce, 11-22, the performance audit's PIPE-95, after Source A's) RX_VK_PCACHE_OWN_PASSES: whether the back end's own
+/// compute passes (FSR 3.1's, the anti-aliasing's, the texture converters': vk_draw.cpp shared_cache_compute) are made
+/// through the play cache as the game's are, on unless set to 0 (0: bare into the main cache, as before)
+inline bool own_passes(const char* env) {
+    return !env || std::atoi(env) != 0;
 }
 
 /// At the start, the play file read: whether it is folded into the main cache now (fold_bytes 0: never)

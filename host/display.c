@@ -262,6 +262,16 @@ static void typed_text(HWND w, WPARAM wp) {
     rx_option_set(HOS_OPT_TEXT_CHAR, (int)u);
 }
 
+/* (Triforce, 11-22, after Casual Gamer's fix) A lone Alt: DefWindowProc enters the menu loop (WM_SYSCOMMAND with SC_KEYMENU)
+   on the window's thread, which during the start-up screen is the one waiting for the shaders, and the screen froze until a key
+   was pressed. The window has no menu bar: nothing to enter. Alt+Space (the system menu, lp ' ') still goes on to Windows;
+   Alt+Enter, F10 and Alt+F4 are WM_SYSKEYDOWN's and WM_SYSKEYUP's, below. HOS_ALT_MENU=1: as before */
+static int keymenu_dropped(WPARAM wp, LPARAM lp) {
+    static int before = -1;
+    if (before < 0) before = getenv("HOS_ALT_MENU") && atoi(getenv("HOS_ALT_MENU")) != 0;
+    return !before && (wp & 0xFFF0) == SC_KEYMENU && lp != ' ';
+}
+
 static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_MOUSEMOVE:
@@ -329,6 +339,7 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_SYSCOMMAND:
+        if (keymenu_dropped(wp, lp)) return 0;   /* (a lone Alt: no menu loop, keymenu_dropped) */
         if ((wp & 0xFFF0) == SC_SCREENSAVE && !(wp & SCF_ISSECURE) &&
             renderer && GetForegroundWindow() == w && !IsIconic(w)) {
             BOOL secure = TRUE;   /* unknown or protected policy keeps Windows' normal handling */

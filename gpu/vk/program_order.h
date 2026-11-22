@@ -100,11 +100,11 @@ inline std::vector<uint8_t> write(const std::vector<uint64_t>& keys, uint32_t ma
 }
 
 /// The keys of a file's bytes; none when they are not a whole file of this version (cut short, another file, a bad check word)
-inline std::vector<uint64_t> read(const uint8_t* data, size_t n, uint32_t magic = kMagic) {
+inline std::vector<uint64_t> read(const uint8_t* data, size_t n, uint32_t magic = kMagic, size_t max_keys = kKeysMax) {
     uint32_t head[4];
     if (!data || n < 24) return {};
     std::memcpy(head, data, 16);
-    if (head[0] != magic || head[1] != kVersion || head[2] > kKeysMax || n != 16 + (size_t)head[2] * 8 + 8) return {};
+    if (head[0] != magic || head[1] != kVersion || head[2] > max_keys || n != 16 + (size_t)head[2] * 8 + 8) return {};
     std::vector<uint64_t> keys(head[2]);
     if (!keys.empty()) std::memcpy(keys.data(), data + 16, keys.size() * 8);
     uint64_t c;
@@ -129,8 +129,9 @@ struct Record {
     std::vector<uint64_t> keys;
     std::unordered_set<uint64_t> seen;
     size_t saved = 0;   // (keys.size() at the last write)
+    size_t max = kKeysMax;   // ((Triforce, 11-21) the pipelines' order keeps more: pipe_order.h kKeysMax)
     bool add(uint64_t key) {
-        if (!key || keys.size() >= kKeysMax || !seen.insert(key).second) return false;
+        if (!key || keys.size() >= max || !seen.insert(key).second) return false;
         keys.push_back(key);
         return true;
     }

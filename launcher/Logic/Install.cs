@@ -85,26 +85,90 @@ public sealed class Uninstaller
     readonly TriforceContext ctx;
     public Uninstaller(TriforceContext ctx) { this.ctx = ctx; }
 
+    // ((Triforce, 11-21, ticket "Downloads folder got deleted while uninstalling the Triforce launcher") The uninstall took its
+    // folder away whole (rmdir /s), and that folder was the install folder or, for a Setup never installed, the folder it ran
+    // from: a TriforceSetup.exe run from Downloads took the player's whole Downloads folder with it. Now only the launcher's own
+    // entries go (OwnFiles, and OwnFolders where the folder is the launcher's alone: Dedicated), then the folder itself only
+    // if nothing else is left in it (rmdir without /s), and a Setup that is not the installed one removes nothing of its folder.
+
+    /// <summary>The launcher's own files in its folder (del patterns): its exe, the copies an update or a handover leaves
+    /// (TriforceSetup.old.exe, TriforceSetup.exe.partial), and its log.</summary>
+    public static readonly string[] OwnFiles = { "TriforceSetup*.exe", "TriforceSetup*.exe.*", "setup.log", "setup.log.*" };
+    /// <summary>The folders it makes there (TriforceContext ToolsFolder, DownloadsFolder, NgxSdkFolder); save-backups stays (saves).</summary>
+    public static readonly string[] OwnFolders = { "tools", "downloads", "ngx-sdk" };
+
+    /// <summary>Is dir a folder of the launcher's alone, where its folders' names (downloads, tools) can only be its own? The
+    /// default install folder, or one named Triforce that is not a drive's root, the account's folder or one above it, nor one
+    /// of the account's known folders. Elsewhere (a player who installed into Downloads, D:\Games or their own folder) its
+    /// folders' names may be the player's: only its files go there.</summary>
+    public static bool Dedicated(string dir, string defaultDir, IEnumerable<string> known)
+    {
+        try
+        {
+            var full = Path.GetFullPath(dir).TrimEnd('\\', '/');
+            if (TriforceContext.SamePath(full, defaultDir)) return true;
+            if (Path.GetPathRoot(full) is { } root && TriforceContext.SamePath(full, root)) return false;
+            foreach (var k in known)
+                if (!string.IsNullOrEmpty(k) && (TriforceContext.SamePath(full, k) || TriforceContext.Inside(full, k))) return false;
+            return string.Equals(Path.GetFileName(full), "Triforce", StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception) { return false; }
+    }
+
+    /// <summary>The account's folders an install folder must never be (nor hold): its own, Desktop, Documents, Downloads and the
+    /// other known ones, AppData's roots, Program Files.</summary>
+    public static IEnumerable<string> KnownFolders()
+    {
+        var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        foreach (var f in new[] { Environment.SpecialFolder.UserProfile, Environment.SpecialFolder.DesktopDirectory, Environment.SpecialFolder.MyDocuments,
+                     Environment.SpecialFolder.MyMusic, Environment.SpecialFolder.MyPictures, Environment.SpecialFolder.MyVideos,
+                     Environment.SpecialFolder.ApplicationData, Environment.SpecialFolder.LocalApplicationData, Environment.SpecialFolder.ProgramFiles,
+                     Environment.SpecialFolder.ProgramFilesX86, Environment.SpecialFolder.Windows })
+            yield return Environment.GetFolderPath(f);
+        if (!string.IsNullOrEmpty(profile))
+        {
+            yield return Path.Combine(profile, "Downloads");
+            yield return Path.Combine(profile, "OneDrive");
+        }
+    }
+
+    /// <summary>The short-lived cmd's line that removes the launcher from dir once this process is gone: its files, its folders
+    /// where dir is Dedicated, then dir itself only when empty.</summary>
+    public static string RemoveCommand(string dir, bool dedicated)
+    {
+        var d = Path.GetFullPath(dir).TrimEnd('\\', '/');
+        var line = "/c timeout /t 2 /nobreak >nul";
+        foreach (var f in OwnFiles) line += " & del /f /q \"" + Path.Combine(d, f) + "\" 2>nul";
+        if (dedicated)
+            foreach (var f in OwnFolders) line += " & rmdir /s /q \"" + Path.Combine(d, f) + "\" 2>nul";
+        return line + " & rmdir \"" + d + "\" 2>nul";
+    }
+
     public UninstallPlan Describe()
     {
+        var dir = ctx.InstalledDir;
         var removes = new List<string>
         {
-            "Triforce and its tools (" + ctx.Home + ")",
+            dir != null ? "Triforce and its tools (" + dir + ")" : "Triforce's settings and Apps-list entry",
             "the shortcuts",
             "the build's work folder and compile cache (" + ctx.WorkFolder + ", made again by a build)",
             "the launcher's settings",
         };
         if (!ctx.IsWindows) removes[0] = "the launcher's updates and NVIDIA's SDK (" + ctx.Platform.DefaultInstallDir + ")";
         var keeps = new List<string> { "your game folders" + (ctx.Settings.GameFolder is { } g ? " (" + g + ")" : ""), "your saves" };
+        if (ctx.IsWindows && dir == null) keeps.Add("this Setup file and everything beside it (" + ctx.SelfDir + "): delete the file yourself");
+        else if (ctx.IsWindows && dir != null && !Dedicated(dir, ctx.Platform.DefaultInstallDir, KnownFolders()))
+            keeps.Add("everything in " + dir + " that is not Triforce's own files");
         return new UninstallPlan(removes, keeps);
     }
 
-    /// <summary>Does it. The launcher's own folder goes once this process is gone (Windows: a short-lived cmd waits 2 s, then
-    /// rmdir; Linux: removed now, a running binary can be unlinked).</summary>
+    /// <summary>Does it. The launcher's own files go once this process is gone (Windows: a short-lived cmd waits 2 s, then
+    /// removes them: RemoveCommand; Linux: removed now, a running binary can be unlinked).</summary>
     public void Run()
     {
-        var dir = ctx.InstalledDir ?? ctx.Home;
-        ctx.Log.Write("uninstall: " + dir);
+        // (the installed launcher's folder only: never the folder a Setup that is not installed runs from, Downloads)
+        var dir = ctx.IsWindows ? ctx.InstalledDir : ctx.Home;
+        ctx.Log.Write("uninstall: " + (dir ?? "(not installed: nothing removed from " + ctx.SelfDir + ")"));
         ctx.Platform.RemoveShortcuts();
         // (the build's work folder and compile cache, nx2/make_game.py --work: several GB, made again by a build)
         var work = ctx.WorkFolder;
@@ -114,9 +178,13 @@ public sealed class Uninstaller
         if (ctx.IsWindows)
         {
             // (this exe is running from the folder: a short-lived cmd removes it once we are gone)
-            if (File.Exists(Path.Combine(dir, BuildInfo.SetupAsset)) && ctx.Allowed(dir))
-                Process.Start(new ProcessStartInfo("cmd.exe", "/c timeout /t 2 /nobreak >nul & rmdir /s /q \"" + dir + "\"")
+            if (dir != null && File.Exists(Path.Combine(dir, BuildInfo.SetupAsset)) && ctx.Allowed(dir))
+            {
+                var dedicated = Dedicated(dir, ctx.Platform.DefaultInstallDir, ctx.TestRoot != null ? Array.Empty<string>() : KnownFolders());
+                ctx.Log.Write("uninstall: " + (dedicated ? "its files and folders" : "its files alone (the folder is not Triforce's alone)"));
+                Process.Start(new ProcessStartInfo("cmd.exe", RemoveCommand(dir, dedicated))
                     { CreateNoWindow = true, UseShellExecute = false, WorkingDirectory = Path.GetTempPath() })?.Dispose();
+            }
         }
         else
         {

@@ -46,7 +46,10 @@ def check_source():
     need("vk_draw.cpp: prepare_workers()", workers,
          ['getenv("RX_VK_PREPARE_THREADS")', "GlobalMemoryStatusEx(&ms)", "ram_free = ms.ullAvailPhys;",
           "GetPriorityClass(GetCurrentProcess())", "cls == ABOVE_NORMAL_PRIORITY_CLASS || cls == HIGH_PRIORITY_CLASS",
-          "prepare_threads::count(cpus, ram_free, above_normal, e ? atoi(e) : 0)", "MemAvailable"])
+          "prepare_threads::count(cpus, ram_free, above_normal, e ? atoi(e) : 0)", "MemAvailable",
+          # ((Triforce) which heap the process is on, said in the same line: nx2/win_manifest.py's HOOKSHOT_SEGMENT_HEAP)
+          "memcpy(&heap_signature, (const char*)heap + 16, sizeof heap_signature);",
+          "prepare_threads::heap_name(heap_signature)", '", the process heap: "'])
     # ((Triforce) the translation pass's workers: fewer on AMD's driver for RDNA 1 and 2, told apart as vk_vendor.h tells it)
     translate = block(draw, "unsigned prepare_translate_workers() {")
     need("vk_draw.cpp: prepare_translate_workers()", translate,
@@ -62,7 +65,7 @@ def check_source():
         need("vk_draw.cpp: %s()" % name, body,
              ["const unsigned workers = prepare_workers();", "for (unsigned i = 0; i < workers; i++) threads.emplace_back(",
               "SetThreadPriority(GetCurrentThread(), prepare_priority());"])
-        if "cpus / 2" in body or "hardware_concurrency" in body:
+        if "cpus / 2" in body or "hardware_concurrency" in body or "cpu_count()" in body:
             raise SystemExit("vk_draw.cpp: %s() counts its workers itself again" % name)
     prepare = block(draw, "bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {")
     need("vk_draw.cpp: prepare_run()", prepare,

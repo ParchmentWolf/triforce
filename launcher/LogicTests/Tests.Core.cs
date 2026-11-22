@@ -32,6 +32,10 @@ static partial class Tests
         yield return ("tools: update from the fake server with progress", ToolsUpdate);
         yield return Sync("build: @@ protocol from a recorded transcript", Protocol);
         yield return Sync("build: estimates from history and without", Estimates);
+        yield return Sync("build: time left, slow first part of the shaders then fast", EtaSlowStart);
+        yield return Sync("build: time left, one item stalls for 10 minutes", EtaStall);
+        yield return Sync("build: time left, a steady stage counts down", EtaSteady);
+        yield return Sync("build: time left, other stages and the compile eta", EtaOtherStages);
         yield return ("build: runner with a fake make_game (done, args, log, times)", RunnerDone);
         yield return ("build: runner stop kills the tree", RunnerStop);
         yield return ("build: runner failure and test-root refusal", RunnerFail);
@@ -382,6 +386,60 @@ static partial class Tests
         Check(!Directory.Exists(Path.Combine(root, "build")), "work folder gone");
         Equal(null, Ctx(root, self).Platform.Settings.GetUninstall("InstallLocation"), "uninstall entry gone");
         Equal(null, Ctx(root, self).Settings.GameFolder, "settings gone");
+        UninstallKeepsOthers();
+    }
+
+    // (11-21, ticket "Downloads folder got deleted while uninstalling the Triforce launcher": the whole folder went, rmdir /s,
+    // and for a Setup run from Downloads, never installed, that folder was Downloads)
+    static void UninstallKeepsOthers()
+    {
+        var def = @"C:\Users\Ann\AppData\Local\Programs\Triforce";
+        var known = new[] { @"C:\Users\Ann", @"C:\Users\Ann\Downloads", @"C:\Users\Ann\Desktop", @"C:\Users\Ann\AppData\Local" };
+        Check(Uninstaller.Dedicated(def, def, known), "the default install folder is the launcher's");
+        Check(Uninstaller.Dedicated(@"D:\Triforce", def, known), "a folder named Triforce is");
+        Check(!Uninstaller.Dedicated(@"C:\Users\Ann\Downloads", def, known), "Downloads is not");
+        Check(!Uninstaller.Dedicated(@"C:\Users\Ann", def, known), "the account's folder is not");
+        Check(!Uninstaller.Dedicated(@"C:\Users", def, known), "a folder above it is not");
+        Check(!Uninstaller.Dedicated(@"D:\", def, known), "a drive's root is not");
+        Check(!Uninstaller.Dedicated(@"D:\Games", def, known), "a folder of the player's own is not");
+        var c = Uninstaller.RemoveCommand(@"C:\Users\Ann\Downloads", false);
+        Check(!c.Contains("rmdir /s"), "outside a folder of its own, no folder is removed whole: " + c);
+        Check(c.Contains(@"del /f /q ""C:\Users\Ann\Downloads\TriforceSetup*.exe"""), "its exe goes");
+        Check(c.EndsWith(@"rmdir ""C:\Users\Ann\Downloads"" 2>nul"), "the folder itself only when empty (no /s)");
+        var c2 = Uninstaller.RemoveCommand(def, true);
+        Check(c2.Contains(@"rmdir /s /q """ + def + @"\tools""") && c2.Contains(@"rmdir /s /q """ + def + @"\downloads"""), "its own folders go in its own folder");
+        Check(!c2.Contains(@"rmdir /s /q """ + def + @""""), "but never the folder whole");
+
+        // (a Setup that is not installed, run from Downloads beside the player's files: nothing of that folder goes)
+        var root = NewRoot("uninstall-downloads");
+        var downloads = Path.Combine(root, "Downloads");
+        var self = Path.Combine(downloads, BuildInfo.SetupAsset);
+        Directory.CreateDirectory(downloads);
+        File.WriteAllText(self, "launcher bytes");
+        File.WriteAllText(Path.Combine(downloads, "photo.jpg"), "the player's");
+        var ctx = Ctx(root, self);
+        Equal(null, ctx.InstalledDir, "not installed");
+        var plan = new Uninstaller(ctx).Describe();
+        Check(plan.Keeps.Any(k => k.Contains(downloads)), "the plan says the Setup's folder stays");
+        new Uninstaller(ctx).Run();
+        Thread.Sleep(3500);
+        Check(File.Exists(Path.Combine(downloads, "photo.jpg")) && File.Exists(self), "the Setup's folder is left as it was");
+
+        // (installed: its files and folders go, the player's file put beside them stays, and so the folder)
+        var root2 = NewRoot("uninstall-installed");
+        var self2 = Path.Combine(root2, "Downloads", BuildInfo.SetupAsset);
+        Directory.CreateDirectory(Path.GetDirectoryName(self2)!);
+        File.WriteAllText(self2, "launcher bytes");
+        var ctx2 = Ctx(root2, self2);
+        var exe = new Installer(ctx2).Run(new Installer(ctx2).DefaultDir, desktop: false, startMenu: false);
+        var idir = Path.GetDirectoryName(exe)!;
+        Directory.CreateDirectory(Path.Combine(idir, "tools", "x"));
+        File.WriteAllText(Path.Combine(idir, "notes.txt"), "the player's");
+        new Uninstaller(ctx2).Run();
+        Thread.Sleep(3500);
+        Check(!File.Exists(exe) && !Directory.Exists(Path.Combine(idir, "tools")), "installed: its exe and tools gone");
+        Check(File.Exists(Path.Combine(idir, "notes.txt")), "and a file of the player's there stays");
+        Check(File.Exists(self2), "the downloaded Setup it was installed from stays");
     }
 
     // ---- report, languages ----

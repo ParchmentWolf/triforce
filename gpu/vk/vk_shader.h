@@ -3,6 +3,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <string>
@@ -13,6 +14,8 @@
 #include "shader_recompiler/shader_info.h"
 
 #include "spv_store.h"
+#include "compute_pin.h"   // ((Triforce, 11-22, PIPE-52) which compute programs are held to 32 lanes: compute_pin_mode)
+#include "fallback_size_policy.h"   // ((Triforce, 11-22, PIPE-56) the mesh fallback's stages too big for two Mesa drivers)
 #include "vk_internal.h"
 #include "vk_state.h"
 
@@ -65,6 +68,16 @@ inline VkShaderModule stage_exact_key(const Stage& st) {
 }
 /// Whether stages are packed in this run (on unless RX_VK_SPV_PACK=0)
 bool spv_pack_on();
+/// ((Triforce, 11-22, the performance audit's PIPE-52) RX_VK_COMPUTE_PIN on this driver (compute_pin.h; read once, logged once
+/// where it is not "all"), and whether a compute module was looked at and has no barrier of Subgroup scope (false for a
+/// module nobody looked at, and always with "all", where no module is looked at)
+compute_pin::Mode compute_pin_mode();
+bool compute_lanes_free(VkShaderModule m);
+/// ((Triforce, 11-22, the performance audit's PIPE-56) Which of the two drivers with a limit on a mesh-fallback stage's size
+/// this is (fallback_size_policy.h; Other on every other driver, where no module is counted), and a stage's OpPhi and
+/// OpFunctionCall counts as make_module took them (0 and 0 for a stage nobody counted). Any thread
+fallback_size::Driver fallback_size_driver();
+fallback_size::Size stage_size(const Stage& st);
 /// (Triforce) A program stage's module let go (vkDestroyShaderModule), and forgotten by the memory line's count (mem_parts.h):
 /// every place that lets a program's module go does it through this
 void stage_module_destroy(VkShaderModule m);
@@ -77,6 +90,12 @@ struct Program {
     uint64_t key = 0;
     bool compute = false, failed = false;
     std::atomic<bool> ready{false};   // translated (graphics programs are translated on a worker: vk_jobs.h)
+    // ((Triforce, 11-22, the performance audit's DESC-22, after Source A's; desc_counts.h) Its descriptor counts as
+    // build_descriptors sums them (buffers, images, texel views), packed: ~0u until its first build once it is ready.
+    // It sits in the four bytes of padding before stages, and THIS FIELD MUST NOT GROW THE STRUCT: sizeof(Program) is in
+    // the program cache's stamp (vk_shader.cpp disk_stamp), and a change of it throws every player's shader and pipeline
+    // caches away (it did on 11-18, 272 to 280: vk_draw.cpp). The static_assert under the struct holds it there)
+    mutable std::atomic<uint32_t> desc_n{~0u};
     std::vector<Stage> stages;
     std::array<uint32_t, 3> workgroup{1, 1, 1};
     uint32_t shared_memory = 0;
@@ -121,6 +140,10 @@ struct Program {
     std::vector<uint8_t> questions;
     uint64_t codes[4]{};   // (hookshot) its stages' code keys: vertex (mesh), fragment, task, the header-only stage (the state list)
 };
+// ((Triforce, 11-22, DESC-22) desc_n in the padding between ready and stages, where it changes no size: see the field)
+static_assert(sizeof(std::atomic<uint32_t>) == 4 && offsetof(Program, desc_n) + 4 <= offsetof(Program, stages) &&
+                  offsetof(Program, stages) == 16,
+              "Program::desc_n must fit the padding before Program::stages: sizeof(Program) is in the program cache's stamp");
 
 enum class ProgramKind { Graphics, Compute, Mesh };
 

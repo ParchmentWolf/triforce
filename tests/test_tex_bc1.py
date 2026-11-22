@@ -202,8 +202,10 @@ def check_menu_and_docs():
     check(re.search(r"\bint tex_bc1 = 1;", header), "Opaque textures as BC1 is not on by default")
     check("if (version < 5) {" in function(menu, "void menu_init() {") and "opts.tex_bc1 = 1" in function(menu, "void menu_init() {"),
           "an options file from before options_version 5 does not take Opaque textures as BC1 on")
-    check("int tex_bc1_at_start = 0;" in menu and "tex_bc1_at_start = opts.tex_bc1;" in function(menu, "void menu_init() {"),
-          "menu_init does not keep the Opaque textures as BC1 row the game started with")
+    # ((11-21, the performance audit's TEX-50) the row's own default until the file is read: a first start, with no file, takes it)
+    check("int tex_bc1_at_start = Options().tex_bc1;" in menu and "static_assert(Options().tex_bc1 == 1," in menu and
+          "tex_bc1_at_start = opts.tex_bc1;" in function(menu, "void menu_init() {"),
+          "the game does not start with the Opaque textures as BC1 row's default, or menu_init does not keep the row it read")
     rows = menu[menu.index("Row rows[] = {"):]
     rows = rows[:rows.index("\n};")]
     row = re.search(r'\{TAB_DEBUG, "Opaque textures as BC1", &opts\.tex_bc1, 0, 1, 1, tx_onoff,.*?hn_tex_bc1, true, true\},', rows, re.S)

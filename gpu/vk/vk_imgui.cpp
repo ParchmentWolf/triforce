@@ -233,7 +233,10 @@ void art_make() {   // (the presenting thread, before a frame: the images as ImG
         memcpy(t->GetPixels(), e.img.rgba.data(), e.img.rgba.size());
         t->UseColors = true;
         ImGui::RegisterUserTexture(t);
-        arts_.push_back({e.name, Art{t, (float)e.img.w, (float)e.img.h}});
+        arts_.push_back({e.name, Art{t, (float)e.img.w, (float)e.img.h, e.img.mask}});
+        if (!e.name.compare(0, 8, "DataFile") || !e.name.compare(0, 7, "Ocarina") || !e.name.compare(0, 7, "MapIcon") || !e.name.compare(0, 5, "Rupee"))
+            // ((Triforce) the achievements' icons: which form each is, once)
+            logf("vk: ui: the game's own %s: %u x %u, %s", e.name.c_str(), e.img.w, e.img.h, e.img.mask ? "a mask" : "a picture");
     }
     skin_.images.clear(), skin_.images.shrink_to_fit();
     art_state.store(3, std::memory_order_release);

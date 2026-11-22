@@ -38,6 +38,18 @@ def main():
         raise SystemExit("pick_device reads the GPU row before menu_init")
     if pick.index('getenv("RX_VK_DEVICE")') > pick.index("gpu_choice::pick("):
         raise SystemExit("pick_device takes the GPU row before RX_VK_DEVICE")
+    # ((Triforce) 11-22) a number saved without a name on the processor graphics: Auto, after RX_VK_DEVICE and before pick, the
+    # types beside the names, and the row set to the card Auto took
+    unnamed = "gpu_choice::unnamed_integrated(menu_gpu_name(), gpu_device_names, valid_types, opts.gpu_device)"
+    if unnamed not in pick:
+        raise SystemExit("pick_device: a number without a name on the processor graphics is taken (no unnamed_integrated)")
+    if not pick.index('getenv("RX_VK_DEVICE")') < pick.index(unnamed) < pick.index("gpu_choice::pick("):
+        raise SystemExit("pick_device: unnamed_integrated is not between RX_VK_DEVICE and the row's pick")
+    if "valid_types.push_back((int)p.deviceType)" not in pick or "gpu_device_names.push_back" not in pick:
+        raise SystemExit("pick_device: the device types are not listed beside the names")
+    fix = pick.index("if (unnamed_integrated) {")
+    if not pick.index("best = (int)i") < fix < pick.index("dev.physical = all[best]") or "opts.gpu_device = (int)k + 1" not in pick[fix:]:
+        raise SystemExit("pick_device: the row does not follow the card Auto took for an unnamed number")
     menu = (vk / "vk_menu.cpp").read_text(encoding="utf-8")
     if not preset_exempt(menu, "gpu_device"):
         raise SystemExit("vk_menu.cpp: changing the GPU row resets the quality preset (and its VRAM budget) to Custom")

@@ -6,6 +6,7 @@
 #include "vr_game.h"      /* ((Triforce VR) Stereo Balanced's hold: realtime_step) */
 #include "step_steady.h"   /* ((Triforce) HOS_STEP_STEADY=1: realtime_step) */
 #include "pace_steady.h"   /* ((Triforce) the Steady frame rate row: steady_period) */
+#include "movie_pace.h"   /* ((Triforce, 11-22, PRESENT-30) paced at 240 while a movie plays at the 60 cap) */
 #include "../gpu/vk/vk_api.h"   /* (HOS_OPT_HDR_*: the Insert menu's HDR, answered by the renderer) */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -287,6 +288,32 @@ void hos_vi_native_acquire(int active) {
     const int64_t now = hos_now_ns();
     if (until > now) pace_sleep(until, now);
 }
+/* ((Triforce, 11-22, the performance audit's PRESENT-30, after Source A's) While a movie plays at a cap of exactly 60 the
+   frames are paced by 240, and the game's limiter and its time step follow as at a cap of 240 (movie_pace.h): the movie
+   player takes one picture an update at most, so at 60 every late frame was a picture the decoder then skipped. Decided
+   once a present (movie_pace_decide, from hos_vi_native_presented); pace_fps is what the pacing and realtime_step go by,
+   fps_max stays the cap itself, which the Steady row, the present interval and the other limiters' hand-off read.
+   Not with the Steady frame rate row on. HOS_MOVIE_PACE=0: the cap kept through movies, as before */
+static int movie_raise;
+static int pace_fps(void) {
+    return movie_pace_fps(movie_raise, fps_max());
+}
+static void movie_pace_decide(void) {
+    static int on = -1, steady = -1;
+    static long long raised;
+    if (on < 0) on = !(getenv("HOS_MOVIE_PACE") && *getenv("HOS_MOVIE_PACE") && atoi(getenv("HOS_MOVIE_PACE")) == 0);
+    if (steady < 0) {   /* (the Steady frame rate row, read as steady_period reads it) */
+        const char *e = getenv("HOS_FPS_STEADY");
+        steady = e && *e ? atoi(e) : hos_ini_option("steady_frame_rate", PACE_STEADY_OFF);
+        if (steady < PACE_STEADY_OFF || steady > PACE_STEADY_REFRESH) steady = PACE_STEADY_OFF;
+    }
+    const int raise = movie_pace_raise(on, fps_max(), steady != PACE_STEADY_OFF, movie_plays());
+    if (raise && !movie_raise)
+        hos_log("vi: a movie plays at the 60 cap: frames paced at %d while it does (HOS_MOVIE_PACE=0: the cap kept)", MOVIE_PACE_FPS);
+    if (!raise && movie_raise) hos_log("vi: the movie is over: frames paced at the 60 cap again, after %lld at %d", raised, MOVIE_PACE_FPS), raised = 0;
+    if (raise) raised++;
+    movie_raise = raise;
+}
 /* (mkw-recomp) MKW's frame pacer (0x806bcbb0, x19 when it sets the interval: nvn_native.c): its measured frame time
    (+0x128, ticks), its running excess (+0x218) and interval (+0x214), logged with the frame rate */
 volatile uint64_t hos_mkw_pacer;
@@ -511,6 +538,16 @@ static void realtime_step(int64_t now) {
     }
     const uint64_t mod = hos_gfx_module;
     if (!mod) return;
+    /* ((Triforce, 11-22, the performance audit's PRESENT-30) what the frames are paced by: the cap, or 240 while a movie
+       plays at the 60 cap (pace_fps). The limiter, the step and the game's rate below follow it, as they followed the cap */
+    const int pace = pace_fps();
+    {   /* (when that comes back down to 60: a rate above 60 left in the game's slot goes back with it, movie_pace.h) */
+        static int before;
+        int *slot = (int *)GP(mod + 0x2c8);
+        const int was = *slot, back = movie_pace_slot(was, before, pace);
+        if (back != was) *slot = back;
+        before = pace;
+    }
     {   /* (hookshot) The frame limiter (f_8042cd20 sleeps to 1 / +0xfc). The engine's adaptive controller writes +0xfc when
            variable refresh is on (+0x231, f_804fc0f0), any rate from 40 up. HOS_FPS_TARGET=<fps>: that rate kept, 0: left alone;
            HOS_FPS_LOG=1: what the game asks for, every 300 presents */
@@ -535,12 +572,16 @@ static void realtime_step(int64_t now) {
             clock_before = game_clock, at_before = now;
         }
         if (target && *limit > 0 && *limit < target) *limit = target;
-        if (fps_max() > 60 && *limit > 0 && *limit < fps_max()) *limit = fps_max();
+        /* ((Triforce, 11-22, PRESENT-30) raised to the pace above 60 as before, and now put back where it was once the
+           pace is 60 again: it was raised once and never lowered, which a cap that never changed did not need) */
+        static MovieLimit raised;
+        const int was = *limit, to = movie_pace_limit(&raised, was, pace);
+        if (to != was) *limit = to;
     }
     /* (the Insert menu's Game speed "per frame": a frame is a 60th of a second of game time. Not past 60 fps: the game would run
        faster than real time, so a cap above 60 keeps the real-time step whatever that row says) */
     /* (nor under 60: a cap of 30 would be the game at half speed for good) */
-    if (!rx_option(0, 1) && fps_max() == 60) {
+    if (!rx_option(0, 1) && pace == 60) {
         int *slot = (int *)GP(mod + 0x2c8);
         if (*slot >= 15 && *slot <= 60) *slot = 60;
         return;
@@ -550,6 +591,12 @@ static void realtime_step(int64_t now) {
     static unsigned count, next;
     static long long steps;
     static StepSteady steady;   /* ((Triforce) HOS_STEP_STEADY=1, below) */
+    {   /* ((Triforce, 11-22, PRESENT-30) a change of the pace, a movie's start or its end: the step's average starts
+           again, as after a load, since the intervals before it were paced by another period) */
+        static int paced;
+        if (paced && paced != pace) { count = next = 0; carry = 0; step_steady_reset(&steady); }
+        paced = pace;
+    }
     const double dt = (now - last) / 1e9;
     last = now;
     if (dt <= 0 || dt > 0.25) { count = next = 0; carry = 0; step_steady_reset(&steady); return; }   /* (a load: the average starts again) */
@@ -572,8 +619,8 @@ static void realtime_step(int64_t now) {
     if (timed_step < 0) timed_step = !(getenv("HOS_FPS_STEP") && !atoi(getenv("HOS_FPS_STEP")));
     /* ((Triforce VR) and while Stereo Balanced holds the game's time for every second update: host/vr_game.c) */
     const int holds = vr_holds_time();
-    const int timed = (fps_max() > 60 || holds) && timed_step && hos_step_probe;
-    const int top = timed ? 60 : fps_max();
+    const int timed = (pace > 60 || holds) && timed_step && hos_step_probe;
+    const int top = timed ? 60 : pace;
     /* (Triforce, after NX2navi's steady step: host/step_steady.h) HOS_STEP_STEADY (on unless =0): the step is not the mean of the last five
        intervals but that of the last 12 without their longest and shortest, the paced period where it is within 3% of it, and
        what the display showed and the game was not given repaid at a 64th a frame (10% of the step at most), within the bounds
@@ -616,7 +663,7 @@ static void realtime_step(int64_t now) {
     }
     const double ratio = secs_avg * 60.0;
     int *slot = (int *)GP(mod + 0x2c8);
-    if (*slot < 15 || *slot > (fps_max() > 60 ? fps_max() : 60)) {   /* (under a cap below 60 it starts at the game's 60) */
+    if (*slot < 15 || *slot > (pace > 60 ? pace : 60)) {   /* (under a cap below 60 it starts at the game's 60) */
         static int logged;
         if (!logged++) hos_log("vi: the graphics module's frame rate reads %d: no real-time step", *slot);
         return;
@@ -796,7 +843,8 @@ void hos_vi_native_presented(void) {
     const int64_t now = hos_now_ns();
     { void hos_bench_present(int64_t now); hos_bench_present(now); }   /* ((Triforce) benchmark mode: every present's interval) */
     /* ((Triforce) the Steady frame rate row: a period this PC holds in the scene, never shorter than the cap's) */
-    const int64_t period = steady_period(1000000000LL / fps_max() * interval, now);
+    movie_pace_decide();   /* ((Triforce, 11-22, PRESENT-30) once a present: 240 while a movie plays at the 60 cap) */
+    const int64_t period = steady_period(1000000000LL / pace_fps() * interval, now);
     pace_period_ns = period;   /* (Triforce: what another limiter is given to hold in this file's place, pace_handed) */
     realtime_step(now);
     /* (behind by more than a frame: the next one is paced from now, with no burst to catch up) */

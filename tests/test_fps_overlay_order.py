@@ -91,6 +91,10 @@ int page = 0;                              // ((Triforce) the menu's page: not t
 constexpr int kModsRowPage = 9;
 void draw_mods_row_shut(ui::Ctx&) { calls += "M"; }
 void draw_notice(ui::Ctx&) { calls += "n"; }
+int ach_notice = -1;                       // ((Triforce) no achievement earned here: its notice is tests/test_achievements.py's)
+int64_t ach_notice_at = 0;
+constexpr int64_t kAchNoticeMs = 4000;
+void draw_ach_notice(ui::Ctx&) { calls += "a"; }
 ''' + fn + r'''
 int main() {
     for (bool startup : {false, true}) for (int fps : {0, 1, 2}) for (bool menu : {false, true}) for (bool can : {true, false}) {

@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -210,5 +211,30 @@ inline uint64_t own_for_keep(uint64_t ws, uint64_t cache_read, bool amd) {
     if (amd) return ws;
     return ws > cache_read ? ws - cache_read : 0;
 }
+/// (11-22, after Casual Gamer's fix) Whether the game is told its mapped pages are used (host/hos_mem.c query_used), from the
+/// host's switches as it reads them: HOS_MEM_QUERY_USED not "0", and the census on (hos_mem_census_on: HOS_MEM_CENSUS not 0 or
+/// less, or HOS_MEM_GIVE_BACK above 0)
+inline bool query_used_on(const char* query_used, const char* census, const char* give_back) {
+    const bool census_on = !(census && atoi(census) <= 0) || (give_back && atoi(give_back) > 0);
+    return !(query_used && query_used[0] == '0' && !query_used[1]) && census_on;
+}
+/// (11-22) Whether the precompile keeps every pipeline for a PC of under 20 GB (vk_draw.cpp precompile_keeps_all): on a discrete
+/// GPU with the game told its mapped pages are used (query_on), which lets old areas go; total 0: not known
+inline bool keep_all_small_pc(bool discrete, uint64_t total, bool query_on) {
+    return discrete && query_on && total && total < (20ull << 30);
+}
+
+/// (11-22, after Casual Gamer's fix) Whether the retired imports kept for good (vk_memory.cpp retired_imports_give_back: Windows,
+/// AMD's and Intel's drivers) are given back all the same: the system heap past high percent of its budget (used of budget;
+/// a budget of 0: not known), or an import refused for want of room within the last kRefusedHoldMs (refused_ms: when, as now_ms
+/// counts; 0: never)
+constexpr int64_t kRefusedHoldMs = 60000;
+inline bool retired_pressed(uint64_t used, uint64_t budget, int high, int64_t now_ms, int64_t refused_ms) {
+    return (budget && high > 0 && used > budget / 100 * (uint64_t)high) || (refused_ms && now_ms - refused_ms < kRefusedHoldMs);
+}
+/// (11-22, after Casual Gamer's fix) Whether the capture's spare buffers are held to 32 MB (vk_memory.cpp cap_spare_max): on a
+/// card the driver allows 6.5 GB or less (small_card), or on a PC of under 20 GB of RAM (ram_total; 0: not known)
+constexpr uint64_t kSpareRamBytes = 20ull << 30;
+inline bool spare_capped(bool small_card, uint64_t ram_total) { return small_card || (ram_total && ram_total < kSpareRamBytes); }
 
 }   // namespace mem_parts

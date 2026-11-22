@@ -16,10 +16,13 @@ par_tune_present at each present). No game, no GPU.
    every 8,000 presents fewer trials, the better way in use as often and as soon after a change; a short trial never changes
    the way and one that finds the other way shorter is followed at once by a full one; a change the scene's means cannot see
    found by a backed-off trial; loads are no scene change; the rule's no-trial verdicts hold through scene changes.
+   "settled": (11-22) the rule gives an area's load window, and the first after it, no verdict (with settled off: on at the
+   load, as Kaefergeneral's log had it); a settled heavy scene like test4's still turns the helpers on without a trial, a
+   window after it settled; a trial the scene changed under changes nothing and the next comes once the scene settles.
 2. The source read: par_tune_present returns at once unless the tuner decides (the Debug row's Off, RX_VK_PARALLEL), hands
    each frame to Tuner::step with the way in use, and applies its change; the rule is RX_VK_PARALLEL_RULE's to turn off, and
    counts the replay thread among the threads that record segments only where it does (RX_VK_PARALLEL_OWN); the back-off is
-   RX_VK_PARALLEL_BACKOFF's to turn off.
+   RX_VK_PARALLEL_BACKOFF's to turn off, settled RX_VK_TUNER_SETTLED's.
 
     python -I -B tests/test_replay_threads_tuner.py [--cxx g++]
 """
@@ -61,7 +64,7 @@ def main():
     replay = (VK / "vk_replay.cpp").read_text(encoding="utf-8")
     tune = function(replay, "void par_tune_present() {")
     in_order(tune, ["if (!par_auto()) return;", "const replay_threads::Frame fr = par_frame_now(ms);",
-                    "t.use_rule = par_rule_on();", "t.backoff = par_backoff_on();",
+                    "t.use_rule = par_rule_on();", "t.backoff = par_backoff_on();", "t.settled = par_settled_on();",
                     "t.threads = par_threads_max() + (par_own_on() ? 1 : 0);",
                     "tuner.step(fr, par_auto_on, par_stream_order_only());", "if (s.flip) par_auto_on = !par_auto_on;"],
              "par_tune_present")
@@ -72,6 +75,9 @@ def main():
     backoff = function(replay, "bool par_backoff_on() {")
     check('getenv("RX_VK_PARALLEL_BACKOFF")' in backoff and 'atoi(getenv("RX_VK_PARALLEL_BACKOFF")) != 0' in backoff,
           "par_backoff_on no longer reads RX_VK_PARALLEL_BACKOFF (on unless 0)")
+    settled = function(replay, "bool par_settled_on() {")
+    check('getenv("RX_VK_TUNER_SETTLED")' in settled and 'atoi(getenv("RX_VK_TUNER_SETTLED")) != 0' in settled,
+          "par_settled_on no longer reads RX_VK_TUNER_SETTLED (on unless 0)")
     own = function(replay, "bool par_own_on() {")
     check('getenv("RX_VK_PARALLEL_OWN")' in own, "par_own_on no longer reads RX_VK_PARALLEL_OWN")
     check("bool par_auto() {\n    static const bool v = !getenv(\"RX_VK_PARALLEL\") && par_threads_max() >= 2;" in replay,
@@ -79,19 +85,21 @@ def main():
     guide = (ROOT / "docs" / "development.md").read_text(encoding="utf-8")
     check("`RX_VK_PARALLEL_RULE=0`" in guide, "docs/development.md does not say what RX_VK_PARALLEL_RULE=0 does")
     check("`RX_VK_PARALLEL_BACKOFF=0`" in guide, "docs/development.md does not say what RX_VK_PARALLEL_BACKOFF=0 does")
+    check("`RX_VK_TUNER_SETTLED=0`" in guide, "docs/development.md does not say what RX_VK_TUNER_SETTLED=0 does")
     with tempfile.TemporaryDirectory(prefix="replay-tuner-") as tmp:
         exe = Path(tmp) / "tuner.exe"
         built = subprocess.run([args.cxx, "-std=c++20", "-O1", "-Wall", "-Wextra", "-Werror", "-I", str(VK),
                                 str(ROOT / "tests" / "replay_threads_tuner_test.cpp"), "-o", str(exe)], capture_output=True, text=True)
         check(built.returncode == 0, "the fixture did not build:\n" + built.stderr[-4000:])
         env = {k: v for k, v in os.environ.items() if not k.startswith("RX_VK_")}
-        for case in ("same", "prev", "rule", "backoff"):
+        for case in ("same", "prev", "rule", "backoff", "settled"):
             r = subprocess.run([str(exe), case], env=env, capture_output=True, text=True, timeout=300)
             print((r.stdout + r.stderr).strip())
             check(r.returncode == 0, "replay_threads_tuner_test %s" % case)
     print("PASS: the helper threads' tuner decides as it did inline with the rule off; with it, on without a trial where the "
           "replay is plainly the frame's limit, no trial where the GPU or the game's threads are, trials in between; the "
-          "back-off makes them rarer and shorter once the way holds, early where the scene changes, off as before")
+          "back-off makes them rarer and shorter once the way holds, early where the scene changes, off as before; both judge "
+          "settled scenes only")
 
 
 if __name__ == "__main__":

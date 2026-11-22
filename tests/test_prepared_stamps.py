@@ -161,11 +161,15 @@ int main(int argc, char** argv) {
             stamp.index("add(v, sizeof v);") > stamp.index("if (patches) {"):
         raise SystemExit("warmed_stamp_of: the module patches' and the rate's words are not added after the others, and only "
                          "where they apply")
-    if "return warmed_stamp_of(libraries, module_patches(), false);" not in block(draw, "uint64_t warmed_stamp(") or \
-            "return warmed_stamp_of(libraries, module_patches(), libraries && dev.foliage_rate);" not in \
+    # ((Triforce, 11-21) and kMeshOptRecipe in both, where RADV builds its native task and mesh pipelines with the optimizer
+    # (mesh_opt_recipe, tests/test_radv_mesh_optimizer.py)
+    if "if (mesh_opt) add(&kMeshOptRecipe, sizeof kMeshOptRecipe);" not in stamp:
+        raise SystemExit("warmed_stamp_of: the mesh optimizer's word is not added only where it applies")
+    if "return warmed_stamp_of(libraries, module_patches(), false, mesh_opt_recipe());" not in block(draw, "uint64_t warmed_stamp(") or \
+            "return warmed_stamp_of(libraries, module_patches(), libraries && dev.foliage_rate, mesh_opt_recipe());" not in \
             block(draw, "uint64_t libraries_stamp("):
-        raise SystemExit("warmed_stamp / libraries_stamp: wanted the modules' patches in both and the rate's libraries in the "
-                         "driver's part's alone")
+        raise SystemExit("warmed_stamp / libraries_stamp: wanted the modules' patches and the mesh optimizer's word in both and the "
+                         "rate's libraries in the driver's part's alone")
     # ((Triforce, 11-19) and bit 2, the water's simplification (shader_water_mode, the RX 470 .. 590 port that came without a
     # new stamp): those cards warm their driver's part again once)
     if "return (dev.fixes.nan_bits && nan_selects ? 1u : 0u) | (shader_water_mode() ? 2u : 0u);" not in block(draw, "uint32_t module_patches("):

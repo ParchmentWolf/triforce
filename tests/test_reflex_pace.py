@@ -62,6 +62,7 @@ FIXTURE = r'''#define VK_NO_PROTOTYPES
 #include "dlssg_pace.h"
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL:%d %s (frame %d)\n", __LINE__, #x, frame_no); std::exit(1); } } while (0)
 static int frame_no;
+namespace gpu_wait_kinds { struct Exclude { Exclude() {} }; }   /* ((Triforce, 11-22, SYNC-27) the sleep's wait is left out of the GPU waits' count: tests/test_gpu_waits.py) */
 /* ---- the clock, the host, the device, the menu */
 static int64_t clock_ns = 1000000000ll;
 static int64_t now_ns() { return clock_ns; }

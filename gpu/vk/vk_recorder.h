@@ -60,6 +60,8 @@
 #endif
 
 #include "vk_loader.h"
+#include "lock_census.h"   // ((Triforce, 11-22, THREAD-68) who holds the lock a thread waits for, RX_VK_LOCK_CENSUS: DrainingMutex)
+#include "new_wait.h"      // ((Triforce, 11-22, OS-04) a nothrow new that must answer at once: NoWait)
 
 namespace mkwvk {
 void logf(const char* fmt, ...);        // (vk_main.cpp)
@@ -254,6 +256,7 @@ struct Arena {
             }
             const size_t cap = n + align > kChunk ? n + align : kChunk;
             if (nchunks == kMaxChunks || cap > g_hard_budget || capacity > g_hard_budget - cap) return nullptr;
+            new_wait::NoWait at_once;   // ((Triforce, OS-04) no chunk: the call is made directly; not a wait at the commit limit)
             void* p = ::operator new(cap, std::align_val_t(64), std::nothrow);
             if (!p) return nullptr;
             chunks[nchunks++] = {static_cast<uint8_t*>(p), cap};
@@ -311,6 +314,9 @@ inline uint64_t now_ns() {
 inline void (*g_thread_start_hook)() = nullptr;
 /// (set by vk_replay.cpp: its end_process, which on Windows ends the process without running every library's detach)
 inline void (*g_end_process_hook)(int) = nullptr;
+/// (set by vk_replay.cpp, lab: RX_VK_LAB_AB's knob norec) true: this hold of the replay's lock makes its calls directly, with no
+/// producer (DrainingMutex::enter), so one run measures the recorder thread against none in its phases
+inline bool (*g_direct_hook)() = nullptr;
 #ifdef RX_REC_TEST_HOOKS
 inline void (*g_test_idle_locked)() = nullptr;   // (tests: called in idle() with sleep_mu held)
 #endif
@@ -463,6 +469,7 @@ inline bool Recorder::start() {   // (the producer, its first packet)
     if (!base) {
         size_t c = 4096;
         while (c < g_ring_bytes && c < (size_t(1) << 30)) c <<= 1;
+        new_wait::NoWait at_once;   // ((Triforce, OS-04) no ring: the recorder is off; not a wait at the commit limit)
         base = static_cast<uint8_t*>(::operator new(c, std::align_val_t(64), std::nothrow));
         if (!base) {
             broken.store(true);
@@ -655,22 +662,26 @@ inline void segments_begin() { boundary(B_PAR); }
 /// producer; the unlock waits for the recorder to run all it published, so the recorder is idle whenever no thread holds it
 struct DrainingMutex {
     std::mutex m;
+    std::atomic<const lock_census::Slot*> owner{nullptr};   // ((Triforce, THREAD-68) the holder, for the lock census; unset when it is off)
     void lock() {
-        m.lock();
+        lock_census::lock(m, owner, "replay_mu");   // (m.lock(), as before, unless RX_VK_LOCK_CENSUS counts)
         enter();
     }
     bool try_lock() {
-        if (!m.try_lock()) return false;
+        if (!lock_census::try_lock(m, owner)) return false;
         enter();
         return true;
     }
     void unlock() {
         boundary(B_REPLAY_UNLOCK);
         t_prod = nullptr;
+        lock_census::unlocking(owner);   // (after the drain: a waiter is behind this thread until here)
         m.unlock();
     }
     static void enter() {
-        if (mode() == THREAD) t_prod = &g_rec;
+        // (the previous holder's unlock waited until the recorder had run all it published: the ring is empty here, so a hold
+        // with no producer makes its calls directly, in order after them)
+        if (mode() == THREAD && !(g_direct_hook && g_direct_hook())) t_prod = &g_rec;
     }
 };
 

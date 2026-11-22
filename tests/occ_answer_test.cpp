@@ -359,6 +359,91 @@ int main() {
         d.note(1), d.note(1), d.note(2);
         CHECK(d.take() == 2 && d.take() == 0);
     }
+    {   // ((Triforce, 11-22, the performance audit's GPUWORK-01) a window with a draw that writes colour
+        bool keep_now = false;
+        Rep r;
+        // the rule off: counted for the line, and the count measured as before, the colour draw under its open query
+        Counter c;
+        c.reset(4, A, 10);
+        c.draw_enter(false);
+        Counter::Colour m = c.colour_draw(false, false);   // (the window's first draw writes colour: no query open yet)
+        CHECK(m.first && !m.open && !m.lose && c.colour && !c.lost);
+        CHECK(c.may_begin(false) && c.begin(false, A));
+        c.open = 10;
+        c.draw_issued(false);
+        c.draw_enter(false);
+        m = c.colour_draw(false, false);
+        CHECK(!m.first && m.open && !m.lose && !c.lost && c.open == 10);   // (a second one, under the open query)
+        c.draw_issued(false);
+        c.open = -1;
+        CHECK(c.report(false, A, 11, &r, &keep_now) == Counter::kMeasured && r.first == 10 && r.n == 1 && c.why == Counter::kNone);
+        // the rule on: a depth-only window is measured as before (no colour draw is ever told to it)
+        Counter d;
+        d.reset(4, A, 20);
+        d.draw_enter(false);
+        CHECK(d.begin(false, A));
+        d.open = 20;
+        d.draw_issued(false);
+        d.open = -1;
+        CHECK(d.report(false, A, 21, &r, &keep_now) == Counter::kMeasured && r.first == 20 && r.n == 1 && !d.colour);
+        // the rule on: a colour draw gives the count up; no query begins again until the next reset; its report is
+        // incomplete for that reason, so nothing is written for it
+        Counter e;
+        e.reset(4, A, 30);
+        e.draw_enter(false);
+        CHECK(e.begin(false, A));
+        e.open = 30;
+        e.draw_issued(false);
+        e.draw_enter(false);
+        m = e.colour_draw(false, true);
+        CHECK(m.first && m.open && m.lose);
+        e.open = -1;        // (the caller ends the open query: occ_close)
+        e.lose_colour();
+        CHECK(e.lost && e.why == Counter::kColour && !e.may_begin(false) && !e.begin(false, A));
+        e.draw_issued(false);
+        e.draw_enter(false);
+        m = e.colour_draw(false, true);   // (a later colour draw of the window: nothing more)
+        CHECK(!m.first && !m.open && !m.lose);
+        e.draw_issued(false);
+        r = Rep{};
+        CHECK(e.report(false, A, 31, &r, &keep_now) == Counter::kIncomplete && e.why == Counter::kColour && r.n == 0);
+        e.reset(4, A, 31);   // (the next window begins afresh)
+        CHECK(!e.lost && !e.colour && e.why == Counter::kNone && e.may_begin(false));
+        // a colour draw before the window's first query, the rule on: the same, with no query to end
+        Counter f;
+        f.reset(4, A, 40);
+        f.draw_enter(false);
+        m = f.colour_draw(false, true);
+        CHECK(m.first && !m.open && m.lose);
+        f.lose_colour();
+        f.draw_issued(false);
+        CHECK(!f.may_begin(false) && f.report(false, A, 40, &r, &keep_now) == Counter::kIncomplete && f.why == Counter::kColour);
+        // not counting (no reset yet), or lost already: a colour draw is nothing to the count
+        Counter g;
+        m = g.colour_draw(false, true);
+        CHECK(!m.first && !m.open && !m.lose && !g.colour);
+        g.reset(4, 0, 0);   // (no recording's: lost)
+        m = g.colour_draw(false, true);
+        CHECK(!m.first && !m.lose && g.why == Counter::kOtherCmd);
+        // counting past a report (keep): a colour draw after the report is told too
+        Counter h;
+        h.reset(4, A, 50);
+        CHECK(h.report(true, A, 50, &r, &keep_now) == Counter::kMeasured);
+        m = h.colour_draw(true, false);
+        CHECK(m.first && !m.lose);
+        m = h.colour_draw(false, false);   // (without keep a reported count is not counting)
+        CHECK(!m.first && !m.open && !m.lose);
+        // the line
+        Stats st;
+        st.colour_windows = 12, st.colour_open = 640, st.colour_lost = 5, st.inc_colour = 4;
+        char line[512];
+        st.colour_line(line, sizeof line, 600, true);
+        CHECK(std::strstr(line, "vk: occlusion queries (RX_VK_OCC_QUERY), 600 presents (3): 12 counting windows met a draw that writes "
+                                "colour, 640 such draws were recorded under an open query; depth-only counting (RX_VK_OCC_DEPTH_ONLY) is "
+                                "on: 5 counts given up at a colour draw, 4 reports kept 4096 for it") == line);
+        st.colour_line(line, sizeof line, 600, false);
+        CHECK(std::strstr(line, "(RX_VK_OCC_DEPTH_ONLY) is off: ") != nullptr);
+    }
     if (failures) std::fprintf(stderr, "%d failed\n", failures);
     else std::printf("occ_answer: all cases pass\n");
     return failures ? 1 : 0;

@@ -13,7 +13,9 @@
 // same call with the same arguments as BC3's colour half. And BC3's alpha half for such a block is (255, 255, indices 0),
 // which decodes to 255, what the BC1 RGB format gives every texel. Which textures are all opaque: astc_opaque.h.
 //
-// A row on the Graphics tab, Off unless set, because what a test cannot show is whether the GPU decoder agrees with
+// ((Triforce, 11-21, TEX-50) On unless the row says off, since options_version 5; and with no options file too, which
+// started it at 0 until then: vk_menu.cpp tex_bc1_at_start.) It was a row on the Graphics tab, off unless set, because what
+// a test cannot show is whether the GPU decoder agrees with
 // astc_opaque.h on every block of the game's textures, and the image changes in vk_texture.cpp have not run in the game.
 #pragma once
 #include <cstdint>

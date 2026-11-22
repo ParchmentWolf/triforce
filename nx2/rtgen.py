@@ -35,6 +35,17 @@ void a64_poll_cur(void);
 #define A64_POLL(c) ((void)0)
 #endif"""
 
+# (Triforce, 11-22, the performance audit's LIFT-47, after Source B's) what a DMB of the load or the store kind is in code
+# lifted with A64_DMB_LIGHT=1 (nx2/insn.py dmb_light). x86-64 orders loads with loads, loads with later stores and stores
+# with stores itself; the empty asm with a "memory" clobber keeps the compiler from moving or merging guest accesses across
+# it (a C11 fence alone would not order the plain accesses), and no instruction is emitted. Any other host: the full fence.
+DMB_LDST = r"""
+#if defined(__x86_64__)
+#define A64_DMB_LDST() __asm__ __volatile__("" ::: "memory")
+#else
+#define A64_DMB_LDST() recomp_barrier()
+#endif"""
+
 ADDR64 = r"""#ifndef A64_ADDR64
 #define A64_ADDR64 1   /* (nx2/rtgen.py: 64-bit guest window) */
 #endif
@@ -73,7 +84,7 @@ SUBST = {
     "a64.h": [
         (THREAD, THREAD.replace("\n} GuestContext;", "\n    uint32_t poll;              "
                                 "/* (nx2/rtgen.py) interrupt request: A64_POLL clears it and calls a64_poll_cur when set */\n} GuestContext;")),
-        (RET_MISMATCH, RET_MISMATCH + POLL_DECL),
+        (RET_MISMATCH, RET_MISMATCH + POLL_DECL + DMB_LDST),
         ("#define A64_PTR(a) (A64_MEM + (uint32_t)(a))", ADDR64),
         (MARK_NATIVE, MARK_NATIVE_64),
     ],

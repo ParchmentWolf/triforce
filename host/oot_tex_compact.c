@@ -19,10 +19,16 @@
    are not touched. Nothing is held unless the switch is set: whether the game can do with fewer cycles (its heap is the
    one that fills, host/oot_heap_retry.c) is for the lab to say first.
 
-   HOS_OOT_TEX_COMPACT_MS=<n>: at most one cycle started every n ms. -1 (a test): none started at all. Unset or 0: as shipped. */
+   HOS_OOT_TEX_COMPACT_MS=<n>: at most one cycle started every n ms. -1 (a test): none started at all. Unset or 0: as shipped.
+
+   (Triforce) And before that, the ask: the manager's step (f_80797240) asks for a round at most once a second
+   (hos_oot_tex_compact_due, nx2/oot_patches.py patch_tex_ask; the rule and HOS_OOT_TEX_ASK_MS in oot_tex_compact.h). Asking
+   every frame against never, standing at the Market: 11.0% and 9.8% of frames of 16.7 ms or more against 3.0% and 1.2%. */
 #include "hos.h"
+#include "oot_tex_compact.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <windows.h>
 
 /* (the supported build's) the compaction's record at the manager's +7992, its state at the record's +8: 3 idle (the next
    step plans), 0 to 2 a cycle's steps */
@@ -77,4 +83,33 @@ void hos_oot_tex_compact(Ctx *c, A64Fn game) {
                     (now - said) / 1e9, started, steps, held, ms);
         said = now, started = held = steps = 0;
     }
+}
+
+/* (Triforce) Whether the manager's step may ask for a round now (patch_tex_ask: called where it would ask, with no round asked
+   for and the ask's bit set). The asks let through and held are logged every 10 s while there are any */
+int hos_oot_tex_compact_due(void) {
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static int ms = -2;
+    static int64_t last = -1, said;
+    static long let, held;
+    AcquireSRWLockExclusive(&lock);
+    if (ms == -2) {
+        const char *e = getenv("HOS_OOT_TEX_ASK_MS");
+        ms = hos_oot_tex_ask_ms(e);
+        if (ms > 0) hos_log("oot: texture compaction: at most one ask every %d ms (HOS_OOT_TEX_ASK_MS; 0: every ask, as shipped)", ms);
+        else hos_log("oot: texture compaction: %s (HOS_OOT_TEX_ASK_MS=%s)", ms ? "no ask let through" : "every ask, as shipped", e);
+    }
+    const int64_t now = hos_now_ns();
+    const int due = hos_oot_tex_ask_due(ms, now, &last);
+    if (due) let++;
+    else held++;
+    if (!said) said = now;
+    if (now - said >= 10000000000LL) {
+        if (let || held)
+            hos_log("oot: texture compaction asks in %.0f s: %ld let through, %ld held (HOS_OOT_TEX_ASK_MS=%d)",
+                    (now - said) / 1e9, let, held, ms);
+        said = now, let = held = 0;
+    }
+    ReleaseSRWLockExclusive(&lock);
+    return due;
 }

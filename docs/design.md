@@ -263,6 +263,6 @@ dump, the runtime made game-neutral, the stage-1 tools checked on MKW's dump as 
   repeat with a delay that keeps ~45 fps. The MKW session's mirror page skip fired 0 times here and was removed.
   Not an instrument's doing: with nothing attached, photographed from outside the window (37 s, ~2200 photographs): 16 with `RX_VK_FRAMEGEN=0`, none at the user's 4x. With
   `RX_VK_SUBMIT_DELAY_US`: 7 at 300, 0 at 1000; a repeat at 1000 with shots still had 7 events against 50-60. So it is a race with the game's threads: less overlap, fewer. The delay is a test, not a fix.
-- The builder's first full build: 43 minutes at below-normal priority, 0 failures; the folder starts from a double click and reaches the title at 60 fps.
+- The builder's first full build: 43 minutes at below-normal priority (the builders' start then; since the performance audit's OS-57 normal, below normal with `HOOKSHOT_LOW_PRIORITY=1`), 0 failures; the folder starts from a double click and reaches the title at 60 fps.
 - Render conditions here gate single lights and read reports earlier in the same stream, so they cannot be read at record time.
 

@@ -53,6 +53,8 @@
 #include <utility>
 #include <vector>
 
+#include "new_wait.h"   // ((Triforce, 11-22, OS-04) a nothrow new that must answer at once: NoWait)
+
 namespace shadow_prev {
 
 inline constexpr uint64_t kPage = 4096;
@@ -217,7 +219,10 @@ inline bool keep_old(std::unique_ptr<uint8_t[]>& b, uint64_t& hash, Vers& v, int
         v.n = (uint8_t)(maxn - 1);
     } else {
         if (alive().load(std::memory_order_relaxed) >= cap) return false;
-        fresh.reset(new (std::nothrow) uint8_t[kPage]);
+        {
+            mkwvk::new_wait::NoWait at_once;   // ((Triforce, OS-04) no page: none kept; not a wait at the commit limit)
+            fresh.reset(new (std::nothrow) uint8_t[kPage]);
+        }
         if (!fresh) return false;
         alive().fetch_add(1, std::memory_order_relaxed);
     }

@@ -218,7 +218,7 @@ def check_source(draw):
     opened = block(draw, "void pcache_play_open(bool same) {")
     need("vk_draw.cpp pcache_play_open", opened,
          ['getenv("RX_VK_PCACHE_PLAY_FILE")', "dev.vk13.pipelineCreationCacheControl", '(pcache_play_path + ".for")',
-          "program_cache_stamp()", "dev.props.pipelineCacheUUID", "pcache_bound::read(pcache_play_path.c_str()",
+          "program_cache_stamp()", "!pcache_head_ok(data.data(), data.size())", "pcache_bound::read(pcache_play_path.c_str()",
           "pcache_play::fold_due(held, fold)", "vkMergePipelineCaches(dev.device, pcache, 1, &made)", "pcache_fold = true;",
           'getenv("RX_VK_PCACHE_FOLD_MB")', "pcache_play_cache = made;", "pcache_play_saved = held;"])
     if opened.index("pcache_fold = true;") > opened.index("pcache_play_cache = made;"):
@@ -253,6 +253,13 @@ def check_source(draw):
     need("vk_loader.h", loader, ["X(vkMergePipelineCaches)"])
     dev = (ROOT / "docs/development.md").read_text(encoding="utf-8")
     need("docs/development.md", dev, ["RX_VK_PCACHE_PLAY_FILE=0", "RX_VK_PCACHE_FOLD_MB", "mkw_vk_pipelines_play.bin"])
+    # ((Triforce, 11-22, the performance audit's PIPE-95) the back end's own compute passes through the play cache too, behind
+    # RX_VK_PCACHE_OWN_PASSES (tests/test_pcache_own_passes.py runs the function)
+    shared = block(draw, "VkResult shared_cache_compute(const VkComputePipelineCreateInfo* ci, VkPipeline* out) {")
+    need("vk_draw.cpp shared_cache_compute", shared,
+         ['static const bool own_passes = pcache_play::own_passes(getenv("RX_VK_PCACHE_OWN_PASSES"));',
+          "return cached_compute(use.cache, ci, out);"])
+    need("docs/development.md", dev, ["RX_VK_PCACHE_OWN_PASSES=0"])
 
 
 def main():

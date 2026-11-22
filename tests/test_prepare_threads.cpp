@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
 static int failures = 0;
 static void expect(bool ok, const char* what) {
@@ -55,6 +56,11 @@ int main() {
     expect(translate(count(4, 64 * GB, false, 0), true, false) == 4 && translate(2, true, false) == 2, "AMD's older driver, few processors: count's");
     expect(translate(count(24, 26 * GB, false, 20), true, true) == 20, "AMD's older driver: the switch still decides");
     expect(translate(count(24, 26 * GB, false, 0), false, false) == 24, "other drivers: count's");
+    // ((Triforce) the process heap's signature: the segment heap's, the NT heap's, anything else not known)
+    expect(prepare_threads::segment_heap(0xDDEEDDEEu) && !prepare_threads::segment_heap(0xFFEEFFEEu) && !prepare_threads::segment_heap(0),
+           "segment_heap: the segment heap's signature only");
+    expect(std::string(prepare_threads::heap_name(0xDDEEDDEEu)) == "segment" && std::string(prepare_threads::heap_name(0xFFEEFFEEu)) == "NT" &&
+           std::string(prepare_threads::heap_name(0x12345678u)) == "not known", "heap_name");
     if (failures) return EXIT_FAILURE;
     std::printf("prepare threads: all checks passed\n");
     return EXIT_SUCCESS;

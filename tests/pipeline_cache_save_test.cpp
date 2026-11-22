@@ -177,6 +177,7 @@ std::uint64_t pcache_own_stamp() { return 0xabcdef0123456789ull; }
 std::atomic<int64_t> pcache_main_built{0};
 std::atomic<int> pcache_preparing{0};
 bool pcache_play_save(int64_t) { return true; }
+thread_local bool pcache_play_only_now = false;   // ((Triforce, 11-22, PIPE-23) vk_draw.cpp: precompile_end_save's play-only save)
 int pcache_play_cache = 0;
 std::atomic<std::size_t> pcache_play_saved{0};
 void pcache_main_written(int64_t) {}

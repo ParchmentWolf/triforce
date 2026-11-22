@@ -21,6 +21,10 @@ int main() {
     CHECK(run_from(512 * MB, false) == 512 * MB);
     CHECK(run_from(512 * MB, true) == 192 * MB);
     CHECK(run_from(64 * MB, true) == 64 * MB);
+    // ((Triforce, 11-22, TEX-38) unset, that free space by the card: allowance/16, 64-512 MB, 512 unknown;
+    // tests/test_compact_start.py has the cards from 2 to 32 GB)
+    CHECK(default_min_free(0) == 512 * MB && default_min_free(512 * MB) == 64 * MB);
+    CHECK(default_min_free(5233 * MB) >> 20 == 327 && default_min_free(16384 * MB) == 512 * MB);
     CHECK(rest(false) == 600 && rest(true) == 120);
     // only the textures' pool's free space comes off the count
     CHECK(reclaimable(850 * MB, 215 * MB) == 215 * MB);    // (the rest is in the render targets' and the buffers' blocks)
@@ -56,6 +60,18 @@ int main() {
     CHECK(rule_target(5600 * MB, 6144 * MB) == UINT64_MAX);                        // (under the budget: they ask nothing)
     CHECK(rule_target(5600 * MB, 5600 * MB) == UINT64_MAX);
     CHECK(rule_target(5600 * MB, 5300 * MB) == 5300 * MB / 8 * 7);                 // (over it: cut to 7/8 of it, as ever)
+    // ((Triforce) RX_VK_EVICT_EXCESS: the budget's size apart from what the 90% and 97% rules left. The size's part is 7/8 of
+    // it as above; the rules' part their budget less 64 MB. The Market on an 8 GB card: 2,873 MB held, a size of 3,285, the
+    // 90% rule's budget 2,811: 126 MB go, not 413)
+    CHECK(rule_target(2873 * MB, 3285 * MB, 2811 * MB) == 2811 * MB - kExcessSlack);
+    CHECK(2873 * MB - rule_target(2873 * MB, 3285 * MB, 2811 * MB) == 126 * MB);
+    CHECK(2873 * MB - rule_target(2873 * MB, 2811 * MB) > 413 * MB);              // (the old cut: 7/8 of the rules' budget)
+    CHECK(rule_target(2800 * MB, 3285 * MB, 2811 * MB) == UINT64_MAX);             // (under both: nothing)
+    CHECK(rule_target(5600 * MB, 6144 * MB, 6144 * MB) == UINT64_MAX);
+    CHECK(rule_target(5600 * MB, 5300 * MB, 5300 * MB) == 5300 * MB / 8 * 7);      // (the size alone: as the old form)
+    CHECK(rule_target(5600 * MB, 5300 * MB, 5000 * MB) == 5300 * MB / 8 * 7);      // (both over: the lower, here the size's)
+    CHECK(rule_target(5600 * MB, 5300 * MB, 4600 * MB) == 4600 * MB - kExcessSlack);   // (and here the rules')
+    CHECK(rule_target(100 * MB, 3285 * MB, 40 * MB) == 0);                         // (never under nothing)
     CHECK(hold_target(100, 60, 4637 * MB, 5000 * MB, 4500 * MB) == 4637 * MB);     // (the count over 90%: one unused 100 presents still goes)
     CHECK(hold_target(59, 60, 4637 * MB, 5000 * MB, 4500 * MB) == UINT64_MAX);     // (one used in the last 60: never)
     CHECK(hold_target(100, 120, 4637 * MB, 5000 * MB, 4500 * MB) == UINT64_MAX);   // (nor before the pass's own time, whatever that is)

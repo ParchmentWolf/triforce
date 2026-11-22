@@ -108,6 +108,9 @@ const std::vector<uint32_t>* renodx_replacement(uint32_t) { return nullptr; }
 #define PROF_EXACT()   // (vk_prof.h's exact-timing scope, since #989: nothing to time here)
 // (local, texture detail: vk_shader.cpp's note of which bindings a module reads by exact texel. Nothing to note here)
 void exact_note(VkShaderModule, const std::vector<uint32_t>&) {}
+void lanes_note(VkShaderModule, const std::vector<uint32_t>&) {}   // (PIPE-52: make_module's note of a module's Subgroup barriers)
+void size_note(VkShaderModule, const std::vector<uint32_t>&) {}    // (PIPE-56: its OpPhi and OpFunctionCall counts)
+void size_move(VkShaderModule, VkShaderModule) {}
 // (Triforce, RX_VK_SPV_PACK: vk_shader.cpp's packing of a ready program's stages. Off here, as with RX_VK_SPV_PACK=0:
 // every stage keeps its module, which is what this test counts. tests/test_spv_store.py has the packing)
 void pack_note(VkShaderModule, const uint32_t*, size_t) {}

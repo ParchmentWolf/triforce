@@ -56,11 +56,17 @@ static SRWLOCK table_lock = SRWLOCK_INIT;
 static Obj **table;
 static uint64_t *table_keys;   /* each slot's object's key, beside it: a probe compares keys without visiting objects */
 static uint64_t cap, used;
-typedef struct Table {   /* (the slots, then the keys: cap of each) */
-    uint64_t cap;
+/* TICK-062 A4/B7, HOS_OBJ_PACK=1: the slot pointer and its key side by side (stride 2: {Obj *, key} pairs, 16 bytes) instead of
+   the pointer array and then the key array (stride 1): a probe touches one cache line, not two, before the object itself.
+   The same values at the same slot numbers, so every lookup answers as before. */
+static uint64_t tstride = 1;
+typedef struct Table {   /* (stride 1: the slots, then the keys, cap of each; stride 2: cap pairs) */
+    uint64_t cap, stride;
     Obj *slot[];
 } Table;
-static uint64_t *table_keys_of(const Table *t) { return (uint64_t *)(void *)(t->slot + t->cap); }
+static uint64_t *table_keys_of(const Table *t) {
+    return t->stride == 2 ? (uint64_t *)(void *)t->slot + 1 : (uint64_t *)(void *)(t->slot + t->cap);
+}
 static Table *live;
 
 static uint64_t slot_of(uint64_t key, uint64_t c) { return (key * 0x9E3779B97F4A7C15ULL >> 20) & (c - 1); }
@@ -68,8 +74,8 @@ static uint64_t slot_of(uint64_t key, uint64_t c) { return (key * 0x9E3779B97F4A
 static Obj *find_locked(uint64_t key) {
     if (!table) return NULL;
     for (uint64_t i = slot_of(key, cap);; i = (i + 1) & (cap - 1)) {
-        if (!table[i]) return NULL;
-        if (table_keys[i] == key && table[i]->kind) return table[i];
+        if (!table[i * tstride]) return NULL;
+        if (table_keys[i * tstride] == key && table[i * tstride]->kind) return table[i * tstride];
     }
 }
 
@@ -135,40 +141,43 @@ static void bury_locked(Obj *o) {
 static Obj *find_dead_locked(uint64_t key) {
     if (!table) return NULL;
     for (uint64_t i = slot_of(key, cap);; i = (i + 1) & (cap - 1)) {
-        if (!table[i]) return NULL;
-        if (table_keys[i] == key && !table[i]->kind) return table[i];
+        if (!table[i * tstride]) return NULL;
+        if (table_keys[i * tstride] == key && !table[i * tstride]->kind) return table[i * tstride];
     }
 }
 
 static void insert_locked(Obj *o) {
     if (!table || used * 2 >= cap) {
         uint64_t ncap = cap ? cap * 2 : 1 << 16;
+        if (!cap) tstride = getenv("HOS_OBJ_PACK") ? 2 : 1;
+        const uint64_t ns = tstride;
         Table *t = (Table *)calloc(1, sizeof(Table) + ncap * (sizeof(Obj *) + sizeof(uint64_t)));
         Obj **nt = t->slot;
         t->cap = ncap;
+        t->stride = ns;
         uint64_t *nk = table_keys_of(t);
         for (uint64_t i = 0; i < cap; i++)
-            if (table[i] && table[i]->kind) {
-                uint64_t j = slot_of(table[i]->key, ncap);
-                while (nt[j]) j = (j + 1) & (ncap - 1);
-                nt[j] = table[i];
-                nk[j] = table[i]->key;
-            } else if (table[i]) {
-                bury_locked(table[i]);
+            if (table[i * tstride] && table[i * tstride]->kind) {
+                uint64_t j = slot_of(table[i * tstride]->key, ncap);
+                while (nt[j * ns]) j = (j + 1) & (ncap - 1);
+                nt[j * ns] = table[i * tstride];
+                nk[j * ns] = table[i * tstride]->key;
+            } else if (table[i * tstride]) {
+                bury_locked(table[i * tstride]);
             }
         table = nt;
         table_keys = nk;
         cap = ncap;
         used = 0;
-        for (uint64_t i = 0; i < cap; i++) used += table[i] != NULL;
+        for (uint64_t i = 0; i < cap; i++) used += table[i * tstride] != NULL;
         __atomic_store_n(&live, t, __ATOMIC_RELEASE);
     }
     uint64_t i = slot_of(o->key, cap);
-    while (table[i] && table[i]->kind) i = (i + 1) & (cap - 1);
-    if (!table[i]) used++;
-    else bury_locked(table[i]);   /* (a tombstone of another address) */
-    __atomic_store_n(&table_keys[i], o->key, __ATOMIC_RELAXED);   /* (before the object: see find_unlocked) */
-    __atomic_store_n(&table[i], o, __ATOMIC_RELEASE);
+    while (table[i * tstride] && table[i * tstride]->kind) i = (i + 1) & (cap - 1);
+    if (!table[i * tstride]) used++;
+    else bury_locked(table[i * tstride]);   /* (a tombstone of another address) */
+    __atomic_store_n(&table_keys[i * tstride], o->key, __ATOMIC_RELAXED);   /* (before the object: see find_unlocked) */
+    __atomic_store_n(&table[i * tstride], o, __ATOMIC_RELEASE);
 }
 
 static Obj *find_unlocked(uint64_t key, int kind) {
@@ -176,10 +185,10 @@ static Obj *find_unlocked(uint64_t key, int kind) {
     if (!t) return NULL;
     const uint64_t *keys = table_keys_of(t);
     for (uint64_t i = slot_of(key, t->cap), n = 0; n < t->cap; i = (i + 1) & (t->cap - 1), n++) {
-        Obj *o = __atomic_load_n(&t->slot[i], __ATOMIC_ACQUIRE);
+        Obj *o = __atomic_load_n(&t->slot[i * t->stride], __ATOMIC_ACQUIRE);
         if (!o) return NULL;
         /* (the key beside the slot first; a slot changing meanwhile gives a miss, and the locked lookup answers) */
-        if (__atomic_load_n(&keys[i], __ATOMIC_RELAXED) == key && o->key == key &&
+        if (__atomic_load_n(&keys[i * t->stride], __ATOMIC_RELAXED) == key && o->key == key &&
             __atomic_load_n(&o->kind, __ATOMIC_ACQUIRE) == kind)
             return o;
     }
@@ -190,10 +199,109 @@ static Obj *obj_lookup(uint64_t key, int kind);
 /* Every nn::os call looks its object up by the guest address (~1.6% of the game threads' time at the castle: a probe
    of the shared table and a cache miss on a scattered object). Game threads use a few objects over and over: a small
    direct-mapped cache per thread answers those. An entry holds while its object is still that address's and of the
-   kind asked for (objects are reused, never freed: spares). HOS_NO_OBJ_CACHE=1: off. */
+   kind asked for (objects are reused, never freed: spares). HOS_NO_OBJ_CACHE=1: off.
+
+   (Triforce) The direct-mapped cache still missed at every step of a walk over many objects at a fixed stride: the game's
+   record pass under the graphics front end (f_80364080) locks and unlocks some 4,000 per-slot mutexes 0x80 apart, and the
+   multiply-shift index folds such keys onto few entries (3,541 of 4,000 missed a pass with 4,096 entries). So by default
+   the cache is 16,384 entries, four ways to a 64-byte set, the set picked by murmur3's finalizer, the oldest way replaced
+   (a stale way of the same key in place); a hit is checked by key and kind as before. The table is allocated at a
+   thread's first lookup (256 KB, kept for the thread's life); without memory, the shared table answers. Each thread counts
+   its lookups and misses; after 65,536 lookups a miss asks obj (never obj_nockpt, which runs under host locks) to add them
+   up, and every 10 s the log says "sync: object cache". HOS_OBJ_CACHE=<n>: n entries (256 to 65,536, a power of two);
+   0: the direct-mapped 4,096 entries, as before. */
+typedef struct { uint64_t key; Obj *o; } ObjWay;
+enum { OBJ_CACHE_WAYS = 4, OBJ_CACHE_DEFAULT = 16384, OBJ_CACHE_DUE = 65536 };
+static _Thread_local uint32_t obj_cache_lookups, obj_cache_missed;
+static _Thread_local int obj_cache_due;
+/* HOS_OBJ_CACHE: unset, empty or not a number 16,384; 0 the direct-mapped cache; else 256 to 65,536, down to a power of two */
+static int obj_cache_entries(void) {
+    static int n = -1;
+    if (n < 0) {
+        const char *e = getenv("HOS_OBJ_CACHE");
+        long v = -1;
+        if (e && *e) {
+            v = 0;
+            for (const char *p = e; *p; p++) {
+                if (*p < '0' || *p > '9') { v = -1; break; }
+                if (v < 1000000) v = v * 10 + (*p - '0');
+            }
+        }
+        int r = OBJ_CACHE_DEFAULT;
+        if (v == 0) r = 0;
+        else if (v > 0) {
+            if (v > 65536) v = 65536;
+            r = 256;
+            while ((long)r * 2 <= v) r *= 2;
+        }
+        n = r;
+    }
+    return n;
+}
+/* The four-way cache (above); entries: obj_cache_entries's, not 0 */
+static Obj *obj_lookup_cached(uint64_t key, int kind, int entries) {
+    static _Thread_local ObjWay *ways;
+    static _Thread_local int no_memory;
+    if (!ways) {
+        if (no_memory) return obj_lookup(key, kind);
+        char *raw = (char *)calloc((size_t)entries + OBJ_CACHE_WAYS, sizeof(ObjWay));   /* (one set more: aligned to 64 bytes) */
+        if (!raw) {
+            no_memory = 1;
+            return obj_lookup(key, kind);
+        }
+        ways = (ObjWay *)(((uintptr_t)raw + 63) & ~(uintptr_t)63);
+    }
+    uint64_t h = key;   /* (murmur3's 64-bit finalizer) */
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 33;
+    h *= 0xc4ceb9fe1a85ec53ULL;
+    h ^= h >> 33;
+    ObjWay *set = ways + (h & (uint64_t)(entries / OBJ_CACHE_WAYS - 1)) * OBJ_CACHE_WAYS;
+    obj_cache_lookups++;
+    for (int w = 0; w < OBJ_CACHE_WAYS; w++) {
+        Obj *o = set[w].o;
+        if (set[w].key == key && o && __atomic_load_n(&o->key, __ATOMIC_RELAXED) == key &&
+            __atomic_load_n(&o->kind, __ATOMIC_ACQUIRE) == kind)
+            return o;
+    }
+    obj_cache_missed++;
+    if (obj_cache_lookups >= OBJ_CACHE_DUE) obj_cache_due = 1;
+    Obj *o = obj_lookup(key, kind);
+    int w = 0;
+    while (w < OBJ_CACHE_WAYS && set[w].key != key) w++;
+    if (w == OBJ_CACHE_WAYS) {   /* (the oldest way, the last, goes; the newest is the first) */
+        memmove(set + 1, set, (OBJ_CACHE_WAYS - 1) * sizeof *set);
+        w = 0;
+    }
+    set[w].key = key, set[w].o = o;
+    return o;
+}
+/* (obj, outside every host lock) this thread's counts into the process's; every 10 s the log line */
+static void obj_cache_flush(void) {
+    static uint64_t lookups, missed;
+    static int64_t said;
+    obj_cache_due = 0;
+    __atomic_fetch_add(&lookups, obj_cache_lookups, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&missed, obj_cache_missed, __ATOMIC_RELAXED);
+    obj_cache_lookups = obj_cache_missed = 0;
+    const int64_t now = hos_now_ns();
+    int64_t was = __atomic_load_n(&said, __ATOMIC_RELAXED);
+    if (!was) {
+        __atomic_compare_exchange_n(&said, &was, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+        return;
+    }
+    if (now - was < 10000000000LL || !__atomic_compare_exchange_n(&said, &was, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+        return;
+    const uint64_t l = __atomic_exchange_n(&lookups, 0, __ATOMIC_RELAXED), m = __atomic_exchange_n(&missed, 0, __ATOMIC_RELAXED);
+    hos_log("sync: object cache (%d entries, %d ways a set; HOS_OBJ_CACHE): %llu lookups, %llu missed (%.2f %%) in %.0f s",
+            obj_cache_entries(), OBJ_CACHE_WAYS, (unsigned long long)l, (unsigned long long)m, l ? 100.0 * m / l : 0.0,
+            (now - was) / 1e9);
+}
 static Obj *obj_nockpt(uint64_t key, int kind);
 static Obj *obj(uint64_t key, int kind) {
     hos_vcore_checkpoint();   /* (virtual cores: every nn::os call, where a better waiter takes the core) */
+    if (obj_cache_due) obj_cache_flush();
     return obj_nockpt(key, kind);
 }
 /* obj without the checkpoint, for lookups under a host lock: a checkpoint there can give the core up and wait for one
@@ -202,11 +310,13 @@ static Obj *obj(uint64_t key, int kind) {
 static Obj *obj_nockpt(uint64_t key, int kind) {
     /* (hookshot: 128 still missed: obj_lookup was the busiest leaf in dense Kokiri, 3.2% of all samples, 4.3% of the instants when one
        thread alone ran; each actor has its own mutexes) */
-    static _Thread_local struct { uint64_t key; Obj *o; } cache[1024];
+    static _Thread_local struct { uint64_t key; Obj *o; } cache[4096];   /* ((Triforce, 11-21) 4096, was 1024: obj_lookup still 1.9% of the game threads */
     static int off = -1;
     if (off < 0) off = getenv("HOS_NO_OBJ_CACHE") != NULL;
     if (!off) {
-        const unsigned i = (unsigned)((key * 0x9E3779B97F4A7C15ULL) >> 54);
+        const int entries = obj_cache_entries();
+        if (entries) return obj_lookup_cached(key, kind, entries);
+        const unsigned i = (unsigned)((key * 0x9E3779B97F4A7C15ULL) >> 52);   /* (12 bits: 4096 entries) */
         Obj *o = cache[i].o;
         if (cache[i].key == key && o && __atomic_load_n(&o->key, __ATOMIC_RELAXED) == key &&
             __atomic_load_n(&o->kind, __ATOMIC_ACQUIRE) == kind)
@@ -336,7 +446,8 @@ static int64_t spin_ns(void) {
     static int64_t ns = -1;
     if (ns < 0) {
         const char *e = getenv("HOS_SPIN_US");
-        ns = (e ? atoll(e) : 20) * 1000;
+        ns = (e ? atoll(e) : 40) * 1000;   /* ((Triforce, 11-21) 40 us, was 20: a spin now gives its core to a waiter that asks
+                                              (hos_vcore_asked), so a longer one blocks nobody. Lab A/B 79.7 -> 80.4, every round) */
     }
     return ns;
 }
@@ -367,6 +478,7 @@ static void spin_until_set(Obj *o, volatile int *flag) {
             spin_end(o, misses, 0);
             return;
         }
+        if (hos_vcore_asked()) return;   /* ((Triforce, 11-21) a waiter wants this core: to the sleep, which gives it up */
     }
 }
 static void spin_until_free(Obj *o) {
@@ -385,6 +497,7 @@ static void spin_until_free(Obj *o) {
             spin_end(o, misses, 0);
             return;
         }
+        if (hos_vcore_asked()) return;   /* ((Triforce, 11-21) a waiter wants this core: to the sleep, which gives it up */
     }
 }
 #else
@@ -448,12 +561,12 @@ static void cv_enter(Obj *cv, Obj *m) {
     if (cv->cv_waiting && cv->cv_mutex != m) cv->cv_mixed = 1;
     if (!cv->cv_waiting) cv->cv_mixed = 0;
     cv->cv_mutex = m;
-    cv->cv_waiting++;
+    __atomic_add_fetch(&cv->cv_waiting, 1, __ATOMIC_SEQ_CST);
 }
 /* a waiter out (cv->lk held): whether a signal reserved its mutex m for it. A reservation made on another mutex (a
    waiter with a different one came in after the signal) is given back: never left owed to nobody */
 static int cv_leave(Obj *cv, Obj *m) {
-    cv->cv_waiting--;
+    __atomic_sub_fetch(&cv->cv_waiting, 1, __ATOMIC_SEQ_CST);
     if (cv->cv_owed <= 0) return 0;
     Obj *r = cv->cv_owed_mutex[--cv->cv_owed];
     if (r == m) return 1;
@@ -578,6 +691,18 @@ HLE(_ZN2nn2os25FinalizeConditionVariableEPNS0_21ConditionVariableTypeE) { drop(A
 HLE(_ZN2nn2os23SignalConditionVariableEPNS0_21ConditionVariableTypeE) {
     Obj *cv = obj(ARG(0), K_COND);
     if (watched_cv(ARG(0))) watch_log("signal", watch_mutex(), ARG(0), c, NULL);
+    /* TICK-062 B1, HOS_CV_SIGNAL_FAST=1: a signal with no waiter changes nothing a later wait can see, so it returns before
+       taking cv->lk. No wake is lost: (1) a waiter registers (cv_waiting++, seq_cst) under cv->lk BEFORE it releases the guest
+       mutex (mutex_release_all) and before it sleeps, and reads cv->gen before registering. (2) A signal the guest orders
+       after a wait's registration (it took the mutex the waiter released, or any release/acquire chain from it) reads
+       cv_waiting with a seq_cst load after that, so it sees >= 1 and takes the slow path below, exactly as before. (3) A
+       signal not ordered with the registration (no mutex, truly concurrent) may read 0: that is the signal ordered before the
+       wait, which the slow path also loses (it bumps gen before the waiter reads gen, so the waiter sleeps on). (4) With no
+       waiter the slow path only bumps gen (compared only as a delta by waiters that registered later) and cv_reserve (a no-op
+       with cv_waiting <= cv_owed, owed being 0 with no waiter) and wakes nobody. The wake order of waiters is untouched. */
+    static int fast = -1;
+    if (fast < 0) fast = !(getenv("HOS_CV_SIGNAL_FAST") && atoi(getenv("HOS_CV_SIGNAL_FAST")) == 0);   /* ((Triforce) on by default since 11-21, lab +5.8%; =0: off */
+    if (fast && !__atomic_load_n(&cv->cv_waiting, __ATOMIC_SEQ_CST)) return;
     AcquireSRWLockExclusive(&cv->lk);
     cv_reserve(cv);
     cv->gen++;
@@ -862,6 +987,12 @@ HLE(_ZN2nn2os19TimedWaitLightEventEPNS0_14LightEventTypeENS_8TimeSpanE) {
 /* System events are created by other HLE APIs (vsync, audio device changes ...) with hos_system_event_init. */
 void hos_system_event_init(uint64_t key, int autoclear) { event_init(key, 0, autoclear); }
 void hos_system_event_signal(uint64_t key) { event_signal(obj(key, K_EVENT)); }
+/* ((Triforce, 11-22, the performance audit's IO-34, after Source A's) A system event cleared, and set, by an HLE that
+   holds a host lock of its own while it does (nn_video.c: the movie decoder's lock, so the event's state and the
+   decoder's count change together). Looked up without the virtual-core checkpoint: one there can give the core up and
+   wait for another with that lock held, while a thread that holds a core waits for the lock (see obj_nockpt) */
+void hos_system_event_clear(uint64_t key) { event_clear(obj_nockpt(key, K_EVENT)); }
+void hos_system_event_signal_held(uint64_t key) { event_signal(obj_nockpt(key, K_EVENT)); }
 HLE(_ZN2nn2os18DestroySystemEventEPNS0_15SystemEventTypeE) { drop(ARG(0)); }
 HLE(_ZN2nn2os16ClearSystemEventEPNS0_15SystemEventTypeE) { event_clear(obj(ARG(0), K_EVENT)); }
 HLE(_ZN2nn2os15WaitSystemEventEPNS0_15SystemEventTypeE) { logged_wait(c, obj(ARG(0), K_EVENT), 0, 0, "system"); }

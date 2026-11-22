@@ -94,6 +94,10 @@ def recorder_calls(text):
 B_DIRECT_STMT = "::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);"
 # ((Triforce, P4) the boundaries whose arguments go through a counting macro of vk_work.h first: cmd_work.h work_begun, work_submitted)
 COUNTED_BOUNDARIES = {"vkBeginCommandBuffer": "RX_WORK_BEGUN", "vkQueueSubmit2": "RX_WORK_SUBMIT"}
+# ((Triforce, 11-22, the performance audit's SYNC-27) the boundaries that block on the GPU: after the drain their macro hands the
+# driver's call and its arguments to a wrapper that times it (vk_work.h gpu_waits_vk, gpu_wait_kinds.h; tests/test_gpu_waits.py)
+TIMED_BOUNDARIES = {"vkQueueWaitIdle": "queue_idle", "vkDeviceWaitIdle": "device_idle", "vkWaitForFences": "fences",
+                    "vkWaitSemaphores": "semaphores", "vkGetQueryPoolResults": "query_results"}
 
 
 C_COMMENT_OR_STRING = re.compile(r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'', re.S)
@@ -167,7 +171,14 @@ def check_sources():
     # ((Triforce, P4) a begin and a submit pass their arguments through RX_WORK_BEGUN / RX_WORK_SUBMIT, which count them: cmd_work.h)
     bmacros = dict(re.findall(r"#define (\w+)\(\.\.\.\) \(::mkwvk::rec::boundary\(::mkwvk::rec::B_\w+\), (::vkx::|::)\w+\("
                               r"(?:RX_WORK_\w+\()?__VA_ARGS__\)?\)\)", work))
+    for f, wrapper in TIMED_BOUNDARIES.items():   # ((Triforce, 11-22, SYNC-27) drained first, then the driver's own call, timed)
+        if "#define %s(...) (::mkwvk::rec::boundary(::mkwvk::rec::B_%s), ::mkwvk::gpu_waits_vk::%s(::vkx::%s, __VA_ARGS__))" % (f, f, wrapper, f) in work:
+            bmacros[f] = "::vkx::"
+        else:
+            problems.append("vk_work.h: %s's macro does not drain and then call the driver through its timed wrapper" % f)
     for f, q in bmacros.items():
+        if f in TIMED_BOUNDARIES:
+            continue
         args = "%s(__VA_ARGS__)" % COUNTED_BOUNDARIES[f] if f in COUNTED_BOUNDARIES else "__VA_ARGS__"
         if "#define %s(...) (::mkwvk::rec::boundary(::mkwvk::rec::B_%s), %s%s(%s))" % (f, f, q, f, args) not in work:
             problems.append("vk_work.h: %s's macro calls another function" % f)
@@ -274,6 +285,10 @@ def build(cxx, headers, out, recorder_text, name, extra=(), work_text=None):
     (d / "vk_loader.h").write_text(test_loader(), encoding="utf-8")
     (d / "vk_work.h").write_text(work_text or (VK / "vk_work.h").read_text(encoding="utf-8"), encoding="utf-8")
     (d / "cmd_work.h").write_text((VK / "cmd_work.h").read_text(encoding="utf-8"), encoding="utf-8")   # ((Triforce, P4) vk_work.h's)
+    for h in ("gpu_wait_kinds.h", "lab_ab.h"):   # ((Triforce, 11-22, SYNC-27) vk_work.h's wait wrappers, and the knob they read)
+        (d / h).write_text((VK / h).read_text(encoding="utf-8"), encoding="utf-8")
+    (d / "lock_census.h").write_text((VK / "lock_census.h").read_text(encoding="utf-8"), encoding="utf-8")   # ((Triforce, THREAD-68) vk_recorder.h's)
+    (d / "new_wait.h").write_text((VK / "new_wait.h").read_text(encoding="utf-8"), encoding="utf-8")   # ((Triforce, OS-04) vk_recorder.h's)
     (d / "vk_recorder.h").write_text(recorder_text, encoding="utf-8")
     exe = d / "recorder_sync_test.exe"
     cmd = [cxx, "-std=c++20", "-O2", "-Wall", "-Wextra", "-Werror", "-Wno-unused-function", "-Wno-missing-field-initializers", "-DVK_NO_PROTOTYPES",
@@ -363,6 +378,10 @@ def exit_test(cxx, headers, out, recorder_text, name):
     (d / "vk_loader.h").write_text(test_loader(), encoding="utf-8")
     (d / "vk_work.h").write_text((VK / "vk_work.h").read_text(encoding="utf-8"), encoding="utf-8")
     (d / "cmd_work.h").write_text((VK / "cmd_work.h").read_text(encoding="utf-8"), encoding="utf-8")   # ((Triforce, P4) vk_work.h's)
+    for h in ("gpu_wait_kinds.h", "lab_ab.h"):   # ((Triforce, 11-22, SYNC-27) vk_work.h's wait wrappers, and the knob they read)
+        (d / h).write_text((VK / h).read_text(encoding="utf-8"), encoding="utf-8")
+    (d / "lock_census.h").write_text((VK / "lock_census.h").read_text(encoding="utf-8"), encoding="utf-8")   # ((Triforce, THREAD-68) vk_recorder.h's)
+    (d / "new_wait.h").write_text((VK / "new_wait.h").read_text(encoding="utf-8"), encoding="utf-8")   # ((Triforce, OS-04) vk_recorder.h's)
     (d / "vk_recorder.h").write_text(recorder_text, encoding="utf-8")
     src = str(ROOT / "tests" / "recorder_exit_test.cpp")
     flags = ["-std=c++20", "-O2", "-Wall", "-Wextra", "-Werror", "-DVK_NO_PROTOTYPES", "-D_CRT_SECURE_NO_WARNINGS"]

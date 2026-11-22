@@ -58,8 +58,10 @@ def check_source():
     need("vk_texture.cpp: texture_sweep()", sweep,
          ["const auto age60 = [](uint64_t presents) { return present_rate::at60(presents, tex_rate.rate); };",
           # (the eviction's own wait, in the hold's count of the dead targets and in the pass)
-          "if (age60(frame_no - last) < need_unused && !shifted) continue;",
-          "if (age60(frame_no - last) < need_unused && !shifted && !gone_early) continue;",
+          # ((Triforce, 11-21, TEX-76) a depth target another size replaced goes sooner: slot_retire.h)
+          "if (age60(frame_no - last) < need_unused && !shifted && !slot_retired(tex)) continue;",
+          "const bool young = age60(frame_no - last) < need_unused;",
+          "if (young && !shifted && !gone_early && !retired) continue;",
           # (what the game let go: in the mass that turns the rule on, and for each texture; the longest gap before a
           # take-back, keep taken's, too)
           "return age60(frame_no - tex->let_go) >= tex_pressure::let_go_wait(let_go_after, age60(tex->back_gap), keep_taken);",

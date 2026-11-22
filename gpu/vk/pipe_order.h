@@ -32,6 +32,7 @@
 #pragma once
 
 #include <algorithm>
+#include <climits>
 #include <cstdint>
 #include <deque>
 #include <iterator>
@@ -45,7 +46,11 @@
 
 namespace mkwvk::pipe_order {
 
-constexpr size_t kKeysMax = program_order::kKeysMax;   // (pipelines a session's order keeps, and the file)
+// ((Triforce, 11-21) 16384, was the programs' 4096: one ten-area tour needs 3918 pipelines, so an adult tour pushed half of the
+// child tour's out and its next tour linked 828 of 2274 ahead where it had linked 1455 of 2012 (pipeline stalls 1.3 -> 2.6 s,
+// the worst 174 -> 464 ms). The file only: what the warm holds stays bounded by kLinksMax and kLibsMax below, and the programs'
+// read-ahead (its RAM) by program_order's own 4096. 8 bytes a pipeline: 128 KB at most)
+constexpr size_t kKeysMax = 16384;   // (pipelines a session's order keeps, and the file)
 constexpr size_t kPerVariant = 32;     // (the order's pipelines made for a program variant, at most: as the notes')
 constexpr size_t kLinksMax = 1024;     // (links held for draws that have not come: a load's, beside the title's taken)
 constexpr size_t kLibsMax = 2048;      // (stage libraries the warm made that no draw has had: two a program variant of 1024)
@@ -58,9 +63,13 @@ inline bool on(const char* env) { return !(env && env[0] == '0' && !env[1]); }
 
 /// The file: program_order.h's form, its own magic
 inline std::vector<uint8_t> write(const std::vector<uint64_t>& keys) { return program_order::write(keys, kMagic); }
-inline std::vector<uint64_t> read(const uint8_t* data, size_t n) { return program_order::read(data, n, kMagic); }
-using program_order::merge;
-using Record = program_order::Record;
+inline std::vector<uint64_t> read(const uint8_t* data, size_t n) { return program_order::read(data, n, kMagic, kKeysMax); }
+inline std::vector<uint64_t> merge(const std::vector<uint64_t>& now, const std::vector<uint64_t>& before, size_t max = kKeysMax) {
+    return program_order::merge(now, before, max);
+}
+struct Record : program_order::Record {
+    Record() { max = kKeysMax; }
+};
 
 /// One pipeline of the order: its place, its note's record in the notes file
 struct Entry {
@@ -154,12 +163,19 @@ public:
         by_place_.emplace(std::make_pair(place, key), o);
         place_of_.emplace(key, place);
         while (by_place_.size() > max_) {
-            const auto last = std::prev(by_place_.end());
-            gone.push_back(last->second);
-            place_of_.erase(last->first.second);
-            by_place_.erase(last);
+            // ((Triforce, 11-21, soft) one behind the draws first (the farthest behind), then the farthest ahead as before
+            const bool back = soft_ && by_place_.begin()->first.first < behind_at_;
+            const auto out = back ? by_place_.begin() : std::prev(by_place_.end());
+            gone.push_back(out->second);
+            place_of_.erase(out->first.second);
+            by_place_.erase(out);
         }
     }
+    /// ((Triforce, 11-21) RX_VK_ORDER_SOFT_BEHIND) Soft: behind() lets nothing go, it marks where behind begins; those held there
+    /// stay for a draw that comes back to them (a tour's shared pipelines sit in another session's region of the merged order,
+    /// and the draws went back and forth: 1265 of 3048 links let go as behind in a child tour after an adult one) and go first
+    /// when a new link needs the room. The bound (max) is the same
+    void soft(bool on) { soft_ = on; }
     /// The link held for key, taken out (a draw's from now on): false when none is
     bool take(uint64_t key, One& out) {
         const auto it = place_of_.find(key);
@@ -172,6 +188,10 @@ public:
     }
     /// Those placed before at, taken out into gone
     void behind(int64_t at, std::vector<One>& gone) {
+        if (soft_) {
+            behind_at_ = std::max(behind_at_, at);
+            return;
+        }
         const auto end = by_place_.lower_bound({at, 0});
         for (auto it = by_place_.begin(); it != end;) {
             gone.push_back(it->second);
@@ -193,7 +213,8 @@ public:
     }
     /// Whether a link at place would stay held: room left, or nearer than the farthest held (made, not let go at once)
     bool room(int64_t place) const {
-        return by_place_.size() < max_ || (!by_place_.empty() && place < std::prev(by_place_.end())->first.first);
+        return by_place_.size() < max_ || (!by_place_.empty() && place < std::prev(by_place_.end())->first.first) ||
+               (soft_ && !by_place_.empty() && by_place_.begin()->first.first < behind_at_);
     }
     /// Whether a link held was linked from library lib
     bool uses(uint64_t lib) const {
@@ -216,6 +237,8 @@ private:
         return false;
     }
     size_t max_;
+    bool soft_ = false;
+    int64_t behind_at_ = INT64_MIN;
     std::map<std::pair<int64_t, uint64_t>, One> by_place_;   // ((place, key): the nearest first)
     std::unordered_map<uint64_t, int64_t> place_of_;
 };

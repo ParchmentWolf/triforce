@@ -41,6 +41,7 @@ def main():
 struct Pool { uint64_t lo; };
 struct VkBufferCopy { uint64_t srcOffset, dstOffset, size; };
 std::mutex cpu_words_mu;
+bool wb_notes_off() { return false; }   // ((Triforce, 11-22, MEM-51) the mirrors are on here: tests/test_mirror_bookkeeping.py has the case without
 std::vector<uint64_t> cpu_words, cpu_words_recent, cpu_words_new;   // (the big and the recent sorted sets, and noted since: vk_memory.cpp)
 #define CHECK(ok) do { if (!(ok)) { std::fprintf(stderr, "failed line %d\n", __LINE__); std::exit(1); } } while (0)
 ''' + helper + r'''

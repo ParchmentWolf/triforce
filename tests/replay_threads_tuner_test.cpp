@@ -14,6 +14,11 @@
 //   better one as often as without it, and as soon after a change; a short trial never changes the way, one that finds the
 //   other way shorter is followed at once by a full one; a change the scene's means cannot see is found by a backed-off
 //   trial; the rule's no-trial verdicts hold; a load is no scene change.
+// "settled": (Triforce, 11-22) Tuner::settled, after Kaefergeneral's #dev-fixes post (a 5900X and an RTX 3090, where the
+//   helpers lose in every settled scene): an area's load window (long frames, the replay most of them, nearly every draw
+//   cuttable) gets no verdict, nor the first window after it; a settled heavy scene where the helpers win still turns them on
+//   without a trial, a window after it settled; a trial the scene changed under changes nothing and the next comes soon
+//   after the scene settles. With settled off, each as before.
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -193,11 +198,12 @@ struct Run {
     long long first_on = -1, first_trial = -1;
 };
 /// frames presents of a scene through the tuner, the way in use applied as par_tune_present applies it
-/// (backoff: the tuner's back-off; off for the checks of the trials' schedule as it was)
-Run run_scene(const Scene& sc, int frames, bool use_rule, uint32_t seed, Tuner* keep = nullptr, bool backoff = false) {
+/// (backoff: the tuner's back-off; off for the checks of the trials' schedule as it was. settled: Tuner::settled)
+Run run_scene(const Scene& sc, int frames, bool use_rule, uint32_t seed, Tuner* keep = nullptr, bool backoff = false,
+              bool settled = true) {
     Tuner local;
     Tuner& t = keep ? *keep : local;
-    t.use_rule = use_rule, t.threads = 4, t.backoff = backoff;
+    t.use_rule = use_rule, t.threads = 4, t.backoff = backoff, t.settled = settled;
     std::mt19937 r(seed);
     bool on = false;
     Run out;
@@ -222,7 +228,7 @@ void same_case() {
     for (int run = 0; run < 60; run++) {
         OldTuner old;
         Tuner t;
-        t.use_rule = false, t.backoff = false;
+        t.use_rule = false, t.backoff = false, t.settled = false;
         bool on = false, order_only = false;
         const double base = 6.0 + (r() % 900) / 100.0, par = 0.85 + (r() % 30) / 100.0;   // (the helpers 15% faster to 15% slower)
         for (int i = 0; i < 12000; i++) {
@@ -277,11 +283,18 @@ void rule_case() {
         CHECK(v.gain == v.saved && v.gain < 1.0 && v.kind != Verdict::kOn);
     }
     // the tuner on each scene, 20,000 presents
+    // (Triforce, 11-22: settled. On at the second window, the first with one before it to tell the scene settled; with
+    // settled off at the first, as before)
     const Run heavy = run_scene(test4_heavy, 20000, true, 1);
-    CHECK(heavy.first_on == Tuner::kWindow);             // (on at the first window, without a trial)
+    CHECK(heavy.first_on == 2 * Tuner::kWindow);         // (on at the second window, without a trial)
     CHECK(heavy.first_trial > heavy.first_on);           // (a trial came after, kEvery later)
     CHECK(heavy.changes == 0 && heavy.trials >= 6);       // (and kept them, 12% shorter frames: no trial took them off)
-    CHECK(heavy.on_frames > 20000 - 120 - (heavy.trials + 1) * (Tuner::kSettle + Tuner::kTake));   // (but in the trials' serial parts)
+    CHECK(heavy.on_frames > 20000 - 240 - (heavy.trials + 1) * (Tuner::kSettle + Tuner::kTake));   // (but in the trials' serial parts)
+    {
+        const Run was = run_scene(test4_heavy, 20000, true, 1, nullptr, false, false);
+        CHECK(was.first_on == Tuner::kWindow && was.first_trial > was.first_on && was.changes == 0 && was.trials >= 6);
+        CHECK(was.on_frames > 20000 - 120 - (was.trials + 1) * (Tuner::kSettle + Tuner::kTake));
+    }
     const Run gpu = run_scene(gpu_bound, 20000, true, 2);
     CHECK(gpu.trials == 0 && gpu.flips == 0 && gpu.rule_off > 100);   // (no trial at all: it cannot pay)
     const Run game = run_scene(test7_trial4, 20000, true, 3);
@@ -299,7 +312,7 @@ void rule_case() {
     // cannot pay, nothing at the title), the trials fewer where they decide, and none changed the way where it held
     {
         const Run h = run_scene(test4_heavy, 20000, true, 1, nullptr, true);
-        CHECK(h.first_on == Tuner::kWindow && h.first_trial > h.first_on && h.changes == 0);
+        CHECK(h.first_on == 2 * Tuner::kWindow && h.first_trial > h.first_on && h.changes == 0);
         CHECK(h.trials >= 2 && h.trials < heavy.trials);
         CHECK(h.on_frames > heavy.on_frames);   // (fewer frames the other way)
         const Run g = run_scene(gpu_bound, 20000, true, 2, nullptr, true);
@@ -394,7 +407,7 @@ void prev_case() {
         PrevTuner prev;
         Tuner t;
         const bool use_rule = run % 2 == 0;
-        prev.use_rule = use_rule, t.use_rule = use_rule, t.backoff = false;
+        prev.use_rule = use_rule, t.use_rule = use_rule, t.backoff = false, t.settled = false;
         prev.threads = t.threads = 2 + run % 3;
         bool on_p = false, on_t = false, order_only = false;
         Scene sc = scenes[r() % 6];
@@ -624,12 +637,119 @@ void backoff_case() {
     }
 }
 
+// ---- (Triforce, 11-22) settled ----
+
+// (from the post: the window of the teleport to the Market, "a frame of 14.84 ms ... the replay thread 11.37, 77% of it ...
+// 1394 of its 1464 draws and dispatches in command buffers to cut"; the settled Market with the replay 62% of the frame and the
+// helpers ~10% slower, 71.4 fps without them; Kokiri 85.8 fps, the helpers ~6% slower)
+const Scene arrival{14.84, 11.37, 6.0, 1464, 1394, 6.0, 1.0};
+const Scene market_settled{14.0, 8.7, 7.0, 3250, 3150, 6.5, 1.10};
+const Scene kokiri{11.66, 7.4, 5.8, 2000, 1900, 4.0, 1.06};
+
+struct Arrival {
+    int on_verdicts = 0, trials = 0, changes = 0;
+    long long first_on = -1, on_frames = 0;
+    std::vector<long long> unsettled;   // (the presents of the windows the rule did not judge, before the first trial)
+};
+/// Kokiri for two windows, the load's window, then `to` (each window the rule's: the first trial comes at present 600)
+Arrival run_arrival(const Scene& to, bool settled, uint32_t seed) {
+    Tuner t;
+    t.use_rule = true, t.backoff = true, t.settled = settled, t.threads = 4;
+    std::mt19937 r(seed);
+    bool on = false;
+    Arrival out;
+    for (int i = 0; i < 6000; i++) {
+        const Scene& sc = i < 2 * Tuner::kWindow ? kokiri : i < 3 * Tuner::kWindow ? arrival : to;
+        const Tuner::Step s = t.step(sample(sc, on, r), on, false);
+        if (s.ruled && s.verdict.kind == Verdict::kOn) out.on_verdicts++;
+        if (s.ruled && s.flip && out.first_on < 0) out.first_on = t.frames();
+        if (s.unsettled && !s.trial && !out.trials) out.unsettled.push_back(t.frames());
+        if (s.trial) out.trials++, out.changes += s.better;
+        if (s.flip) on = !on;
+        out.on_frames += on;
+    }
+    return out;
+}
+
+struct Straddle {
+    bool flipped = false, unsettled = false, second_ok = false, second_changed = true, on_after = true;
+    long long end1 = -1, end2 = -1, settle_at = -1;
+};
+/// A trial the scene changes under: its first part in test7's busy scene, its other way in a fade (5 ms frames either way,
+/// as short as a loading screen's), its last part in a lighter area where the helpers lose by 8% (the trials decide there).
+/// The trial's parts are told apart by its own changes of way
+Straddle run_straddle(bool settled, uint32_t seed) {
+    const Scene fade{5.0, 0.6, 0.9, 30, 0, 0.1, 1.0};
+    const Scene lose{12.0, 9.6, 8.4, 1500, 1400, 3.4, 1.08};
+    Tuner t;
+    t.use_rule = true, t.backoff = true, t.settled = settled, t.threads = 4;
+    std::mt19937 r(seed);
+    bool on = false;
+    int part = 0;   // (0: before the trial's first change of way, 1: its other way, 2: after)
+    Straddle out;
+    for (int i = 0; i < 6000; i++) {
+        const Scene& sc = part == 0 ? test7_busy : part == 1 ? fade : lose;
+        const Tuner::Step s = t.step(sample(sc, on, r), on, false);
+        if (s.settle && out.settle_at < 0) out.settle_at = t.frames();
+        if (s.trial && out.end1 < 0) {
+            out.end1 = t.frames(), out.flipped = s.flip, out.unsettled = s.unsettled;
+        } else if (s.trial && out.end2 < 0) {
+            out.end2 = t.frames(), out.second_ok = s.ok && !s.unsettled, out.second_changed = s.better;
+        }
+        if (s.flip && !s.trial && !s.ruled && part < 2) part++;
+        if (s.flip) on = !on;
+        if (out.end2 > 0 && t.frames() == out.end2) out.on_after = on;
+    }
+    return out;
+}
+
+void settled_case() {
+    CHECK(rule(mean_of(arrival), 4).kind == Verdict::kOn);   // (as the post's log has it, judged alone)
+    CHECK(rule(mean_of(market_settled), 4).kind == Verdict::kTrial && rule(mean_of(kokiri), 4).kind == Verdict::kTrial);
+    // the load's window: no verdict, nor the first window after it; the settled Market's are the trials'
+    {
+        const Arrival n = run_arrival(market_settled, true, 61), o = run_arrival(market_settled, false, 61);
+        CHECK(n.on_verdicts == 0 && n.first_on < 0);
+        // (the first window, none before it; the load's; the Market's first)
+        CHECK((n.unsettled == std::vector<long long>{Tuner::kWindow, 3 * Tuner::kWindow, 4 * Tuner::kWindow}));
+        CHECK(n.trials >= 2 && n.changes == 0);   // (the trials keep the replay thread alone)
+        CHECK(o.on_verdicts >= 1 && o.first_on == 3 * Tuner::kWindow && o.unsettled.empty());   // (before: on at the load's window)
+        std::printf("settled: the load's window into the Market: %d \"on\" verdicts (%d with settled off, on at present %lld), %d "
+                    "windows not judged before the first trial; the helper threads in %lld of 6,000 frames (%lld)\n",
+                    n.on_verdicts, o.on_verdicts, o.first_on, (int)n.unsettled.size(), n.on_frames, o.on_frames);
+    }
+    // a settled heavy scene where the helpers win (test4's): on without a trial, a window after it settled, and kept
+    {
+        const Arrival n = run_arrival(test4_heavy, true, 62), o = run_arrival(test4_heavy, false, 62);
+        CHECK(n.first_on == 5 * Tuner::kWindow);   // (the heavy scene's second window: the first with one like it before)
+        CHECK(n.changes == 0 && n.on_frames > 6000 - 600 - (n.trials + 1) * (Tuner::kSettle + Tuner::kTake));
+        CHECK(o.first_on == 3 * Tuner::kWindow);
+        std::printf("settled: the load's window into test4's heavy scene: the helper threads on at present %lld without a trial "
+                    "(%lld with settled off), kept by %d trials\n", n.first_on, o.first_on, n.trials);
+    }
+    // a trial the scene changed under: nothing changes, and the next comes soon after the scene settles
+    {
+        const Straddle n = run_straddle(true, 63), o = run_straddle(false, 63);
+        CHECK(n.end1 > 0 && n.unsettled && !n.flipped);
+        CHECK(n.settle_at > n.end1 && n.settle_at <= n.end1 + 2 * Tuner::kWindow);
+        // (the next trial kWindow after the settled window, and its 80 + 24 + 80 + 24 + 80 frames)
+        CHECK(n.end2 == n.settle_at + Tuner::kWindow + Tuner::kTake + 2 * (Tuner::kSettle + Tuner::kTake));
+        CHECK(n.second_ok && !n.second_changed && !n.on_after);   // (the settled area's trial keeps the replay thread alone)
+        CHECK(o.flipped && !o.unsettled);   // (before: the fade's short frames passed for the helpers' gain)
+        CHECK(o.end2 - o.end1 >= Tuner::kEvery);
+        std::printf("settled: a trial the scene changed under: %s (%s with settled off); the scene settled %lld presents after "
+                    "it, the next trial ended %lld after it (%lld)\n", n.flipped ? "a change" : "no change",
+                    o.flipped ? "the helper threads on" : "no change", n.settle_at - n.end1, n.end2 - n.end1, o.end2 - o.end1);
+    }
+}
+
 int main(int argc, char** argv) {
     const std::string c = argc > 1 ? argv[1] : "";
     if (c == "same") same_case();
     else if (c == "prev") prev_case();
     else if (c == "rule") rule_case();
     else if (c == "backoff") backoff_case();
+    else if (c == "settled") settled_case();
     else return std::printf("which case?\n"), 2;
     return failures ? 1 : 0;
 }

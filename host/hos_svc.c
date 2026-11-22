@@ -357,6 +357,8 @@ static void query_memory(uint64_t out, uint64_t addr) {
 #define CUR_THREAD 0xFFFF8000u
 static HosThread *thread_handle(uint32_t h) { return h == CUR_THREAD ? hos_self() : hos_thread_by_handle(h); }
 
+int hos_core_count_on(void);
+void hos_core_count_svc(void);
 void a64_svc(Ctx *c, uint32_t imm) {
     hos_vcore_checkpoint();
     switch (imm) {
@@ -445,6 +447,7 @@ void a64_svc(Ctx *c, uint32_t imm) {
         return;
     }
     case 0x10:   /* GetCurrentProcessorNumber */
+        if (hos_core_count_on()) hos_core_count_svc();   /* (TICK-062 A10, HOS_CORE_COUNT) */
         c->x[0] = (uint32_t)hos_thread_core(hos_self());
         return;
     case 0x1E:   /* GetSystemTick */
@@ -503,8 +506,8 @@ void a64_svc(Ctx *c, uint32_t imm) {
             extern int rx_guest_imported(uint64_t lo, uint64_t hi);
             const int io = hos_guest_io_begin(GP(c->x[0]), c->x[1]);   /* (Triforce: the lazy write-back's pages first: rx_backend.c) */
             /* ((Triforce) the census: zeroed pages stay committed, kept for the give-back once no import holds them) */
-            if (rx_guest_imported(c->x[0], c->x[0] + c->x[1]))
-                memset(GP(c->x[0]), 0, (size_t)c->x[1]), hos_mem_note(HOS_MEM_ZEROED, c->x[0], c->x[1]);
+            if (rx_guest_imported(c->x[0], c->x[0] + c->x[1]))   /* ((Triforce, 11-22, MEM-13) the zeros marked written with HOS_MEM_ZERO_MARK=1) */
+                hos_guest_fill(c->x[0], 0, c->x[1]), hos_mem_note(HOS_MEM_ZEROED, c->x[0], c->x[1]);
             else VirtualFree(GP(c->x[0]), (SIZE_T)c->x[1], MEM_DECOMMIT), hos_mem_note(HOS_MEM_DECOMMITTED, c->x[0], c->x[1]);
             hos_guest_io_end(io);
         }

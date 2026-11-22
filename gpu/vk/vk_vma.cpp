@@ -25,13 +25,31 @@ namespace mkwvk {
 VmaAllocator vma;
 uint64_t test_card_ballast = 0;   // (RX_VK_TEST_CARD_MB, a lab tool: the VRAM taken so that the card plays a smaller one; vma_init)
 
+// ---- (Triforce, 11-22, the performance audit's TEX-47, after Source A's) VK_EXT_memory_priority ----
+// Off unless RX_VK_MEMORY_PRIORITY is set and the device has the extension (dev.memory_priority, vk_main.cpp): then the
+// allocator is made with VMA_ALLOCATOR_CREATE_EXT_MEMORY_PRIORITY_BIT and gives every pool's blocks and every allocation of
+// its own the priority its create info names. One that names none gets 0, below the textures, so every VmaPoolCreateInfo and
+// VmaAllocationCreateInfo in this file names its tier: the render targets' pools 1.0, the textures' pool 0.25, the other
+// images, the buffers and the mirrors' pieces 0.5, the lab's ballast 1.0 so that RX_VK_TEST_CARD_MB still holds the card
+// (memory_priority.h; tests/test_memory_priority.py reads this file for it). Without the bit VMA ignores the field, and
+// prio() is 0.5 for everything.
+const memory_priority::Tiers& memory_tiers() {
+    static const memory_priority::Tiers t = memory_priority::active(getenv("RX_VK_MEMORY_PRIORITY"), dev.memory_priority);
+    return t;
+}
+namespace {
+using PrioKind = memory_priority::Kind;
+float prio(PrioKind k) { return memory_priority::of(memory_tiers(), k); }
+}   // namespace
+
 bool vma_init(PFN_vkGetInstanceProcAddr gipa) {
     VmaVulkanFunctions f{};
     f.vkGetInstanceProcAddr = gipa;
     f.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
     VmaAllocatorCreateInfo ci{};
     ci.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT |
-               (dev.memory_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0);
+               (dev.memory_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0) |
+               (dev.memory_priority ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_PRIORITY_BIT : 0);   // ((Triforce, 11-22, TEX-47) above)
     ci.physicalDevice = dev.physical;
     ci.device = dev.device;
     ci.instance = dev.instance;
@@ -39,6 +57,9 @@ bool vma_init(PFN_vkGetInstanceProcAddr gipa) {
     ci.pVulkanFunctions = &f;
     ci.preferredLargeHeapBlockSize = 64ull << 20;   // (64 MB blocks: Eglantine found 256 MB ones wasted VRAM)
     if (vmaCreateAllocator(&ci, &vma) != VK_SUCCESS) return false;
+    if (dev.memory_priority)
+        logf("vk: memory priorities on (RX_VK_MEMORY_PRIORITY, VK_EXT_memory_priority): render targets %.2f, sampled textures "
+             "%.2f, the rest %.2f", (double)prio(PrioKind::Target), (double)prio(PrioKind::Texture), (double)prio(PrioKind::Other));
     // (Triforce, a lab tool) RX_VK_TEST_BALLAST_MB=<n>: that much VRAM taken and held for the session, in 256 MB device buffers
     // of their own. RX_VK_TEST_ALLOWED_MB only changes the number the budget is told; this fills the card for real, as a card
     // with less VRAM or another program's use does: the driver's own behaviour at its limit (allocations of 110-170 ms in a
@@ -67,6 +88,7 @@ bool vma_init(PFN_vkGetInstanceProcAddr gipa) {
             ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
             ai.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
             ai.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+            ai.priority = prio(PrioKind::Held);   // ((Triforce, 11-22, TEX-47) the ballast stays on the card)
             VkBuffer b = VK_NULL_HANDLE;
             VmaAllocation a = VK_NULL_HANDLE;
             if (vmaCreateBuffer(vma, &bi, &ai, &b, &a, nullptr) != VK_SUCCESS) break;   // (kept: never freed)
@@ -128,6 +150,7 @@ VmaPool small_targets_pool() {
     small_target_pool_tried = true;
     if (!target_images_pool()) return VK_NULL_HANDLE;   // (the targets' pool's memory type: target_pool_type)
     VmaPoolCreateInfo pi{};
+    pi.priority = prio(PrioKind::Target);   // ((Triforce, 11-22, TEX-47))
     pi.memoryTypeIndex = target_pool_type;
     pi.blockSize = (getenv("RX_VK_SMALL_TARGET_MB") ? (uint64_t)std::max(4, atoi(getenv("RX_VK_SMALL_TARGET_MB"))) : 16u) << 20;
     // (and a floor of blocks never given back, RX_VK_SMALL_TARGET_KEEP (8 = 128 MB): a tour on an 8 GB card played here lost
@@ -159,11 +182,13 @@ VmaPool target_images_pool() {
     rep.samples = VK_SAMPLE_COUNT_1_BIT;
     rep.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     VmaAllocationCreateInfo ai{};
+    ai.priority = prio(PrioKind::Target);   // ((Triforce, 11-22, TEX-47))
     ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     ai.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     uint32_t type = 0;
     if (vmaFindMemoryTypeIndexForImageInfo(vma, &rep, &ai, &type) != VK_SUCCESS) return VK_NULL_HANDLE;
     VmaPoolCreateInfo pi{};
+    pi.priority = prio(PrioKind::Target);   // ((Triforce, 11-22, TEX-47) the render targets: kept in video memory first)
     pi.memoryTypeIndex = type;
     target_pool_type = type;
     pi.blockSize = target_block();
@@ -197,11 +222,13 @@ VmaPool images_pool() {
     rep.samples = VK_SAMPLE_COUNT_1_BIT;
     rep.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     VmaAllocationCreateInfo ai{};
+    ai.priority = prio(PrioKind::Other);   // ((Triforce, 11-22, TEX-47))
     ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     ai.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     uint32_t type = 0;
     if (vmaFindMemoryTypeIndexForImageInfo(vma, &rep, &ai, &type) != VK_SUCCESS) return VK_NULL_HANDLE;
     VmaPoolCreateInfo pi{};
+    pi.priority = prio(PrioKind::Other);   // ((Triforce, 11-22, TEX-47) the other images: the driver's own 0.5)
     pi.memoryTypeIndex = type;
     pi.blockSize = kImageBlock;
     if (vmaCreatePool(vma, &pi, &image_pool) != VK_SUCCESS) image_pool = VK_NULL_HANDLE;
@@ -227,6 +254,7 @@ VmaPool textures_pool() {
     rep.samples = VK_SAMPLE_COUNT_1_BIT;
     rep.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     VmaAllocationCreateInfo ai{};
+    ai.priority = prio(PrioKind::Texture);   // ((Triforce, 11-22, TEX-47))
     ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     ai.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     uint32_t type = 0;
@@ -235,6 +263,7 @@ VmaPool textures_pool() {
         return VK_NULL_HANDLE;
     }
     VmaPoolCreateInfo pi{};
+    pi.priority = prio(PrioKind::Texture);   // ((Triforce, 11-22, TEX-47) the sampled textures: moved out first)
     pi.memoryTypeIndex = type;
     pi.blockSize = kImageBlock;
     if (vmaCreatePool(vma, &pi, &texture_pool) != VK_SUCCESS) texture_pool = VK_NULL_HANDLE;
@@ -418,6 +447,7 @@ void ahead_main() {
         VkMemoryRequirements req{};
         req.size = a.block, req.alignment = 4096, req.memoryTypeBits = ~0u;
         VmaAllocationCreateInfo ai{};
+        ai.priority = prio(PrioKind::Other);   // ((Triforce, 11-22, TEX-47) in a pool: its blocks have the pool's)
         ai.pool = job.first;
         if (dev.memory_budget) ai.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
         VmaAllocation r = VK_NULL_HANDLE;
@@ -486,6 +516,9 @@ bool create_image_inner(const VkImageCreateInfo& ci, VkImage& image, VmaAllocati
 }
 bool create_image_inner_(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated, bool target, bool textures) {
     VmaAllocationCreateInfo ai{};
+    // ((Triforce, 11-22, TEX-47) for an image that gets memory of its own; in a pool the pool's priority counts. The copies
+    // of this info below keep it)
+    ai.priority = prio(target ? PrioKind::Target : textures ? PrioKind::Texture : PrioKind::Other);
     ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     // (in VRAM or not at all: an image VMA puts in system memory when VRAM is full is read over PCIe every frame,
     // and takes the RAM the game and everything else on the machine need)
@@ -529,6 +562,7 @@ bool create_image_inner_(const VkImageCreateInfo& ci, VkImage& image, VmaAllocat
     // to system memory instead, slow but drawn
     if (getenv("RX_VK_IMAGES_VRAM_ONLY")) return false;
     VmaAllocationCreateInfo sai{};
+    sai.priority = ai.priority;   // ((Triforce, 11-22, TEX-47))
     sai.usage = VMA_MEMORY_USAGE_AUTO;
     if (vmaCreateImage(vma, &ci, &sai, &image, &allocation, nullptr) != VK_SUCCESS) return false;
     static std::atomic<int> told{0};
@@ -549,6 +583,7 @@ bool create_buffer(uint64_t size, VkBufferUsageFlags usage, bool host_visible, V
     bi.size = size;
     bi.usage = usage;
     VmaAllocationCreateInfo ai{};
+    ai.priority = prio(PrioKind::Other);   // ((Triforce, 11-22, TEX-47))
     ai.usage = VMA_MEMORY_USAGE_AUTO;
     if (host_visible) ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
     // (a buffer with VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT gets VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT from VMA:
@@ -568,6 +603,7 @@ bool create_buffer_cached(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buf
     bi.size = size;
     bi.usage = usage;
     VmaAllocationCreateInfo ai{};
+    ai.priority = prio(PrioKind::Other);   // ((Triforce, 11-22, TEX-47))
     ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
     ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
     if (dedicated) ai.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;   // (its own memory object: no part of a 64 MB block left unused)
@@ -575,6 +611,31 @@ bool create_buffer_cached(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buf
     if (vmaCreateBuffer(vma, &bi, &ai, &buffer, &allocation, &info) != VK_SUCCESS) return false;
     if (mapped) *mapped = info.pMappedData;
     return true;
+}
+/// ((Triforce, 11-22, the performance audit's MEM-39; lab only, RX_VK_CAP_UNCACHED=1) As create_buffer_cached, asked for as
+/// memory written in order: the allocator then avoids cached types, which gives write-combined memory where there is one
+bool create_buffer_uncached(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buffer, VmaAllocation& allocation,
+                            void** mapped, bool dedicated) {
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = size;
+    bi.usage = usage;
+    VmaAllocationCreateInfo ai{};
+    ai.priority = prio(PrioKind::Other);   // ((Triforce, 11-22, TEX-47) as create_buffer_cached's)
+    ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+    ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    if (dedicated) ai.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+    VmaAllocationInfo info{};
+    if (vmaCreateBuffer(vma, &bi, &ai, &buffer, &allocation, &info) != VK_SUCCESS) return false;
+    if (mapped) *mapped = info.pMappedData;
+    return true;
+}
+/// ((Triforce, 11-22, MEM-39) An allocation's memory type and that type's property flags: for the log
+uint32_t alloc_memory_type(VmaAllocation allocation, VkMemoryPropertyFlags* flags) {
+    VmaAllocationInfo info{};
+    if (!allocation) return ~0u;
+    vmaGetAllocationInfo(vma, allocation, &info);
+    if (flags) vmaGetAllocationMemoryProperties(vma, allocation, flags);
+    return info.memoryType;
 }
 bool host_cached(VmaAllocation allocation) {
     VkMemoryPropertyFlags f = 0;
@@ -598,6 +659,7 @@ bool create_device_buffer(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buf
     bi.size = size;
     bi.usage = usage;
     VmaAllocationCreateInfo ai{};
+    ai.priority = prio(PrioKind::Other);   // ((Triforce, 11-22, TEX-47))
     ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     ai.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     if (dev.memory_budget) ai.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
@@ -611,6 +673,7 @@ bool vma_piece_alloc(uint64_t size, uint64_t alignment, uint32_t type_bits, VmaA
     VkMemoryRequirements req{};
     req.size = size, req.alignment = alignment, req.memoryTypeBits = type_bits;
     VmaAllocationCreateInfo ai{};
+    ai.priority = prio(PrioKind::Other);   // ((Triforce, 11-22, TEX-47) the mirrors' pieces: the driver's own 0.5)
     ai.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     if (dev.memory_budget) ai.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
     VmaAllocationInfo info{};
@@ -625,6 +688,7 @@ bool vma_piece_alloc(uint64_t size, uint64_t alignment, uint32_t type_bits, VmaA
         piece_pool_tried = true;
         if (vmaFindMemoryTypeIndex(vma, type_bits, &ai, &piece_type) == VK_SUCCESS) {
             VmaPoolCreateInfo pi{};
+            pi.priority = prio(PrioKind::Other);   // ((Triforce, 11-22, TEX-47))
             pi.memoryTypeIndex = piece_type;
             pi.blockSize = kPieceBlock;
             if (vmaCreatePool(vma, &pi, &piece_pool) != VK_SUCCESS) piece_pool = VK_NULL_HANDLE;

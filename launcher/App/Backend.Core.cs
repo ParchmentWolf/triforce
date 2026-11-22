@@ -328,15 +328,21 @@ public sealed partial class Backend
         r.Line += l => { lock (logOut) logOut.AppendLine(l); };
         var last = DateTime.MinValue;
         var eb = req.IsUpdate ? (release != null && workKind == "update" ? "Updating to " + release.Tag : "Building your game again") : "Building your game";
+        // (the lines come on two threads, the tick on a third: one at a time)
+        var pushGate = new object();
+        var ticking = true;
         void Push(bool force = false)
         {
-            if (!force && (DateTime.UtcNow - last).TotalMilliseconds < 250) return;
-            last = DateTime.UtcNow;
-            var e = r.Estimate ?? est;
-            var left = BuildClock.Remaining(e, r.Tracker);
-            WorkScreen(eb, BuildClock.LeftText(left), 0.08 + 0.92 * Fraction(e, r.Tracker), Steps(null, (e, r.Tracker)),
-                "Keep this window open; you can minimize it. You get a notice when the game is ready.", true,
-                req.IsUpdate ? null : new[] { ("Your game", "done"), ("Build", "now"), ("Play", "") });
+            lock (pushGate)
+            {
+                if (!force && (DateTime.UtcNow - last).TotalMilliseconds < 250) return;
+                last = DateTime.UtcNow;
+                var e = r.Estimate ?? est;
+                var left = BuildClock.Remaining(e, r.Tracker);
+                WorkScreen(eb, BuildClock.LeftText(left), 0.08 + 0.92 * Fraction(e, r.Tracker), Steps(null, (e, r.Tracker)),
+                    "Keep this window open; you can minimize it. You get a notice when the game is ready.", true,
+                    req.IsUpdate ? null : new[] { ("Your game", "done"), ("Build", "now"), ("Play", "") });
+            }
         }
         r.Event += _ => Push();
         r.StageChanged += (_, _) => Push(true);
@@ -344,7 +350,15 @@ public sealed partial class Backend
         Go("work");
         using var reg = token.Register(() => r.Stop());
         lastFailure = null;
-        var res = lastResult = await r.RunAsync(req, token);
+        // (a step can take minutes with no line: the time left counts down, or holds, every second all the same)
+        var tick = new Timer(_ => { lock (pushGate) if (ticking) Push(); }, null, 1000, 1000);
+        BuildResult res;
+        try { res = lastResult = await r.RunAsync(req, token); }
+        finally
+        {
+            lock (pushGate) ticking = false;
+            tick.Dispose();
+        }
         Push(true);
         FlushLog();
         logTimer?.Dispose(); logTimer = null;

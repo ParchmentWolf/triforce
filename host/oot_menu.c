@@ -28,14 +28,13 @@
 #define PAUSE_SCREEN_VTABLE 0x84c0baa8ULL
 #define OPTIONS_FROM_PAUSE_NS 500000000LL   /* (the pause menu's last update, at most this long before the Options' first) */
 void rx_option_set(int id, int value);   /* rx_backend.c */
-#if defined(_WIN32) && !defined(HOS_OOT_MENU_NO_MOUSE)   /* (the macro: tests/test_oot_menu_mouse.py builds the other half on Windows) */
-#include <windows.h>
-#include <ctype.h>
-#include <stdio.h>
+/* ((Triforce, 11-22) Both halves': the guest reads, a screen's list of entries and its buttons' boxes, and benchmark mode's
+   presses through the start's screens (bench_menu). Without them the Linux half pressed nothing, and the benchmark stood
+   on the title screen (#bug-tracker, 11-21). The mouse, Quit and Mods stay the Windows half's */
 #include <stdlib.h>
 #include <string.h>
-#include "../gpu/vk/vk_api.h"   /* (HOS_MOUSE_*) */
 #include "hos_bench.h"   /* ((Triforce, 11-19) benchmark mode) */
+void hos_hid_tap(const char *press);   /* (nn_hid.c) */
 
 /* A guest read, of the pointers the game's objects hold: inside the guest's space (below 1 MB: a null pointer's), it is
    read as the lifted code reads it; a page there not committed yet is committed on the touch (mkw_glue.c
@@ -50,6 +49,77 @@ static uint64_t peek64(uint64_t a) {
     uint64_t v = 0;
     return peek(a, &v, 8) ? v : 0;
 }
+
+/* the screen's list of entries: fn(entry, button) for each, at most max */
+static int each_entry(uint64_t screen, int max, void (*fn)(int i, uint64_t entry, uint64_t button, void *arg), void *arg) {
+    const uint64_t head = screen + 136;
+    int32_t off = 0;
+    peek(screen + 156, &off, 4);
+    uint64_t node = peek64(screen + 144);
+    int i = 0;
+    for (; node && node != head && i < max; i++) {
+        const uint64_t entry = node - (uint64_t)(int64_t)off;
+        if (fn) fn(i, entry, peek64(entry + 24), arg);
+        node = peek64(node + 8);
+    }
+    return i;
+}
+
+typedef struct { float x0, y0, x1, y1; } Rect;
+/* The button's boxes (button+0x58, 0xb0 apart). The first is its hit box: its global matrix at +0x28 (3 x 4, by column:
+   the translation at +0x4c, +0x50; the layout's units, moving with a page as it slides; all 0 while its page is not shown)
+   and its rectangle at +0x84 (x, y, w, h, about the box's origin). The second is centred on the slot's picture (its
+   translation at +0xfc, +0x100; its own rectangle a fixed 700 x 700). A few slots' hit boxes cover only a side of the
+   picture (Pa_ItemIcon_05: 100 wide on the right of a slot 260 wide, its centre 80 to the right of the picture's): such
+   a box is mirrored about the picture's centre and both taken */
+static int button_rect(uint64_t button, Rect *r) {
+    float m[12], b[4], c[2];
+    const uint64_t box = peek64(button + 0x58);
+    if (!peek(box + 0x28, m, sizeof m) || !peek(box + 0x84, b, sizeof b)) return 0;
+    const float sx = m[0], sy = m[4], tx = m[9], ty = m[10];
+    if (!(sx > 1e-3f) || !(sy > 1e-3f) || !(b[2] > 0) || !(b[3] > 0)) return 0;
+    r->x0 = tx + sx * b[0], r->x1 = tx + sx * (b[0] + b[2]);
+    r->y0 = ty + sy * b[1], r->y1 = ty + sy * (b[1] + b[3]);
+    float s2;
+    if (peek(box + 0xd8, &s2, 4) && s2 > 1e-3f && peek(box + 0xfc, c, sizeof c)) {
+        const float w = r->x1 - r->x0, h = r->y1 - r->y0, cx = (r->x0 + r->x1) / 2, cy = (r->y0 + r->y1) / 2;
+        if (c[0] - cx < w && cx - c[0] < w && c[1] - cy < h && cy - c[1] < h) {   /* (the picture's centre near the box) */
+            const float x0 = 2 * c[0] - r->x1, x1 = 2 * c[0] - r->x0, y0 = 2 * c[1] - r->y1, y1 = 2 * c[1] - r->y0;
+            if (x0 < r->x0) r->x0 = x0;
+            if (x1 > r->x1) r->x1 = x1;
+            if (y0 < r->y0) r->y0 = y0;
+            if (y1 > r->y1) r->y1 = y1;
+        }
+    }
+    return 1;
+}
+
+/* ((Triforce, 11-19) benchmark mode, host/hos_bench.c: the start's screens pressed through as each gets a focused button. The
+   file select is left on the file it opens on, the newest (its entries are a carousel's places, not files: focusing one by
+   its place loaded another file in a lab run) */
+typedef struct { int index, state; } BenchLook;
+static void bench_entry(int i, uint64_t entry, uint64_t button, void *arg) {
+    (void)entry;
+    BenchLook *l = (BenchLook *)arg;
+    uint8_t state = 0;
+    if (peek(button + 56, &state, 1) && state > l->state) l->index = i, l->state = state;
+}
+static void bench_menu(Ctx *c, uint64_t screen, uint64_t vt) {
+    (void)c;
+    BenchLook l = {-1, 0};
+    const int n = each_entry(screen, 64, bench_entry, &l);
+    int entry = -1;
+    if (hos_bench_menu(screen, vt, 1, l.index, n, &entry) == HOS_BENCH_MENU_PRESS_A) hos_hid_tap("0:A/120");
+}
+
+#if defined(_WIN32) && !defined(HOS_OOT_MENU_NO_MOUSE)   /* (the macro: tests/test_oot_menu_mouse.py builds the other half on Windows) */
+#include <windows.h>
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "../gpu/vk/vk_api.h"   /* (HOS_MOUSE_*) */
+
 /* a printable C string at a (else "-") */
 static const char *text_at(uint64_t a, char *buf, size_t cap) {
     if (!peek(a, buf, cap - 1)) return "-";
@@ -71,21 +141,6 @@ static int64_t goal_ns;
 static uint64_t focused_button;   /* (the last pane f_802ed660 was handed) */
 static uint64_t asked;   /* (the button the mouse asked the focus for, until it has it) */
 static int page_now = -1;   /* (the shown page: 0 Collection, 1 Equipment, 2 Items, 3 System; L and R step through them) */
-
-/* the screen's list of entries: fn(entry, button) for each, at most max */
-static int each_entry(uint64_t screen, int max, void (*fn)(int i, uint64_t entry, uint64_t button, void *arg), void *arg) {
-    const uint64_t head = screen + 136;
-    int32_t off = 0;
-    peek(screen + 156, &off, 4);
-    uint64_t node = peek64(screen + 144);
-    int i = 0;
-    for (; node && node != head && i < max; i++) {
-        const uint64_t entry = node - (uint64_t)(int64_t)off;
-        if (fn) fn(i, entry, peek64(entry + 24), arg);
-        node = peek64(node + 8);
-    }
-    return i;
-}
 
 /* the game's focus setter on a button (on the game's thread, at a screen's update) */
 static int set_focus(Ctx *c, uint64_t screen, uint64_t button) {
@@ -270,7 +325,6 @@ static int map_floors(int *cur, int *top, int *bottom) {
     return *cur >= *bottom && *cur <= *top;
 }
 
-typedef struct { float x0, y0, x1, y1; } Rect;
 /* (Key Items' items, in their grid's order: item_found puts the page's own positions of them in) */
 static const char *const item_keys[9] = {"Item_Medal_Shadow", "Item_Medal_Light", "Item_Medal_Forest", "Item_Stone_Forest",
                                          "Item_Stone_Fire", "Item_Stone_Water", "Item_Medal_Spirit", "Item_Medal_Water",
@@ -285,9 +339,6 @@ static void item_found(const char *key, float x, float y, void *arg) {
             *a->found |= 1 << i, a->x[i] = x, a->y[i] = y;
     }
 }
-/* a button's rectangle in the layout's units (0 when it has none or is hidden) */
-static int button_rect(uint64_t button, Rect *r);
-
 typedef struct { float x, y; uint64_t hit; float area; int n; uint64_t button[128]; Rect rect[128]; } Hit;
 static void shown_entry(int i, uint64_t entry, uint64_t button, void *arg) {
     (void)i, (void)entry;
@@ -810,34 +861,6 @@ static void mouse_tick_locked(Ctx *c, uint64_t screen) {
     if (pressed & HOS_MOUSE_RIGHT) hos_hid_tap("0:B/80");
 }
 
-/* The button's boxes (button+0x58, 0xb0 apart). The first is its hit box: its global matrix at +0x28 (3 x 4, by column:
-   the translation at +0x4c, +0x50; the layout's units, moving with a page as it slides; all 0 while its page is not shown)
-   and its rectangle at +0x84 (x, y, w, h, about the box's origin). The second is centred on the slot's picture (its
-   translation at +0xfc, +0x100; its own rectangle a fixed 700 x 700). A few slots' hit boxes cover only a side of the
-   picture (Pa_ItemIcon_05: 100 wide on the right of a slot 260 wide, its centre 80 to the right of the picture's): such
-   a box is mirrored about the picture's centre and both taken */
-static int button_rect(uint64_t button, Rect *r) {
-    float m[12], b[4], c[2];
-    const uint64_t box = peek64(button + 0x58);
-    if (!peek(box + 0x28, m, sizeof m) || !peek(box + 0x84, b, sizeof b)) return 0;
-    const float sx = m[0], sy = m[4], tx = m[9], ty = m[10];
-    if (!(sx > 1e-3f) || !(sy > 1e-3f) || !(b[2] > 0) || !(b[3] > 0)) return 0;
-    r->x0 = tx + sx * b[0], r->x1 = tx + sx * (b[0] + b[2]);
-    r->y0 = ty + sy * b[1], r->y1 = ty + sy * (b[1] + b[3]);
-    float s2;
-    if (peek(box + 0xd8, &s2, 4) && s2 > 1e-3f && peek(box + 0xfc, c, sizeof c)) {
-        const float w = r->x1 - r->x0, h = r->y1 - r->y0, cx = (r->x0 + r->x1) / 2, cy = (r->y0 + r->y1) / 2;
-        if (c[0] - cx < w && cx - c[0] < w && c[1] - cy < h && cy - c[1] < h) {   /* (the picture's centre near the box) */
-            const float x0 = 2 * c[0] - r->x1, x1 = 2 * c[0] - r->x0, y0 = 2 * c[1] - r->y1, y1 = 2 * c[1] - r->y0;
-            if (x0 < r->x0) r->x0 = x0;
-            if (x1 > r->x1) r->x1 = x1;
-            if (y0 < r->y0) r->y0 = y0;
-            if (y1 > r->y1) r->y1 = y1;
-        }
-    }
-    return 1;
-}
-
 /* ---- (Triforce) The Mods entry under a game list's last button: the pause menu's System page (Save, Load, Options,
    Special Actions, Title Screen: its buttons left of the Basic Controls panel, x under 0) and the title's list (by its
    screen's vtable). Each frame such a list runs the renderer is told its last button's box and whether the game's cursor
@@ -934,6 +957,15 @@ static void mods_list_tick(uint64_t screen, int title, ModsCall *call) {
     const Rect r = l.r[last];
     const float pitch = (l.r[above].y0 + l.r[above].y1) / 2 - (r.y0 + r.y1) / 2;
     if (!(pitch > 20 && pitch < 600)) return;
+    /* ((Triforce, 11-20) the owner: "it should be synced with the timing of the other button ui so it seamlessly moves and
+       disappears with them". How much of the button the game shows is in its box beside its matrix (+0x78, a float, 0 to
+       1: the lab's probe of the title's list read 0 for the 1.5 s the list runs before it shows, a rise over a second
+       as the title opens, 1 to 0 in one frame as Options is chosen, and the 15-frame rise as the list comes back). The
+       renderer drew the entry by a clock of its own from the first frame the list ran: a second and a half before the
+       game's buttons, and 150 ms and a fade after they had gone. It is told the game's own amount now, each frame.
+       Anything but a number from 0 to 1 there: all of it, as before) */
+    float alpha = 1.0f;
+    if (!peek(peek64(l.b[last] + 0x58) + 0x78, &alpha, 4) || !(alpha >= 0.0f && alpha <= 1.0f)) alpha = 1.0f;
     /* The button's state byte (+56) is its focus animation's: 0 none, 1 coming, 3 focused, 2 going. While Mods has the
        cursor the game gets no input (nn_hid.c) and its last button is let go (mods_held, above) */
     uint8_t state = 0;
@@ -964,7 +996,14 @@ static void mods_list_tick(uint64_t screen, int title, ModsCall *call) {
            on it) The entry only while the game's cursor is on this list (its focus controller's entry is this screen's), or
            Mods has the cursor */
         int pend = 0;
-        if (!mods_cursor_button(screen, &pend) && !mods_held.button) return;
+        if (!mods_cursor_button(screen, &pend) && !mods_held.button) {
+            /* ((Triforce, 11-20) the game's buttons are hidden too (Options or the Load list opened over the title: their
+               alpha goes to 0 on that frame): said, not left to the renderer's 150 ms without a report, so the entry
+               goes on the frame they do. With the buttons still showing (the cursor between two of them for a frame) it
+               is not said, and the entry stays as before) */
+            if (alpha <= 0.0f) rx_option_set(HOS_OPT_MODS_LIST, 0);
+            return;
+        }
     }
     /* (coming or there; 2 is its focus going to another button. Let go for Mods, it is still the game's cursor's place) */
     const int focused = state == 1 || state == 3 || (mods_held.button && mods_held.button == l.b[last]);
@@ -979,7 +1018,8 @@ static void mods_list_tick(uint64_t screen, int title, ModsCall *call) {
         mods_entry = (Rect){mx - 550, my - pitch / 2, mx + 550, my + pitch / 2};
     }
     quit_entry = title ? (Rect){0, 0, 0, 0} : (Rect){r.x0, r.y0 - 2 * pitch, r.x1, r.y1 - 2 * pitch};
-    InterlockedExchange64(&mods_entry_ns, (LONG64)now);
+    if (alpha >= 0.5f) InterlockedExchange64(&mods_entry_ns, (LONG64)now);   /* (the mouse's: an entry not shown yet is not there to click) */
+    rx_option_set(HOS_OPT_MODS_ALPHA, (int)(alpha * 1000.0f + 0.5f));
     rx_option_set(HOS_OPT_MODS_X0, (int)r.x0), rx_option_set(HOS_OPT_MODS_X1, (int)r.x1);
     rx_option_set(HOS_OPT_MODS_Y0, (int)r.y0), rx_option_set(HOS_OPT_MODS_Y1, (int)r.y1);
     rx_option_set(HOS_OPT_MODS_PITCH, (int)pitch);
@@ -1048,24 +1088,6 @@ static Seen *screen_seen(uint64_t screen, int64_t now) {
                 screen == pause_screen_now() ? " (the pause menu)" : "");
     }
     return free_one;
-}
-
-/* ((Triforce, 11-19) benchmark mode, host/hos_bench.c: the start's screens pressed through as each gets a focused button. The
-   file select is left on the file it opens on, the newest (its entries are a carousel's places, not files: focusing one by
-   its place loaded another file in a lab run) */
-typedef struct { int index, state; } BenchLook;
-static void bench_entry(int i, uint64_t entry, uint64_t button, void *arg) {
-    (void)entry;
-    BenchLook *l = (BenchLook *)arg;
-    uint8_t state = 0;
-    if (peek(button + 56, &state, 1) && state > l->state) l->index = i, l->state = state;
-}
-static void bench_menu(Ctx *c, uint64_t screen, uint64_t vt) {
-    (void)c;
-    BenchLook l = {-1, 0};
-    const int n = each_entry(screen, 64, bench_entry, &l);
-    int entry = -1;
-    if (hos_bench_menu(screen, vt, 1, l.index, n, &entry) == HOS_BENCH_MENU_PRESS_A) hos_hid_tap("0:A/120");
 }
 
 void hos_oot_menu_tick(Ctx *c, uint64_t screen) {
@@ -1157,11 +1179,23 @@ void hos_oot_menu_tick(Ctx *c, uint64_t screen) {
 #include "../gpu/vk/vk_api.h"   /* (HOS_OPT_GAME_OPTIONS) */
 static int64_t options_seen_ns;   /* (the screens' updates run on several of the game's threads: read and written whole) */
 void hos_oot_menu_focus(Ctx *c, uint64_t screen, uint64_t pane, uint64_t lr) { (void)c, (void)screen, (void)pane, (void)lr; }
+/* ((Triforce, 11-22) benchmark mode: a screen's focused button as the Windows half's focus_entry finds it (its state set and its
+   box shown, the screen's focus manager there), then bench_menu as there */
+static void bench_focus_entry(int i, uint64_t entry, uint64_t button, void *arg) {
+    (void)i, (void)entry;
+    uint8_t state = 0;
+    Rect r;
+    if (!*(int *)arg && peek(button + 56, &state, 1) && state && button_rect(button, &r)) *(int *)arg = 1;
+}
 void hos_oot_menu_tick(Ctx *c, uint64_t screen) {
-    (void)c;
     uint64_t vt = 0;
     if (screen < 0x100000 || screen >= HOS_GUEST_SPACE - 8) return;
     memcpy(&vt, GP(screen), 8);
+    if (hos_bench_on()) {
+        int focus = 0;
+        if (peek64(peek64(screen + 32) + 96)) each_entry(screen, 400, bench_focus_entry, &focus);
+        if (focus) bench_menu(c, screen, vt);
+    }
     static int64_t pause_ran_ns;   /* ((Triforce, 11-20) the pause menu's last update: where the Options were chosen from) */
     static int options_from_pause;
     const int64_t now = hos_now_ns();

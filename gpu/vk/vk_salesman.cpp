@@ -1,5 +1,6 @@
 // (Triforce) The Happy Mask Salesman on the Mods page (vk_salesman.h): his files, his poses, and a small rasterizer.
 #include "vk_salesman.h"
+#include "cpu_count.h"   // ((Triforce, 11-22, OS-49) the threads to size by: HOS_SIM_CPU
 
 #include <algorithm>
 #include <atomic>
@@ -892,7 +893,7 @@ void draw(Model& md, float secs, float lift, int out_w, int out_h, Frame& out) {
             }
         }
     }
-    const int bands = std::clamp((int)std::thread::hardware_concurrency() - 1, 1, 6);
+    const int bands = std::clamp((int)cpu_count() - 1, 1, 6);
     std::vector<std::thread> th;
     for (int bi = 0; bi < bands; bi++) {
         const int ry0 = rs.H * bi / bands, ry1 = rs.H * (bi + 1) / bands;

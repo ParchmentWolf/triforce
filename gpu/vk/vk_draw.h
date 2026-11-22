@@ -38,10 +38,18 @@ struct PipeNote {
 struct PredictPlan {
     uint64_t prog, variant, vertex_note, output_note;
 };
+/// ((Triforce, 11-22, the performance audit's PIPE-44) What a prediction left out, for its line: noted variants the programs'
+/// file has no face for, and vertex layouts that did not fit their program's inputs (RX_VK_PREDICT_TYPES=1: predict_types.h)
+struct PredictCounts {
+    size_t no_face = 0, misfits = 0;
+};
 std::vector<std::unique_ptr<PipeNote>> predict_pipelines(const std::vector<std::unique_ptr<PipeNote>>& notes, size_t* programs,
-                                                         std::vector<PredictPlan>* plan = nullptr);
+                                                         std::vector<PredictPlan>* plan = nullptr, PredictCounts* counts = nullptr);
 std::vector<std::unique_ptr<PipeNote>> predict_rebuild(const std::vector<std::unique_ptr<PipeNote>>& notes,
                                                        const std::vector<PredictPlan>& plan);
+/// ((Triforce, 11-21, PIPE-83) One predicted pipeline's note into n, of the note V whose vertex layout and the note O whose
+/// targets and state it takes: what predict_rebuild makes of each plan entry
+void predicted_into(PipeNote& n, const PipeNote& V, const PipeNote& O, uint64_t prog, uint64_t variant);
 }
 
 #include <functional>
@@ -68,6 +76,9 @@ struct DrawArgs {
 
 /// A recording starts (its slot's descriptor pool and upload stream are reset); value: the timeline value it signals
 void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value);
+/// ((Triforce, 11-21, the performance audit's REPLAY-04) the slot's descriptor pools and grown streams reset now, before the
+/// recording's first packet, so that draw_begin_recording finds it done (vk_draw.cpp)
+void draw_slot_reset(int slot);
 /// Publish CPU writes from this slot's used streams before its commands reach the GPU (also for worker slots).
 void draw_flush_recording(int slot);
 /// The recording's stream still holds [at, at + n) in the mapping at base (a reset starts used over)
@@ -120,7 +131,17 @@ uint64_t replay_stream_pos();
 extern bool occ_live;
 void occ_draw_enter();
 void occ_draw_begin(VkCommandBuffer cmd);
+/// ((Triforce, 11-22, GPUWORK-01) a draw that writes colour, its pass open, before occ_draw_begin: counted, and with
+/// RX_VK_OCC_DEPTH_ONLY the count it falls in is given up)
+void occ_draw_colour(VkCommandBuffer cmd);
+/// ((Triforce, 11-22, DESC-82) whether the thread's count has a query open now (after occ_draw_begin); RX_VK_OCC_LEAN=3, the
+/// census of the colour-off draws such a query counts (occ_lean.h), on: vk_draw.cpp)
+bool occ_counting();
+bool occ_lean_census_on();
 void occ_draw_issued();
+/// ((Triforce, 11-22, PIPE-29) whether this thread's draws are inside a samples-passed count now: draw()'s depth budget waits
+/// for those (a draw left out there changes what the count says)
+bool occ_counting_now();
 void occ_pass_end(VkCommandBuffer cmd);
 void draw_stats(int64_t* draws, int64_t* skipped, int64_t* dispatches, int64_t* pipelines);
 void draw_stats2(int64_t* passes, int64_t* mesh, double* pipeline_ms);
@@ -162,7 +183,7 @@ void memory_trial_orderly_end();
 /// The stream's uniform updates (UPDATE_UB, vk_replay.cpp) that overlap [addr, addr + n) and may not be in guest
 /// memory yet when the GPU reads it: a copy of the range with them applied, at the offset alloc returns in the
 /// recording's stream (mapped at base), or UINT64_MAX when none overlaps
-uint64_t ub_overlay(uint64_t addr, uint64_t n, uint8_t* base, const std::function<uint64_t(uint64_t)>& alloc);
+uint64_t ub_overlay(uint64_t addr, uint64_t n, uint8_t* base, uint64_t (*alloc)(uint64_t, uint64_t), uint64_t align);
 /// Guest memory as the stream's place sees it: as submitted, the stream's uniform updates before it over it
 bool ub_read(uint64_t addr, void* dst, uint64_t n);
 

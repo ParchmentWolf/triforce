@@ -154,14 +154,33 @@ static float *to_mix_rate(float *pcm, uint32_t *frames, uint32_t rate) {
     return out;
 }
 
-float *hos_menu_sound_decode(const uint8_t *b, uint64_t size, uint32_t *frames_out) {
+/* ((Triforce, 11-20) the samples of a channel in the whole DSP-ADPCM frames the file holds, `frames` at most. A tune's last
+   frame may be cut short at the file's end: the shop theme's second channel ends 4 bytes into its last frame of 8 (the 5
+   samples it still counts are there, the frame is not), which decode_channel refuses, as it must for an interface sound.
+   The tune is cut to the whole frames: 5 samples of a minute) */
+static uint32_t frames_held(const uint8_t *info, uint64_t size, uint32_t frames) {
+    const uint16_t codec = u16(info);
+    const uint32_t off = u32(info + 0x30);
+    if (off >= size) return 0;
+    const uint64_t have = size - off;
+    uint64_t n = 0;
+    if (codec == 0) n = have / 2;
+    else if (codec == 1) n = have / 8 * 14;
+    return n < frames ? (uint32_t)n : frames;
+}
+
+/* (the decoder, for a file of at most `seconds`: the interface sounds' ten, the Mods screen's tune's more) */
+static float *decode_most(const uint8_t *b, uint64_t size, uint32_t *frames_out, uint32_t seconds) {
     if (size < 0x10 || memcmp(b, "BWAV", 4)) return NULL;
     const uint16_t nch = u16(b + 0x0e);
     if (!nch || nch > 2 || 0x10 + (uint64_t)nch * 0x4c > size) return NULL;
     const uint32_t rate = u32(b + 0x10 + 4);
     uint32_t frames = u32(b + 0x10 + 8);
     /* (the interface sounds are 48 kHz and short: at most ten seconds of a rate a sound file has) */
-    if (rate < 8000 || rate > 192000 || !frames || frames > rate * 10) return NULL;
+    if (rate < 8000 || rate > 192000 || !frames || frames > (uint64_t)rate * seconds) return NULL;
+    if (seconds > 10)   /* (a tune: as long as the samples its channels hold, the last frame's cut-off ones left out) */
+        for (uint16_t c = 0; c < nch; c++) frames = frames_held(b + 0x10 + c * 0x4c, size, frames);
+    if (!frames) return NULL;
     float *pcm = (float *)calloc((size_t)frames * 2, sizeof *pcm);
     int ok = pcm != NULL;
     for (uint16_t c = 0; ok && c < nch; c++) ok = decode_channel(b, size, b + 0x10 + c * 0x4c, pcm, frames);
@@ -174,6 +193,12 @@ float *hos_menu_sound_decode(const uint8_t *b, uint64_t size, uint32_t *frames_o
     if (rate != MIX_RATE && !(pcm = to_mix_rate(pcm, &frames, rate))) return NULL;
     *frames_out = frames;
     return pcm;
+}
+
+float *hos_menu_sound_decode(const uint8_t *b, uint64_t size, uint32_t *frames_out) { return decode_most(b, size, frames_out, 10); }
+/* ((Triforce, 11-20) a tune: the Mods screen's music, host/mods_music.c) */
+float *hos_menu_sound_decode_long(const uint8_t *b, uint64_t size, uint32_t *frames_out, uint32_t seconds) {
+    return decode_most(b, size, frames_out, seconds);
 }
 
 static void load_all(void) {   /* (once: hos_menu_sound_frame's store of 1 into loaded starts it) */

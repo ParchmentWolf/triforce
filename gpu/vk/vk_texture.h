@@ -18,6 +18,7 @@
 #include "vk_internal.h"
 #include "upload_owed.h"
 #include "upload_same.h"
+#include "astc_reuse.h"   // ((Triforce, 11-21, TEX-14) decoded ASTC used again: the blocks' hash a texture keeps
 
 namespace mkwvk {
 
@@ -59,6 +60,7 @@ struct Texture {
     int nvn_format = 0;       // the format it was made for
     // contents
     bool uploaded = false;    // from guest memory, as of upload_gen
+    bool warmed = false;      // ((Triforce, 11-22, TEX-23) made ahead by the list's look, not drawn yet: its first draw learns it)
     WriteGen upload_gen;      // (Triforce: a page write generation, 64 bits: write_gen.h)
     uint64_t bc_retry_frame = 0;   // (hookshot) a BC3 image whose upload failed: tried again from this frame (vk_texture.cpp)
     upload_owed::Owed owed;        // (Triforce) an upload that found no memory: what it was to bring, and when it is tried again
@@ -72,11 +74,19 @@ struct Texture {
     bool only_cleared = false; // (hookshot) all the GPU did was clear it: what the CPU writes after still counts (a font cache's glyphs)
     WriteGen gpu_gen;         // (the memory generation when the GPU last wrote it: CPU writes after it are taken)
     bool released = false;    // its texture was finalized after the GPU wrote it: CPU writes count again
+    // ((Triforce, 11-21, TEX-14) astc_reuse.h: its ASTC blocks' hash at its first whole upload (zero: not hashed), and
+    // whether it is listed among the finalized ones whose image may serve the same blocks made again elsewhere)
+    astc_reuse::Hash blocks_hash;
+    bool freed_listed = false;
     uint64_t let_go = 0;      // (Triforce) the present at which the game finalized a texture over it, 0 once it is used again:
                               // one uploaded from memory goes first while VRAM is short (texture_sweep)
     uint32_t back_gap = 0;    // ((Triforce) and the longest it stayed let go before it was used again, in presents: it goes
                               // early no sooner than 8 times that after a let-go (tex_pressure.h, keep taken)
     WriteGen release_gen;
+    // ((Triforce, 11-21, TEX-43) finalized_obsolete.h: the CPU has rewritten its storage since the release, and the present
+    // that was last looked at (0: not yet); both start again at a release)
+    mutable bool obsolete = false;
+    mutable uint64_t obsolete_checked = 0;
     uint64_t gpu_wrote_seen = 0;   // (the newest finished GPU write into its storage it was uploaded after)
     uint64_t last_written = 0;     // (the frame the GPU last wrote it: a render target, each frame it is used)
     uint64_t prev_written = 0;     // ((Triforce) the frame it was written in before last_written's, 0: none: redrawn.h)
@@ -227,13 +237,19 @@ void texture_frame(uint64_t completed_value);
 bool texture_warm_on();   // ((Triforce) RX_VK_TEX_WARM: tex_warm.h)
 void texture_warm_note(int slot);
 void texture_warm_step(int64_t last_frame_work);
+/// ((Triforce, 11-22, TEX-23) RX_VK_TEX_WARM_LIST: when the game made a BC or ASTC texture's storage, and its release; any thread)
+void texture_warm_born(const nvn_tex* t);
+void texture_warm_gone(const nvn_tex* t);
 void texture_released(const nvn_tex* t);
+void texture_released_at(const nvn_tex* t, WriteGen gen);   // ((Triforce, 11-22, MEM-85) from that generation: release_queue.h)
 /// (diagnostics: what guest memory holds of a texture's storage now, level by level, logged)
 void texture_log_guest(const Texture* t);
 /// (diagnostics, the replay's lock held) the textures the GPU wrote in [gpu, gpu + size), appended to out
 void texture_describe_written(uint64_t gpu, uint64_t size, std::string& out);
 /// (a host hook's fast check, any thread) whether a texture the GPU wrote may lie in virtual pages [gpu, gpu + size)
 bool texture_gpu_written_in(uint64_t gpu, uint64_t size);
+/// ((Triforce, THREAD-25) page_marks.h, no lock) false: no such texture was ever listed in the range: the call above is false
+bool texture_gpu_written_marked(uint64_t gpu, uint64_t size);
 /// Textures the GPU wrote in [gpu, gpu + size) read back and written into their memory, block linear, as the GPU
 /// would have left them there: before those virtual pages are unmapped or remapped (the work recorded before is
 /// submitted; the replay's lock held). How many were.

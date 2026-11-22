@@ -18,11 +18,27 @@
 //   65535 / 65535 = 1. Modes 4, 5, 10, 12 and 13 carry alpha, and 2, 3, 7, 11, 14 and 15 are the HDR ones, which take the
 //   decoder's other path: no for all of those, without decoding them (such a block may be opaque all the same).
 //   One partition has its mode in bits 13 to 16. Several partitions share one mode when bits 23 and 24 are zero (the mode is
-//   bits 25 to 28); when they do not, the modes' other bits sit below the weights and are not looked for: no.
+//   bits 25 to 28).
+// - (Triforce, 11-21, the performance audit's TEX-50, after Source B's) When bits 23 and 24 are not zero each partition has a
+//   mode of its own, read as the decoder reads it: 2, 5 or 8 more bits for 2, 3 or 4 partitions sit right below the weights
+//   (at 128 less the weights' bits less their own count); with bits 25 to 28 under them they are a class bit a partition,
+//   then two mode bits a partition, and a partition's mode is (bits 23 and 24 as a number, less 1, plus its class bit) * 4
+//   plus its two bits. Yes only when every partition's mode is one of 0, 1, 6, 8 and 9. Those bits count in the decoder's
+//   last error too: 96 bits of weights, the 29 read and 5 or 8 more wrap, and the block is an error. Such blocks were
+//   refused unread, and a texture with one of them stayed BC3. parts_too = false (RX_VK_TEX_BC1_PARTS=0): refused, as before.
 #pragma once
+#include <atomic>
 #include <cstdint>
 
 namespace astc_opaque {
+
+/// Whether a block with a mode a partition is looked at (above); false: refused unread, as before. Set once, at the start
+inline bool parts_too = true;
+/// How many such blocks were found opaque (the log's)
+inline std::atomic<uint64_t> parts_passed{0};
+
+/// Whether the decoder gives both endpoints of a colour endpoint mode the alpha 255: the modes without alpha, low dynamic range
+constexpr bool opaque_mode(unsigned cem) { return cem == 0 || cem == 1 || cem == 6 || cem == 8 || cem == 9; }
 
 /// `n` bits (16 at most) of a block from bit `at`, the lowest first, as the decoder's StreamBits reads them
 inline uint32_t bits(const uint8_t* b, unsigned at, unsigned n) {
@@ -88,17 +104,32 @@ inline bool block(const uint8_t b[16], unsigned bw, unsigned bh) {
     range = range - 2 + (layout != 9 && (mode & 0x200) ? 6 : 0);
     const unsigned wbits = weight_bits(weights, range);
     if (wbits < 24 || wbits > 96) return false;
-    unsigned read, cem;
+    unsigned read, cem = 0, extra = 0;
+    uint32_t base = 0;
     if (parts == 1) {
         cem = bits(b, 13, 4), read = 17;
     } else {
-        const uint32_t base = bits(b, 23, 6);
-        if (base & 3) return false;   // (a mode a partition: not looked for)
-        cem = base >> 2, read = 29;
+        base = bits(b, 23, 6);
+        read = 29;
+        if (base & 3) {   // (a mode a partition: its other bits are below the weights)
+            if (!parts_too) return false;
+            extra = parts == 2 ? 2 : parts == 3 ? 5 : 8;
+        } else {
+            cem = base >> 2;
+        }
     }
-    // (the decoder's last error, its count of the remaining bits wrapping. With one shared mode it cannot: 96 + 29 + 2)
-    if (wbits + read + (dual ? 2u : 0u) > 128) return false;
-    return cem == 0 || cem == 1 || cem == 6 || cem == 8 || cem == 9;
+    // (the decoder's last error, its count of the remaining bits wrapping. With one shared mode it cannot: 96 + 29 + 2. With a
+    // mode a partition it can: 96 + 29 + 8)
+    if (wbits + read + extra + (dual ? 2u : 0u) > 128) return false;
+    if (!extra) return opaque_mode(cem);
+    // (the decoder's own order: (extra << 6 | base) >> 2 is a class bit a partition, then two bits a partition)
+    const uint32_t all = ((bits(b, 128 - wbits - extra, extra) << 6) | base) >> 2;
+    for (unsigned i = 0; i < parts; i++) {
+        const unsigned cls = (base & 3) - 1 + ((all >> i) & 1);
+        if (!opaque_mode((cls << 2) | ((all >> (parts + 2 * i)) & 3))) return false;
+    }
+    parts_passed.fetch_add(1, std::memory_order_relaxed);
+    return true;
 }
 
 /// Whether every one of `n` blocks (16 bytes each, in any order) is one the decoder writes opaque

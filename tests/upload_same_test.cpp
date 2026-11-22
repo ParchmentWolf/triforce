@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "upload_same.h"
+#include "new_wait.h"   // ((Triforce, OS-04) same_copy's nothrow new answers at once: NoWait)
 
 static int failures;
 #define CHECK(c)                                                                     \

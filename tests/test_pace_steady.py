@@ -523,7 +523,8 @@ def check_source():
     check("if (held) __atomic_store_n(&frame_handed, 1, __ATOMIC_RELAXED);" in block(vi, "static int pace_handed(void) {"),
           "a frame another limiter held is not noted")
     presented = block(vi, "void hos_vi_native_presented(void) {")
-    order = [presented.index(s) for s in ("const int64_t period = steady_period(1000000000LL / fps_max() * interval, now);",
+    # ((Triforce, 11-22, PRESENT-30) the base is the pace's period: the cap's, since a movie's raise is not made with this row on)
+    order = [presented.index(s) for s in ("const int64_t period = steady_period(1000000000LL / pace_fps() * interval, now);",
                                           "pace_period_ns = period;", "realtime_step(now);", "shown_at[n & 15] = last + period > now")]
     check(order == sorted(order), "the presents are not paced by the steady period, or the steady step does not see it")
     api = (ROOT / "gpu/vk/vk_api.h").read_text(encoding="utf-8")

@@ -54,6 +54,10 @@ int hos_game_is_mkw(void);
 /* (mkw_glue.c) guest pages made usable by host APIs. (Triforce) 1: committed, 0: the commit failed (logged), -1: not in
    the guest window (logged) */
 int hos_commit(uint64_t addr, uint64_t size);
+/* ((Triforce, 11-21, MEM-09) mkw_glue.c) before guest memory goes to the kernel: each of its pages read once, so that one
+   only reserved is committed (the heap committed as it is touched: hos_heap_on_touch, set by SetMemoryHeapSize) */
+extern int hos_heap_on_touch;
+void hos_guest_touch(uint64_t addr, uint64_t size);
 /* (Triforce) the guest memory census (hos_mem.c, host/guest_census.h): each place that commits, maps or lets go of guest
    pages says what it did. COMMITTED: handed out and committed (before the commit itself); TOUCHED: committed on a first
    touch; PAGES, MAPPED: the game's own pages and physical maps; DECOMMITTED: let go and decommitted; ZEROED: let go and
@@ -84,6 +88,18 @@ void web_mark_written(const void *p, size_t n);   /* (hos/web/win32.c: guest mem
 #else
 #define HOS_WRITTEN(p, n) ((void)0)
 #endif
+/* ((Triforce, 11-22, the performance audit's MEM-13, after Source A's; HOS_MEM_ZERO_MARK=1, off unless set) Guest memory
+   filled by host code: the freed pages a Vulkan import holds, which are zeroed in place and not discarded. The renderer
+   does not see a bare memset (the soft write watch knows what guest code and HOS_WRITTEN mark), so its mirror, its
+   captures and the write-back's shadow kept the freed bytes, and a later write-back could put them back over the zeros.
+   With the switch the fill is marked written: the memset first and the mark after it, since a capture takes the mark
+   before it copies the page. Without it: a plain memset, as before. Off until it is measured at arrivals: the marked
+   zeros are pages the captures and the mirror syncs then copy */
+int hos_mem_zero_mark(void);   /* (hos_mem.c: HOS_MEM_ZERO_MARK, read once) */
+static inline void hos_guest_fill(uint64_t a, int v, uint64_t n) {
+    memset(GP(a), v, (size_t)n);
+    if (hos_mem_zero_mark()) HOS_WRITTEN(GP(a), (size_t)n);
+}
 #ifdef A64_MEM_ZERO
 extern uint64_t hos_space_end;   /* web: the guest window ends where the host's own data starts (hos_main.c) */
 #define HOS_SPACE_END hos_space_end
@@ -128,6 +144,7 @@ void hos_thread_join(HosThread *t);
 void hos_thread_destroy(HosThread *t);
 void hos_thread_set_name(HosThread *t, const char *name);
 void hos_thread_pin(void *h, const char *name);   /* HOS_PIN: host CPU affinity by thread name */
+void hos_sim_cpu_apply(void);   /* ((Triforce, 11-22, OS-49) HOS_SIM_CPU, a lab switch: hos_sim_cpu.h; before any thread */
 int hos_game_cores(void);   /* totk_cores.c: HOS_GAME_CORES, or 0 */
 const char *hos_thread_name(HosThread *t);
 void hos_thread_affinity(HosThread *t, int ideal, uint64_t mask);
@@ -142,6 +159,7 @@ int hos_vcore_away(void);
 void hos_vcore_back(void);
 void hos_vcore_checkpoint(void);
 void hos_vcore_yield(void);
+int hos_vcore_asked(void);                                 /* a waiter asked this thread for its core (vc_kick) */
 int hos_cv_sleep(void *cv, void *srw_lock, unsigned ms);   /* SleepConditionVariableSRW (exclusive) for guest threads */
 void hos_thread_boost(int level);
 void hos_thread_stack(HosThread *t, uint64_t *addr, uint64_t *size);
@@ -152,6 +170,7 @@ Ctx *hos_boot_main_thread(uint64_t stack_size);           /* the calling host th
 uint32_t hos_thread_handle(HosThread *t);
 HosThread *hos_thread_by_handle(uint32_t h);
 int hos_thread_prio(HosThread *t);
+int hos_thread_serial(HosThread *t);   /* ((Triforce, OS-33) a thread the frame waits on: host/short_sleep.h) */
 void hos_thread_wait(HosThread *t, int64_t timeout_ns, int *timed_out);   /* < 0: forever */
 void hos_thread_wake(HosThread *t);
 

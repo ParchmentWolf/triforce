@@ -25,11 +25,12 @@ CASES = {"batch": "1000", "default": None, "off": "0", "burst": "2000", "flush":
 
 
 def log_block(source):
-    start_marker = "#if defined(_WIN32) && !defined(__EMSCRIPTEN__)\nstatic SRWLOCK log_lock"
+    # ((Triforce, 11-22, the performance audit's THREAD-56) the writer is Linux's too now: its guard leaves out only the web build
+    start_marker = "#if !defined(__EMSCRIPTEN__)\nstatic SRWLOCK log_lock"
     end_marker = "\n#else\nstatic int log_queue("
     if source.count(start_marker) != 1 or source.count(end_marker) != 1:
-        raise SystemExit("FAIL: the Windows log queue block of host/hos_thread.c was not found")
-    start = source.index(start_marker) + len("#if defined(_WIN32) && !defined(__EMSCRIPTEN__)\n")
+        raise SystemExit("FAIL: the log queue block of host/hos_thread.c was not found")
+    start = source.index(start_marker) + len("#if !defined(__EMSCRIPTEN__)\n")
     return source[start:source.index(end_marker)]
 
 

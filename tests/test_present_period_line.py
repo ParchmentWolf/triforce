@@ -63,6 +63,9 @@ static void hos_log(const char *fmt, ...) {
 static uint64_t hos_ticks(void) { return 0; }
 static int fps_max(void) { return 240; }
 static int64_t steady_period(int64_t base, int64_t now) { (void)now; return base; }   /* ((Triforce) the Steady frame rate row off) */
+static void movie_pace_decide(void) {}             /* ((Triforce, 11-22, PRESENT-30) no movie plays here: paced by the cap) */
+static int pace_fps(void) { return fps_max(); }
+void hos_bench_present(int64_t now) { (void)now; }   /* (benchmark mode's note of each present: not on here) */
 '''
 
 SUFFIX = r'''
@@ -81,7 +84,7 @@ int main(void) {
             clock_now += d;
             hos_vi_native_presented();
         }
-    if (total < 5000000000LL || nlines != 3) return 90;   /* (one window: its three lines) */
+    if (total < 5000000000LL || nlines != 4) return 90;   /* (one window: its three lines, and its 1% low) */
     if (pace_period_ns != P) return 91;                   /* (the period it counts against is the one it paces by) */
     for (int i = 0; i < nlines; i++) puts(lines[i]);
     printf("expected %.3f\n", off / 1e6 / 1091);
@@ -98,7 +101,8 @@ def main():
     actual = block(source, "void hos_vi_native_presented(")
     with tempfile.TemporaryDirectory(prefix="present-period-") as tmp:
         cpp, exe = Path(tmp) / "fixture.cpp", Path(tmp) / "fixture.exe"
-        cpp.write_text(PREFIX + actual + "\n" + SUFFIX, encoding="utf-8")
+        # (with the 1% low's sort, which the cut-out present calls)
+        cpp.write_text(PREFIX + block(source, "static int cmp_i64_desc(") + "\n" + actual + "\n" + SUFFIX, encoding="utf-8")
         subprocess.run([args.cxx, "-std=c++17", "-Wall", "-Wextra", "-Werror", str(cpp), "-o", str(exe)], check=True)
         out = subprocess.run([str(exe)], capture_output=True, text=True, check=True).stdout
     period = re.search(r"vi: frame intervals against the paced period of ([\d.]+) ms: under 0.75 of it (\d+), 0.75-0.95 (\d+), "

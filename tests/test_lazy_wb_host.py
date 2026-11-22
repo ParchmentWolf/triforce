@@ -34,6 +34,8 @@ GUEST = re.compile(r"\b(GP|A64_MEM|HZ_PTR|hos_guest_range|G8P|G16P|G32P|G64P)\b"
 
 # (file, function, call): why its buffer or pages are never guest memory. Reviewed one by one (2026-11-15)
 ALLOWED = {
+    ("achievements.c", "read_text", "fread"): "into a buffer it mallocs",
+    ("achievements.c", "earned_save", "fwrite"): "from a static buffer of its own, the earned achievements' text",
     ("bug_capture.c", "read_part", "fread"): "into a buffer it mallocs",
     ("nn_fs.c", "hos_fs_rom_file", "ReadFile"): "a RomFS file for the menu sounds (host/menu_sound.c), into a buffer it mallocs",
     ("bug_capture.c", "write_file", "fwrite"): "the report's own files: the options file and a log read into host memory",
@@ -80,6 +82,9 @@ ALLOWED_GUEST = {
     ("mkw_glue.c", "commit_on_touch", "VirtualAlloc"): "the host's own fault handler committing a page that is only reserved "
                                                        "(it asks VirtualQuery first): every page the lazy write-back protects "
                                                        "is committed, imported whole, and its handler comes first",
+    ("mkw_glue.c", "commit_wait", "VirtualAlloc"): "(Triforce, 11-21, MEM-09) the commit its two callers were refused at the commit "
+                                                   "limit, tried again: hos_commit's is inside its hos_guest_io_begin / "
+                                                   "hos_guest_io_end, and commit_on_touch's pages are only reserved, as above",
     ("hos_mem.c", "census_release", "VirtualFree"): "the census's give-back: its caller census_offer wraps the renderer's call "
                                                     "that runs it in hos_guest_io_begin / hos_guest_io_end; inside, the renderer "
                                                     "holds its import locks, under which the lazy write-back's begin is not taken",

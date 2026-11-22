@@ -10,7 +10,9 @@ Only clocks are read around the builds: each build is the call it was.
 The workers of the preparation before the title (prepare_run, warm_libraries, state_list_prepare, predict_run) ran below
 normal priority; in a start that only prepares (HOOKSHOT_PREPARE_ONLY: Setup's build and update) they run at normal, but only
 in a process known to be below normal already (Windows: the below normal or idle class; elsewhere a nice value above 0), so
-that they stay below every program of normal priority. The game's own starts keep below normal, the preparation behind the
+that they stay below every program of normal priority. (Since the performance audit's OS-57 the Windows builders start the
+build tools below normal only with HOOKSHOT_LOW_PRIORITY=1; in their default, normal-class start these workers stay below
+normal, which is still under every program of normal priority: tests/test_build_priority.py.) The game's own starts keep below normal, the preparation behind the
 game idle, and precompile_run's workers the priority they had. The timing line every two minutes is written only after
 progress, so that a warm stuck in one build still goes silent for Setup's silence watch.
 

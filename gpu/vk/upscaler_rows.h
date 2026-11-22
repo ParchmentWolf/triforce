@@ -2,6 +2,8 @@
    Upscaler, and the names it shows for DLSS's (and FSR 3.1's and FSR 4's) modes. No Vulkan, no menu: tests/test_upscaler_rows.cpp checks them. */
 #pragma once
 
+#include <cstdint>
+
 namespace mkwvk::upscaler_rows {
 
 /// The Upscaler row (opts.dlss, RX_VK_DLSS): the game's own network, NVIDIA DLSS, NVIDIA DLAA, AMD FSR 3.1 (built from AMD's
@@ -189,7 +191,18 @@ inline int window_filter(unsigned picture_w, unsigned picture_h, unsigned dest_w
 /// generation transformer, preset M (NVIDIA's own pick for Performance); 2 the same generation as tuned for Ultra
 /// Performance, preset L; 3 NVIDIA's default, preset 0 (the runtime picks per mode, and a runtime update can change it)
 enum { MODEL_K = 0, MODEL_M = 1, MODEL_L = 2, MODEL_DEFAULT = 3, kModels = 4 };
-inline unsigned model_preset(int model) {
+/// (Triforce, 11-22, the performance audit's PRESENT-36, after Source A's and Source B's) The K row on a card with less
+/// than 7 GB of video memory asks for preset E, NVIDIA's last CNN model: less GPU time and less of NGX's own memory than
+/// the transformer there (Source A's, a 6 GB laptop RTX 3050 at 1080p DLSS Performance: 15.75 to 14.20 ms of GPU a frame,
+/// 85 to 58 MB), with more ghosting on grass and thin objects at the smallest render sizes, and NVIDIA marks it deprecated.
+/// vram: the card's video memory in bytes; 0 when the rule is off (vk_dlss.cpp dlss_cnn_vram: RX_VK_DLSS_CNN_VRAM is not
+/// 1, the default) or the size is not known: K as chosen. M, L and NVIDIA's default stay as chosen, and RX_VK_DLSS_PRESET
+/// goes over all of it
+constexpr unsigned kPresetE = 5;
+constexpr uint64_t kCnnVramBytes = 7ull << 30;
+inline bool cnn_for_vram(int model, uint64_t vram) { return model == MODEL_K && vram && vram < kCnnVramBytes; }
+inline unsigned model_preset(int model, uint64_t vram = 0) {
+    if (cnn_for_vram(model, vram)) return kPresetE;
     switch (model) {
     case MODEL_M: return 13;
     case MODEL_L: return 12;
@@ -202,8 +215,8 @@ inline unsigned model_preset(int model) {
 inline bool preset_env(const char* env) {
     return env && ((*env >= 'A' && *env <= 'Z') || (*env >= 'a' && *env <= 'z') || (env[0] == '0' && !env[1]));
 }
-inline unsigned dlss_preset(int model, const char* env) {
-    if (!preset_env(env)) return model_preset(model);
+inline unsigned dlss_preset(int model, const char* env, uint64_t vram = 0) {
+    if (!preset_env(env)) return model_preset(model, vram);
     if (*env == '0') return 0;
     return (unsigned)(*env >= 'a' ? *env - 'a' + 1 : *env - 'A' + 1);
 }

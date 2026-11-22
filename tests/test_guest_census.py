@@ -73,6 +73,14 @@ static unsigned char scratch[1 << 20];
 static uint64_t window_lo;
 #define GP(a) ((void *)((uintptr_t)scratch + (uintptr_t)((a) - window_lo)))
 static uint64_t guest_of(const void *p) { return (uint64_t)((uintptr_t)p - (uintptr_t)scratch) + window_lo; }
+/* ((Triforce, 11-22, the performance audit's MEM-13) host/hos.h's fill of guest memory: the bytes, and the range it would
+   mark written, counted (tests/test_host_free_marks.py has the helper itself and its switch) */
+static int fills;
+static uint64_t fill_lo, fill_n;
+static void hos_guest_fill(uint64_t a, int v, uint64_t n) {
+    memset(GP(a), v, (size_t)n);
+    fills++, fill_lo = a, fill_n = n;
+}
 typedef size_t SIZE_T;
 #define MEM_DECOMMIT 0x4000
 static int decommits;
@@ -96,6 +104,13 @@ static void hos_guest_io_end(int io) { (void)io; }
 static int cores_away, cores_back, core_away_at_discard;
 static int hos_vcore_away(void) { cores_away++; return 1; }
 static void hos_vcore_back(void) { cores_back++; }
+/* ((Triforce, OS-51) the host's part of a long frame, host/stall_host.h: counted around the discard and the zero-fill, not here) */
+enum { STALL_HOST_DISCARD, STALL_HOST_ZERO };
+static int64_t stall_host_begin(void) { return 0; }
+static void stall_host_end(int cause, int64_t began, uint64_t bytes) { (void)cause, (void)began, (void)bytes; }
+/* ((Triforce, OS-40) HOS_DISCARD_KEEP_CORE's line when it is set, and the time a freed region waits for its core back) */
+static void hos_log(const char *fmt, ...) { (void)fmt; }
+static int64_t hos_now_ns(void) { return 0; }
 /* A discard as it happens: whether a listed region still holds its pages (so that hos_region_alloc would not hand them out
    meanwhile), and whether the regions' lock is held */
 static int seen, seen_listed, seen_locked;
@@ -463,7 +478,12 @@ static void test_region_free(void) {
     memset(&list[1], 0, sizeof list[1]);
     list[1].addr = r, list[1].size = 0x40000, nregions = 2, imported_now = 1, window_lo = r;
     hos_mem_note(HOS_MEM_COMMITTED, r, 0x40000);
+    memset(scratch, 0x5A, 0x40000), fills = 0;
     hos_region_free(r);
+    /* ((Triforce, 11-22, MEM-13) zeroed through hos_guest_fill, which marks the whole range it zeroed) */
+    CHECK(fills == 1 && fill_lo == r && fill_n == 0x40000 && !scratch[0] && !scratch[0x3FFFF],
+          "Linux's zeroing under an import is not hos_guest_fill's of the region: %d fills, %#llx +%#llx", fills,
+          (unsigned long long)fill_lo, (unsigned long long)fill_n);
     CHECK(gc_count(&census, GC_KEPT, r, r + 0x40000) == 0x40000 && census_zeroed == zeroed + 0x40000 && census_discarded == discarded,
           "Linux's zeroing under an import: %llu kept, %llu counted zeroed, %llu discarded",
           (unsigned long long)gc_count(&census, GC_KEPT, r, r + 0x40000), (unsigned long long)(census_zeroed - zeroed),
@@ -481,7 +501,12 @@ static void test_region_free(void) {
         list[1].addr = r, list[1].size = 0x40000, nregions = 2, imported_now = 1, window_lo = r;
         hos_mem_note(HOS_MEM_COMMITTED, r, 0x40000);
         seen = 0;
+        memset(scratch, 0x5A, 0x40000), fills = 0;
         hos_region_free(r);
+        /* ((Triforce, 11-22, MEM-13) zeroed through hos_guest_fill, which marks the whole range it zeroed) */
+        CHECK(fills == 1 && fill_lo == r && fill_n == 0x40000 && !scratch[0] && !scratch[0x3FFFF],
+              "Windows' zeroing under an import is not hos_guest_fill's of the region: %d fills, %#llx +%#llx", fills,
+              (unsigned long long)fill_lo, (unsigned long long)fill_n);
         CHECK(seen == 1 && seen_listed && !seen_locked && nregions == 1, "Windows' zeroing under an import: %d seen, %s, %s", seen,
               seen_listed ? "listed" : "no longer listed", seen_locked ? "under the lock" : "not under the lock");
         CHECK(gc_count(&census, GC_KEPT, r, r + 0x40000) == 0x40000 && census_zeroed == zeroed2 + 0x40000 && census_discarded == discarded2,
@@ -598,9 +623,17 @@ MUTATIONS = [
     ("hos_region_free", "game = regions[i].game;", "game = 0;", "the game's own regions are not known as such: every free a discard"),
     ("hos_region_free", "hos_region_discard_needed(game && hos_mem_limit(),", "hos_region_discard_needed(game,",
      "a bare region freed without its discard with the limit off: the default path is no longer upstream's"),
-    ("discard_pages", "    const int away = hos_mem_limit() ? hos_vcore_away() : 0;\n", "    const int away = hos_vcore_away();\n",
+    # ((Triforce, OS-40) the line asks HOS_DISCARD_KEEP_CORE's rule now; not set, it is the limit's, as these two say)
+    ("discard_pages", "    const int away = discard_core_call_away(discard_core(), hos_mem_limit() != 0) ? hos_vcore_away() : 0;\n",
+     "    const int away = hos_vcore_away();\n",
      "the discard gives its core up with the limit off: the default path is no longer upstream's"),
-    ("discard_pages", "    const int away = hos_mem_limit() ? hos_vcore_away() : 0;\n", "    const int away = 0;\n",
+    ("discard_core", "return mode == DISCARD_CORE_GIVEN_UP || (mode == DISCARD_CORE_AS_BEFORE && limit_on);",
+     "return mode == DISCARD_CORE_GIVEN_UP || mode == DISCARD_CORE_AS_BEFORE || limit_on;",
+     "with the switch not set a discard gives its core up without the limit: the default is no longer as before"),
+    ("hos_region_free", "        if (discard_core_region_away(discard_core())) away = hos_vcore_away();\n", "        away = hos_vcore_away();\n",
+     "with the switch not set a freed region gives its core up around its discard: the default is no longer as before"),
+    ("discard_pages", "    const int away = discard_core_call_away(discard_core(), hos_mem_limit() != 0) ? hos_vcore_away() : 0;\n",
+     "    const int away = 0;\n",
      "the discard made with the thread's virtual core held: the threads of its core wait out the kernel's milliseconds"),
     ("discard_pages", "    if (away) hos_vcore_back();\n", "    (void)away;\n", "the core given up for a discard and never taken back"),
     ("discard_pages", "    if (hi <= lo || keep) return;\n", "    if (hi <= lo || keep) return;\n    hos_mem_note(HOS_MEM_DISCARDED, lo, hi - lo);\n",
@@ -649,7 +682,7 @@ def check_source():
     touch = block(glue, "static LONG CALLBACK commit_on_touch(", "host/mkw_glue.c")
     need(touch, "hos_mem_note(HOS_MEM_TOUCHED", "a first touch is not noted")
     free_pages = block(mem, "HLE(_ZN2nn2os15FreeMemoryPagesEmm)", "host/hos_mem.c")
-    need(free_pages, "memset(GP(lo), 0, (size_t)(hi - lo)), hos_mem_note(HOS_MEM_ZEROED, lo, hi - lo)",
+    need(free_pages, "hos_guest_fill(lo, 0, hi - lo), hos_mem_note(HOS_MEM_ZEROED, lo, hi - lo)",   # ((Triforce, 11-22, MEM-13) the helper's)
          "FreeMemoryPages does not note its pages zeroed under an import as kept")
     need(free_pages, "MEM_DECOMMIT), hos_mem_note(HOS_MEM_DECOMMITTED, lo, hi - lo)", "FreeMemoryPages does not note its decommit")
     need(block(mem, "HLE(_ZN2nn2os19AllocateMemoryPagesEmm)", "host/hos_mem.c"), "hos_mem_note(HOS_MEM_PAGES, a, n)",
@@ -692,10 +725,15 @@ def main():
              "hos_mem_commit_end": block(mem, "void hos_mem_commit_end(void *had, uint64_t addr, uint64_t size, int committed)",
                                          "host/hos_mem.c"),
              "pages_mark_used_locked": block(mem, "static void pages_mark_used_locked(", "host/hos_mem.c"),
+             # ((Triforce, OS-40) HOS_DISCARD_KEEP_CORE's rule, which discard_pages and hos_region_free ask: not set here, so
+             # everything below is as before; tests/test_region_free_vcore.py has its other two answers)
+             "discard_core": mem[mem.index("enum { DISCARD_CORE_AS_BEFORE, DISCARD_CORE_GIVEN_UP, DISCARD_CORE_KEPT };"):
+                                 mem.index("static void discard_pages(")],
              "discard_pages": block(mem, "static void discard_pages(", "host/hos_mem.c"),
              "hos_region_discard_needed": block(mem, "int hos_region_discard_needed(int game_region, int census_on, uint64_t game_pages)",
                                                 "host/hos_mem.c"),
              "region_frees_bare": "static int64_t region_frees_bare;",
+             "region_frees_away": "static int64_t region_frees_away, region_back_longest_ns;",
              "hos_region_free": block(mem, "void hos_region_free(uint64_t addr)", "host/hos_mem.c")}
     if mem.count("static int64_t region_frees_bare;") != 1:
         raise SystemExit("FAIL: host/hos_mem.c's region_frees_bare not found once")

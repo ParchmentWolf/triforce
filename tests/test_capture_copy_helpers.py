@@ -68,6 +68,7 @@ def main():
 #include <thread>
 #include <vector>
 #include "capture_behind.h"
+#include "cpu_count.h"   // ((Triforce, 11-22, OS-49) copy_helper_main counts by cpu_count()
 namespace capture_behind = mkwvk::capture_behind;
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); std::fflush(stderr); std::_Exit(1); } } while (0)
 typedef size_t SIZE_T;

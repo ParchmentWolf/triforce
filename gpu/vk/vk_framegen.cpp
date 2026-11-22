@@ -24,6 +24,8 @@
 #include "vk_framegen.h"
 #include "vk_xr.h"   // ((Triforce VR) vk_xr_active)
 #include "framegen_rows.h"    // (Triforce: the Frame generation row's values, AMD FSR 4 among them)
+#include "framegen_idle.h"   // ((Triforce, 11-21, PRESENT-18) its images let go once it has been off a while)
+#include "framegen_refresh.h"   // ((Triforce, 11-21, the upscaler audit's UPS-05) a fixed multiplier and the display's refresh)
 #include "vk_dlssg.h"
 #include "vk_fsr3_inputs.h"   // (AMD FSR 3.1 frame interpolation's depth and motion)
 #include "vk_fsr3fi.h"
@@ -1245,7 +1247,24 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
         set->busy = true;
         fg.next_set = (fg.next_set + 1) % 3;
     }
-    const int cur = fg.cur, prev = cur ^ 1, m = multiplier();
+    // ((Triforce, 11-20) the row's multiplier as it is now, and no more than the frames the sets were made with (ensure_size,
+    // above): the menu runs on the display thread while this one waited for a set, and a step up of the row in that wait
+    // had the game's frame copied into an image never made, which crashed in the driver (framegen_rows.h set_multiplier))
+    const int cur = fg.cur, prev = cur ^ 1;
+    int m = framegen_rows::set_multiplier(multiplier(), fg.mult);
+    // ((Triforce, 11-21, the upscaler audit's UPS-05) RX_VK_FRAMEGEN_REFRESH=1: a fixed multiplier (2x to 8x) makes no more
+    // frames than the display's refreshes that fall in one frame of the game (framegen_refresh.h): the owner's 5x on 165 Hz
+    // showed 331 frames a second, half of them never on the screen. Off unless set; never more than the sets' frames (m)
+    static const bool refresh_cap = framegen_refresh::on(getenv("RX_VK_FRAMEGEN_REFRESH"));
+    if (refresh_cap && opts.framegen >= 2 && opts.framegen <= kMaxMult) {
+        const int row = m;
+        m = framegen_refresh::frames(m, fg.game_ns, framegen_refresh::period_ns(display_refresh_mhz()));
+        static int told = 0;
+        if (m != told)
+            told = m, logf("vk: frame interpolation: %d frame(s) for each of the game's, of the row's %d (the game's frames %.2f ms "
+                           "apart, the display at %.1f Hz: RX_VK_FRAMEGEN_REFRESH)", m, row, fg.game_ns / 1e6,
+                           display_refresh_mhz() / 1000.0);
+    }
     const bool blend = fg.have_prev && !gap;
     static uint64_t sequence = 0;
     sequence++;
@@ -1312,6 +1331,9 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
         for (int k = 1; k < m; k++) make_frame(cmd, prev, cur, set->frame[k - 1], (float)k / (float)m, uw, uh);
         set->made = m - 1;
     }
+    // ((Triforce, 11-20) the game's frame after the made ones, in a frame the set has: the row gone to AMD FSR 4 in the wait
+    // above, over sets made for the game's frames alone, has one made frame and no second image)
+    set->made = framegen_rows::game_slot(set->made, fg.mult);
     const VkImageCopy c{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
                         {uw, uh, 1}};
     vkCmdCopyImage(cmd, fg.frames[cur].image, VK_IMAGE_LAYOUT_GENERAL, set->frame[set->made].image,
@@ -1330,6 +1352,48 @@ void framegen_queue(uint64_t value) {
     fg.jobs.push_back({fg.recorded, fg.recorded_at, value});
     fg.recorded = nullptr;
     fg.cv.notify_all();
+}
+
+/// ((Triforce, 11-21, the performance audit's PRESENT-18, after Source A's) Each present, after its queue (vk_replay.cpp,
+/// after framegen_queue): frame generation's images let go once it has been off for framegen_idle::kPresents presents, the
+/// display thread done with its sets and every queue idle first, as ensure_size does before it drops them. They are made
+/// again at the next frame that needs them. framegen_idle.h has why and the rule; RX_VK_FG_KEEP=1: kept
+void framegen_idle(bool recorded) {
+    static framegen_idle::Counts counts;
+    static const bool keep = getenv("RX_VK_FG_KEEP") && atoi(getenv("RX_VK_FG_KEEP")) != 0;
+    const bool on = framegen_on();
+    bool have_hudless;
+    {
+        std::lock_guard lk(hl.mu);
+        have_hudless = hl.w || hl.taken[0].w || hl.taken[1].w;
+    }
+    const framegen_idle::Release go =
+        framegen_idle::step(counts, {on, recorded, fsr4fg::frames_wanted(), fg.w != 0, have_hudless}, keep);
+    if (!go.shared && !go.hudless) return;
+    {   // (as ensure_size: the display thread done with the sets, then every queue idle)
+        std::unique_lock lk(fg.mu);
+        fg.cv.wait(lk, [] { return fg.jobs.empty() && !fg.sets[0].busy && !fg.sets[1].busy && !fg.sets[2].busy; });
+    }
+    {
+        std::lock_guard qk(dev.present_mu);
+        device_wait_idle_locked();
+    }
+    if (go.shared) {
+        // (the frames and the sets' made frames; the lumas and flows are small)
+        const uint64_t mb = ((uint64_t)fg.w * fg.h * 4 * (2 + 3 * (uint64_t)std::max(fg.mult, 1))) >> 20;
+        logf("vk: frame generation off for %u presents: its images (%ux%u, %dx) let go, about %llu MB (RX_VK_FG_KEEP=1: kept)",
+             framegen_idle::kPresents, fg.w, fg.h, fg.mult, (unsigned long long)mb);
+        drop_size();
+    }
+    if (go.hudless) {
+        std::lock_guard lk(hl.mu);
+        const uint64_t mb = ((uint64_t)hl.taken[0].w * hl.taken[0].h * 4 * 2 + (uint64_t)hl.w * hl.h * 4 * 2) >> 20;
+        for (Hudless::Taken& t : hl.taken) drop_img(t.img), t = {};
+        drop_img(hl.srgb), drop_img(hl.out), hl.w = hl.h = 0;
+        hl.want_w = hl.want_h = 0;
+        logf("vk: AMD FSR frame generation off for %u presents: the images of the picture without the HUD let go, about %llu MB",
+             framegen_idle::kPresents, (unsigned long long)mb);
+    }
 }
 
 void framegen_queue_held(VkImage image, VkImageView view, uint32_t w, uint32_t h, const int crop[4]) {

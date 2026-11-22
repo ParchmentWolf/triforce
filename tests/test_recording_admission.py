@@ -41,13 +41,16 @@ def main():
     start = draw.index('    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};', draw.index('bool bind_descriptors('))
     end = draw.index('\n    return true;\n}', start) + len('\n    return true;')
     fixture = fixture.replace('/* RES */', record).replace('/* STREAM */', stream)
-    fixture = fixture.replace('/* POOL */', block(draw, 'VkDescriptorPool make_pool('))
-    fixture = fixture.replace('/* BEGIN */', block(draw, 'void draw_begin_recording(')).replace('/* DESCRIPTORS */', draw[start:end])
+    # ((Triforce, 11-22, DESC-33) make_pool with the half-pool rule's state before it and its counter after it)
+    pool = draw[draw.index('bool pool_grow_on() {'):draw.index('void pool_took(')] + block(draw, 'void pool_took(')
+    fixture = fixture.replace('/* POOL */', pool)
+    fixture = fixture.replace('/* BEGIN */', block(draw, 'void slot_reset_locked(') + '\n' + block(draw, 'void draw_begin_recording(')).replace('/* DESCRIPTORS */', draw[start:end])
     fixture = fixture.replace('/* BANK_CACHE */', block(draw, 'struct BankCache {') + ';')
     fixture = fixture.replace('/* BANK_BRANCH */', block(block(draw, 'VkDescriptorBufferInfo uniform_range('), 'if (index == 0 || index == 2)'))
     cases = ['healthy', 'no-recording', 'initial-buffer', 'initial-map', 'initial-commit', 'pool-retry', 'parallel',
              'growth-buffer', 'growth-map', 'growth-commit', 'overflow', 'rounding', 'alignment-zero',
-             'alignment-three', 'grow-off', 'reuse', 'retention', 'descriptor-pool', 'descriptor-set', 'descriptor-commit', 'descriptor-retained', 'bank-retry', 'bank-same']
+             'alignment-three', 'grow-off', 'reuse', 'retention', 'descriptor-pool', 'descriptor-set', 'descriptor-commit', 'descriptor-retained', 'bank-retry', 'bank-same',
+             'pool-grow', 'pool-grow-off']   # ((Triforce, 11-22, DESC-33) the slots' pools at half: desc_pool_grow.h)
     if a.case != 'all':
         assert a.case in cases
         cases = [a.case]
@@ -56,10 +59,12 @@ def main():
         cpp.write_text(fixture, encoding='utf-8')
         flags = ['-fsanitize=address,undefined', '-fno-sanitize-recover=all'] if a.sanitize else []
         subprocess.run([a.cxx, '-std=c++20', '-O1', '-pthread', '-Wall', '-Wextra', '-Werror', '-Wno-missing-field-initializers', *flags,
-                        '-I' + str(a.headers), str(cpp), '-o', str(exe)], check=True)
+                        '-I' + str(a.headers), '-I' + str(a.source / 'gpu' / 'vk'), str(cpp), '-o', str(exe)], check=True)
         env = {k: v for k, v in os.environ.items() if not k.startswith('RX_VK_')}
         for case in cases:
-            subprocess.run([str(exe), case], env=env, check=True, timeout=15)
+            # (pool-grow-off: the rule's switch back, RX_VK_DESC_POOL_GROW=0)
+            subprocess.run([str(exe), case], env={**env, 'RX_VK_DESC_POOL_GROW': '0'} if case == 'pool-grow-off' else env,
+                           check=True, timeout=15)
 
 
 if __name__ == '__main__':

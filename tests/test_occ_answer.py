@@ -130,7 +130,7 @@ def check_source(src):
              block(replay, "void occ_slot_begin(Recording& r) {"),
              ["if (!occ_host_reset) vkCmdResetQueryPool(r.cmd, occ_pool, (uint32_t)r.slot * kOccPerSlot, kOccPerSlot), sl.used = 0;",
               "sl.serial = occ_serial_next.fetch_add(1, std::memory_order_relaxed) + 1;", "sl.armed = true;"])
-    submit = block(replay, "void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at = 0) {")
+    submit = block(replay, "void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at = 0, bool part = false) {")
     in_order("vk_replay.cpp submit_recording (sealed after dev.present_mu is let go: the seal is declared before the lock)",
              submit, ["seq = ++rec_seq;", "struct OccSeal {", "if (occ_live && rec.submitted) occ_seal(rec, at);",
                       "} occ_sealed{r, seq};", "std::lock_guard lk(dev.present_mu);   // (one queue"])
@@ -167,9 +167,9 @@ def check_source(src):
               "occ_writers.word(addr, now), sy = occ_writers.word(addr + 16, now);",
               "if (sx == occ::Writers::kNone && sy == occ::Writers::kNone) return;",
               'const bool active = occ_env_real || lab_ab::on("occq");',
-              "if (active && (sx == occ::Writers::kWrittenSrc || sy == occ::Writers::kWrittenSrc)) {",
+              "if (active && (sx == occ::Writers::kWrittenSrc || sy == occ::Writers::kWrittenSrc || gated)) {",
               "host->gpu_read(addr, &x, 8);", "*enabled = mode == 0 ? x == y : x != y;",
-              "occ::cond_decide(*enabled, sx, sy, active, occ_cond_on);", "occ_st.cond(c.kind);",
+              "occ::cond_decide(*enabled, sx, sy, active, occ_cond_on, occ_gate_on);", "occ_st.cond(c.kind);",
               "*enabled = c.enabled;", "if (c.kind == occ::Cond::kWrittenOff) occ_cond_off = &s;",
               "if (occ_log_cond && seen++ % 499 == 0 && logged < 300) {"])
     in_order("vk_replay.cpp occ_rewritten (another counter type's report, or a small clear: the records leave Writers)",
@@ -204,10 +204,10 @@ def check_source(src):
     cond = replay_fn[replay_fn.index("case NOP_RENDER_COND: {"):]
     in_order("vk_replay.cpp NOP_RENDER_COND (not the worker's: the replay's and the dry pass's decide, the segments take it)",
              cond[:2400],
-             ["if (worker) {", "par_conds[cond_at] != 0", "break;", "s.render_enabled = r.mode == 0 ? x == y : x != y;",
+             ["if (worker) {", "par_conds[cond_at] : 1;", "s.render_enabled = v == 1;", "occ_seg_off = v == 2 ? &s : nullptr;", "break;", "s.render_enabled = r.mode == 0 ? x == y : x != y;",
               "if (occ_live) {", "if (r.snapped) occ_cond_off = nullptr;",
               "else occ_cond(s, r.addr, (int)r.mode, x, y, &s.render_enabled);", "if (always) s.render_enabled = true;",
-              "if (dry) par_conds.push_back(s.render_enabled ? 1 : 0);"])
+              "if (dry) {", "const uint8_t v = s.render_enabled ? 1 : occ_live && occ_cond_off == &s ? 2 : 0;", "par_conds.push_back(v);"])
     enable = replay_fn[replay_fn.index("case NOP_RENDER_ENABLE:"):replay_fn.index("case NOP_RENDER_COND: {")]
     need("vk_replay.cpp NOP_RENDER_ENABLE (a condition's skipping ends)", enable,
          ["if (occ_live && !worker && occ_cond_off == &s) occ_cond_off = nullptr;"])
@@ -223,7 +223,8 @@ def check_source(src):
                  ["if (occ_live && !worker) occ_skip_note(s, true);", "if (s.render_enabled && !dry) {"])
     in_order("vk_replay.cpp replay() (a skipped draw or dispatch counted, not a worker's)", replay_fn,
              ["h.op == NOP_DISPATCH || h.op == NOP_DISPATCH_INDIRECT) {", "if (occ_live && !worker) occ_skip_note(s, false);",
-              "if (dry) {", "if (++dry_work % 64 == 0)"])
+              "if (occ_live && !dry && h.op != NOP_DISPATCH && h.op != NOP_DISPATCH_INDIRECT) occ_gate_note(s, worker);",
+              "if (dry) {\n                const bool compute", "if (++dry_work % par_point_every() == 0)"])
     handle = block(replay, "const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_stop = false) {")
     in_order("vk_replay.cpp replay_handle (the replay's counting given up before a dry pass; its reports placed at cb's)", handle,
              ["const uint64_t cb = ++stream_cbs;", "if (occ_live) occ_serial_give_up(cmd), occ_dry_cb = cb;", "rmode = Mode::Dry;"])
@@ -261,6 +262,9 @@ def check_source(src):
             other = max(replay.rfind("\nvoid ", 0, m.start()), replay.rfind("\nbool ", 0, m.start()),
                         replay.rfind("\nuint64_t ", 0, m.start()), replay.rfind("\nint ", 0, m.start()))
             init_fn = replay.rfind("\nbool occ_init() {", 0, m.start())
+            line = replay[replay.rfind("\n", 0, m.start()) + 1:m.start()]
+            if line.strip().startswith("if (occ_live && "):
+                continue   # (behind the switch in the line itself: begin_segment_slot's reset command in the job)
             if max(fn, init_fn) < other:
                 raise SystemExit("vk_replay.cpp: " + call + " outside the occ_ functions")
 
@@ -270,16 +274,19 @@ def check_source(src):
 
     draw = (src / "gpu/vk/vk_draw.cpp").read_text(encoding="utf-8").replace("\r\n", "\n")
     in_order("vk_draw.cpp end_pass (the query ends in its pass)", block(draw, "void end_pass(VkCommandBuffer cmd) {"),
-             ["if (!pass().open) return;", "if (occ_live) occ_pass_end(cmd);", "vkCmdEndRendering(cmd);"])
+             ["Pass& ps = pass();", "if (!ps.open) return;", "if (occ_live) occ_pass_end(cmd);", "vkCmdEndRendering(cmd);"])
     d = block(draw, "void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {")
+    # ((Triforce, 11-22, the performance audit's GPUWORK-01) a draw that writes colour is told to the count right before a query
+    # may begin: counted, and with RX_VK_OCC_DEPTH_ONLY=1 the count given up (tests/test_occ_depth_only.py runs it)
     in_order("vk_draw.cpp draw", d, ["if (occ_live) occ_draw_enter();", "begin_pass(cmd, at);",
-                                     "if (occ_live && pass().open) occ_draw_begin(cmd);"])
-    issued = d.count("st_draws++, pass().draws++;")
-    if issued != d.count("st_draws++, pass().draws++;\n") or issued != d.count("if (occ_live) occ_draw_issued();") or not issued:
+                                     "if (occ_live && ps.open && (writes & 0xFF)) occ_draw_colour(cmd);",
+                                     "if (occ_live && ps.open) occ_draw_begin(cmd);"])
+    issued = d.count("st_draws++, ps.draws++;")
+    if issued != d.count("st_draws++, ps.draws++;\n") or issued != d.count("if (occ_live) occ_draw_issued();") or not issued:
         raise SystemExit("vk_draw.cpp draw: every draw it records (st_draws++) says so to the count (occ_draw_issued)")
 
     dev = (src / "docs/development.md").read_text(encoding="utf-8")
-    for switch in ("RX_VK_OCC_QUERY=1", "RX_VK_OCC_QUERY_SKIP", "RX_VK_OCC_COND=0", "RX_VK_OCC_LOG_COND=1"):
+    for switch in ("RX_VK_OCC_QUERY=0", "RX_VK_OCC_QUERY_SKIP", "RX_VK_OCC_COND=0", "RX_VK_OCC_LOG_COND=1"):
         if "`" + switch not in dev:
             raise SystemExit("docs/development.md: " + switch + " is not in the switches table")
     if "RX_VK_OCC_QUERY_FP" in dev:

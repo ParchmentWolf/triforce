@@ -64,7 +64,7 @@ def main():
     if "if (!rx_option(1, 0)) {" not in behind or "*buttons |= pb;" not in behind:
         raise SystemExit("behind another window the pads reach the game while the Insert menu is open")
     if "const bool pads_ok = mine || (pad_bg_env ? atoi(pad_bg_env) != 0 : opts.pad_background != 0);" not in menu or \
-            "const uint32_t raw = pads_ok && host && host->pad_raw ? host->pad_raw() : 0" not in menu:
+            "uint32_t raw = pads_ok && host && host->pad_raw ? host->pad_raw() : 0" not in menu:   # ((Triforce VR) not const: the hand controllers' menu bits are added to it
         raise SystemExit("the Insert menu takes the pads only from the window in front, while the game takes them behind it")
     option = replay[replay.index("t.option = "):]
     option = option[:option.index("};") + 2]
@@ -108,6 +108,9 @@ static void player_used(void) {}
 void hos_amiibo_poll(void) {}
 int hos_oot_mods_down(void) { return 0; }   /* ((Triforce) host/oot_menu.c: no game list's last button has the cursor here) */
 void vr_pad_read(Ctx *c, uint64_t *buttons, int32_t stick[4]) { (void)c; (void)buttons; (void)stick; }   /* ((Triforce VR) host/vr_game.c: no headset here) */
+static void device_used(int device) { (void)device; }   /* ((Triforce) the device used last, for the button prompts: not looked at */
+static void mods_input(uint64_t *buttons, int32_t stick[4]) { (void)buttons, (void)stick; }   /* (and no Mods entry's input) */
+int hos_bench_input_only(void) { return 0; }   /* ((Triforce) host/hos_bench.c: benchmark mode off */
 """
     actual = "\n".join((cheat_state, cheat_spies, host_spies, block(hid, "static int key("), block(hid, "static int kmap_down("),
         block(hid, "static int game_in_front("), hid[start:end], block(hid, "static void stick_max("),

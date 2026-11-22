@@ -47,7 +47,8 @@ class TargetImagePoolTests(unittest.TestCase):
             self.assertIn(part, rule, part)
         cap = block(self.tex, "uint64_t pool_cap()")
         self.assertIn('getenv("RX_VK_TARGET_POOL_MB")', cap)
-        self.assertIn(": 256", cap)
+        # ((11-21, the performance audit's TEX-29) with no switch a twelfth of the allowance, 256 to 768: target_pool.h)
+        self.assertIn("target_pool::default_mb(", cap)
         self.assertIn("uint64_t pool_key = 0;", self.hdr)
 
     def test_a_texture_made_for_a_target_is_one_and_its_image_comes_from_the_targets_blocks(self):
@@ -95,11 +96,13 @@ class TargetImagePoolTests(unittest.TestCase):
 
     def test_the_trim_is_bounded_a_present_and_gives_back_idle_and_excess_images(self):
         trim = block(self.tex, "size_t pool_trim()")
-        self.assertIn("pool_pressed ? 0 : pool_cap()", trim)
-        self.assertIn("pool_pressed ? 64 : 16", trim)
-        self.assertIn("frame_no - v[i].since <= 120", trim)
+        # ((11-21, TEX-29) the bound, the count and the wait are target_pool.h's, the walk the age list's from its front:
+        # tests/test_target_pool_rules.py has the rules and the order)
+        self.assertIn("target_pool::cap_for(pool_cap(), pool_tier, tiers, floor_kept)", trim)
+        self.assertIn("target_pool::trim_most(pool_tier, floor_kept)", trim)
+        self.assertIn("target_pool::idle_out(frame_no, it->since, idle,", trim)
         self.assertIn("pool_bytes <= cap", trim)
-        self.assertIn("pool_destroy(v[i]);", trim)
+        self.assertIn("pool_destroy(*it);", trim)
         destroy = block(self.tex, "void pool_destroy(Pooled& p)")
         self.assertIn("vkDestroyImageView", destroy)
         self.assertIn("destroy_image(p.image, p.allocation);", destroy)

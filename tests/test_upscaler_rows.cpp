@@ -235,6 +235,31 @@ int main() {
                                                 !ur::preset_env("05") && ur::dlss_preset(ur::MODEL_M, "7") == 13 &&
                                                 ur::dlss_preset(ur::MODEL_L, "") == 12);
     CHECK("preset letters", ur::preset_letter(11) == 'K' && ur::preset_letter(13) == 'M' && ur::preset_letter(0) == '0');
+    {   // ((Triforce, 11-22, the performance audit's PRESENT-36) the K row on a card under 7 GB of video memory: preset E, NVIDIA's CNN
+        const unsigned long long GiB = 1ull << 30, MiB = 1ull << 20;
+        CHECK("CNN under 7 GB: the K row", ur::kPresetE == 5 && ur::kCnnVramBytes == 7 * GiB && ur::cnn_for_vram(ur::MODEL_K, 6 * GiB) &&
+                                               ur::cnn_for_vram(ur::MODEL_K, 7 * GiB - 1) && !ur::cnn_for_vram(ur::MODEL_K, 7 * GiB) &&
+                                               !ur::cnn_for_vram(ur::MODEL_K, 0));
+        CHECK("CNN: the preset is E", ur::model_preset(ur::MODEL_K, 6 * GiB) == 5 && ur::model_preset(ur::MODEL_K, 7 * GiB - 1) == 5 &&
+                                          ur::model_preset(ur::MODEL_K, 7 * GiB) == 11 && ur::model_preset(ur::MODEL_K, 0) == 11 &&
+                                          ur::preset_letter(ur::model_preset(ur::MODEL_K, 6 * GiB)) == 'E');
+        // (many cards, by what their drivers report: only the K row, only under 7 GB, never with the rule's memory at 0)
+        const unsigned mb[] = {2048, 3072, 4096, 5892, 6144, 7167, 7168, 8188, 8192, 10240, 11264, 12288, 16376, 24564, 32607};
+        for (unsigned m : mb) {
+            const unsigned long long v = m * MiB;
+            const bool small = m < 7168;
+            CHECK("CNN: a card", ur::cnn_for_vram(ur::MODEL_K, v) == small && ur::model_preset(ur::MODEL_K, v) == (small ? 5u : 11u) &&
+                                     ur::dlss_preset(ur::MODEL_K, nullptr, v) == (small ? 5u : 11u) && ur::dlss_preset(ur::MODEL_K, nullptr) == 11);
+            CHECK("CNN: M, L and NVIDIA's default as chosen", !ur::cnn_for_vram(ur::MODEL_M, v) && !ur::cnn_for_vram(ur::MODEL_L, v) &&
+                                                                  !ur::cnn_for_vram(ur::MODEL_DEFAULT, v) && ur::model_preset(ur::MODEL_M, v) == 13 &&
+                                                                  ur::model_preset(ur::MODEL_L, v) == 12 && ur::model_preset(ur::MODEL_DEFAULT, v) == 0 &&
+                                                                  ur::dlss_preset(ur::MODEL_M, nullptr, v) == 13);
+            CHECK("CNN: a value past the row is K, as chosen", ur::model_preset(-1, v) == 11 && ur::model_preset(ur::kModels, v) == 11);
+            CHECK("CNN: RX_VK_DLSS_PRESET wins", ur::dlss_preset(ur::MODEL_K, "K", v) == 11 && ur::dlss_preset(ur::MODEL_K, "m", v) == 13 &&
+                                                     ur::dlss_preset(ur::MODEL_K, "0", v) == 0 && ur::dlss_preset(ur::MODEL_K, "E", v) == 5 &&
+                                                     ur::dlss_preset(ur::MODEL_K, "7", v) == (small ? 5u : 11u));
+        }
+    }
     CHECK("model row shown with DLSS built", ur::model_shown(true) && !ur::model_shown(false));
     CHECK("model row fixed with the game's own or the switch", ur::model_fixed(GAME, false) && !ur::model_fixed(DLSS, false) &&
                                                                !ur::model_fixed(DLAA, false) && ur::model_fixed(DLSS, true));

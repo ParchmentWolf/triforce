@@ -12,8 +12,8 @@ what it is made from, or draw it by hand and put it here.
 | `KeyTexFont<A B X Y>_00.<pad input>.png` | the white letters on black (the Talk ring's small buttons) | the icon's letter (its holes), or its shape when it has none |
 | `Controller_Pro.png` | the controller in the pause menu's controls page (System) | the face's `drawing` in `nx2/prompt_faces.py`, drawn by `nx2/prompt_draw.py` |
 | `Controller_Pro1.png`, `ControllerSh_Pro1.png` | the page's tinted copy of the controller, and its shadow | `Controller_Pro.png` (yours if you made one) |
-| `ControllerGuide_Pro_0<0 1>.png` | the page's leader lines that stay, whatever the controls | the face's `parts` in `nx2/prompt_faces.py` (where each control is in the picture) and the router in `prompt_assets.py` (`GUIDE_*`) |
-| `ControllerGuide_Pro_0<0 1>.<Switch button>.<pad input>.png` | the line of that Switch button's label when it is on that pad input, drawn over the lines that stay | the same |
+| `ControllerGuide_Pro_0<0-4>.png` | the page's leader lines that stay, whatever the controls | the face's `parts` in `nx2/prompt_faces.py` (where each control is in the picture) and the router in `prompt_assets.py` (`GUIDE_*`) |
+| `ControllerGuide_Pro_0<0-4>.<Switch button>.<pad input>.png` | the line of that Switch button's label when it is on that pad input, drawn over the lines that stay (`_02`: ZR's, `_03`: the D-pad's frame, by Switch Up's input, `_04`: L's and R's) | the same |
 
 The text icons (dialogue, the control hints, the menus) are not images: they are the face's font, the game's
 `External.bfotf` with the face's Kenney glyphs, picked by `icons` in `nx2/prompt_faces.py`.

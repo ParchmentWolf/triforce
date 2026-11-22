@@ -44,7 +44,7 @@ def check(tex, dev):
         "if (!sweep || sweep_all || kv.second->gpu_written || kv.second->let_go) order.push_back({kv.second->last_frame, kv.second.get()});",
         # (under the budget the loop takes only what was drawn over or let go early)
         "\n        if (sweep && !overwritten && !gone_early) continue;",
-        "const bool overwritten = shifted || drawn_over(tex);",
+        "const bool overwritten = shifted || drawn_over(tex) || stale;",
         "const bool gone_early = let_go_short && tex->let_go && !tex->gpu_written &&",
         # (drawn over: only a texture the GPU drew)
         "    const auto drawn_over = [&](const Texture* tex) {\n        if (!tex->gpu_written) return false;",

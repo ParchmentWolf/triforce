@@ -100,7 +100,7 @@ def check_source(tex, dev):
     # (the step is judged once it is known whether a render target drew over the texture, and before anything else of the
     # pass is done with it: the finalized ones' cap, the let-go count, the choice)
     in_order("vk_texture.cpp texture_sweep (the step)", sweep,
-             ["const bool overwritten = shifted || drawn_over(tex);",
+             ["const bool overwritten = shifted || drawn_over(tex) || stale;",
               "if (!sweep && !overwritten && tex_pressure::stepped(press.step, live_chosen)) continue;",
               "if (finalized_kept && keep_finalized(tex)) {", "if (gone_early) let_go_n++", "evict.push_back({tex,",
               "        if (!overwritten) live_chosen++;", "press.next = frame_no + tex_pressure::kNextLook;",

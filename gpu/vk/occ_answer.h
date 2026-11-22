@@ -15,6 +15,8 @@
 // The game also predicates draws on these words (render conditions, NOP_RENDER_COND): as NX2navi decides them
 // (runtime/vk_exec_xfer.c cond_enabled), a word whose newest report is a samples-passed one with its count still to come is
 // unknown, and the condition renders; a word whose count was written is read from memory, where a real 0 can skip the draw.
+// (11-22) A count over a draw that such a skip left out is marked (Counter::gate, Writers::kGatedSrc, the line counts them);
+// RX_VK_OCC_GATE=1: a condition on it renders (cond_decide), so a skip's 0 cannot hide the same object again and again.
 //
 //   Counter   one counting, from a reset to its report, over the queries its draws began: the replay's (one per NVN
 //             queue's state, under replay_mu) or a parallel replay's segment's (the helper thread's: a segment starts with
@@ -95,6 +97,7 @@ struct Rep {
     uint32_t first = 0, n = 0;
     uint64_t pos = 0;
     int64_t present = 0;
+    bool gated = false;   // (a draw of its count left out by a condition that read a written count: Counter::gate)
 };
 
 /// One samples-passed counting. The replay calls reset() at a SAMPLES_PASSED reset, draw_enter() as a draw goes into draw(),
@@ -113,8 +116,10 @@ struct Counter {
     int open = -1;            // (the query begun and not ended, its index in the block)
     bool lost = false;        // (a draw in another recording, or the block full)
     uint32_t ops = 0, issued = 0;   // (draws that went into draw() while counting, and those it recorded)
-    enum Why { kNone, kSkipped, kOtherCmd, kFull };
+    enum Why { kNone, kSkipped, kOtherCmd, kFull, kColour };
     Why why = kNone;
+    bool gated = false;       // (since the reset a draw was left out by a render condition that read a written count)
+    bool colour = false;      // ((Triforce, 11-22, GPUWORK-01) a draw that writes colour came in since the reset)
 
     /// A parallel replay's segment starts (or ends), or the replay's counting is given up: nothing is counting
     void segment() { *this = Counter{}; }
@@ -126,7 +131,35 @@ struct Counter {
         state = kCounting, slot = none ? -1 : slot_, serial = none ? 0 : serial_, first = next, open = -1, lost = none;
         ops = issued = 0;
         why = none ? kOtherCmd : kNone;
+        gated = false;
+        colour = false;
     }
+    /// (11-22) A draw the replay passes with rendering off because a condition read a written count (a 0 of an earlier
+    /// report): while counting, this count is gated, NVN counts nothing for that draw and neither do the queries. Such a count
+    /// is a skip's result, not the object's visibility (Writers::kGatedSrc)
+    void gate(bool keep) {
+        if (counting(keep)) gated = true;
+    }
+    /// ((Triforce, 11-22, the performance audit's GPUWORK-01, after Source A's) A draw that writes colour comes in, its pass
+    /// open, before begin(). The game's occlusion tests draw depth only (a bounding box against the depth buffer); a query
+    /// that stays open over colour draws makes the GPU wait at its end for the work it encloses. What the caller does with
+    /// the answer: first, this is the window's first such draw, and open, a query is open over it (both counted, whether or
+    /// not the rule is on); lose, the rule is on (depth_only) and the count is given up: the caller ends the open query and
+    /// calls lose_colour(). Nothing for a count not counting or lost already
+    struct Colour {
+        bool first = false, open = false, lose = false;
+    };
+    Colour colour_draw(bool keep, bool depth_only) {
+        Colour r;
+        if (!counting(keep) || lost) return r;
+        r.first = !colour, colour = true;
+        r.open = open >= 0;
+        r.lose = depth_only;
+        return r;
+    }
+    /// The count given up for a colour draw (its open query ended by the caller): no query begins until the next reset,
+    /// its report is incomplete, so the record keeps the placeholder and its render condition renders
+    void lose_colour() { lost = true, why = kColour; }
     void draw_enter(bool keep) {
         if (counting(keep)) ops++;
     }
@@ -162,7 +195,7 @@ struct Counter {
         if (!complete && !lost) why = kSkipped;
         state = kReported;
         if (!complete) return kIncomplete;
-        rep->first = first, rep->n = next - first;
+        rep->first = first, rep->n = next - first, rep->gated = gated;
         return kMeasured;
     }
 };
@@ -170,57 +203,55 @@ struct Counter {
 /// A map from 64-bit keys, open addressing with linear probes and backward-shift deletion (no tombstones): no allocation per
 /// entry. The replay placed one entry for every samples-passed report (~2,600 a frame at the Market) in a std::unordered_map,
 /// a node allocated and freed each time: 0.76 ms a frame of the Presentation Thread (all-thread sample, 2026-11-20)
+// ((Triforce, 11-21) The keys, the used marks and the values in three arrays: a probe reads 9 bytes a slot, not a 48-byte slot.
+// The game's report addresses rotate through ~49,000 a 600-present period, ~27,000 live at once (kKeepAge): the table of slots was
+// ~3 MB, past the core's L2, and its probes and the prune's walk over it were 5% of the Presentation Thread (exact profile of a
+// line-table build, 2026-11-21). Same entries, same order of probes and shifts as before)
 template <class V>
 class FlatU64 {
 public:
-    struct Slot {
-        uint64_t key = 0;
-        V val{};
-        bool used = false;
-    };
     V* find(uint64_t k) {
         if (!n_) return nullptr;
         for (size_t i = idx(k);; i = (i + 1) & mask_) {
-            Slot& s = s_[i];
-            if (!s.used) return nullptr;
-            if (s.key == k) return &s.val;
+            if (!used_[i]) return nullptr;
+            if (keys_[i] == k) return &vals_[i];
         }
     }
     const V* find(uint64_t k) const { return const_cast<FlatU64*>(this)->find(k); }
     V& operator[](uint64_t k) {
         if (V* v = find(k)) return *v;
-        if ((n_ + 1) * 10 > s_.size() * 7) grow();
+        if ((n_ + 1) * 10 > keys_.size() * 7) grow();
         size_t i = idx(k);
-        while (s_[i].used) i = (i + 1) & mask_;
-        s_[i].key = k, s_[i].val = V{}, s_[i].used = true;
+        while (used_[i]) i = (i + 1) & mask_;
+        keys_[i] = k, vals_[i] = V{}, used_[i] = 1;
         n_++;
-        return s_[i].val;
+        return vals_[i];
     }
     size_t count(uint64_t k) const { return find(k) ? 1 : 0; }
     size_t erase(uint64_t k) {
         if (!n_) return 0;
         size_t i = idx(k);
         for (;; i = (i + 1) & mask_) {
-            if (!s_[i].used) return 0;
-            if (s_[i].key == k) break;
+            if (!used_[i]) return 0;
+            if (keys_[i] == k) break;
         }
         // backward shift: the entries after the hole that would be found from a slot at or before it move into it
         for (size_t j = (i + 1) & mask_;; j = (j + 1) & mask_) {
-            if (!s_[j].used) break;
-            const size_t home = idx(s_[j].key);
+            if (!used_[j]) break;
+            const size_t home = idx(keys_[j]);
             const bool moves = i <= j ? (home <= i || home > j) : (home <= i && home > j);
-            if (moves) s_[i] = s_[j], i = j;
+            if (moves) keys_[i] = keys_[j], vals_[i] = vals_[j], i = j;
         }
-        s_[i] = Slot{};
+        keys_[i] = 0, vals_[i] = V{}, used_[i] = 0;
         n_--;
         return 1;
     }
     template <class F>
     void erase_if(F pred) {   // (the keys to go first, then each erased: a shift during the walk would skip or revisit entries)
-        std::vector<uint64_t> gone;
-        for (const Slot& s : s_)
-            if (s.used && pred(s.key, s.val)) gone.push_back(s.key);
-        for (uint64_t k : gone) erase(k);
+        gone_.clear();
+        for (size_t i = 0; i < keys_.size(); i++)
+            if (used_[i] && pred(keys_[i], vals_[i])) gone_.push_back(keys_[i]);
+        for (uint64_t k : gone_) erase(k);
     }
     bool empty() const { return n_ == 0; }
     size_t size() const { return n_; }
@@ -228,18 +259,23 @@ public:
 private:
     size_t idx(uint64_t k) const { return (size_t)((k * 0x9E3779B97F4A7C15ull) >> shift_) & mask_; }
     void grow() {
-        std::vector<Slot> old;
-        old.swap(s_);
-        const size_t cap = old.empty() ? 1024 : old.size() * 2;
-        s_.assign(cap, Slot{});
+        std::vector<uint64_t> ok;
+        std::vector<uint8_t> ou;
+        std::vector<V> ov;
+        ok.swap(keys_), ou.swap(used_), ov.swap(vals_);
+        const size_t cap = ok.empty() ? 1024 : ok.size() * 2;
+        keys_.assign(cap, 0), used_.assign(cap, 0), vals_.assign(cap, V{});
         mask_ = cap - 1;
         shift_ = 64;
         for (size_t c = cap; c > 1; c >>= 1) shift_--;
         n_ = 0;
-        for (const Slot& s : old)
-            if (s.used) (*this)[s.key] = s.val;
+        for (size_t i = 0; i < ok.size(); i++)
+            if (ou[i]) (*this)[ok[i]] = ov[i];
     }
-    std::vector<Slot> s_;
+    std::vector<uint64_t> keys_;
+    std::vector<uint8_t> used_;
+    std::vector<V> vals_;
+    std::vector<uint64_t> gone_;   // (erase_if's list, kept: no allocation a prune)
     size_t n_ = 0, mask_ = 0;
     int shift_ = 64;
 };
@@ -259,12 +295,15 @@ public:
         kWritten,   // (its count is in the record: completion wrote it)
         kFinal      // (no count comes: skip list, knob off, a clear flag, not counted whole, lost, late, the CPU wrote it)
     };
-    enum Src { kNone, kPendingSrc, kWrittenSrc, kFinalSrc };   // (what a render condition reading the word finds)
+    // (what a render condition reading the word finds. kGatedSrc: written, a count over a draw a written count's condition
+    // left out, see Counter::gate)
+    enum Src { kNone, kPendingSrc, kWrittenSrc, kFinalSrc, kGatedSrc };
     struct Placed {
         uint64_t pos = 0;
         int64_t present = 0;
         uint64_t value = 0;   // (what the replay, or a count written since, put in the word: a count is written only over it)
         State state = kFinal;
+        bool gated = false;   // (its count, written, was over a draw a written count's condition left out)
     };
     /// A report's placeholder `value` written at the replay, at pos in the stream (the newest there from now on). write:
     /// its count is to be written once read back (not on RX_VK_OCC_QUERY_SKIP, the lab knob on, not a clear flag)
@@ -287,10 +326,11 @@ public:
         const auto* it = m_.find(addr);
         return !it ? 0 : it->value;
     }
-    /// The count of the report at (addr, pos) is in its record now
-    void wrote(uint64_t addr, uint64_t pos, uint64_t count) {
+    /// The count of the report at (addr, pos) is in its record now (gated: counted over a draw a written count's condition
+    /// left out)
+    void wrote(uint64_t addr, uint64_t pos, uint64_t count, bool gated = false) {
         auto* it = m_.find(addr);
-        if (it && it->pos == pos) it->state = kWritten, it->value = count;
+        if (it && it->pos == pos) it->state = kWritten, it->value = count, it->gated = gated;
     }
     /// No count comes for the report at (addr, pos) (not counted whole, lost, late, never sent, the CPU wrote the record):
     /// a condition reads its word from memory from now on, as before
@@ -317,7 +357,7 @@ public:
         if (!it) return kNone;
         switch (it->state) {
         case kPending: return now - it->present > kLateAge ? kFinalSrc : kPendingSrc;
-        case kWritten: return kWrittenSrc;
+        case kWritten: return it->gated ? kGatedSrc : kWrittenSrc;
         case kFinal: break;
         }
         return kFinalSrc;
@@ -339,23 +379,33 @@ private:
 /// they differ) over the words' sources (Writers::word), after NX2navi's cond_enabled: a samples-passed count not done yet
 /// renders; a written one, as any other word, is read from memory (base_enabled: the replay's answer from memory). active:
 /// RX_VK_OCC_QUERY=1 or the lab knob's phase (else the answer is the base one, whatever the table says); cond_on: false
-/// with RX_VK_OCC_COND=0, every condition on a samples-passed word renders
+/// with RX_VK_OCC_COND=0, every condition on a samples-passed word renders.
+/// (11-22) gate_on (RX_VK_OCC_GATE=1): a word whose count was written over a draw that a written count's condition left
+/// out (Writers::kGatedSrc) is unknown, and the condition renders. The count is a skip's result, not the object's: on the
+/// console the game's CPU reads a 0 before it records the next frame and draws the object's proxy instead; here the count
+/// often lands after the CPU has read the placeholder (4096: visible), the game goes on drawing the object under the
+/// condition, the condition reads the skip's 0, the next count is 0 again, and the object stays hidden for good. Off: as a
+/// written count (read from memory)
 struct Cond {
-    enum Kind { kNotSamples, kBase, kUnknown, kForced, kWrittenOn, kWrittenOff, kMemory };
+    enum Kind { kNotSamples, kBase, kUnknown, kForced, kWrittenOn, kWrittenOff, kMemory, kGated };
     bool enabled;
     Kind kind;
 };
-inline Cond cond_decide(bool base_enabled, Writers::Src sx, Writers::Src sy, bool active, bool cond_on) {
+inline Cond cond_decide(bool base_enabled, Writers::Src sx, Writers::Src sy, bool active, bool cond_on, bool gate_on = false) {
     if (sx == Writers::kNone && sy == Writers::kNone) return {base_enabled, Cond::kNotSamples};
     if (!active) return {base_enabled, Cond::kBase};
     if (!cond_on) return {true, Cond::kForced};
     if (sx == Writers::kPendingSrc || sy == Writers::kPendingSrc) return {true, Cond::kUnknown};
-    if (sx == Writers::kWrittenSrc || sy == Writers::kWrittenSrc)
+    const bool gated = sx == Writers::kGatedSrc || sy == Writers::kGatedSrc;
+    if (gated && gate_on) return {true, Cond::kGated};
+    if (sx == Writers::kWrittenSrc || sy == Writers::kWrittenSrc || gated)
         return {base_enabled, base_enabled ? Cond::kWrittenOn : Cond::kWrittenOff};
     return {base_enabled, Cond::kMemory};
 }
 inline const char* src_name(Writers::Src s) {
-    return s == Writers::kPendingSrc ? "pending" : s == Writers::kWrittenSrc ? "written" : s == Writers::kFinalSrc ? "memory, no count to come" : "memory";
+    return s == Writers::kPendingSrc ? "pending" : s == Writers::kWrittenSrc ? "written"
+         : s == Writers::kGatedSrc ? "written, over a draw a written count skipped"
+         : s == Writers::kFinalSrc ? "memory, no count to come" : "memory";
 }
 
 /// What happened since the last line (under the caller's lock)
@@ -370,9 +420,16 @@ struct Stats {
     int64_t rewritten = 0;    // records rewritten in the stream after their report (a small clear, another counter type)
     int64_t measured = 0, no_reset = 0, incomplete = 0, doubles = 0;   // counted whole by queries, and those not
     int64_t inc_skipped = 0, inc_other_cmd = 0, inc_full = 0;          // why not whole
+    // ((Triforce, 11-22, GPUWORK-01) and of the incomplete ones, those given up for a colour draw in their window
+    // (RX_VK_OCC_DEPTH_ONLY); the windows that met a colour draw, the colour draws under an open query, the counts given up
+    // (colour_line, a line of its own: line() is at the log's length already)
+    int64_t inc_colour = 0, colour_windows = 0, colour_open = 0, colour_lost = 0;
     // render conditions that read a samples-passed report's word (Cond::Kind), and the work they skipped
     int64_t conds = 0, cond_base = 0, cond_unknown = 0, cond_forced = 0, cond_written_on = 0, cond_written_off = 0, cond_memory = 0;
     int64_t draws_skipped = 0, clears_skipped = 0;
+    // (11-22) counts over a draw a written count's condition left out (Counter::gate): counted whole, written (of them 0),
+    // the conditions that read one, and those RX_VK_OCC_GATE=1 rendered
+    int64_t gated = 0, gated_written = 0, gated_zeros = 0, cond_gated_read = 0, cond_gated = 0;
     // at completion
     int64_t written = 0, zeros = 0;    // counts written into their records (of them 0: the object hidden)
     int64_t lost = 0;                  // a query not available once its recording was done: 4096 stays
@@ -389,7 +446,17 @@ struct Stats {
         if (k == Cond::kNotSamples) return;
         conds++;
         (k == Cond::kBase ? cond_base : k == Cond::kUnknown ? cond_unknown : k == Cond::kForced ? cond_forced
-         : k == Cond::kWrittenOn ? cond_written_on : k == Cond::kWrittenOff ? cond_written_off : cond_memory)++;
+         : k == Cond::kWrittenOn ? cond_written_on : k == Cond::kWrittenOff ? cond_written_off : k == Cond::kGated ? cond_gated
+         : cond_memory)++;
+    }
+    /// ((Triforce, 11-22, the performance audit's GPUWORK-01) The colour draws' line, into out. on: the rule is on
+    int colour_line(char* out, size_t size, int64_t presents, bool on) const {
+        return snprintf(out, size,
+                        "vk: occlusion queries (RX_VK_OCC_QUERY), %lld presents (3): %lld counting windows met a draw that "
+                        "writes colour, %lld such draws were recorded under an open query; depth-only counting "
+                        "(RX_VK_OCC_DEPTH_ONLY) is %s: %lld counts given up at a colour draw, %lld reports kept 4096 for it",
+                        (long long)presents, (long long)colour_windows, (long long)colour_open, on ? "on" : "off",
+                        (long long)colour_lost, (long long)inc_colour);
     }
     /// The line, into out
     int line(char* out, size_t size, int64_t presents, size_t tracked) const {
@@ -407,7 +474,8 @@ struct Stats {
                         "%lld (%lld as before: knob occq off; %lld rendered: a count pending (unknown); %lld rendered: "
                         "RX_VK_OCC_COND=0; %lld rendered from a written count; %lld skipped from a written count; %lld from "
                         "memory, no count to come); skipped by them: %lld draws and dispatches, %lld clears; %lld addresses "
-                        "this period, %zu tracked",
+                        "this period, %zu tracked; counts over a draw such a skip left out: %lld counted whole, %lld written "
+                        "(%lld of them 0), %lld conditions read one (%lld rendered: RX_VK_OCC_GATE=1)",
                         (long long)presents, (long long)reports, (long long)in_segments, (long long)skipped, (long long)fixed,
                         (long long)flagged, (long long)rewritten, (long long)measured, (long long)no_reset,
                         (long long)incomplete, (long long)inc_skipped, (long long)inc_other_cmd, (long long)inc_full,
@@ -417,7 +485,8 @@ struct Stats {
                         (long long)at[kAtWait], (long long)at[kAtBegin], (long long)at[kAtPresent], (long long)at[kAtReuse],
                         (long long)conds, (long long)cond_base, (long long)cond_unknown, (long long)cond_forced,
                         (long long)cond_written_on, (long long)cond_written_off, (long long)cond_memory,
-                        (long long)draws_skipped, (long long)clears_skipped, (long long)addrs, tracked);
+                        (long long)draws_skipped, (long long)clears_skipped, (long long)addrs, tracked, (long long)gated,
+                        (long long)gated_written, (long long)gated_zeros, (long long)cond_gated_read, (long long)cond_gated);
     }
 };
 
@@ -458,9 +527,10 @@ void complete(const std::vector<Rep>& reps, const uint64_t* pairs, uint32_t used
             w.settle(p.addr, p.pos);
             continue;
         }
-        w.wrote(p.addr, p.pos, sum);
+        w.wrote(p.addr, p.pos, sum, p.gated);
         const int64_t lat = std::max<int64_t>(0, now - p.present);
         st.written++, st.zeros += sum ? 0 : 1, st.lat_sum += lat, st.lat_ge1 += lat >= 1, st.lat_ge2 += lat >= 2;
+        if (p.gated) st.gated_written++, st.gated_zeros += sum ? 0 : 1;
     }
 }
 /// A recording's reports that never went to the GPU: no count comes for them

@@ -110,6 +110,7 @@ class Table {
         return page < kPages && regions[page / kRegionPages].load(std::memory_order_acquire) != 0;
     }
     bool any() const { return protected_pages.load(std::memory_order_acquire) != 0; }
+    std::atomic<uint64_t> late_retries{0};   // ((Triforce, 11-21) on_fault: faults on a page whose access was given back meanwhile
 
     /// A submission's end, for the whole pages [lo, hi) of a run it is about to write back (seq: this recording). skip gets
     /// the pages that are OWED: their copy is left out, and the debt is this recording's now. The others are copied as ever;
@@ -163,6 +164,21 @@ class Table {
         hold(page, now_ms);
         c.watch_ended_by_write++;
         return false;
+    }
+
+    /// ((Triforce, 11-21) The fault handler's question (lazy_veh), in place of tracked() then fault(). The table gives pages their
+    /// access back (end_pay, end_watch) BEFORE it uncounts them, so a thread that faulted on such a page just before can get here
+    /// with tracked() already false and the page readable and writable again: that access runs again (RETRY), where the handler
+    /// sent it on as not ours and the host's crash report ended the game (a player's report on 0.6.0: about one in 100k frames).
+    /// A page untracked and still without access is not this table's (start_watch counts before it protects). Tracked: fault()
+    Fault on_fault(uint64_t page, bool write, uint64_t grow, uint64_t now_ms, std::vector<Job>& jobs) {
+        if (page >= kPages) return NOT_OURS;
+        if (!tracked(page)) {
+            if (!mem.accessible(page, write)) return NOT_OURS;
+            late_retries.fetch_add(1, std::memory_order_relaxed);
+            return RETRY;
+        }
+        return fault(page, write, grow, now_ms, jobs);
     }
 
     /// A fault at page. NOT_OURS: nothing of this table's. RETRY: the access can run again (a watch ended by this write, a
@@ -393,15 +409,18 @@ class Table {
             uint64_t b = block_end;
             while (b < hi && !hot(b, now_ms)) b = std::min(hi, ((b >> kHotShift) + 1) << kHotShift);
             if (segs.size() >= kMaxSegs) { c.refused_full++; return; }
+            // (a write fault on a watched page has to find the table: its region counts it, and BEFORE the protection, so
+            // that no fault can meet a page without access that tracked() does not know yet. 11-21, a player's report: a
+            // write between the two went to the crash handler)
+            count(a, b, +1);
             if (mem.set(a, b, RO)) {
                 Seg s;
                 s.lo = a, s.hi = b, s.src = src, s.state = WATCH, s.collects_at = e.collects_begun, s.caps_at = e.caps_made;
                 segs.emplace(a, s);
                 nsegs.fetch_add(1, std::memory_order_release);
-                // (a write fault on a watched page has to find the table: its region counts it too)
-                count(a, b, +1);
                 c.watched += b - a, c.watch_pages += b - a;
             } else {
+                count(a, b, -1);
                 c.protect_failed++;
             }
             a = b;

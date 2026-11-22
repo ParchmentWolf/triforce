@@ -29,6 +29,10 @@ import kit
 import nso2  # noqa: F401  (DT_RELR)
 import insn
 import lift_fixes
+import fastvec
+import fma_soft
+import fma_steps
+import vecfp
 import chunks
 import standalone
 import adr_entries  # noqa: E402
@@ -42,6 +46,10 @@ import a64_rtgen
 
 insn.install()
 lift_fixes.install()
+fastvec.install()   # ((Triforce, 11-21, LIFT-02) TBL, EXT, 128-bit loads and DUP as one instruction each: nx2/fastvec.py)
+fma_soft.install()  # ((Triforce, 11-22, LIFT-06) the exact FMA bodies' short way out where the CPU has no FMA3: nx2/fma_soft.py)
+fma_steps.install()   # ((Triforce, 11-22, LIFT-05) FRECPS and FRSQRTS S as one fused instruction where the build has FMA3: nx2/fma_steps.py)
+vecfp.install()   # ((Triforce, 11-22, LIFT-03) SSE fast paths before float forms lifted lane by lane, with A64_VECFP=1: nx2/vecfp.py)
 
 
 def module_of(img, pc):

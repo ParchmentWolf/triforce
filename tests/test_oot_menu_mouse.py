@@ -62,6 +62,7 @@ enum { HOS_OPT_GAME_OPTIONS = 48 };
 enum { HOS_OPT_MODS_LIST = 150, HOS_OPT_MODS_X0, HOS_OPT_MODS_X1, HOS_OPT_MODS_Y0, HOS_OPT_MODS_Y1, HOS_OPT_MODS_PITCH, HOS_OPT_MODS_ENTER,
        HOS_OPT_MODS_SELECTED, HOS_OPT_MODS_PRESS };
 enum { HOS_MODS_LIST_SHOWN = 1, HOS_MODS_LIST_LAST_FOCUSED = 2, HOS_MODS_LIST_TITLE = 4 };
+enum { HOS_OPT_MODS_ALPHA = 162 };
 """
 
 FIXTURE = r"""
@@ -160,6 +161,7 @@ static uint64_t button_new(uint64_t s, float x, float y, float w, float h) {
     const uint64_t entry = alloc(64), button = alloc(128), box = alloc(0x200);
     put64(entry + 24, button), put64(entry + 8, s + 136), put64(button + 0x58, box);
     putf(box + 0x28, 1), putf(box + 0x38, 1), putf(box + 0x4c, x), putf(box + 0x50, y);
+    putf(box + 0x78, 1);   /* ((11-20) the button's alpha, as the game has it for a list that shows: mods_list_tick) */
     putf(box + 0x84, -w / 2), putf(box + 0x88, -h / 2), putf(box + 0x8c, w), putf(box + 0x90, h);
     uint64_t node = s + 144;   /* (the link to the head: the last node's +8, or the first's at +144) */
     while (get64(node) != s + 136) node = get64(node) + 8;
@@ -536,6 +538,7 @@ int64_t hos_now_ns(void) { return now_ns; }
 void hos_log(const char *fmt, ...) { (void)fmt; }
 static int told, told_id, told_value;
 void rx_option_set(int id, int value) { told++, told_id = id, told_value = value; }
+void hos_hid_tap(const char *press) { (void)press; }   /* ((Triforce, 11-22) benchmark mode's presses, both halves': off here) */
 void hos_oot_menu_focus(Ctx *c, uint64_t screen, uint64_t pane, uint64_t lr);
 void hos_oot_menu_tick(Ctx *c, uint64_t screen);
 int hos_oot_options_front(void);
