@@ -308,11 +308,8 @@ static void vr_tick(Ctx *c, const MkwVkXr *x) {
     x->in_play(play && !oot_paused());
 }
 
-/* In first person play, while the left stick is pushed sideways or back the game gets ZL held, so Link strafes as Z-targeting
-   does, facing the way he faced (the head's, from running forward or standing). Pushed forward (within 45 degrees) he runs
-   where the head looks, unless the head is within VR_RUN_ZONE degrees of its rest (the game's own camera's way, which the
-   head turns from): then straight that way, so a head held about forward never steers him. The stick is turned so the game,
-   which moves him relative to the head's view, runs him so, and turn_link faces him that way. The player's own ZL is kept. */
+/* First person play: the left stick runs Link the way it points (forward, back or sideways) from the head's view, with no ZL.
+   Within VR_RUN_ZONE degrees of the head's rest the way is from the game's own camera instead. turn_link faces him that way. */
 static double head_s, head_c = 1;   /* the head's view's level direction (sin, cos of its yaw), from the last camera update */
 static double base_s, base_c = 1;   /* the game's own camera's, before the head turned it */
 static double run_s, run_c = 1;     /* the way a run straight ahead takes */
@@ -329,20 +326,39 @@ static void vr_pad(uint64_t *buttons, int32_t *lx, int32_t *ly) {
     if (now_ns() - fp_at > 200000000ull) return;
     const int64_t m2 = (int64_t)*lx * *lx + (int64_t)*ly * *ly;
     if (m2 < (int64_t)8000 * 8000) return;
-    if (!(*ly > 0 && 2 * (int64_t)*ly * *ly >= m2)) {
-        *buttons |= 1ULL << HOS_SW_ZL;
-        return;
-    }
     const double zone = cfg_int("VR_RUN_ZONE") * M_PI / 180.0;
     const double off = atan2(head_s * base_c - head_c * base_s, head_c * base_c + head_s * base_s);
-    if (!(fabs(off) < zone)) return;
-    /* the stick's way from the rest's forward (s, c) and right (-c, s), then given relative to the head's */
-    const double wx = base_s * *ly - base_c * *lx, wz = base_c * *ly + base_s * *lx;
-    const double f = wx * head_s + wz * head_c, r = -wx * head_c + wz * head_s;
-    *ly = (int32_t)fmax(-32767, fmin(32767, f));
-    *lx = (int32_t)fmax(-32767, fmin(32767, r));
+    const int rest = fabs(off) < zone;
+    const double fs = rest ? base_s : head_s, fc = rest ? base_c : head_c;
+    /* the stick's way from the forward (fs, fc) and right (-fc, fs) */
+    const double wx = fs * *ly - fc * *lx, wz = fc * *ly + fs * *lx;
+    if (rest) {
+        const double f = wx * head_s + wz * head_c, r = -wx * head_c + wz * head_s;
+        *ly = (int32_t)fmax(-32767, fmin(32767, f));
+        *lx = (int32_t)fmax(-32767, fmin(32767, r));
+    }
     const double n = sqrt(wx * wx + wz * wz);
     run_s = wx / n, run_c = wz / n, run_at = now_ns();
+}
+
+static double wrap_pi(double a);
+static double turn_w;      /* the view's yaw while the right stick has turned it: atan2(x, z) of its level forward */
+static int turn_on;
+static uint64_t turn_t;
+
+static void vr_turn(int32_t *rx) {
+    const uint64_t now = now_ns();
+    const double dt = turn_t && now - turn_t < 100000000ull ? (now - turn_t) / 1e9 : 0;
+    turn_t = now;
+    if (now - fp_at > 1000000000ull || g_aiming) {
+        turn_on = 0;
+        return;
+    }
+    if (!turn_on) turn_w = atan2(base_s, base_c), turn_on = 1;
+    if (abs(*rx) < 1000) return;
+    const double deg_per_second = 150.0;
+    turn_w = wrap_pi(turn_w - *rx / 32767.0 * deg_per_second * M_PI / 180.0 * dt);
+    *rx = 0;
 }
 
 void vr_pad_read(Ctx *c, uint64_t *buttons, int32_t stick[4]) {
@@ -350,7 +366,7 @@ void vr_pad_read(Ctx *c, uint64_t *buttons, int32_t stick[4]) {
     /* (no session, VR off or no headset: nothing of VR's here, which runs on every pad read the game makes) */
     if (!x || !x->active || !x->active()) return;
     if (!rx_option(1, 0)) x->pad(buttons, stick, stick + 2);   /* the hand controllers, as the pad (the Insert menu's own while it is open) */
-    if (!rx_option(1, 0)) vr_pad(buttons, &stick[0], &stick[1]);   /* (not while the Insert menu is open) */
+    if (!rx_option(1, 0)) vr_pad(buttons, &stick[0], &stick[1]), vr_turn(&stick[2]);   /* (not while the Insert menu is open) */
     /* (the game reads the pad several times a frame, on its workers: what vr_tick tells VR changes at most once a frame,
        so it runs once in 4 ms, whichever reader comes first) */
     static uint64_t tick_at;
@@ -528,6 +544,10 @@ void hos_vr_camera(Ctx *c) {
     }
     memcpy(in_pos[k], pos, sizeof pos), memcpy(in_at[k], at, sizeof at), memcpy(in_up[k], up, sizeof up);
     have_out[k] = 0;
+    if (scene == 1 && turn_on) {
+        const double dx = at[0] - pos[0], dz = at[2] - pos[2], n = sqrt(dx * dx + dz * dz);
+        if (n > 1e-6) at[0] = pos[0] + n * sin(turn_w), at[2] = pos[2] + n * cos(turn_w);
+    }
     if (scene == 1) {   /* the game's own camera's level way: the head's rest, for a run straight ahead */
         const double fx = at[0] - pos[0], fz = at[2] - pos[2], n = sqrt(fx * fx + fz * fz);
         if (n > 1e-6) base_s = fx / n, base_c = fz / n;
