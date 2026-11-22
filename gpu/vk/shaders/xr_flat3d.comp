@@ -1,0 +1,68 @@
+#version 450
+// Flatscreen 3D (gpu/vk/vk_xr.cpp vk_xr_flat3d): the two eyes' pictures (xr_depth.comp, from the scene without the
+// HUD) made into one for a flat screen, the HUD over each at the screen's depth. Each eye's picture puts the world's far
+// end at the screen; it is taken `move` over (the picture's [0, 1]) so the screen's distance (xr_flat3d_conv.comp) sits
+// at the screen instead, nearer things out of it, farther ones behind. Pictures: 0 red/cyan (Dubois' least-squares
+// mix), 1 side by side squeezed (3D TVs), 2 side by side whole for crossed eyes (the right eye's on the left), 3 above
+// and below squeezed, 4 side by side whole for a phone in a viewer (Google Cardboard: the left eye's on the left, each half
+// the whole picture at half its size, the middle rows).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D left;
+layout(binding = 1) uniform sampler2D right;
+layout(binding = 2) uniform sampler2D hud;   // premultiplied, sRGB-encoded as the eyes
+layout(binding = 3, rgba8) uniform writeonly image2D picture;
+layout(binding = 4, std430) readonly buffer Screen { float inv; float valid; } screen;
+layout(push_constant) uniform Push {
+    ivec2 size;
+    int mode;
+    int hud_on;
+    float shift_l;   // each eye's offset times P00 (xr_depth.comp's shift)
+    float shift_r;
+} p;
+
+vec3 decode(vec3 c) { return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(0.04045, c)); }
+vec3 encode(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c));
+}
+
+// an eye's picture at uv of the screen: moved to the screen's distance, black past its edges, the HUD over it unmoved
+vec3 eye(int e, vec2 uv) {
+    const float move = 0.5 * (e == 0 ? p.shift_l : p.shift_r) * screen.inv;
+    const vec2 at = vec2(uv.x - move, uv.y);
+    vec3 c = vec3(0.0);
+    if (at.x >= 0.0 && at.x <= 1.0) c = (e == 0 ? texture(left, at) : texture(right, at)).rgb;
+    if (p.hud_on != 0) {
+        const vec4 h = texture(hud, uv);
+        c = h.rgb + c * (1.0 - h.a);
+    }
+    return c;
+}
+
+void main() {
+    const ivec2 at = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(at, p.size))) return;
+    const vec2 uv = (vec2(at) + 0.5) / vec2(p.size);
+    vec3 c;
+    if (p.mode == 0) {
+        const vec3 l = decode(eye(0, uv)), r = decode(eye(1, uv));
+        const mat3 ml = mat3(0.437, -0.062, -0.048, 0.449, -0.062, -0.050, 0.164, -0.024, -0.017);
+        const mat3 mr = mat3(-0.011, 0.377, -0.026, -0.032, 0.761, -0.093, -0.007, 0.009, 1.234);
+        c = encode(ml * l + mr * r);
+    } else if (p.mode == 1) {
+        const int e = uv.x < 0.5 ? 0 : 1;
+        c = eye(e, vec2(fract(uv.x * 2.0), uv.y));
+    } else if (p.mode == 2) {   // each half the whole picture at half its size, the middle rows; the right eye's left
+        const int e = uv.x < 0.5 ? 1 : 0;
+        const vec2 local = vec2(fract(uv.x * 2.0), (uv.y - 0.25) * 2.0);
+        c = local.y < 0.0 || local.y > 1.0 ? vec3(0.0) : eye(e, local);
+    } else if (p.mode == 4) {   // as crossed eyes', each eye on its own side
+        const int e = uv.x < 0.5 ? 0 : 1;
+        const vec2 local = vec2(fract(uv.x * 2.0), (uv.y - 0.25) * 2.0);
+        c = local.y < 0.0 || local.y > 1.0 ? vec3(0.0) : eye(e, local);
+    } else {
+        const int e = uv.y < 0.5 ? 0 : 1;
+        c = eye(e, vec2(uv.x, fract(uv.y * 2.0)));
+    }
+    imageStore(picture, at, vec4(c, 1.0));
+}

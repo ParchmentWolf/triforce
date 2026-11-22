@@ -1,0 +1,39 @@
+#version 450
+// Flatscreen 3D (gpu/vk/vk_xr.cpp vk_xr_flat3d): the distance put at the screen, as 1 / distance. Fixed (fixed_inv
+// above 0) or, as the 3DS does, the nearest thing in the picture's middle rows (xr_depth_keep.comp's rows), so the
+// world sits behind the screen; eased toward its target each frame so it does not jump.
+layout(local_size_x = 64) in;
+layout(binding = 0, std430) readonly buffer Rows { uint r[]; } rows;   // each depth row's least, then greatest, depth
+layout(binding = 1, std430) buffer Screen { float inv; float valid; } screen;
+layout(push_constant) uniform Push {
+    int h;            // the depth's rows
+    float plane_a;    // the stored depth d is plane_a + plane_b / distance
+    float plane_b;
+    float near_inv;   // 1 / the nearest distance the screen may sit at
+    float far_inv;    // 1 / the farthest
+    float fixed_inv;  // 1 / a fixed distance, 0 for the nearest thing's
+    float rate;       // the share of the way to the target each frame
+} p;
+
+shared float best[64];
+
+void main() {
+    const uint i = gl_LocalInvocationID.x;
+    float b = 0.0;
+    const int r0 = int(0.15 * float(p.h)), r1 = int(0.85 * float(p.h));
+    for (int row = r0 + int(i); row < r1; row += 64) {
+        const float ra = (uintBitsToFloat(rows.r[row]) - p.plane_a) / p.plane_b;
+        const float rb = (uintBitsToFloat(rows.r[p.h + row]) - p.plane_a) / p.plane_b;
+        if (!isinf(ra) && !isnan(ra) && !isinf(rb) && !isnan(rb)) b = max(b, max(ra, rb));
+    }
+    best[i] = b;
+    barrier();
+    for (uint s = 32; s > 0; s >>= 1) {
+        if (i < s) best[i] = max(best[i], best[i + s]);
+        barrier();
+    }
+    if (i != 0) return;
+    const float target = p.fixed_inv > 0.0 ? p.fixed_inv : clamp(best[0], p.far_inv, p.near_inv);
+    screen.inv = screen.valid > 0.5 ? mix(screen.inv, target, p.rate) : target;
+    screen.valid = 1.0;
+}

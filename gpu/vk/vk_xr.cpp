@@ -39,6 +39,8 @@
 #include "shaders/xr_aim_comp_spv.h"
 #include "shaders/xr_depth_keep_comp_spv.h"
 #include "shaders/xr_depth_comp_spv.h"
+#include "shaders/xr_flat3d_comp_spv.h"
+#include "shaders/xr_flat3d_conv_comp_spv.h"
 #include "shaders/xr_hud_comp_spv.h"
 #include "vk_work.h"
 
@@ -178,6 +180,17 @@ struct Xr {
     VkImageView target_l_view = VK_NULL_HANDLE, scene_r_view = VK_NULL_HANDLE;
     bool second_now = false, acc_ready = false;
     std::atomic<float> acc_shift{0.0f};   // metres the right eye's camera is from the left's (vk_xr_camera)
+    // Flatscreen 3D (FLAT3D, no headset; hud_mu): the eyes made as depth stereo's from the game's own camera, put together
+    // into one picture for the window (shaders/xr_flat3d.comp) at the screen's distance (xr_flat3d_conv.comp)
+    VkDescriptorSetLayout flat_set = VK_NULL_HANDLE, conv_set = VK_NULL_HANDLE;
+    VkPipelineLayout flat_layout = VK_NULL_HANDLE, conv_layout = VK_NULL_HANDLE;
+    VkPipeline flat_pipe = VK_NULL_HANDLE, conv_pipe = VK_NULL_HANDLE;
+    bool flat_tried = false;
+    VkBuffer screen = VK_NULL_HANDLE;   // the screen's 1 / distance, eased (xr_flat3d_conv.comp)
+    VkImage flat8 = VK_NULL_HANDLE;
+    VkImageView flat8_view = VK_NULL_HANDLE;
+    uint32_t flat_w = 0, flat_h = 0;
+    int flat_age = 1000;   // presents since the last picture was made
     VkDescriptorSetLayout hud_set = VK_NULL_HANDLE;
     VkPipelineLayout hud_layout = VK_NULL_HANDLE;
     VkPipeline hud_pipe = VK_NULL_HANDLE;
@@ -554,8 +567,12 @@ bool make_buffer(VkDeviceSize n, VkBufferUsageFlags usage, VkBuffer &buf) {
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     ai.allocationSize = mr.size, ai.memoryTypeIndex = type;
     VkDeviceMemory dm = VK_NULL_HANDLE;
-    return type != UINT32_MAX && vkAllocateMemory(x.device, &ai, nullptr, &dm) == VK_SUCCESS &&
-           vkBindBufferMemory(x.device, buf, dm, 0) == VK_SUCCESS;
+    VkResult ar = type == UINT32_MAX ? VK_ERROR_OUT_OF_DEVICE_MEMORY : vkAllocateMemory(x.device, &ai, nullptr, &dm);
+    // the card's memory full: any other type the buffer may live in, as make_image
+    for (uint32_t i = 0; i < mem.memoryTypeCount && ar != VK_SUCCESS; i++)
+        if ((mr.memoryTypeBits & (1u << i)) && i != type) ai.memoryTypeIndex = i, ar = vkAllocateMemory(x.device, &ai, nullptr, &dm);
+    if (ar != VK_SUCCESS) rt_log("vr: a buffer of %llu bytes found no memory (%d)", (unsigned long long)n, (int)ar);
+    return ar == VK_SUCCESS && vkBindBufferMemory(x.device, buf, dm, 0) == VK_SUCCESS;
 }
 
 // A barrier on all memory: what came before is done and visible to what comes after
@@ -630,7 +647,7 @@ bool make_panel(VkCommandBuffer cb, bool keep_hud, int cut, VkImageView tview = 
     if (!x.scene8) {
         const VkImageUsageFlags u = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         if (!make_image(x.hud_w, x.hud_h, VK_FORMAT_R8G8B8A8_UNORM, u | VK_IMAGE_USAGE_SAMPLED_BIT, x.scene8, x.scene8_view) ||
-            !make_image(x.hud_w, x.hud_h, VK_FORMAT_R8G8B8A8_UNORM, u, x.panel8, x.panel8_view)) {
+            !make_image(x.hud_w, x.hud_h, VK_FORMAT_R8G8B8A8_UNORM, u | VK_IMAGE_USAGE_SAMPLED_BIT, x.panel8, x.panel8_view)) {
             x.hud_pipe = VK_NULL_HANDLE;
             return false;
         }
@@ -898,6 +915,31 @@ void keep_eye(VkCommandBuffer cb, Drawn &d) {
 // the image an eye's picture is in with stereo: Balanced's kept pictures, else depth stereo's
 VkImage eye_image(const Drawn &d, int e) { return d.eye >= 0 ? xr().acc8[e] : xr().eye8[e]; }
 
+VkImage eye_image(const Drawn &d, int e);
+// (vk_xr_capture, last, hud_mu held) with Flatscreen 3D's Cardboard choice while VR runs in stereo: the desktop shows both of
+// the headset's eyes, each its whole picture at half its size in its own half (the left eye's on the left), for a phone in a
+// viewer or a stream in 3D; the window back in TRANSFER_SRC after
+void window_both_eyes(VkCommandBuffer cb, VkImage window, VkExtent2D extent, const int rect[4], const Drawn &d) {
+    Xr &x = xr();
+    int to[4];
+    gfx_fit_rect(rect[2], rect[3], (int)extent.width, (int)extent.height, to);
+    if (to[2] <= 1 || to[3] <= 1 || !x.hud_w || !x.hud_h) return;
+    barrier(cb, window, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    const VkClearColorValue black{};
+    const VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdClearColorImage(cb, window, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
+    const int half = to[2] / 2, h = std::min(to[3], (int)((float)half * (float)x.hud_h / (float)x.hud_w));
+    const int y0 = to[1] + (to[3] - h) / 2;
+    for (int e = 0; e < 2; e++) {
+        VkImageBlit b{};
+        b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        b.srcOffsets[1] = {(int32_t)x.hud_w, (int32_t)x.hud_h, 1};
+        b.dstOffsets[0] = {to[0] + e * half, y0, 0}, b.dstOffsets[1] = {to[0] + e * half + half, y0 + h, 1};
+        vkCmdBlitImage(cb, eye_image(d, e), VK_IMAGE_LAYOUT_GENERAL, window, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+    }
+    barrier(cb, window, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+}
+
 // Stereo Balanced (vk_xr_capture, last, hud_mu held): the desktop shows the left eye. Its presents' window picture
 // (with the HUD and the hands) is kept, and put back over the window on the right eye's presents, so the window does
 // not shift between the eyes every frame; the window back in TRANSFER_SRC after
@@ -936,6 +978,8 @@ void window_left_eye(VkCommandBuffer cb, VkImage window, VkExtent2D extent, VkFo
 // (vk_xr_capture, hud_mu held, after make_panel) each eye's picture from the scene make_panel left in scene8 and this
 // present's scene depth: the eye half the eyes' distance (VR_DEPTH percent of it) to its side of the head's
 // view; false without the depth (the head's view then shows the one picture to both eyes)
+bool eyes_from(VkCommandBuffer cb, const float shift[2], const float planes[2]);
+
 bool make_eyes(VkCommandBuffer cb, const Drawn &d) {
     Xr &x = xr();
     float planes[2];
@@ -943,6 +987,18 @@ bool make_eyes(VkCommandBuffer cb, const Drawn &d) {
         x.stereo_missed++;
         return false;
     }
+    const float tan_x = d.lens.r * d.scale;   // the game's lens: x_ndc = view x / (z tan_x)
+    const float strength = 0.01f * (float)cfg_int("VR_DEPTH");
+    float shift[2];
+    for (int e = 0; e < 2; e++) shift[e] = (e ? 0.5f : -0.5f) * d.ipd * strength / tan_x;   // the left eye to the left
+    if (!eyes_from(cb, shift, planes)) return false;
+    x.stereo_pictures++;
+    return true;
+}
+
+// each eye's picture (eye8) from scene8 and the kept depth, the eye `shift` (view units times P00) to its side
+bool eyes_from(VkCommandBuffer cb, const float shift[2], const float planes[2]) {
+    Xr &x = xr();
     if (!x.depth_tried) {
         x.depth_tried = true;
         if (!make_depth_pipeline()) {
@@ -953,7 +1009,8 @@ bool make_eyes(VkCommandBuffer cb, const Drawn &d) {
     if (!x.depth_pipe) return false;
     if (!x.eye8[0] || x.eye8_w != x.hud_w || x.eye8_h != x.hud_h) {   // (another size's are left behind, as the scene's)
         for (int e = 0; e < 2; e++)
-            if (!make_image(x.hud_w, x.hud_h, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+            if (!make_image(x.hud_w, x.hud_h, VK_FORMAT_R8G8B8A8_UNORM,
+                            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                             x.eye8[e], x.eye8_view[e])) {
                 rt_log("vr: the depth stereo eye images %ux%u could not be made: one picture to both eyes", x.hud_w, x.hud_h);
                 x.depth_pipe = VK_NULL_HANDLE;
@@ -962,8 +1019,6 @@ bool make_eyes(VkCommandBuffer cb, const Drawn &d) {
         x.eye8_w = x.hud_w, x.eye8_h = x.hud_h;
         rt_log("vr: depth stereo: eye pictures %ux%u", x.hud_w, x.hud_h);
     }
-    const float tan_x = d.lens.r * d.scale;   // the game's lens: x_ndc = view x / (z tan_x)
-    const float strength = 0.01f * (float)cfg_int("VR_DEPTH");
     const float near_inv = 1.0f / 0.01f;   // a guard alone: everything has its own depth down to a centimetre
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.depth_pipe);
     for (int e = 0; e < 2; e++) {
@@ -981,15 +1036,13 @@ bool make_eyes(VkCommandBuffer cb, const Drawn &d) {
             else w[i].pImageInfo = &info[i];
         }
         vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.depth_layout, 0, 4, w);
-        const float side = (e ? 0.5f : -0.5f) * d.ipd * strength;   // the left eye to the left: the scene moves right in it
         // the largest move, at most a quarter of the picture: the shader scans no further
-        const float most = std::min(0.25f, 0.5f * std::fabs(side / tan_x) * near_inv + 0.002f);
-        const float pc[7] = {(float)x.hud_w, (float)x.hud_h, side / tan_x, planes[0], planes[1], most, near_inv};
+        const float most = std::min(0.25f, 0.5f * std::fabs(shift[e]) * near_inv + 0.002f);
+        const float pc[7] = {(float)x.hud_w, (float)x.hud_h, shift[e], planes[0], planes[1], most, near_inv};
         vkCmdPushConstants(cb, x.depth_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
         vkCmdDispatch(cb, (x.hud_w + 7) / 8, (x.hud_h + 7) / 8, 1);
         barrier(cb, x.eye8[e], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
     }
-    x.stereo_pictures++;
     return true;
 }
 
@@ -1877,9 +1930,20 @@ extern "C" uint32_t vk_xr_queue(uint32_t family_queues, uint32_t first_free) {
     return x.queue_index = first_free;
 }
 
+// Flatscreen 3D (FLAT3D other than off) with no headset: the device kept for it alone
+bool flat_on() {
+    Xr &x = xr();
+    return !x.ok && x.device && strcmp(cfg_value("FLAT3D"), "off") != 0;
+}
+extern "C" int vk_xr_flat_wanted(void) { return flat_on(); }
+
 extern "C" void vk_xr_device_ready(VkInstance instance, VkPhysicalDevice phys, VkDevice device, uint32_t family) {
     Xr &x = xr();
-    if (!x.ok || x.queue_index == UINT32_MAX) return;
+    if (!x.ok) {   // no headset: the device for flatscreen 3D alone (flat_on)
+        x.vk_instance = instance, x.phys = phys, x.device = device, x.family = family;
+        return;
+    }
+    if (x.queue_index == UINT32_MAX) return;
     x.vk_instance = instance, x.phys = phys, x.device = device, x.family = family;
     vkGetDeviceQueue(device, family, x.queue_index, &x.queue);
     VkSemaphoreTypeCreateInfo tc{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
@@ -1900,13 +1964,13 @@ extern "C" void vk_xr_device_ready(VkInstance instance, VkPhysicalDevice phys, V
 extern "C" int vk_xr_head_wanted(void) { return xr().ok && strcmp(cfg_value("VR_VIEW"), "head") == 0; }
 
 extern "C" int vk_xr_depth_wanted(void) {   // (Balanced keeps the depth too: the hands and the reticle are hidden by it)
-    return vk_xr_head_wanted() && (cfg_int("VR_DEPTH") > 0 || stereo_turns() || stereo_accurate());
+    return flat_on() || (vk_xr_head_wanted() && (cfg_int("VR_DEPTH") > 0 || stereo_turns() || stereo_accurate()));
 }
 
 extern "C" void vk_xr_keep_depth(VkCommandBuffer cb, VkImageView depth, uint32_t w, uint32_t h) {
     if (xr().second_now) return;   // (Stereo Accurate's right eye: the left's depth is the one kept)
     Xr &x = xr();
-    if (!x.ok || !x.head_view.load(std::memory_order_relaxed) || !depth || !w || !h) return;
+    if (!((x.ok && x.head_view.load(std::memory_order_relaxed)) || flat_on()) || !depth || !w || !h) return;
     std::lock_guard<std::mutex> lk(x.hud_mu);
     if (!x.keep_tried) {
         x.keep_tried = true;
@@ -2210,8 +2274,8 @@ extern "C" void vk_xr_untracked(void) {
 extern "C" VkImage vk_xr_scene_image(VkImage target, uint32_t w, uint32_t h, VkFormat format, int *init) {
     Xr &x = xr();
     *init = 0;
-    if (!x.ok || !x.head_view.load(std::memory_order_relaxed) || !(hud_wanted() || vk_xr_depth_wanted()) || !target || !w || !h)
-        return VK_NULL_HANDLE;
+    const bool vr = x.ok && x.head_view.load(std::memory_order_relaxed) && (hud_wanted() || vk_xr_depth_wanted());
+    if (!(vr || flat_on()) || !target || !w || !h) return VK_NULL_HANDLE;
     // other pictures pass through the upscaler too (a 2560x1440 sRGB one): only the one of the presented picture's size
     // is the scene the HUD is drawn over
     if (w != x.pic_w.load(std::memory_order_relaxed) || h != x.pic_h.load(std::memory_order_relaxed)) return VK_NULL_HANDLE;
@@ -2476,7 +2540,8 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
         x.box_drawn[slot] = d;
         if (have_picture) {   // last: the headset's copies are made
             std::lock_guard<std::mutex> lk(x.hud_mu);
-            if (d.eye >= 0) window_left_eye(cb, window, extent, format, rect, d.eye);
+            if (d.stereo && !strcmp(cfg_value("FLAT3D"), "cardboard")) window_both_eyes(cb, window, extent, rect, d);
+            else if (d.eye >= 0) window_left_eye(cb, window, extent, format, rect, d.eye);
         }
     }
     x.pending = slot;
@@ -2499,6 +2564,7 @@ extern "C" void vk_xr_captured(const VkSemaphoreSubmitInfo *signal) {
 namespace {
 std::atomic<uint64_t> planes_bits{0};   // (planes[0], planes[1] as two floats' bits; 0 none yet)
 std::atomic<uint64_t> planes_at{0};     // (plat_now_ns of the last projection)
+std::atomic<float> lens_p00{0.0f};       // (its P00: Flatscreen 3D's eyes' moves)
 
 double plane_dist(const float P[16], double k) {
     const double den = P[10] - k * P[14];
@@ -2519,6 +2585,7 @@ extern "C" void vk_xr_note_projection(const float P[16], int minus_w) {
     uint64_t bits;
     std::memcpy(&bits, planes, 8);
     planes_bits.store(bits, std::memory_order_relaxed);
+    lens_p00.store(P[0], std::memory_order_relaxed);
     planes_at.store(plat_now_ns(), std::memory_order_relaxed);
     static int lines;
     static float logged[2];
@@ -2546,4 +2613,145 @@ extern "C" const MkwVkXr *vk_xr_table(void) {
         vk_xr_hand_item, vk_xr_in_play, vk_xr_aim_freeze, vk_xr_pointer, vk_xr_aim, vk_xr_untracked, vk_xr_hands,
         vk_xr_active};
     return &t;
+}
+
+// Flatscreen 3D's shaders (shaders/xr_flat3d.comp, xr_flat3d_conv.comp): push descriptors, as the others
+bool flat_pipeline(const VkDescriptorSetLayoutBinding *b, uint32_t n, uint32_t push, const uint32_t *code, size_t size,
+                   VkDescriptorSetLayout &set, VkPipelineLayout &layout, VkPipeline &pipe) {
+    Xr &x = xr();
+    VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, li.bindingCount = n, li.pBindings = b;
+    if (vkCreateDescriptorSetLayout(x.device, &li, nullptr, &set) != VK_SUCCESS) return false;
+    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, push};
+    VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pi.setLayoutCount = 1, pi.pSetLayouts = &set, pi.pushConstantRangeCount = 1, pi.pPushConstantRanges = &pr;
+    if (vkCreatePipelineLayout(x.device, &pi, nullptr, &layout) != VK_SUCCESS) return false;
+    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    mi.codeSize = size, mi.pCode = code;
+    VkShaderModule m = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(x.device, &mi, nullptr, &m) != VK_SUCCESS) return false;
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main", nullptr};
+    ci.layout = layout;
+    const VkResult res = vkCreateComputePipelines(x.device, VK_NULL_HANDLE, 1, &ci, nullptr, &pipe);
+    vkDestroyShaderModule(x.device, m, nullptr);
+    return res == VK_SUCCESS;
+}
+
+bool make_flat_pipelines() {
+    Xr &x = xr();
+    const VkDescriptorSetLayoutBinding fb[5] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                                {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                                {2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                                {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                                {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+    const VkDescriptorSetLayoutBinding cbd[2] = {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                                 {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+    return flat_pipeline(fb, 5, 24, XR_FLAT3D_COMP_SPV, sizeof XR_FLAT3D_COMP_SPV, x.flat_set, x.flat_layout, x.flat_pipe) &&
+           flat_pipeline(cbd, 2, 28, XR_FLAT3D_CONV_COMP_SPV, sizeof XR_FLAT3D_CONV_COMP_SPV, x.conv_set, x.conv_layout, x.conv_pipe);
+}
+
+// (vk_xr_flat3d, hud_mu held, the eyes made) the screen's distance eased, then the window's picture made from the eyes
+bool flat_compose(VkCommandBuffer cb, const float shift[2], const float planes[2]) {
+    Xr &x = xr();
+    if (!x.screen) {
+        if (!make_buffer(16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, x.screen)) {
+            x.screen = VK_NULL_HANDLE;
+            return false;
+        }
+        vkCmdFillBuffer(cb, x.screen, 0, 16, 0);
+        memory_barrier(cb);
+    }
+    if (!x.flat8 || x.flat_w != x.hud_w || x.flat_h != x.hud_h) {   // (another size's is left behind, as the scene's)
+        if (!make_image(x.hud_w, x.hud_h, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                        x.flat8, x.flat8_view)) {
+            x.flat8 = VK_NULL_HANDLE;
+            return false;
+        }
+        x.flat_w = x.hud_w, x.flat_h = x.hud_h;
+        rt_log("flat3d: pictures %ux%u", x.hud_w, x.hud_h);
+    }
+    // the screen: the nearest thing in the middle rows (the 3DS's way, 0) or FLAT3D_SCREEN cm
+    const int cm = cfg_int("FLAT3D_SCREEN");
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.conv_pipe);
+    const VkDescriptorBufferInfo rows{x.rows, 0, 8ull * x.depth_h}, scr{x.screen, 0, 16};
+    VkWriteDescriptorSet cw[2]{};
+    for (uint32_t i = 0; i < 2; i++) {
+        cw[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, cw[i].dstBinding = i, cw[i].descriptorCount = 1;
+        cw[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, cw[i].pBufferInfo = i ? &scr : &rows;
+    }
+    vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.conv_layout, 0, 2, cw);
+    struct {
+        int32_t h;
+        float a, b, near_inv, far_inv, fixed_inv, rate;
+    } cp{(int32_t)x.depth_h, planes[0], planes[1], 1.0f / 1.5f, 1.0f / 30.0f, cm > 0 ? 100.0f / (float)cm : 0.0f, 0.08f};
+    vkCmdPushConstants(cb, x.conv_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof cp, &cp);
+    vkCmdDispatch(cb, 1, 1, 1);
+    memory_barrier(cb);
+    const char *m = cfg_value("FLAT3D");
+    const int32_t mode = !strcmp(m, "sbs") ? 1 : !strcmp(m, "crosseye") ? 2 : !strcmp(m, "tab") ? 3 : !strcmp(m, "cardboard") ? 4 : 0;
+    barrier(cb, x.flat8, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.flat_pipe);
+    const VkDescriptorImageInfo info[4] = {{x.linear, x.eye8_view[0], VK_IMAGE_LAYOUT_GENERAL},
+                                           {x.linear, x.eye8_view[1], VK_IMAGE_LAYOUT_GENERAL},
+                                           {x.linear, x.panel8_view, VK_IMAGE_LAYOUT_GENERAL},
+                                           {VK_NULL_HANDLE, x.flat8_view, VK_IMAGE_LAYOUT_GENERAL}};
+    VkWriteDescriptorSet w[5]{};
+    for (uint32_t i = 0; i < 5; i++) {
+        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, w[i].dstBinding = i, w[i].descriptorCount = 1;
+        w[i].descriptorType = i == 4 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                              : i == 3 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        if (i == 4) w[i].pBufferInfo = &scr;
+        else w[i].pImageInfo = &info[i];
+    }
+    vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.flat_layout, 0, 5, w);
+    struct {
+        int32_t w, h, mode, hud_on;
+        float shift_l, shift_r;
+    } fp{(int32_t)x.hud_w, (int32_t)x.hud_h, mode, 1, shift[0], shift[1]};
+    vkCmdPushConstants(cb, x.flat_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof fp, &fp);
+    vkCmdDispatch(cb, (x.hud_w + 7) / 8, (x.hud_h + 7) / 8, 1);
+    barrier(cb, x.flat8, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+    return true;
+}
+
+// Flatscreen 3D: the window's picture (window in TRANSFER_DST_OPTIMAL; to: the game's picture's place in it, rect: the
+// picture's own size) made from this frame's scene before the HUD and its depth, each eye 3.2 cm (FLAT3D_DEPTH percent of
+// it) to its side of the game's camera, the HUD at the screen. Before the menu is drawn over the window
+extern "C" void vk_xr_flat3d(VkCommandBuffer cb, VkImage window, int hdr, const int rect[4], const int to[4]) {
+    Xr &x = xr();
+    if (!flat_on() || hdr || rect[2] <= 0 || rect[3] <= 0 || to[2] <= 0 || to[3] <= 0) {
+        x.flat_age = 1000;
+        return;
+    }
+    // the game's picture's size: the scene kept before the HUD is the one of this size (vk_xr_scene_image)
+    x.pic_w.store((uint32_t)rect[2], std::memory_order_relaxed), x.pic_h.store((uint32_t)rect[3], std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lk(x.hud_mu);
+    float planes[2];
+    const float p00 = lens_p00.load(std::memory_order_relaxed);
+    const bool cam = vk_xr_planes(planes) && p00 > 0.0f && x.depth_kept;
+    bool made = false;
+    if (cam && make_panel(cb, false, 0)) {
+        if (!x.flat_tried) {
+            x.flat_tried = true;
+            if (!make_flat_pipelines()) {
+                rt_log("flat3d: the shaders could not be made: flatscreen 3D off");
+                x.flat_pipe = VK_NULL_HANDLE;
+            } else rt_log("flat3d: on, the game's lens P00 %.3f", p00);
+        }
+        const float half = 0.5f * 0.064f * 0.01f * (float)cfg_int("FLAT3D_DEPTH");
+        const float shift[2] = {-half * p00, half * p00};
+        made = x.flat_pipe && eyes_from(cb, shift, planes) && flat_compose(cb, shift, planes);
+    }
+    // a present with no new scene (the same frame shown again) shows the last picture; a few without one (a menu, the
+    // title, a paused game drawing no world) the game's own
+    x.flat_age = made ? 0 : std::min(x.flat_age + 1, 1000);
+    if (x.flat_age > 2 || !x.flat8) return;
+    memory_barrier(cb);
+    VkImageBlit b{};
+    b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    b.srcOffsets[1] = {(int32_t)x.flat_w, (int32_t)x.flat_h, 1};
+    b.dstOffsets[0] = {to[0], to[1], 0}, b.dstOffsets[1] = {to[0] + to[2], to[1] + to[3], 1};
+    vkCmdBlitImage(cb, x.flat8, VK_IMAGE_LAYOUT_GENERAL, window, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+    memory_barrier(cb);
 }

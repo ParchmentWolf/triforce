@@ -39,6 +39,10 @@ void vk_xr_keep_depth(VkCommandBuffer cb, VkImageView depth, uint32_t w, uint32_
 // Stereo Accurate: metres from the left eye's camera to the right's while it is on (0: not now); the right eye's pass (vk_replay.cpp)
 // begins (phase 1: the left eye's target copied apart) and ends (0)
 float vk_xr_accurate_shift(void);
+// Flatscreen 3D (the VR tab's Flatscreen 3D rows, no headset): wanted now; the window's picture made in 3D before the menu is
+// drawn over it (window in TRANSFER_DST_OPTIMAL; rect: the game's picture's own size, to: its place in the window)
+int vk_xr_flat_wanted(void);
+void vk_xr_flat3d(VkCommandBuffer cb, VkImage window, int hdr, const int rect[4], const int to[4]);
 void vk_xr_second_eye(VkCommandBuffer cb, int phase);
 // vk_draw.cpp xr_stand_in, with the depth: the view the scene was drawn with (rows 0-2 of its 3x4 view: right, up, back, each with
 // its translation), so the picture is matched to the camera update that gave it (the game draws a frame behind them)

@@ -156,6 +156,9 @@ struct Options {
     int vr_screen_curve = 1;    // the floating screen curved around the head
     int vr_camera = 0;          // Immersive: 0 first person (Link's eyes), 1 third person (the game's camera turned by the head)
     int vr_view_scale = 100;    // the game's lens over the headset's, percent (50 to 200)
+    int flat3d = 0;             // (Triforce) Flatscreen 3D without a headset: 0 off, 1 red/cyan, 2 side by side, 3 crossed eyes, 4 above and below, 5 Cardboard
+    int flat3d_depth = 100;     // its eyes' distance, percent of 6.4 cm
+    int flat3d_screen = 0;      // the screen's distance in cm, 0 the nearest thing in the picture's middle
     int vr_resolution = 0;      // (Triforce VR) the 3D's size while VR is on: 0 the Graphics tab's Render resolution, else its values
     int vr_stereo = 0;          // 0 Performant (each eye from one picture and its depth), 1 Balanced (eyes in turn, the game's time held)
     int vr_depth = 100;         // the eyes' distance, percent of the wearer's own (0 to 200)

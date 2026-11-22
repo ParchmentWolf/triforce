@@ -5109,7 +5109,7 @@ bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, 
     const bool xr_double = xr_double_env || vk_xr_accurate_shift() > 0.0f;
     static NvnState xr_began;
     static uint64_t xr_began_value = 0;
-    if (xr_double && !p && cb == 0) xr_began = *cur_state, xr_began_value = value, xr_eye.cb_scene = false;
+    if (xr_double && !p && cb == 0) xr_began = *cur_state, xr_began_value = value, xr_eye.cb_scene = false, xr_detect_reset(false);
     for (; cb < n; cb++, p = nullptr) {
         if (!handles[cb]) continue;
         stop = replay_handle(cmd, p ? p : reinterpret_cast<const uint8_t*>(handles[cb]), may_stop);
@@ -5121,6 +5121,7 @@ bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, 
         end_pass(rec_cur->cmd);
         full_barrier(rec_cur->cmd, "barrier (the other eye's walk)");
         vk_xr_second_eye(rec_cur->cmd, 1);   // (VR: the left eye's target copied apart, the right eye's scene kept apart)
+        xr_detect_reset(true);
         xr_eye.hits = 0, xr_eye.on = true, second_eye = true;
         VkCommandBuffer c2 = rec_cur->cmd;
         for (int k = 0; k < n; k++)
@@ -8266,6 +8267,11 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
         } else if (decision == PresentTraceDecision::Limit) {
             logf("vk: present geometry: limit of %u changes reached; further geometry messages suppressed", PresentGeometryTrace::kLimit);
         }
+    }
+    if (src) {   // ((Triforce) Flatscreen 3D: the game's picture made in 3D, before the menu is drawn over it (vk_xr.cpp)
+        const PresentSourceRect fr = present_source_rect(sw, sh, crop);
+        const int pic[4] = {(int)fr.x, (int)fr.y, (int)fr.w, (int)fr.h}, to[4] = {(int)rect.x, (int)rect.y, (int)rect.w, (int)rect.h};
+        vk_xr_flat3d(f.cmd, dst, dev.hdr || hdr_image, pic, to);
     }
     checkpoint_mark(f.cmd, index, 'M');   // ((Triforce) RX_VK_CHECKPOINTS)
     menu_record(f.cmd, index, dev.swap_extent.width, dev.swap_extent.height);   // (hookshot) Dear ImGui's overlays, over all of it
