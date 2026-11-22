@@ -145,8 +145,7 @@ static void hide_link(uint64_t actor) {
 }
 
 /* First person (VR_CAMERA first): the camera at Link's eyes, from his feet, his facing and his age; the offsets VR_EYE_UP,
-   _SIDE and _FORWARD (centimetres, -30..30) move it from the place found right in a Quest 3 (child 1.27 m, adult 1.80 m over
-   his feet, 8 cm ahead of them). 0 while there is no Link. */
+   _SIDE and _FORWARD (centimetres, -30..30) move it from the place found right in a Quest 3 (below). 0 while there is no Link. */
 static int first_person_eye(double eye[3]) {
     if (strcmp(cfg_value("VR_CAMERA"), "first")) return 0;
     const uint64_t actor = player();
@@ -155,12 +154,12 @@ static int first_person_eye(double eye[3]) {
     double fx = m[2], fz = m[8], n = sqrt(fx * fx + fz * fz);   /* his facing: the rotation's third column, level */
     if (!(n > 1e-4)) return 0;
     fx /= n, fz /= n;
-    /* (VR_BODY arms: the eyes at his own eyes (adult 1.45 m, 18 cm ahead of his feet, found right in a Quest 3 with his
-       arms shown; young Link scaled alike, 1.0 m), so his shoulders are under them and his arms reach where the hands
-       are: from a grown-up's height the hands' places lay out of his reach. Hidden: a grown-up's height) */
-    const int body = !strcmp(cfg_value("VR_BODY"), "arms"), child = oot_childhood();
-    const double up = (body ? (child ? 1.00 : 1.45) : (child ? 1.27 : 1.80)) + cfg_int("VR_EYE_UP") / 100.0;
-    const double ahead = (body ? 0.18 : 0.08) + cfg_int("VR_EYE_FORWARD") / 100.0, side = cfg_int("VR_EYE_SIDE") / 100.0;
+    /* (the eyes at his own head, with his arms shown or not: adult 1.73 m and 6 cm ahead of his feet, found right in a
+       Quest 3 against his body with only his head hidden (the earlier 1.45 m and 18 cm sat 28 cm low and 12 cm ahead of
+       it; hidden's 1.80 m and 8 cm was a guess with his model in the way); young Link scaled alike, 1.19 m and 4 cm) */
+    const int child = oot_childhood();
+    const double up = (child ? 1.19 : 1.73) + cfg_int("VR_EYE_UP") / 100.0;
+    const double ahead = (child ? 0.04 : 0.06) + cfg_int("VR_EYE_FORWARD") / 100.0, side = cfg_int("VR_EYE_SIDE") / 100.0;
     eye[0] = feet[0] + ahead * fx - side * fz;   /* his right: (-fz, 0, fx) */
     eye[1] = feet[1] + up;
     eye[2] = feet[2] + ahead * fz + side * fx;
@@ -350,7 +349,7 @@ void vr_pad_read(Ctx *c, uint64_t *buttons, int32_t stick[4]) {
     const MkwVkXr *x = xr();
     /* (no session, VR off or no headset: nothing of VR's here, which runs on every pad read the game makes) */
     if (!x || !x->active || !x->active()) return;
-    x->pad(buttons, stick, stick + 2);   /* the hand controllers, as the pad */
+    if (!rx_option(1, 0)) x->pad(buttons, stick, stick + 2);   /* the hand controllers, as the pad (the Insert menu's own while it is open) */
     if (!rx_option(1, 0)) vr_pad(buttons, &stick[0], &stick[1]);   /* (not while the Insert menu is open) */
     /* (the game reads the pad several times a frame, on its workers: what vr_tick tells VR changes at most once a frame,
        so it runs once in 4 ms, whichever reader comes first) */

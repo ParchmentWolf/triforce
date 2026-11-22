@@ -101,6 +101,9 @@ bool dry_temporal_dispatch(NvnState& s);
 /// begins; and the watch on the game's programs that reach guest memory past their bindings (page table, texel buffers), counted
 /// while it is on
 bool upscale_dispatch(NvnState& s);
+/// (Triforce VR) RX_VK_XR_SPAN=1: the scene span's measuring probe (vk_draw.cpp), each op of the stream in order
+bool xr_span_wanted();
+void xr_span_probe(uint32_t op, const uint8_t* a, uint32_t avail, const uint8_t* cb_start, uint64_t rec, NvnState& s);
 void draw_tail_watch(bool on);
 uint64_t draw_tail_programs();
 /// (Triforce, vk_replay.cpp) While a segment is recorded whose draws the dry pass told the temporal hooks: draw() does not

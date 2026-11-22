@@ -9448,6 +9448,71 @@ static bool typed_upscale(VkCommandBuffer cmd, VkImageView input_view, VkImageVi
 static bool temporal_rejected_network(VkCommandBuffer cmd, uint64_t key, Texture* src, const nvn_tex* in, Texture* dst,
                                       const nvn_tex* out);
 
+static Texture* xr_keep_scene_depth(VkCommandBuffer cmd, Texture* out, uint32_t level);
+/// (Triforce VR) The gameplay upscale for VR (vk_xr.cpp), found as temporal_stand_in finds it: before it, the scene's depth and
+/// camera kept for the headset's eyes; its output, returned, is then kept before the HUD is drawn over it (XrAfterUpscale, once
+/// the dispatch or whatever stands in for it is recorded). nullptr: not the gameplay upscale, or VR wants neither
+static Texture* xr_before_upscale(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
+    if (!vk_xr_active() || p.stages.empty()) return nullptr;
+    const Stage& st = p.stages[0];
+    if (!gameplay_network(p.key) && !(st.info.uses_cooperative_matrix && st.info.texture_descriptors.size() == 1 &&
+                                      st.info.image_descriptors.size() == 1))
+        return nullptr;
+    if (st.info.image_descriptors.empty()) return vk_xr_note_upscale(0), nullptr;
+    Texture* out = nullptr;
+    uint32_t level = 0;
+    const auto& od = st.info.image_descriptors[0];
+    if (const uint32_t h = handle_of(s, st, od, 0))
+        texture_view_of(h, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Storage, image_format(od.format), &out, &level);
+    vk_xr_note_upscale(out && out->image && !level);
+    return xr_keep_scene_depth(cmd, out, level);
+}
+/// (Triforce VR) an upscale's output (the gameplay network's, or what stands in for a network of another share that does not
+/// translate: upscale_stub): before it is written, the scene's depth and camera kept for the headset's eyes. nullptr: none
+static Texture* xr_keep_scene_depth(VkCommandBuffer cmd, Texture* out, uint32_t level) {
+    if (!out || !out->image || level) return nullptr;
+    float view[12];
+    VkImageView depth = VK_NULL_HANDLE;
+    uint32_t w = 0, h = 0;
+    if (vk_xr_depth_wanted() && temporal_xr_scene(out, level, view, &depth, &w, &h)) {
+        full_barrier(cmd);   // (the scene's draws into its depth, before the copy reads it)
+        vk_xr_keep_depth(cmd, depth, w, h);
+        vk_xr_scene_camera(view);
+        // (a compute pipeline and push descriptors of VR's own: the next draw or dispatch sets all of its again)
+        last_dyn_valid = false, last_desc_valid = false, last_vb_valid = false, last_pipeline = VK_NULL_HANDLE;
+        vertex_set.on = false, last_ib.on = false;
+        descriptors_disturbed();
+    }
+    return out;
+}
+/// (Triforce VR) the gameplay upscale's output, once recorded, copied for VR's HUD panel and depth stereo (vk_xr_scene_image)
+struct XrAfterUpscale {
+    VkCommandBuffer cmd;
+    Texture* out;
+    ~XrAfterUpscale() {
+        if (!out) return;
+        int init = 0;
+        const VkImage keep = vk_xr_scene_image(out->image, out->width, out->height, out->format, &init);
+        if (!keep) return;
+        full_barrier(cmd);
+        if (init) {
+            VkImageMemoryBarrier2 ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+            ib.srcStageMask = ib.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            ib.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            ib.image = keep, ib.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            dep.imageMemoryBarrierCount = 1, dep.pImageMemoryBarriers = &ib;
+            vkCmdPipelineBarrier2(cmd, &dep);
+        }
+        VkImageCopy cp{};
+        cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        cp.extent = {out->width, out->height, 1};
+        vkCmdCopyImage(cmd, out->image, VK_IMAGE_LAYOUT_GENERAL, keep, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+        full_barrier(cmd);
+    }
+};
 bool upscale_stub(VkCommandBuffer cmd, const NvnState& s, uint64_t key) {
     static const bool off = getenv("RX_VK_NO_UPSCALE_STUB") != nullptr;
     if (off) return false;
@@ -9515,6 +9580,9 @@ bool upscale_stub(VkCommandBuffer cmd, const NvnState& s, uint64_t key) {
     if (!src || !dst || !src->image || !dst->image || (src->aspect | dst->aspect) != VK_IMAGE_ASPECT_COLOR_BIT || src->bc ||
         dst->bc || src->samples != VK_SAMPLE_COUNT_1_BIT || dst->samples != VK_SAMPLE_COUNT_1_BIT)
         return declined("its input or output has no plain colour image");
+    // ((Triforce VR) the scene's upscale of another share (the game lowers its render size under load): the scene's depth and
+    // camera kept before it, its output once its commands are recorded, as at the gameplay network's own dispatch)
+    const XrAfterUpscale xr_after{cmd, vk_xr_active() && dst->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ? xr_keep_scene_depth(cmd, dst, 0) : nullptr};
     // (hookshot) an upscale network that did not translate here (the Render resolution's fixed shares have one each, and on a
     // GPU without cooperative matrices they are left out): the temporal upscaler is offered it first, as temporal_stand_in
     // offers the networks that did translate. It takes only the scene into the picture; anything else goes on below
@@ -9811,64 +9879,6 @@ bool fsr3_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
     else if (out && gameplay_network(p.key)) hudless_after = {out, level, p.key};
     return done;
 }
-/// (Triforce VR) The gameplay upscale for VR (vk_xr.cpp), found as temporal_stand_in finds it: before it, the scene's depth and
-/// camera kept for the headset's eyes; its output, returned, is then kept before the HUD is drawn over it (XrAfterUpscale, once
-/// the dispatch or whatever stands in for it is recorded). nullptr: not the gameplay upscale, or VR wants neither
-static Texture* xr_before_upscale(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
-    if (!vk_xr_active() || p.stages.empty()) return nullptr;
-    const Stage& st = p.stages[0];
-    if (!gameplay_network(p.key) && !(st.info.uses_cooperative_matrix && st.info.texture_descriptors.size() == 1 &&
-                                      st.info.image_descriptors.size() == 1))
-        return nullptr;
-    if (st.info.image_descriptors.empty()) return nullptr;
-    Texture* out = nullptr;
-    uint32_t level = 0;
-    const auto& od = st.info.image_descriptors[0];
-    if (const uint32_t h = handle_of(s, st, od, 0))
-        texture_view_of(h, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Storage, image_format(od.format), &out, &level);
-    if (!out || !out->image || level) return nullptr;
-    float view[12];
-    VkImageView depth = VK_NULL_HANDLE;
-    uint32_t w = 0, h = 0;
-    if (vk_xr_depth_wanted() && temporal_xr_scene(out, level, view, &depth, &w, &h)) {
-        full_barrier(cmd);   // (the scene's draws into its depth, before the copy reads it)
-        vk_xr_keep_depth(cmd, depth, w, h);
-        vk_xr_scene_camera(view);
-        // (a compute pipeline and push descriptors of VR's own: the next draw or dispatch sets all of its again)
-        last_dyn_valid = false, last_desc_valid = false, last_vb_valid = false, last_pipeline = VK_NULL_HANDLE;
-        vertex_set.on = false, last_ib.on = false;
-        descriptors_disturbed();
-    }
-    return out;
-}
-/// (Triforce VR) the gameplay upscale's output, once recorded, copied for VR's HUD panel and depth stereo (vk_xr_scene_image)
-struct XrAfterUpscale {
-    VkCommandBuffer cmd;
-    Texture* out;
-    ~XrAfterUpscale() {
-        if (!out) return;
-        int init = 0;
-        const VkImage keep = vk_xr_scene_image(out->image, out->width, out->height, out->format, &init);
-        if (!keep) return;
-        full_barrier(cmd);
-        if (init) {
-            VkImageMemoryBarrier2 ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-            ib.srcStageMask = ib.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-            ib.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-            ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            ib.image = keep, ib.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-            VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-            dep.imageMemoryBarrierCount = 1, dep.pImageMemoryBarriers = &ib;
-            vkCmdPipelineBarrier2(cmd, &dep);
-        }
-        VkImageCopy cp{};
-        cp.srcSubresource = cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        cp.extent = {out->width, out->height, 1};
-        vkCmdCopyImage(cmd, out->image, VK_IMAGE_LAYOUT_GENERAL, keep, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
-        full_barrier(cmd);
-    }
-};
 /// (hookshot) A temporal upscaler (NVIDIA DLSS, AMD FSR 4: vk_temporal.cpp) in place of the gameplay upscale network, when
 /// one is on and its inputs are as expected: the network's input as it samples it, its output's storage view
 bool temporal_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
@@ -12291,6 +12301,128 @@ bool upscale_dispatch(NvnState& s) {
     if (!cp->ready.load(std::memory_order_acquire) || cp->failed || cp->stages.empty()) return false;
     const auto& info = cp->stages[0].info;
     return info.uses_cooperative_matrix && info.texture_descriptors.size() == 1 && info.image_descriptors.size() == 1;
+}
+// (Triforce VR, RX_VK_XR_SPAN=1, a measuring probe for Accurate stereo's double render; with RX_VK_PARALLEL=0, the stream in
+// order) Every 600th frame, all the stream does in it: the targets drawn into (runs of draws, the cameras they bind), dispatches by program, uniform updates (those into
+// a camera's buffer marked), copies, clears, barriers, events, and where a command buffer or a recording begins
+namespace {
+struct XrSpan {
+    bool on = false;
+    uint64_t frame = ~0ull, done = ~0ull;
+    const uint8_t* cb = nullptr;
+    uint64_t rec = ~0ull;
+    const Texture* run_c = nullptr;
+    const Texture* run_d = nullptr;
+    uint32_t run_w = 0, run_h = 0, run_fmt = 0;
+    int run_n = 0, run_scene = 0, ncam = 0, lines = 0, rep = 0;
+    uint64_t cams[6]{}, all_cams[16]{};
+    int nall = 0;
+    std::string last;
+    std::vector<std::string> out;
+};
+XrSpan xs;
+void xs_line(const std::string& l) {
+    if (l == xs.last) { xs.rep++; return; }
+    if (xs.rep) xs.out.push_back("    (x" + std::to_string(xs.rep + 1) + ")"), xs.rep = 0;
+    xs.last = l;
+    if (xs.out.size() < 4000) xs.out.push_back(l);
+}
+void xs_run_end() {
+    if (!xs.run_n) return;
+    char b[256];
+    int n = snprintf(b, sizeof b, "  draws %d into %p fmt %u %ux%u depth %p (scene-camera draws %d) cams", xs.run_n, (const void*)xs.run_c,
+                     xs.run_fmt, xs.run_w, xs.run_h, (const void*)xs.run_d, xs.run_scene);
+    for (int i = 0; i < xs.ncam && n < 230; i++) n += snprintf(b + n, sizeof b - n, " %llx", (unsigned long long)xs.cams[i]);
+    xs.last.clear(), xs_line(b);
+    xs.run_n = xs.run_scene = xs.ncam = 0, xs.run_c = nullptr;
+}
+void xs_flush(const char* why) {
+    xs_run_end();
+    if (xs.rep) xs.out.push_back("    (x" + std::to_string(xs.rep + 1) + ")"), xs.rep = 0;
+    logf("vk: xr span: frame %llu, %zu lines, %s", (unsigned long long)xs.frame, xs.out.size(), why);
+    for (const std::string& l : xs.out) logf("vk: xr span: %s", l.c_str());
+    xs.out.clear(), xs.last.clear(), xs.on = false, xs.done = xs.frame, xs.nall = 0, xs.cb = nullptr, xs.rec = ~0ull;
+}
+bool xs_cam(uint64_t a) {
+    for (int i = 0; i < xs.nall; i++) if (a >= xs.all_cams[i] && a < xs.all_cams[i] + 0x230) return true;
+    return false;
+}
+}  // namespace
+bool xr_span_wanted() {
+    static const bool v = getenv("RX_VK_XR_SPAN") && atoi(getenv("RX_VK_XR_SPAN")) != 0;
+    return v;
+}
+void xr_span_probe(uint32_t op, const uint8_t* a, uint32_t avail, const uint8_t* cb_start, uint64_t rec, NvnState& s) {
+    const uint64_t frame = texture_frame_no();
+    if (xs.on && frame != xs.frame) xs_flush("the frame ended");
+    const bool draw = op == NOP_DRAW || op == NOP_DRAW_IDX || op == NOP_DRAW_INDIRECT || op == NOP_DRAW_MESH;
+    if (!xs.on) {   // (the whole frame, from its first op)
+        if (frame % 600 || frame == xs.done) return;
+        xs.on = true, xs.frame = frame;
+    }
+    char b[200];
+    if (cb_start != xs.cb || rec != xs.rec) {
+        xs_run_end();
+        snprintf(b, sizeof b, "command buffer %p%s, recording %llu", (const void*)cb_start, rec != xs.rec ? " (new recording)" : "",
+                 (unsigned long long)rec);
+        xs_line(b);
+        xs.cb = cb_start, xs.rec = rec;
+    }
+    if (draw) {
+        const Targets at = bare_targets(s, targets(s));
+        if (at.color[0] != xs.run_c || at.depth != xs.run_d || at.width != xs.run_w || at.height != xs.run_h) {
+            xs_run_end();
+            xs.run_c = at.color[0], xs.run_d = at.depth, xs.run_w = at.width, xs.run_h = at.height;
+            xs.run_fmt = at.color[0] ? (uint32_t)at.color[0]->format : 0;
+        }
+        xs.run_n++;
+        const uint64_t cam = s.ubo[0][0].addr;
+        if (s.ubo[0][0].size >= 0x230 && at.depth) {
+            xs.run_scene++;
+            bool have = false;
+            for (int i = 0; i < xs.ncam; i++) have |= xs.cams[i] == cam;
+            if (!have && xs.ncam < 6) xs.cams[xs.ncam++] = cam;
+            have = false;
+            for (int i = 0; i < xs.nall; i++) have |= xs.all_cams[i] == cam;
+            if (!have && xs.nall < 16) xs.all_cams[xs.nall++] = cam;
+        }
+        return;
+    }
+    switch (op) {
+    case NOP_DISPATCH: case NOP_DISPATCH_INDIRECT: {
+        xs_run_end();
+        const uint8_t types[8]{};
+        const Program* cp = program_for(s, ProgramKind::Compute, types);
+        const bool up = upscale_dispatch(s);
+        snprintf(b, sizeof b, "  dispatch%s %016llx%s", op == NOP_DISPATCH_INDIRECT ? " indirect" : "",
+                 (unsigned long long)(cp ? cp->key : 0), up ? "  <- the gameplay upscale" : "");
+        xs_line(b);
+        return;
+    }
+    case NOP_UPDATE_UB: {
+        nvn_p_update_ub u{};
+        if (avail >= sizeof u) std::memcpy(&u, a, sizeof u);
+        snprintf(b, sizeof b, "  uniform update %llx +%llu%s", (unsigned long long)u.dst, (unsigned long long)u.size,
+                 xs_cam(u.dst) ? "  <- INTO A CAMERA" : "");
+        xs_line(b);
+        return;
+    }
+    case NOP_SIGNAL_EVENT: xs_run_end(), xs_line("  signal event"); return;
+    case NOP_WAIT_EVENT: xs_run_end(), xs_line("  wait event"); return;
+    case NOP_BARRIER: xs_line("  barrier"); return;
+    case NOP_COPY_B2B: case NOP_COPY_B2T: case NOP_COPY_T2B: case NOP_COPY_T2T:
+        xs_run_end();
+        snprintf(b, sizeof b, "  copy %s", op == NOP_COPY_B2B ? "buffer to buffer" : op == NOP_COPY_B2T ? "buffer to texture"
+                                         : op == NOP_COPY_T2B ? "texture to buffer" : "texture to texture");
+        xs_line(b);
+        return;
+    case NOP_CLEAR_COLOR: case NOP_CLEAR_DS: case NOP_CLEAR_TEX: case NOP_CLEAR_BUF:
+        xs_line(op == NOP_CLEAR_COLOR ? "  clear colour" : op == NOP_CLEAR_DS ? "  clear depth/stencil" : op == NOP_CLEAR_TEX ? "  clear texture" : "  clear buffer");
+        return;
+    case NOP_REPORT_COUNTER: case NOP_RESET_COUNTER: xs_line("  counter"); return;
+    case NOP_RENDER_COND: xs_line("  render condition"); return;
+    default: return;
+    }
 }
 void draw_tail_watch(bool on) { tail_watch_on.store(on, std::memory_order_relaxed); }
 uint64_t draw_tail_programs() { return st_tail_programs.load(std::memory_order_relaxed); }

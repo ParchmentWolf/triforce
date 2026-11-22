@@ -173,6 +173,8 @@ const char* tx_onoff(int v) { return v ? "On" : "Off"; }
 // (Triforce VR) the VR tab's values
 const char* tx_vr_view(int v) { return v ? "Immersive" : "Theater"; }
 const char* tx_vr_camera(int v) { return v ? "Third person" : "First person"; }
+const char* tx_resolution(int v);
+const char* tx_vr_resolution(int v) { return v <= 0 ? "As in Graphics" : tx_resolution(v); }
 const char* tx_vr_stereo(int v) { return v == 1 ? "Balanced" : "Performant"; }
 const char* tx_vr_controls(int v) { return v ? "Touch controllers" : "Gamepad"; }
 const char* tx_vr_hand(int v) { return v ? "Right-handed" : "Left-handed"; }
@@ -1289,6 +1291,10 @@ Row rows[] = {
      "How much of the world the view takes in. The default, 100%, matches the headset's lenses exactly. Higher fits "
      "more of the world into your view, so everything looks smaller; lower zooms in. Away from 100%, the world seems "
      "to swim as you turn your head.", nullptr, false, true, -1, false, "vr_view_scale"},
+    {TAB_VR, "Render resolution", &opts.vr_resolution, 0, ur::kValues - 1, 1, tx_vr_resolution,
+     "The size the 3D is drawn at while VR is on, in every stereo mode. As in Graphics: the Graphics tab's Render resolution "
+     "(Auto lowers it under load, which looks blocky in the headset). A fixed size costs more GPU time but stays sharp. "
+     "Applies after a restart.", nullptr, true, true, -1, false, "vr_resolution"},
     {TAB_VR, "Stereo", &opts.vr_stereo, 0, 1, 1, tx_vr_stereo,
      "Performant: the game draws one picture and each eye's is made from it and its depth at the game's full rate; "
      "edges beside near things can smear. Balanced: each eye is drawn in turn, true depth everywhere, with the game's "
@@ -1310,7 +1316,7 @@ Row rows[] = {
     {TAB_VR, "Controls", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},
     {TAB_VR, "Control scheme", &opts.vr_controls, 0, 1, 1, tx_vr_controls,
      "Gamepad: a normal controller (or the keyboard and mouse), as without VR. Touch controllers: A/B the game's A/B, "
-     "X/Y mirror A/B, the sticks' clicks X (jump), the grips ZL/ZR. Swing the sword hand to slash; both hands together "
+     "X/Y mirror A/B, the sticks' clicks X (jump), the triggers L/R, the grips ZL/ZR. In menus every button is its own. Swing the sword hand to slash; both hands together "
      "behind your head draw or put away the sword and shield; the shield held before the eye on its side targets. "
      "D-pad: both arms shaken upward boots, both hands together before your face the ocarina, both hands beside your "
      "head Navi, a hand shaken sideways above your head the mask.", nullptr, false, true, -1, false, "vr_controls"},
@@ -5385,9 +5391,14 @@ void menu_init() {
     restart_init();   // (what this run started with: the rows that take a restart differ from it once changed)
 }
 
-bool resolution_auto() { return opts.resolution == 0; }
+// ((Triforce VR) the VR tab's Render resolution over the Graphics tab's while VR is on: read once, at the start, as both are)
+static int resolution_in_effect() {
+    static const int v = opts.vr && opts.vr_resolution > 0 && opts.vr_resolution < ur::kValues ? opts.vr_resolution : -1;
+    return v >= 0 ? v : opts.resolution;
+}
+bool resolution_auto() { return resolution_in_effect() == 0; }
 int resolution_scale() {
-    const float s = upscaler_rows::percent(opts.resolution) / 100.0f;
+    const float s = upscaler_rows::percent(resolution_in_effect()) / 100.0f;
     return s > 0 ? (int)(twelfths(s) * 10000.0f / 12.0f + 0.5f) : 0;   // (the twelfth game_size labels)
 }
 
@@ -5406,6 +5417,7 @@ void menu_set_gpu_count(int count) {
 }
 
 bool menu_is_open() { return open_now.load(std::memory_order_relaxed); }
+bool menu_embedded() { return open_now.load(std::memory_order_relaxed) && embed_open; }
 // (the tools off on the Debug tab: flight, the free camera and heart protection put away; -1, heart protection never set, is the
 // host's own HOS_OOT_PROTECT_HEARTS)
 int menu_heart_protection() {
@@ -6312,7 +6324,26 @@ void menu_tick() {
     // reach our tabs from the game's Options screen, the owner's for a while. The keys stay the front window's)
     static const char* pad_bg_env = getenv("HOS_INPUT_BACKGROUND");
     const bool pads_ok = mine || (pad_bg_env ? atoi(pad_bg_env) != 0 : opts.pad_background != 0);
-    const uint32_t raw = pads_ok && host && host->pad_raw ? host->pad_raw() : 0, pad_press = raw & ~pad_held;
+    uint32_t raw = pads_ok && host && host->pad_raw ? host->pad_raw() : 0;
+    {   // ((Triforce VR) the hand controllers in a menu: their buttons as the pad inputs those Switch buttons are bound to, the
+        // left stick as the menus' stick bits, the right's up and down too)
+        uint64_t sw = 0;
+        float st[2][2];
+        if (vk_xr_menu_buttons(&sw, st)) {
+            for (int b = 0; b < HOS_SW_N && host && host->binding; b++)
+                if (sw >> b & 1) {
+                    const int p = host->binding(HOS_BIND_PAD, b, 0);
+                    if (p >= 0 && p < HOS_PAD_N) raw |= 1u << p;
+                }
+            if (st[0][1] > 0.5f) raw |= 1u << HOS_PAD_LS_UP;
+            if (st[0][1] < -0.5f) raw |= 1u << HOS_PAD_LS_DOWN;
+            if (st[0][0] < -0.5f) raw |= 1u << HOS_PAD_LS_LEFT;
+            if (st[0][0] > 0.5f) raw |= 1u << HOS_PAD_LS_RIGHT;
+            if (st[1][1] > 0.5f) raw |= 1u << HOS_PAD_RS_UP;
+            if (st[1][1] < -0.5f) raw |= 1u << HOS_PAD_RS_DOWN;
+        }
+    }
+    const uint32_t pad_press = raw & ~pad_held;
     const uint32_t chord = 1u << HOS_PAD_BACK | 1u << HOS_PAD_START;
     const bool chord_now = (raw & chord) == chord && (pad_held & chord) != chord;
     pad_held = raw;

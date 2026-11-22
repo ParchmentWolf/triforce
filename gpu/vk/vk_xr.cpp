@@ -177,6 +177,7 @@ struct Xr {
     bool hud_tried = false;
     VkImage hud_boxes[3]{};
     std::atomic<uint32_t> panels{0};
+    std::atomic<uint32_t> scenes_kept{0}, depths_kept{0}, upscales{0}, upscales_vr{0}, panel_no_scene{0}, panel_not_new{0};
     std::atomic<uint32_t> pic_w{0}, pic_h{0};   // the game's presented picture's size: the HUD's target is the scene upscaled to it
     // depth stereo (VR_DEPTH, hud_mu): shaders/xr_depth.comp makes each eye's picture from the scene the HUD's
     // shader leaves and the scene's depth kept by vk_xr_keep_depth
@@ -228,6 +229,7 @@ struct Xr {
     // (input_map.h bits) and sticks, and the grips' poses in the LOCAL space
     std::mutex hands_mu;
     uint64_t hand_buttons = 0;
+    bool hand_menu = false;      // the buttons are a menu's (labelled, not play's): vk_xr_menu_buttons gives them to this menu
     float hand_sticks[2][2]{};   // left, right; x right, y up
     Pose grip[2];
     Pose aim_pose[2];   // the controllers' aim poses (their pointing rays, -z), as their own pointers use
@@ -598,7 +600,8 @@ std::atomic<double> update_step{-1};
 // reticle while Link aims); false when there is nothing new to make them from
 bool make_panel(VkCommandBuffer cb, bool keep_hud, int cut) {
     Xr &x = xr();
-    if (!x.scene || !x.hud_target || x.kept == x.used) return false;
+    if (!x.scene || !x.hud_target) return x.panel_no_scene++, false;
+    if (x.kept == x.used) return x.panel_not_new++, false;
     if (!x.hud_tried) {
         x.hud_tried = true;
         if (!make_hud_pipeline()) {
@@ -1139,17 +1142,28 @@ struct Controls {
         const uint64_t now = plat_now_ns();
         uint64_t bits = 0;
         const auto set_bit = [&](int bit, bool down) { bits |= down ? 1ull << bit : 0; };
-        set_bit(A, on(session, a, XR_NULL_PATH) || on(session, xb, XR_NULL_PATH));
-        set_bit(B, on(session, b, XR_NULL_PATH) || on(session, yb, XR_NULL_PATH));
-        set_bit(X, on(session, click, hand[0]) || on(session, click, hand[1]));
         bool squeezed_before[2] = {squeeze_on[0], squeeze_on[1]};
         for (int h = 0; h < 2; h++) {   // pressed past 0.6, released under 0.4
             const float t = value(session, trigger, hand[h]), s = value(session, squeeze, hand[h]);
             trigger_on[h] = trigger_on[h] ? t > 0.4f : t > 0.6f;
             squeeze_on[h] = squeeze_on[h] ? s > 0.4f : s > 0.6f;
         }
-        const bool in_play = x.in_play.load();
-        if (!in_play) set_bit(ZL, squeeze_on[0]), set_bit(ZR, squeeze_on[1]);   // menus and events: the grips as ever
+        const bool in_play = x.in_play.load() && !menu_is_open();   // (this menu over play: its buttons, no play roles)
+        if (!in_play) {
+            // menus, pauses and events (and this menu over play): a pad's buttons as labelled, the triggers L and R, the grips
+            // ZL and ZR, each stick's click its own
+            set_bit(A, on(session, a, XR_NULL_PATH)), set_bit(B, on(session, b, XR_NULL_PATH));
+            set_bit(X, on(session, xb, XR_NULL_PATH)), set_bit(Y, on(session, yb, XR_NULL_PATH));
+            set_bit(STICK_L, on(session, click, hand[0])), set_bit(STICK_R, on(session, click, hand[1]));
+            set_bit(L, trigger_on[0]), set_bit(R, trigger_on[1]);
+            set_bit(ZL, squeeze_on[0]), set_bit(ZR, squeeze_on[1]);
+        } else {
+            // play: X and Y mirror A and B, and either stick's click jumps (X), so a controller with fewer buttons plays it all
+            set_bit(A, on(session, a, XR_NULL_PATH) || on(session, xb, XR_NULL_PATH));
+            set_bit(B, on(session, b, XR_NULL_PATH) || on(session, yb, XR_NULL_PATH));
+            set_bit(X, on(session, click, hand[0]) || on(session, click, hand[1]));
+            set_bit(L, trigger_on[0]), set_bit(R, trigger_on[1]);   // the triggers L and R: the game's item bars
+        }
         // the Menu: a tap is Plus for a moment at its release, a second's hold Minus for a moment then
         if (on(session, menu, XR_NULL_PATH)) {
             if (!menu_down) menu_down = now, minus_sent = false;
@@ -1360,7 +1374,7 @@ struct Controls {
                 set_bit(std::fabs(sx) > std::fabs(sy) ? (sx < 0 ? Y : A) : (sy > 0 ? X : R), true);
         }
         std::lock_guard<std::mutex> lk(x.hands_mu);
-        x.hand_buttons = bits;
+        x.hand_buttons = bits, x.hand_menu = !in_play;
         std::memcpy(x.hand_sticks, sticks, sizeof sticks);
         for (int h = 0; h < 2; h++) {
             x.grip[h] = poses[h], x.grip_ok[h] = pose_ok[h];
@@ -1743,6 +1757,10 @@ void run(void *) {
                    "game's camera %u, lens %u", (unsigned long long)frames, (unsigned long long)tracked_frames,
                    (unsigned long long)copies, x.tracked_pictures.exchange(0), x.panels.exchange(0), x.stereo_pictures.exchange(0),
                    x.stereo_missed.exchange(0), x.menu_pictures.exchange(0), x.camera_given.exchange(0), x.lens_given.exchange(0));
+            rt_log("vr: the scene's feed (10 s): gameplay upscales %u (%u taken for VR), scenes kept %u, depths kept %u; panels "
+                   "declined: %u without a scene or target, %u with no scene new since the last", x.upscales.exchange(0),
+                   x.upscales_vr.exchange(0), x.scenes_kept.exchange(0), x.depths_kept.exchange(0), x.panel_no_scene.exchange(0),
+                   x.panel_not_new.exchange(0));
             {
                 std::lock_guard<std::mutex> lk(x.hands_mu);
                 rt_log("vr: hands: buttons %#llx, sticks %.2f %.2f / %.2f %.2f, grips %s %s (left at %.2f %.2f %.2f)",
@@ -1901,6 +1919,7 @@ extern "C" void vk_xr_keep_depth(VkCommandBuffer cb, VkImageView depth, uint32_t
     vkCmdDispatch(cb, (w + 7) / 8, (h + 7) / 8, 1);
     memory_barrier(cb);
     x.depth_kept++;
+    x.depths_kept++;
 }
 
 extern "C" int vk_xr_head_active(void) {
@@ -2172,14 +2191,28 @@ extern "C" VkImage vk_xr_scene_image(VkImage target, uint32_t w, uint32_t h, VkF
     }
     x.hud_target = target;
     x.kept++;
+    x.scenes_kept++;
     return x.scene;
 }
+
+extern "C" int vk_xr_menu_buttons(uint64_t *buttons, float sticks[2][2]) {
+    Xr &x = xr();
+    if (!x.ok || !x.running.load() || strcmp(cfg_value("VR_CONTROLS"), "meta") != 0) return 0;
+    std::lock_guard<std::mutex> lk(x.hands_mu);
+    if (!x.hand_menu) return 0;
+    *buttons = x.hand_buttons;
+    std::memcpy(sticks, x.hand_sticks, sizeof x.hand_sticks);
+    return 1;
+}
+
+extern "C" void vk_xr_note_upscale(int taken) { xr().upscales++; if (taken) xr().upscales_vr++; }
 
 extern "C" int vk_xr_wants_capture(int hdr) {
     Xr &x = xr();
     if (!x.ok || !x.timeline) return 0;
     const bool head = vk_xr_head_wanted();
-    x.head_view.store(head && !menu_is_open(), std::memory_order_relaxed);
+    // (this menu over the game's own Options screen stays in the head's view, the game's paused picture on the HUD panel)
+    x.head_view.store(head && (!menu_is_open() || menu_embedded()), std::memory_order_relaxed);
     if (hdr) {
         static bool told;
         if (!told) told = true, rt_log("vr: the headset needs HDR off");
@@ -2263,9 +2296,18 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
         }
         const VkImage hb = x.hud_boxes[slot];
         barrier(cb, hb, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        b.srcOffsets[0] = {rect[0], rect[1], 0};
-        b.srcOffsets[1] = {rect[0] + rect[2], rect[1] + rect[3], 1};
-        vkCmdBlitImage(cb, picture, picture_layout, hb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+        if (menu_embedded()) {   // this menu open over the game's Options screen: the window's picture, the menu drawn over it
+            int wr[4];
+            gfx_fit_rect(rect[2], rect[3], (int)extent.width, (int)extent.height, wr);
+            b.srcOffsets[0] = {wr[0], wr[1], 0};
+            b.srcOffsets[1] = {wr[0] + wr[2], wr[1] + wr[3], 1};
+            vkCmdBlitImage(cb, window, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, hb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b,
+                           VK_FILTER_LINEAR);
+        } else {
+            b.srcOffsets[0] = {rect[0], rect[1], 0};
+            b.srcOffsets[1] = {rect[0] + rect[2], rect[1] + rect[3], 1};
+            vkCmdBlitImage(cb, picture, picture_layout, hb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+        }
         barrier(cb, hb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         overlay_onto_hud(cb, slot, window, extent, d);
         x.pending = slot;

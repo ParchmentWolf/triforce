@@ -1824,6 +1824,8 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
     const Mode mode = rmode;
     const bool dry = mode == Mode::Dry, worker = mode == Mode::Worker;
     mesh_ahead::t_table.clear();   // ((Triforce) RX_VK_MESH_AHEAD: what was copied ahead holds within one walk of a command buffer)
+    const uint8_t* const cb_start = p;
+    const bool span_probe = xr_span_wanted();
     for (;;) {
         if (p == end) return;
         nvn_op_hdr h;
@@ -1838,6 +1840,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
         }
         const uint8_t* a = p + 8;
         const uint32_t avail = h.size - 8;
+        if (!dry && span_probe) xr_span_probe(h.op, a, avail, cb_start, rec_value_now, s);   // ((Triforce VR) RX_VK_XR_SPAN
         if (dry && dry_tail_find) dry_tail_check(p, h, a, avail, s);
         if (dry && dry_up_find) dry_up_check(p, h, s);   // ((Triforce) the early tail: par_up)
         if (mesh_ahead::t_table.n && !mesh_run_kind(h.op, p)) mesh_ahead::t_table.clear();   // ((Triforce) the run ends here)
