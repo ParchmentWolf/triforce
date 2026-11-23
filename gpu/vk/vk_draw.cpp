@@ -13676,7 +13676,7 @@ int xr_swap_copies(float* p, uint64_t n) {
     return done;
 }
 void xr_eye_shift(float* c) {
-    float before[0x100 / 4];
+    float before[0x230 / 4];
     std::memcpy(before, c, sizeof before);
     const float d = xr_eye.d;
     c[3] -= d;
@@ -13689,6 +13689,23 @@ void xr_eye_shift(float* c) {
             c[0x30 / 4 + i * 4 + j] = v;
         }
     c[0xb0 / 4 + 3] += d * c[0], c[0xc0 / 4 + 3] += d * c[1], c[0xd0 / 4 + 3] += d * c[2];
+    {   // (the frame before's camera, 0x150 on in the same layout: moved alike, so what reprojects the frame before's pictures
+        // (foliage blended over frames, glows) finds this eye's own place then, not a jump of the eyes' distance)
+        float* q = c + 0x150 / 4;
+        if (q[0xa0 / 4] == 0.0f && q[0xa8 / 4] == -1.0f) {   // (its projection's w row, as the current one's)
+            q[3] -= d;
+            const float* Pq = q + 0x70 / 4;
+            const float Vq[16] = {q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8], q[9], q[10], q[11], 0, 0, 0, 1};
+            for (int i = 0; i < 4; i++)
+                for (int j = 0; j < 4; j++) {
+                    float v = 0;
+                    for (int k = 0; k < 4; k++) v += Pq[i * 4 + k] * Vq[k * 4 + j];
+                    q[0x30 / 4 + i * 4 + j] = v;
+                }
+            q[0xb0 / 4 + 3] += d * q[0], q[0xc0 / 4 + 3] += d * q[1], q[0xd0 / 4 + 3] += d * q[2];
+            xr_swap_note(before + 0x150 / 4 + 0x30 / 4, q + 0x30 / 4, 16);
+        }
+    }
     xr_swap_note(before + 0x30 / 4, c + 0x30 / 4, 16);   // (the view-projection, the view, the inverse view)
     xr_swap_note(before, c, 12);
     xr_swap_note(before + 0xb0 / 4, c + 0xb0 / 4, 12);
