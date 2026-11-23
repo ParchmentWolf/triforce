@@ -2,6 +2,7 @@
 window pixel (inside the same picture pixel when the window is the larger, so Sharpness did next to nothing), and its
 per-pixel math, the shader's own sharpen() compiled as C++, is the picture unchanged at 0, never past the lightest or
 darkest pixel around it nor outside 0..1 (no halos, no clipping) at any setting, and steeper edges as the setting rises.
+The shader's side_outside() is compiled too: full side fill outside the middle, with both soft edges wholly inside it.
 fg_scale_comp_spv.h names the hash of the fg_scale.comp it was made from (its first line), checked against the shader as it
 is now with or without glslang; with glslangValidator the shader compiles, and with the version the header names, the rest of
 the header is its output byte for byte. --write makes the header: glslang's output with that line on top.
@@ -80,6 +81,10 @@ static float min(float a, float b) { return std::min(a, b); }
 static float max(float a, float b) { return std::max(a, b); }
 static float clamp(float v, float lo, float hi) { return std::min(std::max(v, lo), hi); }
 static vec3 clamp(vec3 v, vec3 lo, vec3 hi) { return min(max(v, lo), hi); }
+static float smoothstep(float lo, float hi, float x) {
+    const float t = clamp((x - lo) / (hi - lo), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
 '''
 
 FIXTURE = r'''
@@ -90,7 +95,36 @@ static vec3 rnd3() { return {rnd(), rnd(), rnd()}; }
 static float ch(vec3 v, int i) { return i == 0 ? v.r : i == 1 ? v.g : v.b; }
 // a blurred edge (the picture as it reaches the window pass), sampled one picture pixel apart around x
 static float edge(float x) { return 0.1f + 0.8f / (1.0f + std::exp(-2.0f * x)); }
+static void check_sides() {
+    // Player's 3840x1600, both fixed wide pictures, and the normalized pixel-cap picture.
+    const int pictures[][2] = {{3840, 2848}, {5120, 2560}, {5120, 3840}, {7224, 3616}};
+    const float feather = 0.006f;
+    for (const auto& picture : pictures) {
+        const int width = picture[0];
+        const float x0 = float(width - picture[1]) / (2.0f * width), x1 = 1.0f - x0;
+        float previous = 1.0f;
+        for (int pixel = 0; pixel < width; ++pixel) {
+            const float x = (pixel + 0.5f) / width;
+            const float outside = side_outside(x, x0, x1);
+            CHECK(outside >= 0.0f && outside <= 1.0f);
+            if (x <= x0 || x >= x1) CHECK(outside == 1.0f);
+            else if (x >= x0 + feather && x <= x1 - feather) CHECK(outside == 0.0f);
+            else CHECK(outside > 0.0f && outside < 1.0f);
+            if (x < 0.5f) CHECK(outside <= previous);
+            else CHECK(outside >= previous);
+            previous = outside;
+        }
+        CHECK(side_outside(x0, x0, x1) == 1.0f);
+        CHECK(side_outside(x1, x0, x1) == 1.0f);
+        CHECK(side_outside(x0 + feather, x0, x1) == 0.0f);
+        CHECK(side_outside(x1 - feather, x0, x1) == 0.0f);
+        CHECK(std::abs(side_outside(x0 + feather * 0.5f, x0, x1) - 0.5f) < 1e-4f);
+        CHECK(std::abs(side_outside(x1 - feather * 0.5f, x0, x1) - 0.5f) < 1e-4f);
+    }
+    std::puts("PASS: side fill is whole outside the middle; monotonic 0.006 soft edges stay inside at 3840, 5120 and 7224");
+}
 int main() {
+    check_sides();
     const float amounts[] = {0.0f, 0.1f, 0.4f, 0.8f, 1.0f};
     for (int i = 0; i < 200000; i++) {
         const vec3 c = rnd3(), n = rnd3(), s = rnd3(), w = rnd3(), e = rnd3();
@@ -159,7 +193,11 @@ def main():
             raise SystemExit("missing the neighbour at %s" % tap)
     lobe = re.search(r"const float kMaxLobe = [^;]*;", text).group(0)
     fn = block(text, "vec3 sharpen(")
-    fixture = SHIM + lobe.replace("const float", "static const float") + "\nstatic " + fn + FIXTURE
+    sides = block(text, "float side_outside(")
+    side_branch = block(body, "if (pc.side != 0 && pc.x1 > pc.x0)")
+    if "outside = side_outside(uv.x, pc.x0, pc.x1);" not in side_branch:
+        raise SystemExit("the side pass does not use the tested side_outside rule")
+    fixture = SHIM + lobe.replace("const float", "static const float") + "\nstatic " + fn + "\nstatic " + sides + FIXTURE
     with tempfile.TemporaryDirectory(prefix="fg-sharpen-") as tmp:
         cpp = Path(tmp) / "fixture.cpp"
         exe = Path(tmp) / "fixture"

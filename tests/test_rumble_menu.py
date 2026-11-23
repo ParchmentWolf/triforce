@@ -87,8 +87,9 @@ bool can_mic() { return false; }
 /* (the Upscaler row's choices, which set_row steps through: the game's own only, here) */
 unsigned upscalers_available() { return 1; }
 void mic_chosen() {}
-// (set_row steps the Output row through vk_menu.cpp's step_output_choice (#1144): not what this checks)
-int step_output_choice(int id, int dir) { return id + dir; }
+// (set_row steps the Output row through vk_menu.cpp's output_step, its choices (#1144): not what this checks)
+struct { unsigned w, h; } remembered_custom{};
+bool output_step(int, bool) { return false; }
 %(set_row)s
 /* (menu_tick's arrows: Left, Right, and Enter as Right; a click on the value's left or right half presses them) */
 void arrow(Row& r, bool right) { %(arrow)s }

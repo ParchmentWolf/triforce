@@ -1,5 +1,7 @@
 """host/hos_main.c's widescreen sizes, game-free: the picture, scene, camera ratio and HUD for screens wider and
-narrower than 16:9 (a 4:3 CRT, 16:10, 5:4 and narrower, 21:9, 32:9), and the game's own picture for 16:9.
+narrower than 16:9 (a 4:3 CRT, 16:10, 5:4 and narrower, 21:9, 32:9), and the game's own picture for 16:9. A shape of the
+Ultrawide row's or HOS_ASPECT's is kept to 3840x2160's pixels; an Output resolution of its own shape (3840x1600, 5120x2160)
+is the picture, pixel for pixel (gpu/vk/output_sizes.h output_picture).
 
     python -I -B tests/test_widescreen_shapes.py [--cc gcc]
 """
@@ -32,6 +34,7 @@ def main():
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "gpu/vk/output_sizes.h"
 
 volatile uint64_t hos_wide_out, hos_wide_scene;
 volatile float hos_wide_ratio, hos_wide_squeeze, hos_wide_margin;
@@ -40,13 +43,13 @@ static unsigned out_h = 1440;
 uint32_t hos_output_size(int height) { return height ? out_h : out_h * 16 / 9; }
 static void hos_log(const char *f, ...) { (void)f; }
 
-static void wide(float want) {
+static void wide(float want, int sized) {   /* (as host/hos_main.c has them: a float shape) */
 ''' + block() + r'''
 }
 
 int main(int argc, char **argv) {
     out_h = (unsigned)atoi(argv[2]);
-    wide((float)atof(argv[1]));
+    wide((float)atof(argv[1]), argc > 3 && atoi(argv[3]));
     printf("%llux%llu %llux%llu %.4f %.4f %.4f\n",
            (unsigned long long)(hos_wide_out & 0xffffffffu), (unsigned long long)(hos_wide_out >> 32),
            (unsigned long long)(hos_wide_scene & 0xffffffffu), (unsigned long long)(hos_wide_scene >> 32),
@@ -66,20 +69,37 @@ int main(int argc, char **argv) {
         ("2.3889", 1440, "3440x1440 2584x1080 2.3889 0.7442 0.1279"),  # 21:9 (3440 x 1440), as before
         ("3.5556", 1440, "5120x1440 3840x1080 3.5556 0.5000 0.2500"),  # 32:9, as before
         ("0", 1440, "0x0 0x0 0.0000 0.0000 0.0000"),                   # Ultrawide off
+        # a shape of the row's or HOS_ASPECT's at the 4K output: at most 3840x2160's pixels, the shape kept
+        ("2.3704", 2160, "4416x1864 3312x1398 2.3691 0.7504 0.1248"),
+        ("3.5556", 2160, "5400x1520 4048x1140 3.5526 0.5004 0.2498"),
+    )
+    # (the Output resolution's own shape, its width over its height: the picture is that size)
+    sized = (
+        (3840, 1600, "3840x1600 2880x1200 2.4000 0.7407 0.1296"),
+        (3440, 1440, "3440x1440 2584x1080 2.3889 0.7442 0.1279"),
+        (2560, 1080, "2560x1080 1920x810 2.3704 0.7500 0.1250"),
+        (5120, 1440, "5120x1440 3840x1080 3.5556 0.5000 0.2500"),
+        (5120, 2160, "5120x2160 3840x1620 2.3704 0.7500 0.1250"),   # (more than 3840x2160's pixels: not made smaller)
+        (1920, 1200, "1920x1200 1440x900 1.6000 1.0000 0.0000"),
+        (7224, 2032, "7224x2032 5416x1524 3.5551 0.5001 0.2500"),   # (a 7680x2160 screen as output_size_used takes it)
     )
     with tempfile.TemporaryDirectory(prefix="widescreen-") as tmp:
         work = Path(tmp)
         source, exe = work / "fixture.c", work / "fixture.exe"
         source.write_text(fixture, encoding="utf-8")
-        subprocess.run([args.cc, "-std=c11", str(source), "-o", str(exe), "-lm"], check=True)
+        subprocess.run([args.cc, "-std=c11", "-I", str(ROOT), str(source), "-o", str(exe), "-lm"], check=True)
         bad = []
         for want, height, expect in cases:
             got = subprocess.run([str(exe), want, str(height)], capture_output=True, text=True, check=True).stdout.strip()
             if got != expect:
                 bad.append("ratio %s at %u: %s, expected %s" % (want, height, got, expect))
+        for w, h, expect in sized:
+            got = subprocess.run([str(exe), repr(w / h), str(h), "1"], capture_output=True, text=True, check=True).stdout.strip()
+            if got != expect:
+                bad.append("the output size %ux%u: %s, expected %s" % (w, h, got, expect))
         if bad:
             raise SystemExit("FAIL:\n  " + "\n  ".join(bad))
-    print("PASS: widescreen sizes for 4:3, 16:10, 5:4, 16:9, 21:9 and 32:9 screens")
+    print("PASS: widescreen sizes for 4:3, 16:10, 5:4, 16:9, 21:9 and 32:9 screens, and for output sizes of their own shape")
 
 
 if __name__ == "__main__":

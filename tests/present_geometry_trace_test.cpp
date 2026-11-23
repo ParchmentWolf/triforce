@@ -45,6 +45,8 @@ VkImage framegen_hdr(int, VkImageView, uint32_t, uint32_t, const int*, uint32_t,
     ++hdr_calls; return encoded ? 29 : VK_NULL_HANDLE;
 }
 VkImage framegen_scale(int, VkImageView, VkImage, uint32_t, uint32_t, const int*, uint32_t, uint32_t) { return scaled ? 9 : 0; }
+void n64_screen_begin(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) {}   // ((Triforce, 11-22) N64 Classic's TV's screen: vk_n64.h)
+void n64_screen_end() {}
 void blit_crop_to_rect(int, VkImage, uint32_t, uint32_t, const int*, VkImage, int, PresentRect rect) { ++blits; drawn = rect; }
 void present(VkImage src = 1, uint32_t sw = 3440, uint32_t sh = 1440, const int* crop = nullptr, VkImageView view = 2) {
     struct { int cmd = 1; } f; VkImage dst = 3;

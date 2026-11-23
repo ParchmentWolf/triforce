@@ -76,6 +76,11 @@ vec3 side_fill(vec2 uv) {
 }
 // (and less than one step of 8 bits of noise over it: the dim, smooth sides showed 8-bit steps as contour lines)
 float dither(ivec2 g) { return (fract(52.9829189 * fract(0.06711056 * float(g.x) + 0.00583715 * float(g.y))) - 0.5) / 255.0; }
+// The sides cover every pixel outside the middle; the soft edge belongs inside the menu's own edge.
+float side_outside(float x, float x0, float x1) {
+    const float feather = 0.006;
+    return max(1.0 - smoothstep(x0, x0 + feather, x), smoothstep(x1 - feather, x1, x));
+}
 void main() {
     const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
     const ivec2 d = imageSize(dst);
@@ -92,8 +97,7 @@ void main() {
     // (beside a menu: the sides first, and wholly outside the middle nothing else, not the filter's 16 taps to throw away)
     float outside = 0.0;
     if (pc.side != 0 && pc.x1 > pc.x0) {
-        const float feather = 0.006;
-        outside = max(1.0 - smoothstep(pc.x0 - feather, pc.x0, uv.x), smoothstep(pc.x1, pc.x1 + feather, uv.x));
+        outside = side_outside(uv.x, pc.x0, pc.x1);
         if (outside >= 1.0) {
             imageStore(dst, g, vec4(pc.side == 2 ? vec3(0.0) : side_fill(uv) + dither(g), 1.0));
             return;

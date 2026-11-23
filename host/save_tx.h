@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
 
 #define SAVE_TX_BACKUPS 5
 #define SAVE_TX_BACKUP_GAP_S 300
@@ -50,6 +51,26 @@ static int tx_crashed(void) {
     return save_tx_dead;
 }
 static time_t tx_now(void) { return save_tx_test_now ? save_tx_test_now : time(NULL); }
+
+/* ((Triforce, 11-23, ticket "Cannot launch into game after 0.7 update", Linux) The first thing a mount's working copy could not
+   do, said in the mount's note: the log only said "no working copy could be made", never which file or why. Called right
+   after the call that failed (its error: GetLastError on Windows, errno's text elsewhere) */
+static char save_tx_why[HOS_FS_PATH + 128];
+static void tx_why(const char *what, const char *path) {
+    if (save_tx_why[0]) return;
+#ifdef _WIN32
+    const unsigned long e = (unsigned long)GetLastError();
+    snprintf(save_tx_why, sizeof save_tx_why, "%s %s (error %lu)", what, path, e);
+#else
+    const int e = errno;
+    snprintf(save_tx_why, sizeof save_tx_why, "%s %s (%s)", what, path, strerror(e));
+#endif
+}
+static void tx_note_add(char *note, size_t cap, const char *what) {   /* (after a recovery's note, when there is one) */
+    if (!note || !cap) return;
+    const size_t n = strlen(note);
+    if (n + 1 < cap) snprintf(note + n, cap - n, "%s%s", n ? "; " : "", what);
+}
 static int tx_exists(const char *p) { return GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES; }
 static int tx_is_dir(const char *p) {
     const DWORD a = GetFileAttributesA(p);
@@ -107,9 +128,13 @@ static int tx_empty(const char *dir) {   /* 1: a folder with nothing in it */
 static int tx_copy_file(const char *src, const char *dst, int flush) {
     HANDLE in = CreateFileA(src, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
                             FILE_ATTRIBUTE_NORMAL, NULL);
-    if (in == INVALID_HANDLE_VALUE) return 0;
+    if (in == INVALID_HANDLE_VALUE) {
+        tx_why("cannot open", src);
+        return 0;
+    }
     HANDLE out = CreateFileA(dst, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (out == INVALID_HANDLE_VALUE) {
+        tx_why("cannot make", dst);
         CloseHandle(in);
         return 0;
     }
@@ -118,12 +143,12 @@ static int tx_copy_file(const char *src, const char *dst, int flush) {
     int ok = buf != NULL;
     while (ok) {
         DWORD got = 0, put = 0;
-        if (!ReadFile(in, buf, chunk, &got, NULL)) ok = 0;
+        if (!ReadFile(in, buf, chunk, &got, NULL)) ok = 0, tx_why("cannot read", src);
         else if (!got) break;
-        else if (!WriteFile(out, buf, got, &put, NULL) || put != got) ok = 0;
+        else if (!WriteFile(out, buf, got, &put, NULL) || put != got) ok = 0, tx_why("cannot write", dst);
     }
     free(buf);
-    if (ok && flush && !FlushFileBuffers(out)) ok = 0;
+    if (ok && flush && !FlushFileBuffers(out)) ok = 0, tx_why("cannot write out", dst);
     CloseHandle(out);
     CloseHandle(in);
     return ok;
@@ -132,7 +157,10 @@ static int tx_copy_file(const char *src, const char *dst, int flush) {
 /* A folder with everything in it, links left out; dst is made. 1: every file copied */
 static int tx_copy_tree(const char *src, const char *dst, int flush) {
     tx_make_dirs(dst);
-    if (!tx_is_dir(dst)) return 0;
+    if (!tx_is_dir(dst)) {
+        tx_why("cannot make the folder", dst);
+        return 0;
+    }
     char pat[HOS_FS_PATH];
     WIN32_FIND_DATAA fd;
     snprintf(pat, sizeof pat, "%s\\*", src);
@@ -144,7 +172,7 @@ static int tx_copy_tree(const char *src, const char *dst, int flush) {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
         char a[HOS_FS_PATH], b[HOS_FS_PATH];
         if (snprintf(a, sizeof a, "%s\\%s", src, fd.cFileName) >= (int)sizeof a ||
-            snprintf(b, sizeof b, "%s\\%s", dst, fd.cFileName) >= (int)sizeof b) { ok = 0; continue; }
+            snprintf(b, sizeof b, "%s\\%s", dst, fd.cFileName) >= (int)sizeof b) { ok = 0; tx_why("a path too long under", src); continue; }
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ok &= tx_copy_tree(a, b, flush);
         else ok &= tx_copy_file(a, b, flush);
     } while (FindNextFileA(f, &fd));
@@ -350,19 +378,34 @@ static int save_tx_mount(const SaveTxPaths *p, char *note, size_t cap) {
     }
     if (tx_crashed()) return 0;
     tx_old_away(p, 1, NULL, 0);
+    save_tx_why[0] = 0;
+    char why[HOS_FS_PATH + 256];
     tx_delete_tree(p->work);
-    if (tx_exists(p->work)) return 0;   /* (a file of it is held open: no second run of the game beside this one's files) */
+    if (tx_exists(p->work)) {   /* (a file of it is held open: no second run of the game beside this one's files) */
+        tx_why("cannot delete", p->work);
+        snprintf(why, sizeof why, "the working copy from before could not be deleted: %s", save_tx_why);
+        tx_note_add(note, cap, why);
+        return 0;
+    }
     /* (the newest save: a finished commit still waiting, else the committed one) */
     const unsigned left = tx_ready_highest(p, ready, sizeof ready);
     const char *from = left ? ready : p->save;
     if (tx_is_dir(from)) {
         if (!tx_copy_tree(from, p->work, 0)) {
+            snprintf(why, sizeof why, "the save could not be copied to its working copy: %s", save_tx_why[0] ? save_tx_why : "?");
+            tx_note_add(note, cap, why);
             tx_delete_tree(p->work);
             return 0;
         }
     } else tx_make_dirs(p->work);
     tx_make_dirs(p->save);   /* (the save "exists" from its first mount on, as before: IsSaveDataExisting) */
-    return tx_is_dir(p->work);
+    if (!tx_is_dir(p->work)) {
+        tx_why("cannot make the folder", p->work);
+        snprintf(why, sizeof why, "the working copy could not be made: %s", save_tx_why);
+        tx_note_add(note, cap, why);
+        return 0;
+    }
+    return 1;
 }
 
 /* Every file of a folder written out to the disk (FlushFileBuffers). 1: all of them */

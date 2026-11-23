@@ -38,6 +38,14 @@ static int said(const char *text) {   /* how often the log has it */
     return n;
 }
 #include "achievements_constants.inc"
+/* (host/save_files.c: off but for the "file1" and "file2" runs, which play a save file of that folder under the game's) */
+static char files_dir[440];
+static int files_first;
+const char *hos_save_files_dir(int *first) {
+    if (!files_dir[0]) return NULL;
+    *first = files_first;
+    return files_dir;
+}
 static int sounds;
 static int64_t sound_at;
 static void hos_menu_sound_play(int id, int64_t now_ns) {
@@ -49,7 +57,10 @@ static void hos_menu_sound_play(int id, int64_t now_ns) {
 static int renderer;   /* 0: no renderer yet (rx_option answers what it is given) */
 static char incoming[600], row_text[160][400], notice_day[16][32];
 static int incoming_n, row_bits[160], rows_added, rows_shown = -1, notices[16], nnotices;
+static int row_on = 1, row_notices = 1;   /* (the System tab's Achievements and Achievement notices rows) */
 int rx_option(int id, int otherwise) {
+    if (id == HOS_OPT_ACH_ON) return renderer ? row_on : otherwise;
+    if (id == HOS_OPT_ACH_NOTICES) return renderer ? row_notices : otherwise;
     if (!renderer) return otherwise;
     CHECK(id == HOS_OPT_ACH_ASK);
     return 1;
@@ -126,25 +137,68 @@ int main(int argc, char **argv) {
         renderer = 1;
         hos_achievements_frame(), at(10), hos_achievements_frame(), at(100);
         CHECK(!asked && !logged[0] && !rows_added && rows_shown < 0 && !nnotices && !sounds && !ready && !file("triforce_achievements.txt")[0]);
+    } else if (!strcmp(argv[2], "rows")) {   /* the System tab's two rows, in a game folder of its own without a list of the player's */
+        renderer = 1, row_on = 0;
+        hos_achievements_frame();   /* (the list is named all the same: its page shows what was earned) */
+        CHECK(rows_shown == 35);
+        at(10), at(20);   /* Achievements Off: nothing asked of the save data, nothing earned or written */
+        CHECK(!asked && !said("earned \"") && !nnotices && !file("triforce_achievements.txt")[0]);
+        row_on = 1, row_notices = 0;   /* On again, the notices Off: earned at the next check, told to the list one a check, no sound */
+        at(30);
+        CHECK(asked && said("achievements: earned \"") == 5 && lines(file("triforce_achievements.txt")) == 6 && nnotices == 1);
+        at(31), at(32), at(33), at(34), at(35);   /* (a tenth of a second apart: no notice's time between them) */
+        CHECK(nnotices == 5 && !sounds && notices[4] == row_of("Three Stones"));
+        row_notices = 1;   /* the notices On again: the next one earned has its sound */
+        set(ACH_ITEM, "Item_Medal_Light", 1);
+        at(40);
+        CHECK(nnotices == 6 && sounds == 1 && notices[5] == row_of("Sage of Light"));
+    } else if (!strcmp(argv[2], "file2")) {   /* the save files on, File 2 played: none of what the game folder earned is its */
+        snprintf(files_dir, sizeof files_dir, "%s/user-2", game_dir);
+        const int lines_before = lines(file("triforce_achievements.txt"));
+        renderer = 1;
+        hos_achievements_frame();
+        CHECK(said("achievements: 36 (1 of achievements.txt), 0 earned so far") == 1 && rows_shown == 36 && !(row_bits[0] & HOS_ACH_EARNED));
+        at(20);
+        CHECK(said("achievements: earned \"") == 6 && said("earned \"Mine\" (6 of 36)") == 1 && !said("could not be written"));
+        CHECK(lines(file("user-2/triforce_achievements.txt")) == 7 && strstr(file_text, " Mine\n") && !strstr(file_text, "Spider Hunter"));
+        CHECK(lines(file("triforce_achievements.txt")) == lines_before && strstr(file_text, " Spider Hunter\n"));   /* (the game folder's as it was) */
+    } else if (!strcmp(argv[2], "file1")) {   /* File 1, never played with files: it starts from what the game folder earned */
+        snprintf(files_dir, sizeof files_dir, "%s/user", game_dir), files_first = 1;
+        renderer = 1;
+        hos_achievements_frame();
+        CHECK(said("achievements: 36 (1 of achievements.txt), 7 earned so far") == 1 && (row_bits[row_of("Spider Hunter")] & HOS_ACH_EARNED));
+        at(10);
+        CHECK(!said("earned \"") && !file("user/triforce_achievements.txt")[0]);   /* (nothing new: nothing written yet) */
+        set(ACH_ITEM, "Item_Medal_Light", 1);
+        at(20);
+        CHECK(said("earned \"Sage of Light\" (8 of 36)") == 1);
+        /* its own file from here: the eight, and the line no list has, kept; the game folder's without the eighth */
+        CHECK(lines(file("user/triforce_achievements.txt")) == 10 && strstr(file_text, " Sage of Light\n") && strstr(file_text, "\ndeadbeef 5 Gone\n"));
+        CHECK(lines(file("triforce_achievements.txt")) == 9 && !strstr(file_text, "Sage of Light"));
+    } else if (!strcmp(argv[2], "again1")) {   /* File 1's next start: its own file now, not the game folder's */
+        snprintf(files_dir, sizeof files_dir, "%s/user", game_dir), files_first = 1;
+        renderer = 1;
+        hos_achievements_frame();
+        CHECK(said("achievements: 36 (1 of achievements.txt), 8 earned so far") == 1);
     } else if (!strcmp(argv[2], "first")) {
         CHECK(hos_achievements_on());
         hos_achievements_frame();   /* the first present, before the renderer answers: the lists are read, nothing is named */
-        CHECK(said("achievements: 26 (1 of achievements.txt), 0 earned so far") == 1 && said("achievements: 2 left out") == 1);
+        CHECK(said("achievements: 36 (1 of achievements.txt), 0 earned so far") == 1 && said("achievements: 2 left out") == 1);
         CHECK(!rows_added && rows_shown < 0);
         at(20);   /* six earned before the menu has the list: written and said at once, shown only once it has */
-        CHECK(said("achievements: earned \"") == 6 && said("earned \"A Sword of Your Own\" (1 of 26)") == 1 && said("earned \"Mine\" (6 of 26)") == 1);
+        CHECK(said("achievements: earned \"") == 6 && said("earned \"A Sword of Your Own\" (1 of 36)") == 1 && said("earned \"Mine\" (6 of 36)") == 1);
         CHECK(said("earned \"Three Stones\"") == 1 && !said("Spider Hunter") && !said("could not be written"));
         CHECK(lines(file("triforce_achievements.txt")) == 7 && strstr(file_text, " A Sword of Your Own\n") && strstr(file_text, " Mine\n"));
         CHECK(!nnotices && !sounds);
         renderer = 1;
         hos_achievements_frame();   /* the list named, whole, in its order: name, the line about it, the day; the icon and earned */
-        CHECK(rows_added == 26 && rows_shown == 26 && !nnotices);
+        CHECK(rows_added == 36 && rows_shown == 36 && !nnotices);
         CHECK(!strncmp(row_text[0], "A Sword of Your Own\nFind a blade in the forest.\n", 48) && is_day(row_text[0] + 48));
         CHECK(row_bits[0] == (1 | 1 << 4 | HOS_ACH_EARNED));                 /* (sword green, earned) */
         CHECK(!strcmp(row_text[1], "First Melody\nLearn the royal family's song.\n") && row_bits[1] == 4);   /* (a note, gold; not earned: no day) */
-        CHECK(row_of("Mine") == 25 && row_bits[25] == (2 | 3 << 4 | HOS_ACH_EARNED) && row_bits[row_of("Twice as Tough")] == (6 | 7 << 4));
+        CHECK(row_of("Mine") == 35 && row_bits[35] == (2 | 3 << 4 | HOS_ACH_EARNED) && row_bits[row_of("Twice as Tough")] == (6 | 7 << 4));
         hos_achievements_frame(), hos_achievements_frame();
-        CHECK(rows_added == 26);   /* (named once) */
+        CHECK(rows_added == 36);   /* (named once) */
         /* shown one at a time, each for its 4.5 s, in the list's order, with the sound and the day */
         at(30);
         CHECK(nnotices == 1 && sounds == 1 && sound_at == 3 * S && notices[0] == 0 && is_day(notice_day[0]));
@@ -153,18 +207,18 @@ int main(int argc, char **argv) {
         at(75);
         CHECK(nnotices == 2 && sounds == 2 && notices[1] == row_of("Forest's Thanks"));
         for (int t = 120; t <= 400; t += 10) at(t);
-        CHECK(nnotices == 6 && sounds == 6 && notices[5] == 25);
-        CHECK(said("achievements: earned \"") == 6 && said("achievements: 26 (") == 1 && lines(file("triforce_achievements.txt")) == 7);
+        CHECK(nnotices == 6 && sounds == 6 && notices[5] == 35);
+        CHECK(said("achievements: earned \"") == 6 && said("achievements: 36 (") == 1 && lines(file("triforce_achievements.txt")) == 7);
     } else {
         renderer = 1;
         hos_achievements_frame();   /* the next start: what was earned is, and is neither said nor shown again */
-        CHECK(said("achievements: 26 (1 of achievements.txt), 6 earned so far") == 1 && rows_shown == 26);
+        CHECK(said("achievements: 36 (1 of achievements.txt), 6 earned so far") == 1 && rows_shown == 36);
         at(10);
         CHECK(!said("earned \"") && !nnotices && !sounds);
         CHECK((row_bits[0] & HOS_ACH_EARNED) && !(row_bits[row_of("Spider Hunter")] & HOS_ACH_EARNED));
         have[5].value = 10;   /* (the tenth token) */
         at(20);
-        CHECK(said("earned \"Spider Hunter\" (7 of 26)") == 1 && nnotices == 1 && notices[0] == row_of("Spider Hunter") && is_day(notice_day[0]));
+        CHECK(said("earned \"Spider Hunter\" (7 of 36)") == 1 && nnotices == 1 && notices[0] == row_of("Spider Hunter") && is_day(notice_day[0]));
         /* the file whole again: the seven, and the line of an achievement no list has now, as it was */
         CHECK(lines(file("triforce_achievements.txt")) == 9 && strstr(file_text, " Spider Hunter\n") && strstr(file_text, "\ndeadbeef 5 Gone\n"));
         CHECK(!file("triforce_achievements.txt.new")[0]);

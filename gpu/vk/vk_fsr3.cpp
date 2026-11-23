@@ -23,6 +23,7 @@
 #include "vk_draw.h"      // (descriptors_disturbed)
 #include "vk_gprof.h"     // (RX_VK_PASS_TIMING: a span per pass, so the report names them)
 #include "vk_menu.h"
+#include "vk_n64.h"       // ((Triforce, N64 Classic) its 3D pass takes the gameplay upscale while it is on: fsr3_wanted)
 #include "vk_temporal.h"   // (temporal_env_chosen: RX_VK_DLSS / RX_VK_FSR4 over the row's FSR 3.1)
 #include "vk_texture.h"
 #include "sharpen_rules.h"   // ((Triforce, S1, S2) the Sharpness row as FSR's own: RCAS's constants, the boost below 3/4)
@@ -974,6 +975,8 @@ std::string own_said(Out& o) {
 bool fsr3_wanted() {
     static const int env = env_switch("RX_VK_FSR");
     if (env == 0) return false;
+    // ((Triforce, 11-22, N64 Classic) not while its 3D pass draws the gameplay upscale: n64_rules.h upscaler, the switch too)
+    if (n64_rules::upscaler(n64_in_front(), upscaler_rows::FSR3) != upscaler_rows::FSR3) return false;
     // (the Upscaler row's FSR 3.1 or its Native AA, upscaler_rows.h, read each time: the row changes it while the game runs.
     // RX_VK_DLSS=1 / 2 or RX_VK_FSR4=1 / 2 goes over the row, its FSR 3.1 too: vk_temporal.cpp's chain draws then)
     return (env > 0 || (upscaler_rows::is_fsr3(opts.dlss) && !temporal_env_chosen())) && fsr3::supported();

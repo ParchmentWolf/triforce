@@ -77,6 +77,8 @@ inline VkResult query_results(Call&& call, VkDevice device, VkQueryPool pool, ui
 #define vkCmdUpdateBuffer(...) (::mkwvk::rec::rx_vkCmdUpdateBuffer(RX_WORK_ON(__VA_ARGS__)))
 #define vkCmdBeginQuery(...) (::mkwvk::rec::rx_vkCmdBeginQuery(RX_WORK_ON(__VA_ARGS__)))
 #define vkCmdEndQuery(...) (::mkwvk::rec::rx_vkCmdEndQuery(RX_WORK_ON(__VA_ARGS__)))
+// ((Triforce, 11-23) RX_VK_QUERY_RING: a recording's timestamps copied by the GPU into a mapped ring, vk_replay.cpp gpu_time_end)
+#define vkCmdCopyQueryPoolResults(...) (::mkwvk::rec::rx_vkCmdCopyQueryPoolResults(RX_WORK_ON(__VA_ARGS__)))
 
 // (RX_VK_RECORDER) the calls that set state, bind or mark: not work (no count), but in the command buffer in order with the work, so
 // through the recorder too

@@ -22,6 +22,8 @@ Host* host = &host_object;
 VkImage framegen_scale(VkCommandBuffer,VkImageView,VkImage,uint32_t,uint32_t,const int*,uint32_t,uint32_t) {
     return VK_NULL_HANDLE; // This GPU fixture exercises direct blits; filtered routing is covered by L1.
 }
+void n64_screen_begin(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) {}   // ((Triforce, 11-22) N64 Classic's TV's screen: vk_n64.h)
+void n64_screen_end() {}
 // @PRODUCTION_HELPERS@
 void record_actual(VkCommandBuffer command,VkImage src,uint32_t sw,uint32_t sh,const int* crop,VkImage dst) {
     struct { VkCommandBuffer cmd; } f{command};

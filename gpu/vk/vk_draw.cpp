@@ -59,6 +59,7 @@
 #include "vk_texture.h"
 #include "movie_upscale_policy.h"
 #include "upscale_off.h"      // ((Triforce, 11-22, GPUWORK-20) which network dispatches the plain stretch stands in for)
+#include "vk_n64.h"           // ((Triforce, 11-22, N64 Classic) its 3D pass in the gameplay upscale's place: n64_upscale)
 #include "stub_same_size.h"   // ((Triforce, 11-22, GPUWORK-21) a gameplay network that cannot run, at its input's size: upscale_stub)
 #include "lab_ab.h"           // ((Triforce, 11-22, GPUWORK-20) the lab's "upoff" phases)
 #include "occ_lean.h"         // ((Triforce, 11-22, DESC-82) the occlusion proxies' census, RX_VK_OCC_LEAN=3)
@@ -109,6 +110,7 @@
 #include "shaders/clear_u_frag_spv.h"
 #include "shaders/clear_vert_spv.h"
 #include "shaders/taau_upscale_comp_spv.h"
+#include "shaders/n64_3d_comp_spv.h"   // ((Triforce, N64 Classic) shaders/n64_3d.comp)
 #include "shaders/movie_upscale_comp_spv.h"
 #include "shader_recompiler/backend/spirv/mma_layout.h"
 #include "vk_renodx.h"
@@ -3805,6 +3807,11 @@ std::atomic<uint32_t> upscale_lod_render_h{0};                        // (and it
 // ((Triforce, S8) this frame's scene size, from the upscaler's camera note in stream order (upscale_lod_scene): the
 // game's dynamic resolution makes new targets at each size, which the last upscale's size (the frame before's) misses)
 std::atomic<uint64_t> upscale_lod_scene_now{0};   // (sharpen_rules.h lod_scene_pack)
+// ((Triforce, 11-22, N64 Classic, step 3) the picture its 3D pass last drew, w | h << 32 (n64_upscale): while its texture blur
+// is on (a positive bias, which only it asks for), a draw of a scene's size for that picture is the scene (n64_rules.h
+// scene_draw), the frame of a dynamic resolution's new size included: the upscalers' scene camera, which takes that frame
+// for them, is not noted while they step aside
+std::atomic<uint64_t> n64_lod_output{0};
 /// ((Triforce, S8) Whether a draw into these targets renders the jittered scene (sharpen_rules.h lod_scene_now): its colour
 /// targets, or a depth-only draw's depth target (lod_scene_size), at the last upscale's render size or this frame's scene
 /// camera's. False while no bias is in use
@@ -3817,9 +3824,16 @@ bool draw_in_scene(const Targets& at) {
     if (at.depth) depth = {at.depth->width, at.depth->height, at.depth_level};
     uint32_t w, h;
     sharpen_rules::lod_scene_size(color, n, depth, &w, &h);
-    return sharpen_rules::lod_scene_now(w, h, upscale_lod_render.load(std::memory_order_relaxed),
-                                        upscale_lod_render_h.load(std::memory_order_relaxed),
-                                        upscale_lod_scene_now.load(std::memory_order_relaxed), texture_frame_no());
+    const bool upscalers = sharpen_rules::lod_scene_now(w, h, upscale_lod_render.load(std::memory_order_relaxed),
+                                                        upscale_lod_render_h.load(std::memory_order_relaxed),
+                                                        upscale_lod_scene_now.load(std::memory_order_relaxed), texture_frame_no());
+    if (upscalers) return true;
+    // ((Triforce, 11-22, N64 Classic, step 3) its blur: a draw of a scene's size and shape for the picture its pass drew)
+    if (upscale_lod_bias.load(std::memory_order_relaxed) > 0.0f) {
+        const uint64_t o = n64_lod_output.load(std::memory_order_relaxed);
+        return n64_rules::scene_draw(w, h, (uint32_t)o, (uint32_t)(o >> 32));
+    }
+    return false;
 }
 /// compare: the shader reads depth with a reference (a sampler without one cannot compare). scene: for a draw into the
 /// jittered scene (draw_in_scene), the only one the upscaler's texture LOD bias is added for
@@ -4593,7 +4607,14 @@ void upscale_lod_tick() {
     // not draw, makes no samplers anew twice; without it, none)
     static bool jitter = false;
     float want = 0.0f;
-    if (!off && (temporal_wanted() || fsr3_wanted())) {
+    // ((Triforce, 11-22, N64 Classic, step 3) its texture blur while its 3D pass draws the gameplay upscale (the upscalers step
+    // aside then): the look's positive bias, never past the card's limit (n64_rules.h lod_bias), on the same scene-only path,
+    // taken as it is (it changes only with the look). RX_VK_N64_LOD over the preset's; RX_VK_UPSCALE_LOD_BIAS is the upscalers'
+    const bool n64 = n64_3d_now();
+    if (n64) {
+        jitter = false;
+        want = n64_rules::lod_bias(n64_look(), dev.props.limits.maxSamplerLodBias);
+    } else if (!off && (temporal_wanted() || fsr3_wanted())) {
         if (temporal_jitter_size(0) || fsr3_inputs::jitter_size(0)) jitter = true;
         want = sharpen_rules::lod_bias_want(mode, fixed, upscale_lod_render.load(std::memory_order_relaxed),
                                             upscale_lod_output.load(std::memory_order_relaxed), jitter);
@@ -4603,12 +4624,13 @@ void upscale_lod_tick() {
         upscale_lod_scene_now.store(0, std::memory_order_relaxed);
     }
     const float now = upscale_lod_bias.load(std::memory_order_relaxed);
-    const float next = sharpen_rules::lod_bias_step(mode, now, want);   // (a fixed one as it is asked)
+    const float next = n64 ? want : sharpen_rules::lod_bias_step(mode, now, want);   // (a fixed one as it is asked; N64's too)
     if (next == now) return;
     upscale_lod_bias.store(next, std::memory_order_relaxed);
     sampler_bias_changed();
     logf("vk: texture LOD bias %+.2f on the scene's tiled textures (%s; was %+.2f)", (double)next,
          next == 0.0f ? "no upscaler: the game's own"
+         : n64        ? "N64 Classic's texture blur"
          : fixed_on   ? "RX_VK_UPSCALE_LOD_BIAS"
          : jitter     ? "the upscaler's render scale, -0.5 for its jitter"
                       : "the upscaler's render scale", (double)now);
@@ -7672,7 +7694,9 @@ extern int64_t presents_now;   // (vk_replay.cpp)
 // movie draws none: then ultrawide's sides are blurred or black (vk_framegen.cpp wide_sides)
 std::atomic<int64_t> world_drawn_at{0};
 // The last present whose frame drew the item wheel's background (02ff9920: the last frame of play, blurred, over the whole picture;
-// drawn behind the wheel only, not the pause menu or the map): no sides of ours then (vk_framegen.cpp wide_sides)
+// not drawn by the pause menu or the map): no sides of ours then (vk_framegen.cpp wide_sides). (Triforce) The same program draws
+// the backdrop of a system menu over the title (the file select: the title movie blurred), which is centred and takes the
+// sides: wide_sides_rule.h tells the two apart with the host
 std::atomic<int64_t> wheel_drawn_at{0};
 uint32_t stage_cbuf_word(const NvnState& s, const Stage& st, uint32_t index, uint32_t offset);   // (vk_shader.cpp)
 // (hookshot) RX_VK_EXPOSURE_LOG=1: the final pass's exposure (c3+0x38 of its fragment stage, OoT's 73320e720a317817) at each
@@ -10492,6 +10516,133 @@ static bool typed_upscale(VkCommandBuffer cmd, VkImageView input_view, VkImageVi
     if (temporal) probe_image(cmd, out, level, 0, key, 't');
     return true;
 }
+/// ((Triforce, 11-22) N64 Classic's 3D pass (n64-classic-mode-plan.md, step 2; shaders/n64_3d.comp) in a gameplay upscale
+/// network's place, from taau_stand_in under its lock: the network's input (input_view; `in` for its size) made into the grid
+/// of the look's lines (n64_rules.h grid: as wide as the output's shape makes it), each grid pixel the mean of its footprint,
+/// kept at the look's colour depth with the ordered dither; then out to the network's output (output_view, `out` at
+/// `level`) at the picture's size, linear along each line and hard between lines. The grid image is this pass's own, made
+/// again at a new size; the one before is given back 120 presents later, when no work in flight can use it. false: nothing
+/// was recorded (the pipeline or the grid could not be made), and the caller leaves the game's network to draw
+static bool n64_upscale(VkCommandBuffer cmd, VkImageView input_view, const Texture* in, VkImageView output_view, Texture* out,
+                        uint32_t level) {
+    if (!dev.push_descriptor || !vkCmdPushDescriptorSetKHR || !input_view || !output_view || !in || !out) return false;
+    static VkPipeline pipe = VK_NULL_HANDLE;
+    static VkPipelineLayout layout = VK_NULL_HANDLE;
+    static VkSampler linear = VK_NULL_HANDLE;
+    static bool tried = false;
+    struct Push {
+        int32_t grid[2], size[2];
+        int32_t pass, bits;
+        float dither;
+    };
+    if (!tried) {
+        tried = true;
+        VkDescriptorSetLayoutBinding b[3] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                             {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                             {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+        VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+        li.bindingCount = 3, li.pBindings = b;
+        VkDescriptorSetLayout set{};
+        vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &set);
+        const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, (uint32_t)sizeof(Push)};
+        VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pi.setLayoutCount = 1, pi.pSetLayouts = &set, pi.pushConstantRangeCount = 1, pi.pPushConstantRanges = &pr;
+        vkCreatePipelineLayout(dev.device, &pi, nullptr, &layout);
+        VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        mi.codeSize = sizeof N64_3D_COMP_SPV, mi.pCode = N64_3D_COMP_SPV;
+        VkShaderModule m{};
+        vkCreateShaderModule(dev.device, &mi, nullptr, &m);
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main", nullptr};
+        ci.layout = layout;
+        if (!m || vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+        if (m) vkDestroyShaderModule(dev.device, m, nullptr);
+        VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        si.magFilter = si.minFilter = VK_FILTER_LINEAR;
+        si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.maxLod = 0.25f;
+        if (vkCreateSampler(dev.device, &si, nullptr, &linear) != VK_SUCCESS) linear = VK_NULL_HANDLE;
+        logf("vk: N64 Classic: its 3D pass %s", pipe && linear ? "is ready" : "was not made: the game's upscale draws");
+    }
+    if (!pipe || !linear) return false;
+    const n64_rules::Look look = n64_look();
+    const uint32_t ow = std::max(1u, out->width >> level), oh = std::max(1u, out->height >> level);
+    const n64_rules::Grid g = n64_rules::grid(look.lines, ow, oh);
+    if (!g.w || !g.h || !in->width || !in->height) return false;
+    // ((step 3) the scene's size and the picture's for its texture blur, as the upscalers note theirs: upscale_lod_tick,
+    // draw_in_scene)
+    upscale_lod_note(in->width, in->height, ow);
+    n64_lod_output.store((uint64_t)oh << 32 | ow, std::memory_order_relaxed);
+    struct GridImage {
+        VkImage image = VK_NULL_HANDLE;
+        VmaAllocation memory = nullptr;
+        VkImageView view = VK_NULL_HANDLE;
+        uint32_t w = 0, h = 0;
+        uint64_t frame = 0;
+    };
+    static GridImage now;
+    static std::vector<GridImage> old;
+    for (size_t i = 0; i < old.size();) {
+        if (texture_frame_no() - old[i].frame < 120) { i++; continue; }
+        if (old[i].view) vkDestroyImageView(dev.device, old[i].view, nullptr);
+        destroy_image(old[i].image, old[i].memory);
+        old.erase(old.begin() + (ptrdiff_t)i);
+    }
+    if (!now.image || now.w != g.w || now.h != g.h) {
+        if (now.image) now.frame = texture_frame_no(), old.push_back(now);
+        now = GridImage{};
+        VkImageCreateInfo ic{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ic.imageType = VK_IMAGE_TYPE_2D, ic.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        ic.extent = {g.w, g.h, 1}, ic.mipLevels = 1, ic.arrayLayers = 1, ic.samples = VK_SAMPLE_COUNT_1_BIT;
+        ic.tiling = VK_IMAGE_TILING_OPTIMAL, ic.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+        if (!create_image(ic, now.image, now.memory)) return now = GridImage{}, false;
+        VkImageViewCreateInfo vc{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vc.image = now.image, vc.viewType = VK_IMAGE_VIEW_TYPE_2D, vc.format = ic.format;
+        vc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        if (vkCreateImageView(dev.device, &vc, nullptr, &now.view) != VK_SUCCESS) {
+            destroy_image(now.image, now.memory);
+            return now = GridImage{}, false;
+        }
+        VkImageMemoryBarrier2 ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};   // (UNDEFINED -> GENERAL, once)
+        ib.srcStageMask = VK_PIPELINE_STAGE_2_NONE, ib.srcAccessMask = VK_ACCESS_2_NONE;
+        ib.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        ib.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        ib.image = now.image, ib.subresourceRange = vc.subresourceRange;
+        VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        di.imageMemoryBarrierCount = 1, di.pImageMemoryBarriers = &ib;
+        vkCmdPipelineBarrier2(cmd, &di);
+        now.w = g.w, now.h = g.h;
+        static int told = 0;   // (each new size said, the first 16: the output's size changes rarely)
+        if (told++ < 16)
+            logf("vk: N64 Classic: the 3D on a %ux%u grid for a %ux%u picture, from a %ux%u 3D, %s colour", g.w, g.h, ow, oh,
+                 in->width, in->height, look.colour_bits ? (look.colour_bits == 5 ? "15-bit" : "18-bit") : "full");
+    }
+    const VkDescriptorImageInfo in_info{linear, input_view, VK_IMAGE_LAYOUT_GENERAL};
+    const VkDescriptorImageInfo grid_info{VK_NULL_HANDLE, now.view, VK_IMAGE_LAYOUT_GENERAL};
+    const VkDescriptorImageInfo out_info{VK_NULL_HANDLE, output_view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet w[3]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET},
+                              {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+    w[0].dstBinding = 0, w[0].descriptorCount = 1, w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w[0].pImageInfo = &in_info;
+    w[1].dstBinding = 1, w[1].descriptorCount = 1, w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    w[1].pImageInfo = &grid_info;
+    w[2].dstBinding = 2, w[2].descriptorCount = 1, w[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    w[2].pImageInfo = &out_info;
+    Push pc{{(int32_t)g.w, (int32_t)g.h}, {(int32_t)ow, (int32_t)oh}, 0, look.colour_bits, look.dither};
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 3, w);
+    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+    vkCmdDispatch(cmd, (g.w + 7) / 8, (g.h + 7) / 8, 1);   // (make: the grid)
+    full_barrier(cmd, "barrier (N64 Classic's grid)");
+    pc.pass = 1;
+    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+    vkCmdDispatch(cmd, (ow + 7) / 8, (oh + 7) / 8, 1);   // (show: the picture)
+    descriptors_disturbed();   // (the program's own pushes are gone from the bind point)
+    return true;
+}
 /// ((Triforce, FG-2) A gameplay network's output whose dispatch goes on past fsr3_stand_in (the game's own network, or the
 /// TAAU or the Anti-aliasing row's pass in its place): taken as frame generation's picture without the HUD once it has run,
 /// hudless_after_dispatch. The recording thread's own: each worker records its dispatches whole)
@@ -10629,15 +10780,19 @@ bool taau_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
     if (!dev.push_descriptor || !vkCmdPushDescriptorSetKHR || p.stages.empty()) return false;
     const Stage& st = p.stages[0];
     const bool off = upscale_off_on();
-    const bool shaped = off && st.info.uses_cooperative_matrix && st.info.texture_descriptors.size() == 1 &&
+    const bool n64 = n64_3d_now();   // ((Triforce, 11-22, N64 Classic) its 3D pass in the network's place: n64_upscale)
+    const bool shaped = (off || n64) && st.info.uses_cooperative_matrix && st.info.texture_descriptors.size() == 1 &&
                         st.info.image_descriptors.size() == 1;
-    const upscale_off::Choice ch = upscale_off::choose(taau_key(p.key), off, gameplay_network(p.key), shaped);
+    const upscale_off::Choice ch = upscale_off::choose(taau_key(p.key), off, gameplay_network(p.key), shaped, n64);
     if (!ch.stand_in) return false;
     if (st.info.texture_descriptors.empty() || st.info.image_descriptors.empty()) return false;
-    if (ch.by_shape) {   // (a network of that shape that is not a gameplay upscale, a movie's: its input is not the scene's format)
-        Texture* in = nullptr;
+    Texture* in = nullptr;   // (the network's input: for one taken by its shape, and for N64 Classic's grid, which needs its size)
+    if (ch.by_shape || ch.n64) {
         const uint32_t in_handle = handle_of(s, st, st.info.texture_descriptors[0], 0);
         if (in_handle) texture_view_of(in_handle, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Sample, VK_FORMAT_UNDEFINED, &in);
+        if (!in) return false;
+    }
+    if (ch.by_shape) {   // (a network of that shape that is not a gameplay upscale, a movie's: its input is not the scene's format)
         if (!in || in->format != VK_FORMAT_E5B9G9R9_UFLOAT_PACK32) return false;
     }
     size_t ntex = 0;   // (build_descriptors' image infos: the textures', then the images')
@@ -10653,8 +10808,10 @@ bool taau_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
     const char* keys = !ch.temporal ? "the upscaler Off" : getenv("RX_VK_TAAU_KEYS") ? getenv("RX_VK_TAAU_KEYS") : "fd029a317a9a4b94";
     bool done;
     {
-        ParLock lk;   // (Triforce: typed_upscale's pipeline and history images are shared by every recording thread: upscale_stub)
-        done = typed_upscale(cmd, dw().imgs[0].imageView, dw().imgs[ntex].imageView, out, level, p.key, keys, ch.temporal);
+        ParLock lk;   // (Triforce: typed_upscale's pipeline and history images are shared by every recording thread: upscale_stub;
+                      // N64 Classic's pipeline and grid as well)
+        if (ch.n64) done = n64_upscale(cmd, dw().imgs[0].imageView, in, dw().imgs[ntex].imageView, out, level);
+        else done = typed_upscale(cmd, dw().imgs[0].imageView, dw().imgs[ntex].imageView, out, level, p.key, keys, ch.temporal);
     }
     if (done) hudless_after_dispatch(cmd, p.key);   // ((Triforce, FG-2) the picture it wrote in the network's place, before the HUD)
     return done;

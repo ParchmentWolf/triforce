@@ -50,7 +50,10 @@ def build(cxx, work, headers="", opt="-O2"):
     work.mkdir(parents=True, exist_ok=True)
     logo_rgba.write(str(work / "hookshot_logo.h"))
     win = os.name == "nt"
-    target = ["--target=x86_64-pc-windows-msvc", "-fms-extensions", "-D_CRT_SECURE_NO_WARNINGS"] if win and "clang" in cxx else []
+    # (the game's own target: llvm-mingw's GNU one with HOOKSHOT_MINGW, as the builds have it, else MSVC; the a64 kit's toolchain)
+    sys.path.insert(0, str(ROOT / "third_party" / "a64-kit" / "tools"))
+    import toolchain
+    target = toolchain.native_target() if win and "clang" in cxx else []
     includes = ["-I" + str(ROOT / "gpu" / "vk"), "-I" + str(IMGUI), "-I" + str(ZSTD), "-I" + str(work),
                 "-I" + header_dir("vulkanheaders", "vulkan/vulkan.h", headers)]
     if os.name != "nt":   # (the Win32 names the back end's headers use, as its own build has them on POSIX)

@@ -38,6 +38,9 @@ if [ -n "$run" ]; then
 fi
 for game in bin/triforce bin/hookshot; do
     if [ -x "$HERE/$game" ]; then
+        # ((Triforce, 11-23) the log into triforce_log.txt whatever stderr is (Steam's pipe, a terminal, ~/.xsession-errors),
+        # as the launcher's Play does. HOS_LOG_FILE=0: stderr, as before)
+        export HOS_LOG_FILE="${HOS_LOG_FILE:-1}"
         cd "$HERE"
         exec "./$game"
     fi

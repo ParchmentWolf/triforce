@@ -98,6 +98,7 @@ FIXTURE = r'''#define _CRT_SECURE_NO_WARNINGS
 #include "step_steady.h"
 #include "pace_steady.h"
 #include "movie_pace.h"
+#include "n64_pace.h"   /* ((Triforce, N64 Classic) pace_fps and movie_pace_decide take its rate: none here (rx_option says 0)) */
 static int fails = 0;
 #define CHECK(x) do { if (!(x)) { printf("FAIL:%d %s\n", __LINE__, #x); fails++; } } while (0)
 typedef long long LONG64;
@@ -124,6 +125,7 @@ int rx_option(int id, int otherwise) { (void)id; return otherwise; }
 static int steady_row;           /* (the options file's steady_frame_rate) */
 int hos_ini_option(const char *key, int otherwise) { return strcmp(key, "steady_frame_rate") ? otherwise : steady_row; }
 enum { HOS_OPT_DISPLAY_CAP = 60 };
+enum { HOS_OPT_N64_FPS = 61 };
 static volatile long long presents;
 volatile uint64_t hos_gfx_module = MOD;
 volatile int hos_fixed_resolution, hos_dynres_runs;
@@ -240,7 +242,8 @@ def main():
     vi = (HOST / "nn_vi.c").read_text(encoding="utf-8")
 
     check('#include "movie_pace.h"' in vi, "nn_vi.c does not take movie_pace.h")
-    check("return movie_pace_fps(movie_raise, fps_max());" in block(vi, "static int pace_fps(void) {"), "pace_fps is not the rule's")
+    check("return n64_pace_fps(n64_rate, movie_pace_fps(movie_raise, fps_max()));" in block(vi, "static int pace_fps(void) {"),
+          "pace_fps is not the rule's (N64 Classic's rate over it: tests/test_n64_pace.py)")
     decide = block(vi, "static void movie_pace_decide(void) {")
     check('if (on < 0) on = !(getenv("HOS_MOVIE_PACE") && *getenv("HOS_MOVIE_PACE") && atoi(getenv("HOS_MOVIE_PACE")) == 0);' in decide,
           "HOS_MOVIE_PACE is not read once, on unless 0")
@@ -255,7 +258,7 @@ def main():
     check("movie_seen();" in block(vi, "uint32_t hos_movie_frames(uint64_t player) {")[:400], "a movie player's update is not noted")
 
     presented = block(vi, "void hos_vi_native_presented(void) {")
-    order = [presented.index(s) for s in ("const int interval = fps_max() < 60 ? 1 : present_interval;", "movie_pace_decide();",
+    order = [presented.index(s) for s in ("const int interval = n64_pace_interval(n64_rate, fps_max() < 60 ? 1 : present_interval);", "movie_pace_decide();",
                                           "const int64_t period = steady_period(1000000000LL / pace_fps() * interval, now);",
                                           "pace_period_ns = period;", "realtime_step(now);")]
     check(order == sorted(order) and presented.count("movie_pace_decide();") == 1,
@@ -278,7 +281,8 @@ def main():
 
     movie = vi[vi.index("static volatile LONG64 movie_seen_ns;"):vi.index("static int pace_handed(void) {")]
     host = "\n".join([block(vi, "static int fps_cap_of("), block(vi, "static int fps_max(void) {"), movie, "static int movie_raise;",
-                      block(vi, "static int pace_fps(void) {"), decide, block(vi, "static float text_scale("),
+                      "static int n64_rate;", block(vi, "static int pace_fps(void) {"), block(vi, "static void n64_pace_decide(void) {"),
+                      decide, block(vi, "static float text_scale("),
                       block(vi, "static int realtime_rate("), step])
     with tempfile.TemporaryDirectory(prefix="movie-pace-") as tmp:
         src, exe = Path(tmp) / "rules.c", Path(tmp) / "rules.exe"

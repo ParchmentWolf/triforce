@@ -10,6 +10,11 @@ volume) is cut out of vk_menu.cpp with its label and the options file's reading,
 hooks in menu_tick (the state before and after, nothing put with the row at 0), the renderer's two options, and the
 row's lines in readme.md and docs/development.md. tests/test_menu_sound.py has the host's side.
 
+((Triforce, 11-22, N64 Classic) The Remembered page, opened from Graphics' Remembered settings row: a page of its own to the
+ear, as the Motion page is (its row and its Back take their press for themselves): opened with decide, left with cancel, its
+Copy Faithful and Reset to defaults a decide. Read in vk_menu.cpp: sound_state gives it its own page, and those two rows keep
+their press for the sound.)
+
     python -I -B tests/test_menu_sound_events.py [--cxx g++]
 """
 import argparse
@@ -128,6 +133,13 @@ int main() {
     CHECK(sound_of(on_page(rows(3, 4), 1, 6), rows(3, 4), In().back_()) == kCancel);
     CHECK(sound_of(rows(3, 2), on_page(rows(3, 2), 7), In()) == kDecide);
     CHECK(sound_of(on_page(rows(3, 2), 7, 1), rows(3, 2), In()) == kCancel);
+    /* ((Triforce, N64 Classic) the Remembered page, likewise (its page, 10, under Graphics' tab): even onto the same row number
+       and value, opening is a decide and Back a cancel; its two action rows a decide; Up and Down on it the cursor */
+    CHECK(sound_of(rows(2, 2), on_page(rows(2, 2), 10, 2), In()) == kDecide);
+    CHECK(sound_of(on_page(rows(2, 2), 10, 2), rows(2, 2), In()) == kCancel);
+    CHECK(sound_of(on_page(rows(2, 2), 10, 23), on_page(rows(2, 2), 10, 23), In().confirm_()) == kDecide);
+    CHECK(sound_of(on_page(rows(2, 2), 10, 3), on_page(rows(2, 2), 10, 4), In().move_()) == kCursor);
+    CHECK(sound_of(rows(2, 2), rows(2, 2), In()) == kNone);   /* (as Graphics' rows alone: nothing, which was the silence) */
     /* out of a mode by Back: an amount, a flag's On and Off, a Restart waiting for its second press */
     CHECK(sound_of(on_page(rows(5, 0), 4, 3, 0, kModeEdit), on_page(rows(5, 0), 4, 3), In().back_()) == kCancel);
     CHECK(sound_of(with_mode(rows(4, 1), kModeConfirm), rows(4, 1), In().back_()) == kCancel);
@@ -269,6 +281,16 @@ def main():
     check("menu_sound::kSysCursor == HOS_MENU_SOUND_SYS_CURSOR" in menu and "menu_sound::kSysDecide == HOS_MENU_SOUND_SYS_DECIDE" in menu
           and "menu_sound::kFanfare == HOS_MENU_SOUND_FANFARE" in menu and "menu_sound::kLast + 1 == HOS_MENU_SOUND_N" in menu,
           "vk_menu.cpp does not hold the Mods entry's sounds (the fanfare, the system menu's cursor and decide) against vk_api.h's")
+    # ((Triforce, 11-22, N64 Classic) the Remembered page: its own page to the ear, and its two actions' press kept for the sound
+    check("constexpr int kSoundPageN64 = 10;" in menu, "vk_menu.cpp: the Remembered page has no page of its own to the ear (10)")
+    state = block(menu, "static menu_sound::State sound_state() {")
+    check("const bool n64_page = page == 0 && cur_tab == TAB_N64;" in state and
+          "s.page = motion ? kSoundPageMotion : n64_page ? kSoundPageN64 : page;" in state and
+          "cur_tab == TAB_N64 ? (int)TAB_GRAPHICS : cur_tab" in state,
+          "sound_state: the Remembered page is not its own page under Graphics' tab")
+    check("else if (press[7] && n64_action(r)) n64_act(n64_action(r)), changed = true;" in tick and
+          "else if (press[7] && is_n64_page_row(r)) cur_tab = TAB_N64," in tick,
+          "menu_tick: Copy Faithful and Reset to defaults do not keep their press for the sound (decide)")
     events = (vk / "menu_sound_events.h").read_text(encoding="utf-8")
     check("if (sound <= kNone || sound > kLast) return false;" in events,
           "the sounds' queue does not take every sound up to kLast (the Mods entry's are dropped)")

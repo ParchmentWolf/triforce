@@ -199,12 +199,12 @@
     {
       "id": "output",
       "label": "Output resolution",
-      "help": "The size of the game's whole frame before it is scaled to your window. Applies after a restart.",
+      "help": "The picture size before scaling to the window. The game menu and native launcher also offer handheld, connected screens and Custom sizes. Applies after a restart.",
       "choices": [
         {
-          "label": "1536x864 (handheld)",
+          "label": "1920x1080",
           "set": {
-            "output_res": "7"
+            "output_res": "3"
           }
         },
         {
@@ -223,6 +223,12 @@
           "label": "3840x2160",
           "set": {
             "output_res": "2"
+          }
+        },
+        {
+          "label": "5120x2880",
+          "set": {
+            "output_res": "5"
           }
         }
       ],
@@ -279,7 +285,7 @@
     {
       "id": "ultrawide",
       "label": "Aspect ratio",
-      "help": "Monitor's shape widens the camera to fill a screen wider than 16:9. The HUD stays stretched. Applies after a restart.",
+      "help": "The picture's shape for a 16:9 Output resolution: a fixed 21:9 or 32:9 for a screen or a window of that shape (the game's own menu has 16:10 too). A Screen that is not 16:9 has the screen's own shape. Applies after a restart.",
       "choices": [
         {
           "label": "16:9",
@@ -288,9 +294,15 @@
           }
         },
         {
-          "label": "Monitor's shape",
+          "label": "21:9",
           "set": {
-            "ultrawide": "1"
+            "ultrawide": "2"
+          }
+        },
+        {
+          "label": "32:9",
+          "set": {
+            "ultrawide": "3"
           }
         }
       ],

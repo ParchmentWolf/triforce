@@ -73,6 +73,7 @@
 #include "vk_fsr4.h"
 #include "vk_menu.h"
 #include "vk_renodx.h"   // (renodx_built: temporal_scene_format)
+#include "vk_n64.h"      // ((Triforce, N64 Classic) its 3D pass takes the gameplay upscale while it is on: temporal_mode)
 #include "vk_texture.h"
 
 #include "shaders/dlss_actor_frag_spv.h"
@@ -116,6 +117,9 @@ int temporal_mode() {
     rearm_on_choice(v);
     if (dlss > 0) v = dlss >= 2 ? ur::DLAA : ur::DLSS;   // (2 and up: DLAA, as RX_VK_DLSS was clamped before)
     else if (fsr4 > 0) v = fsr4 >= 2 ? ur::FSR4_AA : ur::FSR4;
+    // ((Triforce, 11-22, N64 Classic) while its 3D pass draws the gameplay upscale, the game's own as far as the chain is
+    // concerned (n64_rules.h upscaler): no jitter, no motion, no feature drawn. The row and the switches keep their values
+    v = n64_rules::upscaler(n64_in_front(), v);
     // (FSR 3.1, the row's 3, is not an engine of this chain: the game's own as far as it is concerned. Nor anything while
     // FSR 3.1 upscales: one upscaler at a time, and one camera jitter. A switch above goes over the row's FSR 3.1 too
     // (fsr3_wanted asks temporal_env_chosen); RX_VK_FSR=1 goes over them)
@@ -265,6 +269,8 @@ struct State {
     uint32_t pre_out_id = 0;   // (its creation number and texture_destroyed_count when noted: there_still)
     uint64_t pre_out_noted = 0;
     const Texture* pre_scene = nullptr;
+    uint32_t pre_scene_id = 0;   // (its creation number and texture_destroyed_count when drawn into: pre_scene_alive)
+    uint64_t pre_scene_noted = 0;
     uint64_t pre_late = 0, pre_drawn = 0, pre_missed = 0;
     int pre_miss_run = 0;   // (frames in a row without the point)
     uint64_t pre_late_frame = 0;
@@ -592,6 +598,16 @@ bool make_pipelines(bool hdr) {
 /// or its picture at the output's size
 bool there_still(uint32_t id, uint64_t noted) { return !texture_destroyed_since(id, noted); }
 bool there_still(const Camera& cam) { return there_still(cam.color_id, cam.noted) && there_still(cam.depth_id, cam.noted); }
+/// The scene's target the engine drew into before the bloom, unless that texture went since: then the pending point is
+/// dropped. (0.7.0 crash at pre_dispatch: the stale pointer read after the scene's target went with a window resize, an
+/// alt-tab or an area change while a point was still pending; RX_VK_PRE_SCENE_CHECK=0 = as before)
+bool pre_scene_alive(State& s) {
+    static const bool check = !getenv("RX_VK_PRE_SCENE_CHECK") || strcmp(getenv("RX_VK_PRE_SCENE_CHECK"), "0");
+    if (!s.pre_scene) return false;
+    if (!check || there_still(s.pre_scene_id, s.pre_scene_noted)) return true;
+    s.pre_scene = nullptr, s.pre_pending = false, s.pre_final = nullptr, s.pre_direct = false;
+    return false;
+}
 
 /// A view of a depth texture's depth alone, for sampling (made once per image); of a colour texture, its colour (the
 /// scene's target, sampled and written by temporal_pre_tonemap)
@@ -1592,6 +1608,7 @@ bool pre_copy(VkCommandBuffer cmd, Texture* final, Texture* in, VkImageView in_v
 bool pre_dispatch(VkCommandBuffer cmd, int mode, Texture* in, VkImageView in_view, Texture* out, VkImageView out_view,
                   uint32_t out_level, bool learn = true) {
     State& s = st();
+    if (s.pre_pending) (void)pre_scene_alive(s);
     // (the engine drew before the bloom, and this is the scene's upscale: the tone mapped picture goes to the output as it
     // is, or is there already, drawn at the output's size)
     // (its input is the scene's own texture with the game's formats, the game packing the tone mapped picture back into it;
@@ -1729,6 +1746,7 @@ bool pre_fsr3(VkCommandBuffer cmd, Texture* scene, VkImageView view, uint32_t rw
     }
     full_barrier(cmd);
     s.pre_pending = true, s.pre_frame = texture_frame_no(), s.pre_scene = scene, s.pre_drawn++;
+    s.pre_scene_id = scene->id, s.pre_scene_noted = texture_destroyed_count();
     s.pre_final = nullptr, s.pre_direct = false, s.pre_miss_run = 0, s.pre_touched = false;
     s.pre_picture = {picture, ow, oh};
     return true;
@@ -2050,6 +2068,7 @@ bool chain(VkCommandBuffer cmd, int mode, Engine& engine, const Camera& cam, con
     s.status_drawn++;
     if (pre) {
         s.pre_pending = true, s.pre_frame = now, s.pre_scene = pre, s.pre_drawn++;
+        s.pre_scene_id = pre->id, s.pre_scene_noted = texture_destroyed_count();
         s.pre_final = nullptr, s.pre_direct = false, s.pre_miss_run = 0, s.pre_touched = false;
         s.pre_picture = {picture, s.output.width, s.output.height};
         full_barrier(cmd);
@@ -2082,6 +2101,7 @@ bool temporal_pre_point(const Texture* color0, uint64_t program, bool* late) {
     if (!color0 || !pre_wanted(temporal_mode())) return false;
     State& s = st();
     std::lock_guard lk(s.mu);
+    if (s.pre_pending) (void)pre_scene_alive(s);
     // (pending from an earlier frame: that frame had no upscale's dispatch after it. Not this frame's)
     if (s.pre_pending && texture_frame_no() != s.pre_frame && color0 == s.pre_scene) s.pre_pending = false;
     if (s.pre_pending) {   // (the engine drew already: a draw into the scene now is one it did not see)
@@ -2196,7 +2216,7 @@ bool temporal_pre_dispatch(VkCommandBuffer cmd, Texture* in, VkImageView in_view
 bool temporal_pre_composite(const Texture* color0, uint32_t width, uint32_t height, TemporalRetarget* k) {
     State& s = st();
     std::lock_guard lk(s.mu);
-    if (!s.pre_pending || s.pre_final || !s.pre_scene || !color0 || color0 == s.pre_scene) return false;
+    if (!s.pre_pending || s.pre_final || !pre_scene_alive(s) || !color0 || color0 == s.pre_scene) return false;
     if (!temporal_scene_format(color0->format) || width != s.pre_scene->width || height != s.pre_scene->height)
         return false;
     s.pre_final = color0;
@@ -2222,7 +2242,7 @@ VkImageView temporal_pre_merged(VkCommandBuffer cmd) {
     std::lock_guard lk(s.mu);
     const uint32_t ow = s.pre_picture.width, oh = s.pre_picture.height;
     // (nothing drawn into the scene since, or no copy of it: the engine's picture as it is)
-    if (!s.pre_pending || !s.pre_touched || !s.pre_scene || !s.base.image || s.base.width != s.pre_scene->width ||
+    if (!s.pre_pending || !s.pre_touched || !pre_scene_alive(s) || !s.base.image || s.base.width != s.pre_scene->width ||
         s.base.height != s.pre_scene->height)
         return s.pre_picture.view;
     const VkDescriptorType S = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, I = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;

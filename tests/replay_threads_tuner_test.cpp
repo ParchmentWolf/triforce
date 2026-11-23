@@ -19,6 +19,10 @@
 //   cuttable) gets no verdict, nor the first window after it; a settled heavy scene where the helpers win still turns them on
 //   without a trial, a window after it settled; a trial the scene changed under changes nothing and the next comes soon
 //   after the scene settles. With settled off, each as before.
+// "calm": (Triforce, 11-22) Tuner::settled's calm scene between trials: no trial on a loading screen (nothing cut), a trial
+//   due during an arrival waits for the calm scene, a scene that never calms still has its trials; the rule's "on" in the
+//   Market's steady texture load (this PC's, fix one's A/B) withdrawn when the area comes down to its settled frames, and kept
+//   where the scene stays; where the helpers win, on again two windows after a withdrawal.
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -283,13 +287,13 @@ void rule_case() {
         CHECK(v.gain == v.saved && v.gain < 1.0 && v.kind != Verdict::kOn);
     }
     // the tuner on each scene, 20,000 presents
-    // (Triforce, 11-22: settled. On at the second window, the first with one before it to tell the scene settled; with
+    // (Triforce, 11-22: settled. On at the third window, the scene held kOnWindows windows (11-23; the second before); with
     // settled off at the first, as before)
     const Run heavy = run_scene(test4_heavy, 20000, true, 1);
-    CHECK(heavy.first_on == 2 * Tuner::kWindow);         // (on at the second window, without a trial)
+    CHECK(heavy.first_on == Tuner::kOnWindows * Tuner::kWindow);   // (on at the third window, without a trial)
     CHECK(heavy.first_trial > heavy.first_on);           // (a trial came after, kEvery later)
     CHECK(heavy.changes == 0 && heavy.trials >= 6);       // (and kept them, 12% shorter frames: no trial took them off)
-    CHECK(heavy.on_frames > 20000 - 240 - (heavy.trials + 1) * (Tuner::kSettle + Tuner::kTake));   // (but in the trials' serial parts)
+    CHECK(heavy.on_frames > 20000 - 360 - (heavy.trials + 1) * (Tuner::kSettle + Tuner::kTake));   // (but in the trials' serial parts)
     {
         const Run was = run_scene(test4_heavy, 20000, true, 1, nullptr, false, false);
         CHECK(was.first_on == Tuner::kWindow && was.first_trial > was.first_on && was.changes == 0 && was.trials >= 6);
@@ -312,7 +316,7 @@ void rule_case() {
     // cannot pay, nothing at the title), the trials fewer where they decide, and none changed the way where it held
     {
         const Run h = run_scene(test4_heavy, 20000, true, 1, nullptr, true);
-        CHECK(h.first_on == 2 * Tuner::kWindow && h.first_trial > h.first_on && h.changes == 0);
+        CHECK(h.first_on == Tuner::kOnWindows * Tuner::kWindow && h.first_trial > h.first_on && h.changes == 0);
         CHECK(h.trials >= 2 && h.trials < heavy.trials);
         CHECK(h.on_frames > heavy.on_frames);   // (fewer frames the other way)
         const Run g = run_scene(gpu_bound, 20000, true, 2, nullptr, true);
@@ -648,7 +652,7 @@ const Scene kokiri{11.66, 7.4, 5.8, 2000, 1900, 4.0, 1.06};
 
 struct Arrival {
     int on_verdicts = 0, trials = 0, changes = 0;
-    long long first_on = -1, on_frames = 0;
+    long long first_on = -1, on_frames = 0, first_in_use = -1;   // (first_in_use: by the rule or a trial)
     std::vector<long long> unsettled;   // (the presents of the windows the rule did not judge, before the first trial)
 };
 /// Kokiri for two windows, the load's window, then `to` (each window the rule's: the first trial comes at present 600)
@@ -666,6 +670,7 @@ Arrival run_arrival(const Scene& to, bool settled, uint32_t seed) {
         if (s.unsettled && !s.trial && !out.trials) out.unsettled.push_back(t.frames());
         if (s.trial) out.trials++, out.changes += s.better;
         if (s.flip) on = !on;
+        if (on && out.first_in_use < 0) out.first_in_use = t.frames();
         out.on_frames += on;
     }
     return out;
@@ -718,14 +723,17 @@ void settled_case() {
                     "windows not judged before the first trial; the helper threads in %lld of 6,000 frames (%lld)\n",
                     n.on_verdicts, o.on_verdicts, o.first_on, (int)n.unsettled.size(), n.on_frames, o.on_frames);
     }
-    // a settled heavy scene where the helpers win (test4's): on without a trial, a window after it settled, and kept
+    // a settled heavy scene where the helpers win (test4's): on by its first trial, due at present 600, a window before the
+    // rule's third (11-23: kOnWindows; the rule turned them on at 600 before), and kept
     {
         const Arrival n = run_arrival(test4_heavy, true, 62), o = run_arrival(test4_heavy, false, 62);
-        CHECK(n.first_on == 5 * Tuner::kWindow);   // (the heavy scene's second window: the first with one like it before)
-        CHECK(n.changes == 0 && n.on_frames > 6000 - 600 - (n.trials + 1) * (Tuner::kSettle + Tuner::kTake));
+        const long long trial_end = 600 + Tuner::kTake + 2 * (Tuner::kSettle + Tuner::kTake);
+        CHECK(n.first_in_use > 0 && n.first_in_use <= trial_end);
+        CHECK(n.changes <= 1 && n.on_frames > 6000 - trial_end - (n.trials + 1) * (Tuner::kSettle + Tuner::kTake));
         CHECK(o.first_on == 3 * Tuner::kWindow);
-        std::printf("settled: the load's window into test4's heavy scene: the helper threads on at present %lld without a trial "
-                    "(%lld with settled off), kept by %d trials\n", n.first_on, o.first_on, n.trials);
+        std::printf("settled: the load's window into test4's heavy scene: the helper threads on at present %lld (%s; %lld with "
+                    "settled off, by the rule), kept by %d trials\n", n.first_in_use, n.first_on > 0 ? "by the rule" : "by a trial",
+                    o.first_on, n.trials - n.changes);
     }
     // a trial the scene changed under: nothing changes, and the next comes soon after the scene settles
     {
@@ -743,6 +751,143 @@ void settled_case() {
     }
 }
 
+// ---- (Triforce, 11-22) "calm": the calm scene between trials, the trial gate and the rule's "on" withdrawn ----
+
+/// A run of stretches through a tuner with the rule, the back-off and settled (or not): (scene, presents) each; a scene whose
+/// draws and times slide from one to the next is a stretch of `mix` steps. Counts per stretch index
+struct Calm {
+    int trials = 0, withdrawn = 0, rule_on = 0;
+    std::vector<int> trials_in, on_in;   // (per stretch: trials that ended in it, presents with the helper threads on)
+    std::vector<long long> trial_ends;
+    long long first_on_after_withdrawal = -1, withdrawn_at = -1;
+};
+Scene mix(const Scene& a, const Scene& b, double k) {
+    return {a.frame + (b.frame - a.frame) * k, a.replay + (b.replay - a.replay) * k, a.gpu + (b.gpu - a.gpu) * k,
+            a.draws + (b.draws - a.draws) * k, a.cut + (b.cut - a.cut) * k, a.op + (b.op - a.op) * k,
+            a.par_factor + (b.par_factor - a.par_factor) * k};
+}
+struct Stretch {
+    Scene from, to;   // (to: the scene it slides to over its presents; the same as from for a steady one)
+    int n;
+};
+Calm run_calm(const std::vector<Stretch>& stretches, bool settled, uint32_t seed) {
+    Tuner t;
+    t.use_rule = true, t.backoff = true, t.settled = settled, t.threads = 4;
+    std::mt19937 r(seed);
+    bool on = false;
+    Calm out;
+    for (size_t k = 0; k < stretches.size(); k++) {
+        out.trials_in.push_back(0), out.on_in.push_back(0);
+        const Stretch& st = stretches[k];
+        for (int i = 0; i < st.n; i++) {
+            const Scene sc = mix(st.from, st.to, st.n > 1 ? (double)i / (st.n - 1) : 0.0);
+            const Tuner::Step s = t.step(sample(sc, on, r), on, false);
+            if (s.trial) out.trials++, out.trials_in[k]++, out.trial_ends.push_back(t.frames());
+            if (s.withdrawn) out.withdrawn++, out.withdrawn_at = t.frames();
+            if (s.ruled && s.flip) {
+                out.rule_on++;
+                if (out.withdrawn_at >= 0 && out.first_on_after_withdrawal < 0) out.first_on_after_withdrawal = t.frames();
+            }
+            if (s.flip) on = !on;
+            out.on_in[k] += on;
+        }
+    }
+    return out;
+}
+
+void calm_case() {
+    // (a loading screen: nothing to cut; this PC's settled Market from fix one's A/B, the helpers 12% slower; the arrival's
+    // texture load there, as its log has it: 21.5 ms frames, the replay 17.3 ms of them, 2,174 to 2,537 draws nearly all cut)
+    const Scene loading{4.71, 0.6, 0.9, 6, 0, 0.1, 1.0};
+    const Scene market_here{13.66, 8.44, 6.87, 798, 269, 3.6, 1.12};
+    const Scene market_load{21.5, 17.3, 9.9, 2400, 2200, 12.0, 0.88};
+    CHECK(rule(mean_of(market_load), 4).kind == Verdict::kOn);   // (as the log's window at present 13080 has it)
+    // a loading screen after the helper threads went on in a heavy scene: no trial there (both ways the same work)
+    {
+        const std::vector<Stretch> run{{test4_heavy, test4_heavy, 4000}, {loading, loading, 20000}};
+        const Calm n = run_calm(run, true, 71), o = run_calm(run, false, 71);
+        CHECK(n.rule_on == 1 && n.trials_in[1] == 0);
+        CHECK(o.trials_in[1] >= 3);
+        std::printf("calm: a loading screen after the helper threads went on: %d trials in 20,000 presents (%d with settled off)\n",
+                    n.trials_in[1], o.trials_in[1]);
+    }
+    // a trial due during an arrival waits for the calm scene: none ends on the arrival's sliding frames
+    {
+        // (test7's busy scene, the trials decide; then 600 presents of an area coming in, its draws and times sliding to the
+        // settled Market's, the next trial due in them; then the Market)
+        const std::vector<Stretch> run{{test7_busy, test7_busy, 1300}, {test7_busy, market_here, 600}, {market_here, market_here, 6000}};
+        const Calm n = run_calm(run, true, 72);
+        CHECK(n.trials_in[0] >= 1 && n.trials_in[1] == 0 && n.trials_in[2] >= 1);
+        std::printf("calm: an arrival with a trial due: %d trials on its sliding frames, %d in the settled scene after it\n",
+                    n.trials_in[1], n.trials_in[2]);
+    }
+    // a scene that never calms (two scenes swapped every 60 to 359 presents) still has its trials, kEvery late at most
+    {
+        const Scene a{12.0, 9.6, 8.4, 1500, 1400, 3.4, 1.08}, b{12.0, 9.6, 8.4, 2400, 2250, 3.4, 1.08};
+        std::vector<Stretch> run{{test7_busy, test7_busy, 1000}};
+        std::mt19937 r(73);
+        for (int i = 0, alt = 0; i < 23000; alt = !alt) {
+            const int len = 60 + (int)(r() % 300);
+            run.push_back({alt ? a : b, alt ? a : b, len}), i += len;
+        }
+        const Calm n = run_calm(run, true, 73);
+        long long gap = 0;
+        for (size_t i = 1; i < n.trial_ends.size(); i++) gap = std::max(gap, n.trial_ends[i] - n.trial_ends[i - 1]);
+        // (the longest back-off, its wait for a calm scene and the trial's own frames)
+        CHECK(n.trials >= 10 && gap <= Tuner::kBackoffMax + Tuner::kEvery + Tuner::kTake + 2 * (Tuner::kSettle + Tuner::kTake));
+        std::printf("calm: a scene that never settles: %d trials in 24,000 presents, at most %lld presents apart\n", n.trials, gap);
+    }
+    // the Market's arrival: the rule's "on" in the texture load's steady stretch is withdrawn when the area comes down to its
+    // settled frames, and the settled Market runs on the replay thread alone
+    {
+        const std::vector<Stretch> run{{test7_busy, test7_busy, 3000}, {loading, loading, 300}, {market_load, market_load, 240},
+                                       {market_load, market_here, 480}, {market_here, market_here, 1200}};
+        const Calm n = run_calm(run, true, 74);
+        CHECK(n.rule_on == 1 && n.withdrawn == 1);
+        // (the settled Market's 1,200 presents: the helper threads off but in a trial's other way at most)
+        CHECK(n.on_in[4] <= Tuner::kSettle + Tuner::kTake);
+        CHECK(n.on_in[3] < 480);                              // (off during the area's coming down)
+        std::printf("calm: the Market's arrival: the rule's \"on\" in the texture load withdrawn at present %lld, the helper threads "
+                    "in %d of the 480 presents coming down and %d of the settled Market's 1,200\n", n.withdrawn_at, n.on_in[3],
+                    n.on_in[4]);
+    }
+    // (11-23) the Market's arrival on 0.7 (testq #973, 3 launches): the texture load comes down a window at a time, two windows
+    // alike at ~2,300 draws (the rule's "on" there, 16.6 ms frames, the replay 12.8 ms, 3.6 us a draw), then 1,634, then ~870,
+    // then the settled Market (12.4 ms, the replay 5.6, 652 draws, 138 cut; the helpers ~18% slower, trial 1 of the stock run).
+    // Three windows alike to the first: no "on" in that slide; two alike (kOnWindows 2, the gate before): "on" in it
+    {
+        const Scene field7{11.5, 5.2, 6.0, 700, 150, 2.5, 1.10};
+        const Scene load7{16.6, 12.8, 9.2, 2300, 2200, 8.3, 0.92}, mid7{14.6, 9.9, 8.0, 1634, 1450, 6.0, 1.0},
+            low7{13.4, 6.6, 6.7, 870, 420, 3.4, 1.12}, market7{12.4, 5.6, 6.2, 652, 138, 2.5, 1.18};
+        CHECK(rule(mean_of(load7), 4).kind == Verdict::kOn && rule(mean_of(market7), 4).kind == Verdict::kOff);
+        int on_runs = 0, on_frames = 0;
+        for (uint32_t seed = 0; seed < 20; seed++) {
+            const std::vector<Stretch> run{{field7, field7, 2000}, {loading, loading, 300}, {load7, load7, 240},
+                                           {mid7, mid7, 120}, {low7, low7, 120}, {market7, market7, 1400}};
+            const Calm n = run_calm(run, true, 80 + seed);
+            on_runs += n.rule_on > 0;
+            for (size_t k = 2; k < n.on_in.size(); k++) on_frames += n.on_in[k];
+        }
+        CHECK(on_runs == 0 && on_frames == 0);
+        std::printf("calm: the Market's arrival on 0.7 (its texture load coming down a window at a time): the rule's \"on\" in %d "
+                    "of 20 runs, the helper threads in %d of their arrival and Market frames\n", on_runs, on_frames);
+    }
+    // where the helpers win (test4's): a steady scene keeps the rule's "on" (nothing withdrawn); a change to another heavy scene
+    // where they win withdraws it, and the rule turns them on again kOnWindows windows on
+    {
+        const Calm steady = run_calm({{test4_heavy, test4_heavy, 20000}}, true, 75);
+        CHECK(steady.withdrawn == 0 && steady.on_in[0] > 20000 - Tuner::kOnWindows * Tuner::kWindow - (steady.trials + 1) * (Tuner::kSettle + Tuner::kTake));
+        const Scene heavier{14.5, 12.0, 7.4, 3900, 3700, 9.9, 0.86};
+        CHECK(rule(mean_of(heavier), 4).kind == Verdict::kOn);
+        const Calm n = run_calm({{test4_heavy, test4_heavy, 700}, {heavier, heavier, 3000}}, true, 76);
+        CHECK(n.withdrawn == 1 && n.first_on_after_withdrawal > n.withdrawn_at);
+        CHECK(n.first_on_after_withdrawal - n.withdrawn_at <= Tuner::kOnWindows * Tuner::kWindow);
+        std::printf("calm: test4's heavy scene: %d withdrawn in 20,000 presents; a change to a heavier one: withdrawn at %lld, the "
+                    "rule's \"on\" again %lld presents later\n", steady.withdrawn, n.withdrawn_at,
+                    n.first_on_after_withdrawal - n.withdrawn_at);
+    }
+}
+
 int main(int argc, char** argv) {
     const std::string c = argc > 1 ? argv[1] : "";
     if (c == "same") same_case();
@@ -750,6 +895,7 @@ int main(int argc, char** argv) {
     else if (c == "rule") rule_case();
     else if (c == "backoff") backoff_case();
     else if (c == "settled") settled_case();
+    else if (c == "calm") calm_case();
     else return std::printf("which case?\n"), 2;
     return failures ? 1 : 0;
 }

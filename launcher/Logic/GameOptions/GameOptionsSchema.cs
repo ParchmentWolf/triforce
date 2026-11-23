@@ -17,11 +17,17 @@ public static class GameOptionsSchema
 {
     /// <summary>The file the game reads at its start and writes at every change in its menu, in the game folder.</summary>
     public const string FileName = "triforce_options.ini";
-    /// <summary>The options_version the game writes (vk_menu.cpp save, merged_rows.h kVersion): the file's format, which
-    /// menu_init's rules read.</summary>
-    public const int CurrentVersion = 8;
+    /// <summary>The options_version the game writes (vk_menu.cpp save): the file's format, which menu_init's rules read.</summary>
+    public const int CurrentVersion = 9;
 
     public const string OutputResKey = "output_res";
+    public const string OutputWidthKey = "output_width";
+    public const string OutputHeightKey = "output_height";
+    public const string UltrawideKey = "ultrawide";
+    /// <summary>The Custom size the player entered, &lt;w&gt;x&lt;h&gt;, kept by the game's menu while a screen's size is in
+    /// output_width and output_height (vk_menu.cpp remembered_custom); empty or absent when there is none. The menu reads
+    /// it under any Output resolution, and so does GameOptionsFile. No row.</summary>
+    public const string CustomSizeKey = "output_custom_size";
     public const string ResolutionKey = "resolution";
     public const string UpscalerKey = "dlss";
     public const string RumbleKey = "rumble_strength";
@@ -155,7 +161,23 @@ public static class GameOptionsSchema
     static string TxRdxGrade(int v, IGameOptionValues? o) => v.ToString(CultureInfo.InvariantCulture);
     static string TxSpeed(int v, IGameOptionValues? o) => v != 0 ? "Real time" : "Per frame";
     static string TxTextSpeed(int v, IGameOptionValues? o) => OrFirst(new[] { "Normal", "2x", "4x", "Instant" }, v);
-    static string TxUltrawide(int v, IGameOptionValues? o) => Pick(new[] { "16:9", "16:10", "21:9", "32:9" }, v);
+    static readonly string[] Shapes = { "16:9", "16:10", "21:9", "32:9" };
+    /// <summary>tx_shape: the row's choice, or the shape of an Output resolution that has its own (the row then has nothing
+    /// to choose) with its size. (The game shows HOS_ASPECT's there while it is set.)</summary>
+    static string TxUltrawide(int v, IGameOptionValues? o)
+    {
+        if (!OutputShaped(o)) return Pick(Shapes, v);
+        var (w, h) = OutputSizeOf(V(o, OutputResKey, 0), o);
+        return ShapeName((double)w / h) + " (" + w + "x" + h + ")";
+    }
+    /// <summary>shape_name: one of the Ultrawide row's where it is that one, else its width for a height of 1 (2.40:1).</summary>
+    static string ShapeName(double ratio)
+    {
+        for (var row = 1; row <= 3; row++)
+            if (Math.Abs(ratio / UltrawideRatio(row) - 1.0) < 0.001) return Shapes[row];
+        return ratio.ToString("0.00", CultureInfo.InvariantCulture) + ":1";
+    }
+    static string TxPixels(int v, IGameOptionValues? o) => v.ToString(CultureInfo.InvariantCulture);
     static string TxWideHud(int v, IGameOptionValues? o) => v != 0 ? "Screen edges" : "Middle";
     static string TxWideMenus(int v, IGameOptionValues? o) => Pick(new[] { "Full width", "Centred, blurred sides", "Centred, black bars" }, v);
     static string TxPrompts(int v, IGameOptionValues? o) =>
@@ -213,22 +235,148 @@ public static class GameOptionsSchema
     /// <summary>The microphone_device line's name as text: the file's bytes are UTF-8 (read here as Latin-1, byte for byte).</summary>
     internal static string MicName(string raw) => System.Text.Encoding.UTF8.GetString(System.Text.Encoding.Latin1.GetBytes(raw)).Trim();
 
-    // ---- the Output resolution and the Render resolution ----
+    // ---- the Output resolution, the picture it gives, and the Render resolution ----
 
-    /// <summary>The Output resolution's sizes by their saved value (kOutputs); 6 and 7 came after the others so that saved
-    /// values keep their sizes. (options_version 8) 7 is 1536x864, the game's handheld profile, once a row of its own.</summary>
+    /// <summary>The Output resolution's fixed sizes by their saved value (kOutputs); 6 came after the others so that saved
+    /// values keep their sizes. 9 is Custom, any size (gpu/vk/output_sizes.h): the size is the picture's, the game's frame
+    /// 16:9 at its height, and a size that is not 16:9 is a wider or narrower picture by itself. The game's menu lists the
+    /// size of every connected screen by its name and saves the one chosen as Custom's size, so here such a choice is
+    /// Custom with that size. 8 is Screen, the size of the screen the game's window opens on: what an older file has, and
+    /// still read; the game's menu saves it as that size.</summary>
     public static readonly IReadOnlyList<(int W, int H)> Outputs = new[] { (2048, 1152), (2560, 1440), (3840, 2160), (1920, 1080), (5120, 1440), (5120, 2880), (5120, 2160), (1536, 864) };
-    /// <summary>The Output resolution's handheld profile (merged_rows.h kHandheldOutput).</summary>
     public const int HandheldOutput = 7;
-    /// <summary>The order the menu shows them in, smallest to largest (kOutputOrder).</summary>
-    public static readonly IReadOnlyList<int> OutputOrder = new[] { 7, 3, 0, 1, 2, 4, 6, 5 };
-    static int OutputChoice(int v) => v >= 0 && v < Outputs.Count ? v : 0;
+    public const int OutputScreen = 8, OutputCustom = 9;
+    /// <summary>The order the launcher lists them in: the fixed sizes smallest to largest, then Screen and Custom. (The menu
+    /// puts the screens' sizes and Custom among the fixed ones by their sizes, output_entries.)</summary>
+    public static readonly IReadOnlyList<int> OutputOrder = new[] { 7, 3, 0, 1, 2, 4, 6, 5, OutputScreen, OutputCustom };
+    static int OutputChoice(int v) => v >= 0 && v <= OutputCustom ? v : 0;
+
+    // (gpu/vk/output_sizes.h, as plain code)
+    const int OutputMinW = 640, OutputMinH = 360, OutputMaxW = 7680, OutputMaxH = 2880;
+    const double OutputMaxPixels = 5120.0 * 2880.0, OutputRowPixels = 3840.0 * 2160.0, ShapeMin = 5.0 / 4.0, ShapeMax = 32.0 / 9.0;
+    static int OutputFrameWidth(int height) => (height * 16 + 36) / 72 * 8;
+    static bool ShapeIsGame(double shape) => !(shape > 16.0 / 9.0 * 1.01 || shape < 16.0 / 9.0 * 0.99);
+    static bool SizeShaped((int W, int H) s) => s.W > 0 && s.H > 0 && !ShapeIsGame((double)s.W / s.H);
+    /// <summary>ultrawide_row_ratio: the Ultrawide row's shape, 0 for the game's own 16:9.</summary>
+    static double UltrawideRatio(int row) => row <= 0 ? 0 : row == 1 ? 1.6f : row == 2 ? (float)(64.0 / 27.0) : (float)(32.0 / 9.0);
+    /// <summary>output_width_range: the widths, whole multiples of 8, a picture of height h can have on one side of 16:9:
+    /// within 5:4 to 32:9 and outside the 1% beside 16:9, within the width's ends and the pixels. Lo above Hi: none.</summary>
+    static (int Lo, int Hi) OutputWidthRange(int h, bool wide)
+    {
+        const double game = 16.0 / 9.0;
+        var edge = h * game * (wide ? 1.01 : 0.99);
+        var least = wide ? Math.Floor(edge / 8.0) * 8.0 + 8.0 : Math.Ceiling(h * ShapeMin / 8.0) * 8.0;
+        var most = wide ? Math.Floor(h * ShapeMax / 8.0) * 8.0 : Math.Ceiling(edge / 8.0) * 8.0 - 8.0;
+        var pixels = Math.Floor(OutputMaxPixels / h / 8.0) * 8.0;
+        least = Math.Max(least, OutputMinW);
+        most = Math.Min(Math.Min(most, OutputMaxW), pixels);
+        return ((int)least, most < 0 ? 0 : (int)most);
+    }
+    /// <summary>output_size_used: a size from outside (the screen's, Custom's) as the game takes it, null for none. Its
+    /// shape first (5:4 to 32:9), then into the limits in that shape: 7680x4320 is 5120x2880. The width is the multiple of
+    /// 8 nearest the shape's among those OutputWidthRange allows, so what comes out is taken as itself when given again.</summary>
+    internal static (int W, int H)? OutputSizeUsed(long w, long h)
+    {
+        if (w <= 0 || h <= 0) return null;
+        var shape = Math.Clamp((double)w / h, ShapeMin, ShapeMax);
+        if (ShapeIsGame(shape))
+        {
+            var gh = (int)Math.Clamp(h, OutputMinH, OutputMaxH);
+            return (OutputFrameWidth(gh), gh);
+        }
+        var wide = shape > 16.0 / 9.0;
+        double fh = h, scale = 1.0;
+        var fw = fh * shape;
+        if (fh * scale > OutputMaxH) scale = OutputMaxH / fh;
+        if (fw * scale > OutputMaxW) scale = OutputMaxW / fw;
+        if (fw * fh * scale * scale > OutputMaxPixels) scale = Math.Sqrt(OutputMaxPixels / (fw * fh));
+        int uh;
+        if (scale < 1.0) uh = (int)(fh * scale / 8.0) * 8;
+        else
+        {
+            if (fh < OutputMinH) fh = OutputMinH;
+            if (fh * shape < OutputMinW) fh = OutputMinW / shape;
+            uh = (int)Math.Ceiling(fh);
+        }
+        var (lo, hi) = OutputWidthRange(uh, wide);
+        if (lo > hi)
+        {
+            uh = (uh - 1) / 8 * 8;
+            (lo, hi) = OutputWidthRange(uh, wide);
+        }
+        return (Math.Clamp((int)(uh * shape / 8.0 + 0.5) * 8, lo, hi), uh);
+    }
+    /// <summary>custom_rows_read: the Output width and Output height rows' values for the file's two numbers (0: no line): a
+    /// side that is not a size is its default; as written where the rows can hold them, else the size the game takes.</summary>
+    internal static (int W, int H) CustomRowsRead(long w, long h)
+    {
+        if (w <= 0) w = 2560;
+        if (h <= 0) h = 1440;
+        var held = w >= OutputMinW && w <= OutputMaxW && h >= OutputMinH && h <= OutputMaxH;
+        return held ? ((int)w, (int)h) : OutputSizeUsed(w, h)!.Value;
+    }
+    /// <summary>output_picture: the picture for the frame's height and a shape, null for the game's own 16:9 picture.</summary>
+    internal static (int W, int H)? OutputPicture(int frameH, double want, bool sized)
+    {
+        if (!(want > 1.0) || ShapeIsGame(want)) return null;
+        var r = Math.Clamp(want, ShapeMin, ShapeMax);
+        var most = sized ? OutputMaxPixels : OutputRowPixels;
+        int oh = frameH, ow = (int)(oh * r / 8 + 0.5) * 8;
+        if ((double)ow * oh > most)
+        {
+            oh = (int)(Math.Sqrt(most / r) / 8) * 8;
+            ow = (int)(oh * r / 8) * 8;
+        }
+        return (ow, oh);
+    }
+    /// <summary>output_res_read: output_res as a file of an older options_version holds it, with its Ultrawide row. Before 8,
+    /// 5120x1440 (4) and 5120x2160 (6) were the game's frame: with the row on another shape than theirs, the 16:9 size of
+    /// their height, which gives the same picture.</summary>
+    internal static int OutputResRead(int v, int version, int ultrawide)
+    {
+        if (version >= 8) return v;
+        if (v == 4 && ultrawide != 0 && ultrawide != 3) return 1;
+        if (v == 6 && ultrawide != 0 && ultrawide != 2) return 2;
+        return v;
+    }
+    /// <summary>row_size: the size a choice shows, null for a Screen that is not known.</summary>
+    static (int W, int H)? RowSize(int v, IGameOptionValues? o)
+    {
+        v = OutputChoice(v);
+        if (v < OutputScreen) return Outputs[v];
+        if (v == OutputScreen) return o?.Screen is { } s ? OutputSizeUsed(s.W, s.H) : null;
+        // (under another choice with a size kept aside, Custom is that size: choosing it takes it back, as in the menu, where
+        // only the kept pair is offered then, output_entries)
+        if (V(o, OutputResKey, 0) != OutputCustom && o?.EnteredCustomSize is { } entered) return OutputSizeUsed(entered.W, entered.H);
+        return OutputSizeUsed(V(o, OutputWidthKey, 2560), V(o, OutputHeightKey, 1440));
+    }
+    /// <summary>output_size_of: the size a choice runs at (2560x1440 for a Screen that is not known, as the game).</summary>
+    static (int W, int H) OutputSizeOf(int v, IGameOptionValues? o) => RowSize(v, o) ?? Outputs[1];
+    /// <summary>output_shaped: the Output resolution chosen has a shape of its own (docked), so the Ultrawide row does not apply.</summary>
+    internal static bool OutputShaped(IGameOptionValues? o) =>
+        o != null && V(o, OutputResKey, 0) != HandheldOutput && SizeShaped(OutputSizeOf(V(o, OutputResKey, 0), o));
+    /// <summary>output_picture_of: the picture the options give, the size's own or its height in the Ultrawide row's shape.</summary>
+    static (int W, int H) PictureOf(IGameOptionValues? o)
+    {
+        var v = OutputChoice(V(o, OutputResKey, 0));
+        var size = OutputSizeOf(v, o);
+        var frameH = v == 0 ? Outputs[1].H : size.H;
+        var sized = SizeShaped(size);
+        var want = sized ? (double)size.W / size.H : UltrawideRatio(Math.Clamp(V(o, UltrawideKey, 0), 0, 3));
+        if (OutputPicture(frameH, want, sized) is not { } p) return v == 0 ? Outputs[0] : size;
+        return v == 0 ? (p.W * 4 / 5, p.H * 4 / 5) : p;
+    }
+    /// <summary>tx_output_res: a fixed size, "Screen (WxH)" with the main monitor's size where the launcher knows it (the
+    /// game shows the monitor's it opens on), "Custom (WxH)" with the Output width and Output height rows' size as the game
+    /// takes it.</summary>
     static string TxOutputRes(int v, IGameOptionValues? o)
     {
         v = OutputChoice(v);
-        if (v == HandheldOutput) return "1536x864 (handheld)";
-        var (w, h) = Outputs[v];
-        return w + "x" + h;
+        var size = RowSize(v, o);
+        if (v == 7) return "1536x864 (handheld)";
+        if (v < OutputScreen) return size!.Value.W + "x" + size.Value.H;
+        var name = v == OutputScreen ? "Screen" : "Custom";
+        return size is { } s ? name + " (" + s.W + "x" + s.H + ")" : name;
     }
 
     // (upscaler_rows.h)
@@ -272,7 +420,8 @@ public static class GameOptionsSchema
     }
     static string ModeName(int v) => Percent(v) switch { 67 => "Quality", 58 => "Balanced", 50 => "Performance", 33 => "Ultra Performance", _ => "" };
     /// <summary>tx_resolution: by the Upscaler chosen, and the size the game draws the 3D at for a fixed share of the
-    /// Output resolution (the handheld profile's 1536x864 among them), a twelfth of it as the game takes it.</summary>
+    /// picture (the Output resolution's own, or its height in the Ultrawide row's shape; the handheld profile's 1536x864),
+    /// a twelfth of it as the game takes it.</summary>
     static string TxResolution(int v, IGameOptionValues? o)
     {
         var up = V(o, UpscalerKey, 0);
@@ -280,7 +429,7 @@ public static class GameOptionsSchema
         var p = Percent(v);
         if (p == 0) return "Auto (dynamic)";
         if (ScalesByMode(up) && ModeName(v).Length > 0) return ModeName(v) + " (" + p + "%)";
-        var (ow, oh) = Outputs[OutputChoice(V(o, OutputResKey, 0))];
+        var (ow, oh) = (V(o, OutputResKey, 0) == HandheldOutput) ? (1536, 864) : PictureOf(o);
         var k = Math.Min(Math.Max((int)(p / 100.0f * 12.0f + 0.5f), 1), 12);
         return p + "% (" + (ow * k + 11) / 12 + "x" + oh * k / 12 + ")";
     }
@@ -382,16 +531,20 @@ public static class GameOptionsSchema
     {
         Row(GameOptionTab.Display, "Screen", "Fullscreen", 0, 1, 1, 0, GameOptionKind.Choice, TxOnoff, false, true,
             "The game fills the whole screen, without the window's border. F10 and Alt+Enter do the same."),
-        Row(GameOptionTab.Display, "Screen", "Output resolution", 0, 7, 1, 0, GameOptionKind.Choice, TxOutputRes, true, false,
-            "The size of the game's whole frame, HUD included, before it is scaled to the window. Applies after a restart."),
+        Row(GameOptionTab.Display, "Screen", "Output resolution", 0, 9, 1, 0, GameOptionKind.Choice, TxOutputRes, true, false,
+            "The picture's size, before it is scaled to the window: the fixed sizes, and the size of each connected screen by its name. A size that is not 16:9 is a wider or narrower picture: the HUD, menus and story movies keep their 16:9 shape at its height. Docked only. Applies after a restart."),
+        Row(GameOptionTab.Display, "Screen", "Output width", 640, 7680, 8, 2560, GameOptionKind.Slider, TxPixels, true, false,
+            "The output resolution's width in pixels, where it is a screen's size or Custom; hold Left or Right to move faster. Output resolution shows the size the game takes: 5:4 to 32:9 in shape, at most the pixels of 5120x2880. Applies after a restart."),
+        Row(GameOptionTab.Display, "Screen", "Output height", 360, 2880, 8, 1440, GameOptionKind.Slider, TxPixels, true, false,
+            "The output resolution's height in pixels, where it is a screen's size or Custom; hold Left or Right to move faster. Output resolution shows the size the game takes: 5:4 to 32:9 in shape, at most the pixels of 5120x2880. Applies after a restart."),
         Row(GameOptionTab.Display, "Screen", "GPU device", 0, 8, 1, 0, GameOptionKind.Choice, TxGpu, true, true,
             "Which graphics card the game runs on. Applies after a restart."),
         Row(GameOptionTab.Display, "Ultrawide", "Aspect ratio", 0, 3, 1, 0, GameOptionKind.Choice, TxUltrawide, true, false,
-            "The shape of the picture: the game's own 16:9, or 16:10, 21:9 or 32:9 for a screen of that shape. A screen of another shape shows it between black bars. Applies after a restart."),
+            "The picture's shape for a 16:9 Output resolution: the game's own 16:9, or a fixed 16:10, 21:9 or 32:9 at the same height, for a screen or a window of that shape. A screen of another shape shows the picture between black bars. An Output resolution that is not 16:9 has its own shape, shown here. Applies after a restart."),
         Row(GameOptionTab.Display, "Ultrawide", "HUD position", 0, 1, 1, 0, GameOptionKind.Choice, TxWideHud, true, true,
-            "Where the hearts, the item buttons and the map sit. Middle: in the middle 16:9, as on a normal screen. Screen edges: in the screen's corners. Applies after a restart."),
+            "With a picture wider than 16:9: where corner HUD elements, tips and notices sit. Middle: in the middle 16:9, as on a normal screen. Screen edges: out in the screen's corners. Applies after a restart."),
         Row(GameOptionTab.Display, "Ultrawide", "Menu sides", 0, 2, 1, 1, GameOptionKind.Choice, TxWideMenus, false, false,
-            "What is beside the pause, item and map menus, loading screens and movies, which are 16:9. Changes at once."),
+            "With a picture wider than 16:9: the pause, item and map menus, and what shows beside them. Loading screens and story movies, which draw no world either, get the same sides (the title's movie fills the picture up to 12:5); a fade always covers the whole screen. Changes at once."),
         Merged(GameOptionTab.Display, "HDR", "HDR", 0, 3, 1, MergeHdr, TxHdrMode, true, true,
             "HDR10 on an HDR display (Windows: Use HDR on in the display settings). Native + RenoDX applies after a restart."),
         Row(GameOptionTab.Display, "HDR", "Paper white", 80, 400, 10, 200, GameOptionKind.Slider, TxNits, false, true,
@@ -560,6 +713,7 @@ public static class GameOptionsSchema
         [VersionKey] = "the file's format: the rules the game reads an older file by (GameOptionsFile.Save writes 8 when it brings an older file up to date)",
         [MicDeviceKey] = "the Microphone row's device, by its name: the game's to choose from the devices it lists",
         [GpuNameKey] = "the GPU device row's card by its name (11-20): Save writes it with the row; the game finds the card by it first",
+        [CustomSizeKey] = "the Custom size entered before a screen's size was chosen in the game's Output resolution row: the game's to keep; GameOptionsFile empties it when it writes another Custom size, and takes it back into the rows when the Output resolution is changed",
         ["layout_preset"] = "the Controls page's Layout preset: choosing one in the game rebinds the pad_ lines, which a changed value alone would not do",
         ["debug_tools"] = "the Debug tab (not ported)",
         ["descriptor_reuse"] = "the Debug tab's Developer rows (not ported)",

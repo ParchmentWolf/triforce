@@ -15,7 +15,9 @@
 extern "C" {
 #endif
 
-#define MKWVK_API_VERSION 15
+/* ((Triforce, 11-22) 16: MkwVkRenderer's screen_point, N64 Classic's TV's curve for the game's own menus' mouse. 11-23: 19, as
+   ultrawide's screens and wide_backdrop (16, 17, 18 on its own line) came first on next/update) */
+#define MKWVK_API_VERSION 19
 enum { HOS_OPT_CHEAT_HEARTS = 32, HOS_OPT_CHEAT_FLIGHT, HOS_OPT_CHEAT_ACTION, HOS_OPT_CHEAT_CAMERA };
 /* (hookshot) the Motion page's rows (host/pad_sdl.c reads them, vk_replay.cpp's option answers them): Motion controls on
    or off, the horizontal's and the vertical's sensitivity in percent, each turned around, and the deadzone (0 to 2) */
@@ -39,6 +41,10 @@ enum { HOS_OPT_GAME_OPTIONS = 48, HOS_OPT_EXITING };
    rate cap on Monitor's rate (host/nn_vi.c fps_max, gpu/vk/fps_cap.h): its refresh rate rounded, 30 to 240; 0 when the
    rate cannot be read. 60 to 69 are the display, graphics and system rows' */
 enum { HOS_OPT_DISPLAY_CAP = 60 };
+/* ((Triforce, 11-22, N64 Classic, step 7) HOS_OPT_N64_FPS: the frame rate N64 Classic asks the host to pace the game at
+   (gpu/vk/n64_rules.h fps: Faithful's 20, the Remembered page's row; 0 none: the cap's), asked once a present
+   (host/nn_vi.c n64_pace_decide, host/n64_pace.h) */
+enum { HOS_OPT_N64_FPS = 61 };
 /* (Triforce) The System tab's save rows (gpu/vk/vk_menu.cpp), whose work the host does on a thread of its own
    (host/save_share.c): HOS_OPT_SHARE_ASK, option: what a row asked for since the last read, HOS_SHARE_*, 0 nothing (taken:
    the next read answers 0). HOS_OPT_SHARE_TEXT, option_set: the next byte of a line for the menu, UTF-8, and
@@ -135,7 +141,7 @@ enum { HOS_MENU_SOUND_OPEN = 1, HOS_MENU_SOUND_CLOSE, HOS_MENU_SOUND_CURSOR, HOS
    the button above it, then HOS_OPT_MODS_LIST: HOS_MODS_LIST_* bits (that frame's report is whole). HOS_OPT_MODS_ENTER,
    option_set: the cursor goes onto Mods (1: the game's Down there, which the game is not given, host/nn_hid.c), or Mods was
    clicked (2: open it; (Triforce, 11-19) 3: Quit under it clicked, its dialog opens; 4: the mouse moved onto Quit; 5: a Down
-   held from higher up the list, its repeat onto Mods, which repeats on at the step). HOS_OPT_MODS_SELECTED, option: 1 while the cursor is on Mods or its screen is open (the game gets
+   held from higher up the list, its repeat onto Mods, which repeats on at the step; on the title, while the save files are on, the entry under Mods is Save Select, host/save_files.c, and 3 and 4 are its). HOS_OPT_MODS_SELECTED, option: 1 while the cursor is on Mods or its screen is open (the game gets
    no input then: host/nn_hid.c). HOS_OPT_MODS_PRESS, option_set: presses the game was given meanwhile that are the menu's (a
    test's scripted ones, which reach no window): HOS_MODS_PRESS_* bits. ((Triforce, 11-19) with HOS_MODS_REPORT, each read's
    report: also the directions held then, HOS_MODS_PRESS_DIRS bits shifted by HOS_MODS_HELD_SHIFT, which the menu repeats
@@ -170,7 +176,28 @@ enum { HOS_OPT_MODS_ALPHA = 162 };
    HOS_OPT_ACH_COUNT, option_set: the list is whole (0: none). HOS_OPT_ACH_EARNED, option_set: the achievement at that place
    in the list was earned now, the bytes sent so far the day: the notice shows it. One at a time, the host waits between two */
 enum { HOS_OPT_ACH_TEXT = 165, HOS_OPT_ACH_ADD, HOS_OPT_ACH_COUNT, HOS_OPT_ACH_EARNED, HOS_OPT_ACH_ASK };
+/* ((Triforce) 11-23: the System tab's Achievements group. HOS_OPT_ACH_ON, option: 1 while its Achievements row is On (0:
+   nothing is asked of the save data and nothing earned, at once). HOS_OPT_ACH_NOTICES, option: 1 while its Achievement
+   notices row is On (0: what is earned is told to the list without the notice's sound, and the menu shows no notice).
+   185 and 186: 170 is the bench's helper test, 180 to 184 the save files) */
+enum { HOS_OPT_ACH_ON = 185, HOS_OPT_ACH_NOTICES };
 enum { HOS_ACH_EARNED = 256 };
+/* ((Triforce) 11-22) The benchmark's helper-thread test (host/hos_bench.c, HOS_BENCH_HELPERS=1). HOS_OPT_HELPERS_FORCE,
+   option_set: 0 the replay thread alone, 1 the replay helper threads in use, -1 the tuner decides again (gpu/vk/replay_threads.h),
+   each from the next present on; option: the helper threads such a test can use, 0 where it cannot (the Debug tab's row Off,
+   RX_VK_PARALLEL, or a PC Automatic gives none) */
+enum { HOS_OPT_HELPERS_FORCE = 170 };
+/* (Triforce) Save files (host/save_files.c keeps them, on unless HOS_SAVE_FILES=0; gpu/vk/vk_menu.cpp and
+   gpu/vk/save_file_rows.h show them: the file select at the title, and the System tab's Save files row; 180 to 184 are
+   theirs; 170 is the bench's helper test). HOS_OPT_FILES_ASK, option: the file the player chose to play that is not this run's, its number (1 the first; taken:
+   the next read answers 0), 0 none; a renderer that shows them answers 0 and more. Once it answers the host names the
+   files, in their order: HOS_OPT_FILES_TEXT, option_set: the next byte of a file's name, UTF-8, then a line feed and when it
+   was last saved (nothing: no save in it yet); HOS_OPT_FILES_ADD, option_set: the bytes sent so far are the next file's, the
+   value its HOS_FILE_* bits; HOS_OPT_FILES_COUNT, option_set: the list is whole, the value how many, and HOS_FILES_CHOSEN when
+   this start follows a choice (the game restarted for it). HOS_OPT_FILES_SAID, option_set: what became of the file asked
+   for: 1 it is the next start's (the menu restarts the game), 2 it could not be kept (nothing changes) */
+enum { HOS_OPT_FILES_TEXT = 180, HOS_OPT_FILES_ADD, HOS_OPT_FILES_COUNT, HOS_OPT_FILES_ASK, HOS_OPT_FILES_SAID };
+enum { HOS_FILE_SAVED = 1, HOS_FILE_CURRENT = 2, HOS_FILES_CHOSEN = 256 };
 
 /* (hookshot) the mouse over the window while it is free (not captured): the Insert menu's (host/display.c,
    host/posix/display_sdl.c). x and y: the cursor in the window's pixels, of a window width x height pixels (the
@@ -200,6 +227,14 @@ typedef struct MkwVkBench {
 } MkwVkBench;
 
 /* what the executable gives the back end */
+/* ((Triforce) a connected screen: its native size in pixels, whether the game's window opens on it, and the monitor's own
+   name in UTF-8 ("" where the system has none) */
+typedef struct MkwVkScreen {
+    uint32_t w, h;
+    int32_t opens;
+    char name[64];
+} MkwVkScreen;
+
 typedef struct MkwVkHost {
     uint32_t version;   /* MKWVK_API_VERSION */
     void (*log)(const char *line);
@@ -284,6 +319,14 @@ typedef struct MkwVkHost {
     /* (Triforce, 11-19, version 15) while the game has the keys' face (prompt_face): the face of the controller used last,
        once host/prompts.c has built its icons for the overlay (prompts/External.pad.bfotf.zs); -1 none */
     int (*prompt_pad_face)(void);
+    /* ((Triforce) 16) the connected screens as the host found them at the start (host/hos_screens.h), for the Insert menu's
+       Output resolution row, which offers each one's size: at most cap written, how many; 0 when none is known */
+    int (*screens)(MkwVkScreen *out, int cap);
+    /* ((Triforce) 17) ultrawide's menus: 1 while a game menu runs whose backdrop is the one the Ultrawide menus row puts in
+       the middle 16:9 (host/oot_title_movie.h: the file select, the file's box, the Options, the system menus' backdrop
+       itself). The blur of the last picture that the renderer sees drawn is then that backdrop, to be given sides, and not
+       the item wheel's background, which keeps the whole picture (gpu/vk/wide_sides_rule.h) */
+    int (*wide_backdrop)(void);
 } MkwVkHost;
 
 /* what the back end gives the executable: the rx_* functions (gpu/render/rx_nvn.h, rx_core) */
@@ -332,6 +375,10 @@ typedef struct MkwVkRenderer {
     /* (hookshot, the Insert menu) a setting changed from the game's side, kept in the options file: 7 the mouse's sensitivity
        in percent (the - and = keys, host/nn_hid.c) */
     void (*option_set)(int id, int value);
+    /* ((Triforce, 11-22, N64 Classic) a point of a w x h window, in its pixels (the cursor's), to the point of the game's picture
+       N64 Classic's TV showed there at the last present, through its screen's curve: where the game's own menus drew what the
+       cursor is over (host/oot_menu.c). As it is when the TV did not draw (gpu/vk/vk_n64.h n64_screen_point) */
+    void (*screen_point)(int *x, int *y, int w, int h);
 } MkwVkRenderer;
 
 /* the DLL's one export: null when Vulkan is not usable (the executable then falls back to WebGPU) */

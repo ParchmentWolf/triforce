@@ -17,14 +17,20 @@ public enum GameOptionKind { Choice, Slider }
 public sealed record GameOptionChoice(int Value, string Label);
 
 /// <summary>The values of the other rows, for the labels that depend on them (the Render resolution's sizes follow the
-/// Upscaler and the Output resolution; the Anti-aliasing row shows the upscaler's own while one draws; the Microphone shows
-/// the saved device's name). GameOptionsFile is one.</summary>
+/// Upscaler and the Output resolution; the Anti-aliasing row shows the upscaler's own while one
+/// draws; the Microphone shows the saved device's name; the Output resolution's Screen and Custom show their sizes, and the
+/// Ultrawide row the shape of an Output resolution that has its own). GameOptionsFile is one.</summary>
 public interface IGameOptionValues
 {
     /// <summary>A row's value as the game reads it (its default when the file has no line).</summary>
     int Get(string key);
     /// <summary>A line's value as the file has it, null when it has no such line.</summary>
     string? Raw(string key);
+    /// <summary>The main monitor's size in pixels, for the Output resolution's Screen; null where it is not known.</summary>
+    (int W, int H)? Screen => null;
+    /// <summary>The Custom size the game's menu keeps aside (output_custom_size), which choosing Custom takes back; null
+    /// where there is none.</summary>
+    (int W, int H)? EnteredCustomSize => null;
 }
 
 /// <summary>((Triforce, options_version 8) A saved value that a merged row stands for (vk_menu.cpp's TAB_HIDDEN rows): its key

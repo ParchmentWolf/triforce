@@ -21,6 +21,10 @@ void *hos_sdl_window(const char *title, int width, int height);
 void hos_sdl_fullscreen(void *window, int on);   /* (the desktop's mode, borderless) */
 void hos_sdl_relative_mouse(void *window, int on);
 int hos_sdl_desktop_size(int *width, int *height);
+/* ((Triforce) every connected display, the main one first: its desktop size in pixels and its name ("" when SDL has none);
+   how many were written, at most cap. 0 from an SDL without the calls: hos_sdl_desktop_size still has the main one's) */
+typedef struct { int w, h; char name[64]; } HosSdlDisplay;
+int hos_sdl_displays(HosSdlDisplay *out, int cap);
 int hos_sdl_refresh_mhz(void *window);   /* the refresh rate of the window's display in mHz, 0 when not known (the main thread) */
 int hos_sdl_vulkan_surface(void *window, void *instance, void *surface_out);   /* (VkInstance, VkSurfaceKHR *): 1 if made */
 void hos_sdl_pixel_size(void *window, int *width, int *height);

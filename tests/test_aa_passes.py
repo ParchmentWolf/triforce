@@ -81,6 +81,8 @@ static bool before_bloom = false;   // (the Upscale before bloom row: the upscal
 bool temporal_before_bloom() { return before_bloom; }
 bool fsr3_wanted() { return false; }
 bool fsr3_native() { return false; }
+static int n64_front = 0;   // ((Triforce, N64 Classic) vk_n64.cpp n64_in_front: the preset while its 3D pass draws, 0 none)
+int n64_in_front() { return n64_front; }
 static uint64_t frame_no = 10;
 uint64_t texture_frame_no() { return frame_no; }
 VkResult shared_cache_compute(const VkComputePipelineCreateInfo* ci, VkPipeline* out) {
@@ -157,6 +159,9 @@ static int logic(const char* env) {
         }
         upscaling = ur::DLAA, frame_no++;
         CHECK(aa_mode() == ar::FXAA);   // (the switch over an upscaler too: a lab's A/B of the game's SMAA under it)
+        n64_front = 1, frame_no++;
+        CHECK(aa_mode() == ar::FXAA);   // ((Triforce, N64 Classic) and over N64 Classic's Off)
+        n64_front = 0;
         std::puts("aa passes: RX_VK_AA is the run's choice");
         return 0;
     }
@@ -229,6 +234,16 @@ static int logic(const char* env) {
     CHECK(!aa_asked() && aa_state() == ar::QUIET);
     frame_no++;
     CHECK(!aa_asked() && !aa_leave_out(ar::kWeightsKey));
+    // ((Triforce, 11-22, N64 Classic) its 3D pass draws: the game's SMAA is left out with the game's own chosen, its edge and
+    // weight passes too once a composition is replaced; and the game's own again when it stops, as after any other choice
+    n64_front = 1, frame_no++;
+    CHECK(aa_asked() && aa_mode() == ar::OFF);
+    aa_composed(true, nullptr);
+    frame_no++;
+    CHECK(aa_leave_out(ar::kEdgesKey) && aa_leave_out(ar::kWeightsKey));
+    n64_front = 0, frame_no++;
+    CHECK(aa_asked() && !aa_leave_out(ar::kEdgesKey) && aa_mode() == ar::GAME);
+    CHECK(!aa_asked() && aa_state() == ar::QUIET);
     // FXAA with none of the game's compositions met for a minute (another game version): said once in the log, and to the row
     opts.aa = ar::FXAA;
     const size_t before = said.size();

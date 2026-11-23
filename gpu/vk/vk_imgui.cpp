@@ -234,9 +234,9 @@ void art_make() {   // (the presenting thread, before a frame: the images as ImG
         t->UseColors = true;
         ImGui::RegisterUserTexture(t);
         arts_.push_back({e.name, Art{t, (float)e.img.w, (float)e.img.h, e.img.mask}});
-        if (!e.name.compare(0, 8, "DataFile") || !e.name.compare(0, 7, "Ocarina") || !e.name.compare(0, 7, "MapIcon") || !e.name.compare(0, 5, "Rupee"))
-            // ((Triforce) the achievements' icons: which form each is, once)
-            logf("vk: ui: the game's own %s: %u x %u, %s", e.name.c_str(), e.img.w, e.img.h, e.img.mask ? "a mask" : "a picture");
+        if (!e.name.compare(0, 8, "DataFile") || !e.name.compare(0, 5, "Heart") || !e.name.compare(0, 7, "Ocarina") || !e.name.compare(0, 7, "MapIcon") ||
+            !e.name.compare(0, 5, "Rupee"))   // ((Triforce) the file select's and the achievements': which form each is, once)
+            logf("vk: ui: the load list's %s: %u x %u, %s", e.name.c_str(), e.img.w, e.img.h, e.img.mask ? "a mask" : "a picture");
     }
     skin_.images.clear(), skin_.images.shrink_to_fit();
     art_state.store(3, std::memory_order_release);
@@ -490,7 +490,9 @@ bool init() {
     // screen's pictures and the Salesman. 64 ran out at the fifth page of mods, 11-17: every overlay then waited on it)
     ii.DescriptorPoolSize = 1024;
     ii.MinImageCount = 2;
-    ii.ImageCount = 4;            // (its vertex buffers in turn: one more than the three frames present_image keeps in flight)
+    // (its vertex buffers in turn, one set a draw: one more than the three frames present_image keeps in flight, and (11-22) two
+    // draws a frame while the options go under N64 Classic's TV (record_layer, record_rest): 2 x 3 + 1, rounded up)
+    ii.ImageCount = 8;
     ii.UseDynamicRendering = true;
     ii.PipelineInfoMain.PipelineRenderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     ii.PipelineInfoMain.PipelineRenderingCreateInfo.colorAttachmentCount = 1;
@@ -614,14 +616,10 @@ void idle() {
     reap(false);   // (staging buffers and old textures let go while nothing shows too)
 }
 
-void record_to(VkCommandBuffer cmd, VkImage image, VkImageView view, uint32_t w, uint32_t h) {
-    ImGui::Render();
-    ImDrawData* dd = ImGui::GetDrawData();
-    presents++;
-    reap(false);
-    if (srgb_target) linearize(dd);
-    else if (dev.hdr) hdr10(dd);   // (the overlays at the paper white, not at the display's peak with the wrong primaries)
-    if (!image || !view) return;
+namespace {
+/// The frame's textures copied in on cmd (no wait on the queue). false: the font atlas could not be made, and the frame waits
+/// for it (nothing drawn); a picture that could not be made has its draws left out
+bool textures(VkCommandBuffer cmd, ImDrawData* dd) {
     // (a texture that could not be made has no descriptor: draws that sample it must not be recorded. (Triforce, 11-17) Those
     // draws alone are left out, not the frame's overlays: one picture of the Mods screen that could not be made hid every
     // overlay, the menus and the Mods entry under the game's list with them. The font atlas missing leaves the frame out)
@@ -640,12 +638,16 @@ void record_to(VkCommandBuffer cmd, VkImage image, VkImageView view, uint32_t w,
     if (!missing.empty()) {   // (asked for again next frame)
         static bool told = false;
         if (!told) told = true, logf("vk: ui: a texture could not be made (out of memory?): %s", atlas_missing ? "the overlays wait for it" : "its pictures left out");
-        if (atlas_missing) return;
+        if (atlas_missing) return false;
         for (ImDrawList* list : dd->CmdLists)
             for (ImDrawCmd& dc : list->CmdBuffer)
                 if (dc.TexRef._TexData && missing.contains(dc.TexRef._TexData))
                     dc.ElemCount = 0, dc.TexRef = ImGui::GetIO().Fonts->TexRef;   // (nothing drawn; a descriptor that is there bound)
     }
+    return true;
+}
+/// dd's drawing over image (TRANSFER_DST_OPTIMAL before and after, a view of it for colour attachment), one render pass
+void render_over(VkCommandBuffer cmd, VkImage image, VkImageView view, uint32_t w, uint32_t h, ImDrawData* dd) {
     layout(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
            VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
            VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
@@ -665,6 +667,182 @@ void record_to(VkCommandBuffer cmd, VkImage image, VkImageView view, uint32_t w,
     layout(cmd, image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
            VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
+}
+} // namespace
+
+void record_to(VkCommandBuffer cmd, VkImage image, VkImageView view, uint32_t w, uint32_t h) {
+    ImGui::Render();
+    ImDrawData* dd = ImGui::GetDrawData();
+    presents++;
+    reap(false);
+    if (srgb_target) linearize(dd);
+    else if (dev.hdr) hdr10(dd);   // (the overlays at the paper white, not at the display's peak with the wrong primaries)
+    if (!image || !view) return;
+    if (!textures(cmd, dd)) return;
+    render_over(cmd, image, view, w, h, dd);
+}
+
+// ---- ((Triforce, 11-22, N64 Classic, after the owner's test: "None of the classic visual effects apply to any of the custom
+// UI") The frame's drawing in two: the options (the background list: vk_menu.cpp menu_tv_layer draws them there) into a
+// layer of the picture's place, which N64 Classic's TV lays over the picture and takes in with it (n64_tv.comp); then the
+// rest (the foreground list: the FPS counter, the notice, benchmark mode's panel) over the window, flat, as before ----
+namespace {
+struct Layer {
+    VkImage image = VK_NULL_HANDLE;
+    VmaAllocation alloc = nullptr;
+    VkImageView draw = VK_NULL_HANDLE;     // (the overlays' own format: their pipeline's, the window images' views')
+    VkImageView sample = VK_NULL_HANDLE;   // (its UNORM: the bytes as they are, encoded as the picture is; draw's when not sRGB)
+    uint32_t w = 0, h = 0;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+};
+Layer layer;
+bool split = false;         // (this frame was drawn by record_layer: record_rest has the rest of it to draw)
+bool split_wait = false;    // (...but its textures could not be made: nothing of it is drawn, as record_to does then)
+bool split_layer = false;   // (...and the options are in the layer: over the window only beside the picture's place)
+float split_place[4] = {};
+/// An sRGB format's UNORM twin, the same bytes; the format itself otherwise
+VkFormat unorm_of(VkFormat f) {
+    return f == VK_FORMAT_B8G8R8A8_SRGB ? VK_FORMAT_B8G8R8A8_UNORM
+         : f == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_R8G8B8A8_UNORM
+         : f == VK_FORMAT_A8B8G8R8_SRGB_PACK32 ? VK_FORMAT_A8B8G8R8_UNORM_PACK32
+                                               : f;
+}
+/// The layer at w x h in the overlays' format: the one before let go once the frames in flight are done with it. false: it
+/// could not be made (said once); the options then go over the window as before
+bool layer_fit(uint32_t w, uint32_t h) {
+    if (layer.image && layer.w == w && layer.h == h && layer.format == pipeline_format) return true;
+    if (layer.image) {
+        dead.push_back({presents, Tex{layer.image, layer.alloc, layer.draw, VK_NULL_HANDLE}});
+        if (layer.sample != layer.draw) dead.push_back({presents, Tex{VK_NULL_HANDLE, nullptr, layer.sample, VK_NULL_HANDLE}});
+        layer = Layer{};
+    }
+    const VkFormat sample_format = unorm_of(pipeline_format);
+    VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ci.flags = sample_format != pipeline_format ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
+    ci.imageType = VK_IMAGE_TYPE_2D;
+    ci.format = pipeline_format;
+    ci.extent = {w, h, 1};
+    ci.mipLevels = ci.arrayLayers = 1;
+    ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    Layer made;
+    bool ok = create_image(ci, made.image, made.alloc);
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image = made.image;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vi.format = pipeline_format;
+    if (ok) ok = vkCreateImageView(dev.device, &vi, nullptr, &made.draw) == VK_SUCCESS;
+    vi.format = sample_format;
+    if (ok && sample_format == pipeline_format) made.sample = made.draw;
+    else if (ok) ok = vkCreateImageView(dev.device, &vi, nullptr, &made.sample) == VK_SUCCESS;
+    if (!ok) {   // (nothing recorded uses them yet)
+        static bool told = false;
+        if (!told)
+            told = true, logf("vk: ui: the options' layer under N64 Classic's TV (%ux%u, format %d) could not be made: they go over "
+                              "the window as before", w, h, (int)pipeline_format);
+        if (made.draw) vkDestroyImageView(dev.device, made.draw, nullptr);
+        if (made.image) destroy_image(made.image, made.alloc);
+        return false;
+    }
+    made.w = w, made.h = h, made.format = pipeline_format;
+    layer = made;
+    return true;
+}
+/// The lists to draw (the empty left out), in an ImDrawData of its own over a w x h image whose corner is (x, y) of the window
+ImDrawData part_of(std::initializer_list<ImDrawList*> lists, float x, float y, uint32_t w, uint32_t h) {
+    ImDrawData d;
+    d.Valid = true;
+    d.DisplayPos = ImVec2(x, y);
+    d.DisplaySize = ImVec2((float)w, (float)h);
+    d.FramebufferScale = ImVec2(1.0f, 1.0f);
+    for (ImDrawList* l : lists) {
+        if (!l || l->CmdBuffer.Size == 0 || l->VtxBuffer.Size == 0) continue;
+        d.CmdLists.push_back(l);
+        d.TotalVtxCount += l->VtxBuffer.Size;
+        d.TotalIdxCount += l->IdxBuffer.Size;
+    }
+#ifndef IMGUI_DISABLE_OBSOLETE_FUNCTIONS
+    d.CmdListsCount = d.CmdLists.Size;
+#endif
+    return d;
+}
+} // namespace
+
+VkImageView record_layer(VkCommandBuffer cmd, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    ImGui::Render();
+    ImDrawData* dd = ImGui::GetDrawData();
+    presents++;
+    reap(false);
+    split = true, split_layer = false;
+    split_place[0] = (float)x, split_place[1] = (float)y, split_place[2] = (float)w, split_place[3] = (float)h;
+    // (the overlays' colours once for the frame as an sRGB window image takes them: the layer's drawing view is of that format
+    // too. HDR10's are made in record_rest, for the window alone: the layer is SDR, as the picture it goes into)
+    if (srgb_target) linearize(dd);
+    split_wait = !textures(cmd, dd);
+    if (split_wait) return VK_NULL_HANDLE;
+    ImDrawData d = part_of({ImGui::GetBackgroundDrawList()}, (float)x, (float)y, w, h);
+    if (d.CmdLists.empty() || !layer_fit(w, h)) return VK_NULL_HANDLE;   // (nothing of the options; or no layer: over the window)
+    layout(cmd, layer.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, 0,
+           VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    ca.imageView = layer.draw;
+    ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    ca.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;   // (nothing: the options' colours over it come out premultiplied by their cover)
+    ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    ca.clearValue.color = VkClearColorValue{{0.0f, 0.0f, 0.0f, 0.0f}};
+    VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    ri.renderArea = {{0, 0}, {w, h}};
+    ri.layerCount = 1;
+    ri.colorAttachmentCount = 1;
+    ri.pColorAttachments = &ca;
+    vkCmdBeginRendering(cmd, &ri);
+    ImGui_ImplVulkan_RenderDrawData(&d, cmd);
+    vkCmdEndRendering(cmd);
+    layout(cmd, layer.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+           VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    split_layer = true;
+    return layer.sample;
+}
+
+void record_rest(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h) {
+    if (!split) return;
+    split = false;
+    if (split_wait || index >= dev.swap_views.size() || !dev.swap_views[index]) return;
+    ImDrawData* dd = ImGui::GetDrawData();
+    if (!srgb_target && dev.hdr) hdr10(dd);   // (the window's part: at the paper white, as record_to has it)
+    ImDrawList* under = ImGui::GetBackgroundDrawList();
+    ImDrawList* over = ImGui::GetForegroundDrawList();
+    if (!split_layer) {   // (the options not in a layer: over the window, under the rest, as before)
+        ImDrawData d = part_of({under, over}, 0.0f, 0.0f, w, h);
+        if (!d.CmdLists.empty()) render_over(cmd, dev.swap_images[index], dev.swap_views[index], w, h, &d);
+        return;
+    }
+    // (the options in the layer, under the TV: what of them lies beside the picture's place, on the black bars of another
+    // shape, still over the window, cut to those bars; then the rest)
+    const float x0 = split_place[0], y0 = split_place[1], x1 = x0 + split_place[2], y1 = y0 + split_place[3];
+    const float W = (float)w, H = (float)h;
+    const ImVec4 bars[4] = {{0, 0, W, y0}, {0, y1, W, H}, {0, y0, x0, y1}, {x1, y0, W, y1}};
+    std::vector<ImDrawList*> cut;
+    for (const ImVec4& bar : bars) {
+        if (bar.z <= bar.x || bar.w <= bar.y || !under->CmdBuffer.Size || !under->VtxBuffer.Size) continue;
+        ImDrawList* c = under->CloneOutput();
+        for (ImDrawCmd& dc : c->CmdBuffer)   // (none left of one: the backend skips it)
+            dc.ClipRect = ImVec4(std::max(dc.ClipRect.x, bar.x), std::max(dc.ClipRect.y, bar.y), std::min(dc.ClipRect.z, bar.z),
+                                 std::min(dc.ClipRect.w, bar.w));
+        cut.push_back(c);
+    }
+    ImDrawData d = part_of({}, 0.0f, 0.0f, w, h);
+    for (ImDrawList* l : cut) d.CmdLists.push_back(l), d.TotalVtxCount += l->VtxBuffer.Size, d.TotalIdxCount += l->IdxBuffer.Size;
+    if (over && over->CmdBuffer.Size && over->VtxBuffer.Size)
+        d.CmdLists.push_back(over), d.TotalVtxCount += over->VtxBuffer.Size, d.TotalIdxCount += over->IdxBuffer.Size;
+#ifndef IMGUI_DISABLE_OBSOLETE_FUNCTIONS
+    d.CmdListsCount = d.CmdLists.Size;
+#endif
+    if (!d.CmdLists.empty()) render_over(cmd, dev.swap_images[index], dev.swap_views[index], w, h, &d);
+    for (ImDrawList* l : cut) IM_DELETE(l);
 }
 
 void record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h) {

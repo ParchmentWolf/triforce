@@ -248,6 +248,7 @@ int main() {
 '''
 
 MENU = r'''#include "@ROOT@/gpu/vk/aa_rows.h"
+#include "@ROOT@/gpu/vk/n64_rules.h"
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -267,11 +268,20 @@ int aa_env_choice() { return env_now; }
 int aa_state() { return state_now; }
 bool reflex_available() { return true; }
 namespace mkwvk::dlssg { bool reflex_on() { return false; } }   /* ((Triforce) Reflex through Streamline: row_fixed asks it) */
+/* ((Triforce) what else sets the picture's shape and Custom's size, tests/test_output_resolution.py: row_fixed asks them) */
+int shape_owner() { return 0; }
+bool custom_env(long* = nullptr, long* = nullptr) { return false; }
 bool antilag_available() { return true; }
 unsigned upscalers_available() { return ~0u; }
 bool filter_needed() { return true; }
 const char* dlss_preset_env() { return nullptr; }
 int output_choice(int v) { return v; }
+/* ((Triforce, 11-22, N64 Classic) its 3D pass drawing in the upscaler's place (vk_n64.cpp n64_in_front), RX_VK_N64, and the
+   Remembered page's rows (none here) */
+int n64_front = mkwvk::n64_rules::OFF;
+int n64_in_front() { return n64_front; }
+bool n64_env_set() { return false; }
+int n64_rem_row(const int*) { return -1; }
 @TEXT@
 @HINT@
 @FIXED@
@@ -317,10 +327,11 @@ int main() {
         opts.aa = v, up_now = ur::GAME, env_now = -1, state_now = aa_rows::QUIET;
         CHECK(!std::strcmp(tx_aa(v), names[v]) && !row_fixed(&opts.aa));
         CHECK(hn_aa(v, -1) && hn_aa(v, -1) == hn_aa(v, 0));
-        /* every line a value can have, for the help's height: its own, DLSS's, FSR's, the switch's, the missing passes' */
+        /* every line a value can have, for the help's height: its own, DLSS's, FSR's, the switch's, the missing passes', N64
+           Classic's */
         int n = 0;
         while (hn_aa(v, n)) n++;
-        CHECK(n == 5 && !hn_aa(v, 5) && !hn_aa(v, 6));
+        CHECK(n == 6 && !hn_aa(v, 6) && !hn_aa(v, 7));
         for (int w = 0; w < v; w++) CHECK(std::strcmp(hn_aa(v, 0), hn_aa(w, 0)));
         /* replaced: nothing more to say */
         state_now = aa_rows::REPLACED;
@@ -353,6 +364,14 @@ int main() {
             state_now = aa_rows::MISSING;
             CHECK(hn_aa(v, -1) == hn_aa(v, env == aa_rows::GAME ? 3 : 4));
         }
+    /* ((Triforce, 11-22, N64 Classic) while its 3D pass draws: the row says so, has nothing to choose, keeps the choice, and
+       its line says why; RX_VK_AA's run is vk_aa.cpp's to take over it (tests/test_aa_passes.py) */
+    for (int v = 0; v < aa_rows::kValues; v++) {
+        opts.aa = v, up_now = ur::GAME, env_now = -1, state_now = aa_rows::MISSING, n64_front = mkwvk::n64_rules::FAITHFUL;
+        CHECK(!std::strcmp(tx_aa(v), "N64 Classic") && row_fixed(&opts.aa) && opts.aa == v);
+        CHECK(hn_aa(v, -1) == hn_aa(v, 5) && std::strstr(hn_aa(v, -1), "N64 Classic") && std::strstr(hn_aa(v, -1), "kept"));
+    }
+    n64_front = mkwvk::n64_rules::OFF;
     /* the other rows' fixing is theirs: the row's own value does not fix another. ((Triforce, options_version 7) DLAA is the
        Render resolution's Native (100%) step: that row has its steps) */
     up_now = ur::DLAA, env_now = -1;
@@ -395,8 +414,13 @@ def main():
 
     # the renderer's side: what is in effect is the row's rule, asked with what upscales as the menu's Upscaler row shows it
     mode = definition(aa, "int aa_mode")
-    check("ar::chosen(opts.aa, env_choice())" in mode and "ar::effective(choice, upscaler_now(), temporal_before_bloom(), env_choice() >= 0)" in mode,
+    choice = definition(aa, "int choice_now")
+    check("const int choice = choice_now();" in mode and "ar::chosen(opts.aa, env_choice())" in choice and
+          "ar::effective(choice, upscaler_now(), temporal_before_bloom(), env_choice() >= 0)" in mode,
           "aa_mode does not take the row's choice (RX_VK_AA over it) through aa_rows.h's effective")
+    # ((Triforce, 11-22, N64 Classic) Off while its 3D pass draws the gameplay upscale; RX_VK_AA still over it)
+    check("return env_choice() >= 0 ? choice : n64_rules::anti_aliasing(n64_in_front(), choice);" in choice,
+          "the row's choice no longer gives way to N64 Classic's 3D pass, or RX_VK_AA no longer goes over that")
     check("frame_read.load(std::memory_order_acquire) == frame" in mode and "std::lock_guard lk(s.mu);" in mode,
           "aa_mode no longer takes the choice once a frame")
     check(re.sub(r"\s+", " ", definition(aa, "int upscaler_now")).endswith(
@@ -407,7 +431,7 @@ def main():
     check('getenv("RX_VK_AA")' in aa and 'getenv("RX_VK_AA_KEEP")' in aa, "vk_aa.cpp no longer reads its two switches")
     # the game's own chosen and nothing left to free: a dispatch asks a comparison and nothing else
     check(re.sub(r"\s+", " ", definition(aa, "bool aa_asked")) ==
-          "bool aa_asked() { return ar::chosen(opts.aa, env_choice()) != ar::GAME || engaged.load(std::memory_order_relaxed) || upscaler_asks(); }",
+          "bool aa_asked() { return choice_now() != ar::GAME || engaged.load(std::memory_order_relaxed) || upscaler_asks(); }",
           "aa_asked is no longer the row's choice, whether anything is left to free and whether an upscaler leaves the SMAA out")
     asks = definition(aa, "bool upscaler_asks")
     check("ar::effective(ar::GAME, upscaler_now(), temporal_before_bloom(), env_choice() >= 0) != ar::GAME" in asks and

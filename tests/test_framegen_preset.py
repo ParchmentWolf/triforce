@@ -71,7 +71,8 @@ void restart_values(int*) {}
 struct { void note(const int*) {} } restart_state;
 bool can_mic() { return false; }
 void mic_chosen() {}
-int step_output_choice(int id, int dir) { return id + dir; }
+struct { unsigned w, h; } remembered_custom{};
+bool output_step(int, bool) { return false; }
 const char* tx_framegen_row(int) { return ""; }
 const char* hn_framegen_row(int, int) { return ""; }
 const char* tx_fps_cap(int) { return ""; }

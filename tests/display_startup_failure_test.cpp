@@ -51,6 +51,8 @@ static int hos_sdl_init(unsigned flags) {
     return mode != "init_failure";
 }
 static int hos_sdl_desktop_size(int* w, int* h) { *w = 2560; *h = 1440; return 1; }
+// ((Triforce) hos_display_init reads every display for the Output resolution: tests/test_screen_size.py)
+static void screens_read(int, int) {}
 static void* hos_sdl_window(const char*, int w, int h) {
     require(w == 1280 && h == 720, "changed default window size");
     ++windows;

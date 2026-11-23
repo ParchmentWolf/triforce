@@ -754,7 +754,7 @@ function onBench(b) {
     $('#benchEb').textContent = b.eb || '';
     $('#places').innerHTML = (b.places || []).map(p => `<div class="place noimg${p.fps2 != null ? ' two' : ''}"><div class="pg">${sparkline(p.graph)}${p.graph2 ? sparkline(p.graph2, 'b') : ''}</div>` +
       (p.fps2 != null
-        ? `<div class="two"><b>${esc(p.name)}</b><span><i>Your settings</i><strong>${p.fps}</strong> fps &#183; low ${p.low}</span><span class="vs"><i>${esc(b.second || '')}</i><strong>${p.fps2}</strong> fps &#183; low ${p.low2}</span></div></div>`
+        ? `<div class="two"><b>${esc(p.name)}</b><span><i>${esc(b.first || 'Your settings')}</i><strong>${p.fps}</strong> fps &#183; low ${p.low}</span><span class="vs"><i>${esc(b.second || '')}</i><strong>${p.fps2}</strong> fps &#183; low ${p.low2}</span></div></div>`
         : `<div><b>${esc(p.name)}</b><span><strong>${p.fps}</strong> fps &#183; low ${p.low}</span></div></div>`)).join('');
     $('#verdict').innerHTML = b.verdict || '';
     $('#recs').innerHTML = (b.recs || []).map(r => `<div class="rec${r.same ? ' same' : ''}"><b>${esc(r.name)}</b><s>${esc(r.from)}</s><em>&#8594;</em><strong>${esc(r.to)}</strong></div>`).join('');

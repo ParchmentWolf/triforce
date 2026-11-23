@@ -52,7 +52,7 @@ static void built_in(int print) {
             for (int k = 0; k < list.a[i].nconds; k++) printf("%c %s %d\n", list.a[i].conds[k].kind, list.a[i].conds[k].what, list.a[i].conds[k].least);
         return;
     }
-    CHECK(n == 25 && list.n == 25 && refused == 0);
+    CHECK(n == 35 && list.n == 35 && refused == 0);
     for (int i = 0; i < list.n; i++) {
         const Ach *a = &list.a[i];
         CHECK(a->name[0] && a->about[0] && a->nconds >= 1 && !a->earned && a->key == ach_key(a->name));
@@ -61,6 +61,7 @@ static void built_in(int print) {
     }
     CHECK(ach_key("") == 2166136261u && ach_key("a") == 0xe40c292cu);
     CHECK(list.a[0].icon == (1 | 1 << 4) && list.a[1].icon == 4 && list.a[24].icon == (6 | 7 << 4));   /* (sword green, a note, shield silver) */
+    CHECK(list.a[28].nconds == 4 && list.a[31].nconds == 2 && list.a[31].conds[1].least == 50 && list.a[34].icon == (6 | 3 << 4));   /* (the tunics and boots; the bombs; shield blue) */
 }
 
 static void form(void) {

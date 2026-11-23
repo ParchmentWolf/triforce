@@ -6,6 +6,7 @@
 #include "step_steady.h"   /* ((Triforce) HOS_STEP_STEADY=1: realtime_step) */
 #include "pace_steady.h"   /* ((Triforce) the Steady frame rate row: steady_period) */
 #include "movie_pace.h"   /* ((Triforce, 11-22, PRESENT-30) paced at 240 while a movie plays at the 60 cap) */
+#include "n64_pace.h"     /* ((Triforce, 11-22, N64 Classic) paced at its frame rate: n64_pace_decide, pace_fps */
 #include "../gpu/vk/vk_api.h"   /* (HOS_OPT_HDR_*: the Insert menu's HDR, answered by the renderer) */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -294,9 +295,13 @@ void hos_vi_native_acquire(int active) {
    fps_max stays the cap itself, which the Steady row, the present interval and the other limiters' hand-off read.
    Not with the Steady frame rate row on. HOS_MOVIE_PACE=0: the cap kept through movies, as before */
 static int movie_raise;
+/* ((Triforce, 11-22, N64 Classic, step 7) the rate it paces the frames at, 0 none (n64_pace.h): n64_pace_decide, once a
+   present with the movie's decision, so a movie gives way to nothing and the cap stays the cap */
+static int n64_rate;
 static int pace_fps(void) {
-    return movie_pace_fps(movie_raise, fps_max());
+    return n64_pace_fps(n64_rate, movie_pace_fps(movie_raise, fps_max()));
 }
+static void n64_pace_decide(void);   /* (below) */
 static void movie_pace_decide(void) {
     static int on = -1, steady = -1;
     static long long raised;
@@ -312,6 +317,23 @@ static void movie_pace_decide(void) {
     if (!raise && movie_raise) hos_log("vi: the movie is over: frames paced at the 60 cap again, after %lld at %d", raised, MOVIE_PACE_FPS), raised = 0;
     if (raise) raised++;
     movie_raise = raise;
+    n64_pace_decide();   /* ((Triforce, N64 Classic, step 7) its rate, beside the movie's */
+}
+/* ((Triforce, 11-22, N64 Classic, step 7) The rate the renderer asks for (HOS_OPT_N64_FPS: Faithful's 20, or the Remembered
+   page's row; 0 none), taken where n64_pace.h takes it: under the cap, 15 and up, none while a movie plays. HOS_N64_PACE=0:
+   never. Each change said once */
+static void n64_pace_decide(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = n64_pace_on(getenv("HOS_N64_PACE"));
+        if (!on) hos_log("vi: HOS_N64_PACE=0: N64 Classic's frame rate is not taken, the cap's is");
+    }
+    int rx_option(int id, int otherwise);
+    const int was = n64_rate;
+    n64_rate = n64_pace_rate(on, on ? rx_option(HOS_OPT_N64_FPS, 0) : 0, movie_plays(), fps_max());
+    if (n64_rate != was)
+        hos_log(n64_rate ? "vi: N64 Classic: frames paced at %d (the cap %d)" : "vi: N64 Classic: frames paced at the cap again (%d, the cap %d)",
+                n64_rate ? n64_rate : fps_max(), fps_max());
 }
 /* (mkw-recomp) MKW's frame pacer (0x806bcbb0, x19 when it sets the interval: nvn_native.c): its measured frame time
    (+0x128, ticks), its running excess (+0x218) and interval (+0x214), logged with the frame rate */
@@ -581,6 +603,9 @@ static void realtime_step(int64_t now) {
        faster than real time, so a cap above 60 keeps the real-time step whatever that row says) */
     /* (nor under 60: a cap of 30 would be the game at half speed for good) */
     if (!rx_option(0, 1) && pace == 60) {
+        /* (a movie's 240 pacing left the timed step (1/240 s) there: the game's own step again, or the game ran at a quarter
+           of its speed at a full 60 fps after the first movie, 0.7.0 "extreme slowmo") */
+        __atomic_store_n(&hos_frame_seconds_bits, 0, __ATOMIC_RELAXED);
         int *slot = (int *)GP(mod + 0x2c8);
         if (*slot >= 15 && *slot <= 60) *slot = 60;
         return;
@@ -821,7 +846,7 @@ void hos_vi_native_presented(void) {
         if (ms) hos_sleep_ns(ms * 1000000LL);
     }
     /* (a cap under 60 paces by itself, whatever interval the game asked for while Monitor's rate was not known yet) */
-    const int interval = fps_max() < 60 ? 1 : present_interval;
+    const int interval = n64_pace_interval(n64_rate, fps_max() < 60 ? 1 : present_interval);   /* ((N64 Classic) 1 at its rate) */
     const int64_t now = hos_now_ns();
     { void hos_bench_present(int64_t now); hos_bench_present(now); }   /* ((Triforce) benchmark mode: every present's interval) */
     /* ((Triforce) the Steady frame rate row: a period this PC holds in the scene, never shorter than the cap's) */

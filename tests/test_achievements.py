@@ -124,8 +124,25 @@ def check_sources():
                  "ach_list.done(value);", "if (ach_list.earn(value)) menu_refresh = true;"):
         check(line in setter, "the menu does not take the host's achievements: " + line)
     table = menu[menu.index("Row rows[] = {"):]
-    check(table.index('"Bug capture (F8)"') < table.index('{TAB_SYSTEM, "Achievements", nullptr, 0, 0, 0, nullptr,') < table.index('MENU_HEADING(TAB_SYSTEM, "Mod cheats")')
-          and 'constexpr char kAchRow[] = "Achievements";' in menu, "the Achievements row is not on the System tab after Bug capture (F8)")
+    # (11-23) a group of their own, the System tab's first: the list's page, then the two switches
+    system = [m.start() for m in re.finditer(r"TAB_SYSTEM", table)]
+    order = [table.index(part) for part in ('MENU_HEADING(TAB_SYSTEM, "Achievements"),', '{TAB_SYSTEM, "View achievements", nullptr, 0, 0, 0, nullptr,',
+                                            '{TAB_SYSTEM, "Achievements", &opts.achievements, 0, 1, 1, tx_onoff,',
+                                            '{TAB_SYSTEM, "Achievement notices", &opts.achievement_notices, 0, 1, 1, tx_onoff,',
+                                            'MENU_HEADING(TAB_SYSTEM, "Game"),')]
+    check(order == sorted(order) and system[0] > order[0] and system[0] - order[0] < 40 and 'constexpr char kAchRow[] = "View achievements";' in menu,
+          "the Achievements group is not the System tab's first, with its page's row and its two switches")
+    check(re.search(r"\bint achievements = 1;", read("gpu", "vk", "vk_menu.h")) and re.search(r"\bint achievement_notices = 1;", read("gpu", "vk", "vk_menu.h")),
+          "the Achievements rows are not On unless set")
+    check("if (id == HOS_OPT_ACH_ON) return opts.achievements != 0;" in replay and "if (id == HOS_OPT_ACH_NOTICES) return opts.achievement_notices != 0;" in replay,
+          "the renderer does not tell the host the Achievements rows")
+    check("if (!hos_achievements_on() || !rx_option(HOS_OPT_ACH_ON, 1)) return;" in own and "if (!quiet) hos_menu_sound_play(HOS_MENU_SOUND_SYS_DECIDE, now_ns);" in own,
+          "the host earns with the Achievements row Off, or plays the notice's sound with the notices Off")
+    tick = block(menu, "void menu_tick() {")
+    check("earned >= 0 && opts.achievement_notices) ach_notice = earned, ach_notice_at = prof_now();" in tick, "a notice shows with the Achievement notices row Off")
+    notice = block(menu, "void draw_ach_notice(ui::Ctx& c) {")
+    check('constexpr char kAchWhere[] = "See all: Options > System";' in menu and "ui::kSoft, kAchWhere);" in notice and "ui::size_of(c.f.body, 12 * s, kAchWhere).x" in notice,
+          "the notice does not say where the list is, or is not as wide as that line")
     check("(strcmp(rows[i].name, kAchRow) || rows[i].tab != TAB_SYSTEM || ach_list.shown() > 0) &&" in block(menu, "bool row_shown("),
           "the Achievements row shows before the host named them")
     press = menu[menu.index("else if (press[7] && is_ach_row(r)) page = kAchPage"):]
@@ -134,10 +151,13 @@ def check_sources():
     check("else if (page == kAchPage) draw_achievements(k);" in block(menu, "void draw_menu(ui::Ctx& c, bool perf_under) {"), "the Achievements page is not drawn")
     page = number(menu, "kAchPage")
     check(page not in (0, 1, 3, 4, 5, 6, number(menu, "kModsPage"), number(menu, "kModsRowPage")), "kAchPage is another page's number")
-    for record in ("void menu_record(", "void menu_record_image("):
-        body = block(menu, record)
-        check("ach_notice >= 0 && prof_now() - ach_notice_at < kAchNoticeMs * 1000000" in body and "&& !earned)" in body
-              and "if (earned) draw_ach_notice(c);" in body, "%s an achievement's notice is not drawn, or not while nothing else shows" % record)
+    body = block(menu, "void menu_record_image(")
+    check("ach_notice >= 0 && prof_now() - ach_notice_at < kAchNoticeMs * 1000000" in body and "&& !earned)" in body
+          and "if (earned) draw_ach_notice(c);" in body, "menu_record_image: an achievement's notice is not drawn, or not while nothing else shows")
+    # ((Triforce, 11-23) N64 Classic split menu_record: what shows (showing_now) and the drawing (draw_overlays), the notice in both)
+    check("s.earned = !s.start && ach_notice >= 0 && prof_now() - ach_notice_at < kAchNoticeMs * 1000000" in block(menu, "Showing showing_now(")
+          and "if (s.earned) draw_ach_notice(c);" in block(menu, "void draw_overlays(")
+          and "&& !s.earned)" in block(menu, "void menu_record("), "menu_record: an achievement's notice is not drawn, or not while nothing else shows")
     check(number(own, "SHOWN_MS") > int(re.search(r"kAchNoticeMs = (\d+);", menu).group(1)), "the host shows the next notice before this one is gone")
     return api, own
 
@@ -181,7 +201,7 @@ def main():
         check(own.count(marker) == 1, "host/achievements.c no longer includes menu_sound.h last")
         (tmp / "achievements_actual.inc").write_text(own[own.index(marker) + len(marker):], encoding="utf-8")
         (tmp / "achievements_constants.inc").write_text(
-            "".join(block(api, start) + ";\n" for start in ("enum { HOS_OPT_ACH_TEXT = 165", "enum { HOS_ACH_EARNED = 256", "enum { HOS_MENU_SOUND_OPEN = 1")),
+            "".join(block(api, start) + ";\n" for start in ("enum { HOS_OPT_ACH_TEXT = 165", "enum { HOS_OPT_ACH_ON = 185", "enum { HOS_ACH_EARNED = 256", "enum { HOS_MENU_SOUND_OPEN = 1")),
             encoding="utf-8")
         exe = tmp / "host.exe"
         run([a.cc] + warnings + ["-Wno-unused-function", "-I" + str(ROOT / "host"), "-I" + str(tmp), str(ROOT / "tests" / "achievements_host_test.c"),
@@ -204,6 +224,20 @@ def main():
             f.write(b"deadbeef 5 Gone\n")
         run([str(exe), str(game), "second"], says="PASS", cwd=str(tmp), env=on)
         check(sorted(f.name for f in game.iterdir()) == ["achievements.txt", "triforce_achievements.txt"], "the game folder has other files now")
+        # (11-23) the System tab's two rows, in a game folder of its own
+        rows_game = tmp / "rows game"
+        rows_game.mkdir()
+        run([str(exe), str(rows_game), "rows"], says="PASS", cwd=str(tmp), env=on)
+        # the save files on (host/save_files.c): what a file earned is kept in its own folder, and is no other file's.
+        # File 1 starts from what the game folder earned before; the game folder's own is left as it was
+        before = earned.read_bytes()
+        (game / "user").mkdir(), (game / "user-2").mkdir()
+        run([str(exe), str(game), "file2"], says="PASS", cwd=str(tmp), env=on)
+        run([str(exe), str(game), "file1"], says="PASS", cwd=str(tmp), env=on)
+        run([str(exe), str(game), "again1"], says="PASS", cwd=str(tmp), env=on)
+        check(earned.read_bytes() == before, "the game folder's earned achievements were changed by a save file's")
+        check(sorted(f.name for f in (game / "user-2").iterdir()) == ["triforce_achievements.txt"] and
+              sorted(f.name for f in (game / "user").iterdir()) == ["triforce_achievements.txt"], "a save file's folder has other files now")
         check((game / "achievements.txt").read_bytes() == OWN_LIST.encode("utf-8"), "the player's own list was changed")
     print("PASS: achievements: the list and what it refuses, earning, the file of the earned ones, the host's naming and notices, "
           "the menu's list and page, and on unless HOS_ACHIEVEMENTS=0")

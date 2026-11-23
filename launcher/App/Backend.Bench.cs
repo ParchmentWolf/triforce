@@ -18,7 +18,12 @@ public sealed partial class Backend
     void RegisterBench()
     {
         On("bench", _ => BenchAsk());
-        OnAsync("bench.go", m => (string?)m["id"] == "go" ? RunBench(compare: false) : Task.CompletedTask);
+        OnAsync("bench.go", m => (string?)m["id"] switch
+        {
+            "go" => RunBench(compare: false),
+            "helpers" => RunBench(compare: false, helperTest: true),   // ((Triforce) 11-22: with the helper-thread test)
+            _ => Task.CompletedTask,
+        });
         OnAsync("bench.compare", _ => RunBench(compare: true));
         On("benchstop", _ => { try { benchCts?.Cancel(); } catch { } });
         On("benchapply", _ => ApplyBench());
@@ -49,11 +54,13 @@ public sealed partial class Backend
             "<p>The game opens full screen, loads your newest save by itself and flies through four places: Hyrule Field, " +
             "Castle Town Market, Kokiri Forest and Lake Hylia. Its own panel shows where it is and the frame rate.</p>" +
             "<p><b>About 2 minutes.</b> Leave the controls alone meanwhile. Esc in the game stops it.</p>" +
-            "<p>Your saves are not touched, and your settings are put back as they were. Then this window shows what it found.</p>",
-            "bench.go", new[] { ("no", "Not now", false), ("go", "Start", true) });
+            "<p>Your saves are not touched, and your settings are put back as they were. Then this window shows what it found.</p>" +
+            "<p><b>With the helper-thread test</b> it measures each place twice, with the replay helper threads off and on, and " +
+            "says which your PC runs faster (about 1 minute more).</p>",
+            "bench.go", new[] { ("no", "Not now", false), ("helpers", "With the helper-thread test", false), ("go", "Start", true) });
     }
 
-    async Task RunBench(bool compare)
+    async Task RunBench(bool compare, bool helperTest = false)
     {
         var g = GameDir;
         if (g == null || benchCts != null) return;
@@ -70,8 +77,9 @@ public sealed partial class Backend
         var t0 = DateTime.UtcNow;
         void Running(string line) => Send(new JsonObject
         {
-            ["t"] = "bench", ["phase"] = "run", ["pass"] = compare ? "Comparing with " + second!.Value.Item2 : "Finding your best settings",
-            ["frac"] = Math.Min(0.97, (DateTime.UtcNow - t0).TotalSeconds / 150), ["fps"] = null,
+            ["t"] = "bench", ["phase"] = "run",
+            ["pass"] = compare ? "Comparing with " + second!.Value.Item2 : helperTest ? "Finding your best settings · with the helper-thread test" : "Finding your best settings",
+            ["frac"] = Math.Min(0.97, (DateTime.UtcNow - t0).TotalSeconds / (helperTest ? 220 : 150)), ["fps"] = null,
             ["place"] = new JsonObject { ["name"] = "Running in the game window", ["img"] = pic },
             ["line"] = line + " · " + BuildClock.Span(DateTime.UtcNow - t0),
         });
@@ -85,7 +93,7 @@ public sealed partial class Backend
         });
         try
         {
-            var run = await bm.RunOnceAsync(g, second, progress, cts.Token);
+            var run = await bm.RunOnceAsync(g, second, progress, cts.Token, helperTest);
             if (compare) { benchRun2 = run; benchSecond = second; }
             else { benchRun = run; benchRun2 = null; benchSecond = bm.SecondPass(g, BenchIni.Read(Path.Combine(g, GameOptionsSchema.FileName))); }
             benchLast = "Last run " + DateTime.Now.ToString("d MMM, HH:mm");
@@ -113,8 +121,14 @@ public sealed partial class Backend
         if (g == null || benchRun == null) return;
         var now = BenchIni.Read(Path.Combine(g, GameOptionsSchema.FileName));
         var r1 = benchRun; var r2 = benchRun2;
-        benchRecs = Benchmark.Recommend(now, r1.Scenes, r2?.Scenes, r2 != null ? benchSecond : null, Benchmark.DisplayHz());
+        // ((Triforce) 11-22) after the helper-thread test the other rows are judged by the frame rates of the way it recommends
+        var helpers = Benchmark.RecommendHelpers(now, r1.Scenes);
+        var p1 = helpers == null ? r1.Scenes : Benchmark.AsRecommended(r1.Scenes, helpers.To);
+        var recs0 = Benchmark.Recommend(now, p1, r2?.Scenes, r2 != null ? benchSecond : null, Benchmark.DisplayHz());
+        if (helpers != null) recs0.Add(helpers);
+        benchRecs = recs0;
         var use2 = r2 != null && benchRecs.Any(c => c.Key == Benchmark.KUpscaler && c.Changes);
+        var tested = r2 == null && r1.Scenes.Any(s => s.Helpers != null);   // (the helper-thread test's halves side by side)
         var places = new JsonArray();
         for (var i = 0; i < r1.Scenes.Count; i++)
         {
@@ -126,6 +140,11 @@ public sealed partial class Backend
                 ["graph"] = Graph(a.FrameTimes),
             };
             if (b != null) { o["fps2"] = Math.Round(b.AverageFps); o["low2"] = Math.Round(b.OnePercentLow); o["graph2"] = Graph(b.FrameTimes); }
+            else if (tested && a.Helpers is { } h)
+            {
+                o["fps"] = Math.Round(h.OffFps); o["low"] = Math.Round(h.OffLow); o["graph"] = Graph(h.OffTimes);
+                o["fps2"] = Math.Round(h.OnFps); o["low2"] = Math.Round(h.OnLow); o["graph2"] = Graph(h.OnTimes);
+            }
             places.Add(o);
         }
         var recs = new JsonArray();
@@ -135,10 +154,12 @@ public sealed partial class Backend
         Send(new JsonObject
         {
             ["t"] = "bench", ["phase"] = "done", ["places"] = places, ["recs"] = recs,
-            ["verdict"] = Benchmark.Summary(r1.Scenes, r2?.Scenes, r2 != null ? benchSecond?.name : null) + Benchmark.SkippedNote(r1.Skipped),
+            ["verdict"] = Benchmark.Summary(r1.Scenes, r2?.Scenes, r2 != null ? benchSecond?.name : null) + Benchmark.SkippedNote(r1.Skipped) +
+                          Benchmark.HelperNote(r1),
             ["eb"] = "Benchmark finished · " + BuildClock.Span(r1.Took + (r2?.Took ?? TimeSpan.Zero)) + (gpu != null ? " · " + gpu : ""),
             ["compare"] = r2 == null && benchSecond != null ? "Compare with " + benchSecond.Value.name : null,
-            ["second"] = r2 != null ? benchSecond?.name : null,
+            ["second"] = r2 != null ? benchSecond?.name : tested ? "Helpers on" : null,
+            ["first"] = tested ? "Helpers off" : r1.Scenes.Any(s => s.Helpers != null) ? "Your settings, helpers off" : null,
             ["apply"] = benchRecs.Any(c => c.Changes),
         });
     }
@@ -176,6 +197,8 @@ public sealed partial class Backend
     /// <summary>The menu's own words for the values the benchmark touches (Triforce.Logic.GameOptionsSchema).</summary>
     static string BenchLabel(string key, int v, IReadOnlyList<SettingChange> all, bool after = false)
     {
+        if (key == Benchmark.KHelpers)   // ((Triforce) 11-22: the Debug tab's row, not one of the schema's; gpu/vk/vk_menu.cpp tx_replay_threads)
+            return v == Benchmark.HelpersOff ? "Off" : v is >= 1 and <= 7 ? $"Auto, {v + 1} threads" : "Automatic";
         if (GameOptionsSchema.ByKey(key) is not { } row) return GameOptionsSchema.Part(key)?.Label(v) ?? v.ToString();   // ((Triforce, options_version 8) a merged row's part: Steady frame rate, Frame generation)
         if (key == Benchmark.KResolution)
         {

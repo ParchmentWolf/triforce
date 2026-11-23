@@ -78,14 +78,17 @@
 #include "merged_rows.h"   // ((Triforce, options_version 7) the rows that each choose two saved values, and the older files' migration)
 #include "aa_rows.h"        // (Triforce, the Anti-aliasing row: its choices, and when it does not apply)
 #include "vk_aa.h"          // (...RX_VK_AA over it, and whether the game's pass was there to replace)
+#include "vk_n64.h"         // ((Triforce, N64 Classic, step 4) its TV in the window filter's place)
 #include "tex_detail.h"     // (the Texture detail row: the levels' names, RX_VK_TEX_DETAIL)
 #include "fps_cap.h"        // (the Game frame rate cap row's Monitor's rate)
 #include "ultrawide_rows.h" // ((Triforce) the Ultrawide row's shapes, and its old Monitor's shape read before options_version 6)
+#include "output_sizes.h"   // ((Triforce) the Output resolution row's sizes: the fixed ones, Screen and Custom)
 #include "present_mode.h"   // (the VSync row: what its choice comes to on this driver)
 #include "game_language.h"  // (the Game language row: what language.txt chooses and offers)
 #include "menu_restart.h"
 #include "mod_cheat_rows.h"   // (Triforce: the System tab's rows for the cheats of the mods' cheat files)
 #include "achievement_rows.h"   // (Triforce: the achievements the host names, their notice and their page)
+#include "save_file_rows.h"     // (Triforce: the save files the host names, and the title's file select)
 #include "menu_sound_events.h"   // (Triforce: the options' own sounds: which one a tick asks for, and their queue to the host)
 #include "mods_entry_anim.h"     // ((Triforce, 11-19) the Mods entry under the title's list: the game's entries' animations)
 #include "focus_anim.h"          // ((Triforce, 11-19) Mods and Quit under the System list, Quit's dialog: the game's buttons' and dialogs')
@@ -130,7 +133,9 @@ enum MenuTab {
     TAB_MOTION = TAB_COUNT,   // (hookshot: not a tab of the strip, the Motion page that the Controls tab's Motion row
                               // opens: one past the strip's tabs, so a tab added before TAB_COUNT moves it along)
     TAB_PAGE = TAB_MOTION + 1,   // (hookshot: the Controls page's rows, above its grid; no tab shows them)
-    TAB_HIDDEN = TAB_PAGE + 1    // ((Triforce, options_version 7) saved values a merged row stands for: never shown, merged_rows.h)
+    TAB_N64 = TAB_PAGE + 1,      // ((Triforce, 11-22, N64 Classic, step 5) the Remembered page that the Graphics tab's
+                                 // Remembered settings row opens: no tab shows it)
+    TAB_HIDDEN = TAB_N64 + 1    // ((Triforce, options_version 7) saved values a merged row stands for: never shown, merged_rows.h)
 };
 
 struct Row {
@@ -307,6 +312,7 @@ unsigned upscalers_available() {
 int upscaler() { return fsr3_wanted() ? (int)(fsr3_native() ? ur::FSR3_AA : ur::FSR3) : temporal_mode(); }
 /// ((Triforce, options_version 7) the engine alone: an engine's native AA is the Render resolution row's Native (100%))
 const char* tx_upscaler(int) {
+    if (n64_in_front() != n64_rules::OFF) return "N64 Classic";   // ((Triforce, N64 Classic) its 3D pass draws in their place)
     static const char* t[ur::kUpscalers] = {"Game", "NVIDIA DLSS", "NVIDIA DLSS", "AMD FSR 3.1", "AMD FSR 4", "AMD FSR 4",
                                             "AMD FSR 3.1"};
     // ((Triforce, FSR4-7) FSR 4 by the version AMD's library runs here, "AMD FSR 4.1", once it has been asked. up is the
@@ -486,22 +492,243 @@ struct Out {
     uint32_t w, h;
 };
 // ((Triforce, 11-16, the owner: "Add a resolution of 5120x2160 before 5120x2880") 6 is 5120x2160, after the others so that the
-// saved numbers keep their sizes; kOutputOrder shows it between 5120x1440 and 5120x2880)
-// ((Triforce, options_version 7) 7 is 1536x864, the game's handheld profile, which was a row of its own (Handheld profile) that
-// overrode this one: host/nn_applet.c runs the game undocked for it. kOutputOrder shows it first, the smallest)
+// saved numbers keep their sizes. (Triforce) 8 Screen and 9 Custom take their sizes from outside the build. The rule for all of
+// them is output_sizes.h's: the size is the picture's, the game's frame 16:9 at its height
 constexpr Out kOutputs[] = {{2048, 1152}, {2560, 1440}, {3840, 2160}, {1920, 1080}, {5120, 1440}, {5120, 2880}, {5120, 2160}, {1536, 864}};
-constexpr int kLastOutput = std::size(kOutputs) - 1;
-static_assert(kLastOutput == merged_rows::kHandheldOutput, "the Output resolution row's handheld profile is merged_rows.h's");
+static_assert(std::size(kOutputs) == OUTPUT_FIXED_N);
+constexpr int kLastOutput = OUTPUT_LAST;
 int output_choice(int v) { return v >= 0 && v <= kLastOutput ? v : 0; }
-// Display the sizes from smallest to largest while keeping the IDs used by saved settings.
-constexpr int kOutputOrder[] = {7, 3, 0, 1, 2, 4, 6, 5};
-static_assert(std::size(kOutputOrder) == std::size(kOutputs));
-int step_output_choice(int id, int dir) {
-    const int* pos = std::find(std::begin(kOutputOrder), std::end(kOutputOrder), output_choice(id));
-    const int next = std::clamp((int)(pos - std::begin(kOutputOrder)) + dir, 0, kLastOutput);
-    return kOutputOrder[next];
+// The connected screens as the host found them at the start (MkwVkHost.screens, at menu_init): each one's native size, the
+// size the game takes it at (output_size_used: {0, 0} for none), the monitor's own name, and whether the window opens on it.
+// The row offers each one's size; what is saved is that size, as Custom's (output_width=, output_height=), never a place in
+// this list: the same file means the same picture with other screens connected, and a size whose screen is gone is Custom
+struct Screen {
+    Out native, used;
+    std::string name;
+    bool opens;
+};
+std::vector<Screen> screens;
+void screen_add(uint32_t w, uint32_t h, const char* name, bool opens) {
+    unsigned uw = 0, uh = 0;
+    if (!output_size_used(w, h, &uw, &uh)) return;
+    screens.push_back(Screen{Out{w, h}, Out{uw, uh}, name ? name : "", opens});
 }
-Out shown_output() { return kOutputs[output_choice(opts.output_res)]; }
+/// The screen the window opens on, nullptr when the host knows none
+const Screen* screen_opening() {
+    for (const Screen& s : screens)
+        if (s.opens) return &s;
+    return nullptr;
+}
+/// The main monitor's size, for an options file from before options_version 6 whose Ultrawide row was Monitor's shape: the
+/// one the host reads that row by (host/hos_main.c, host/nn_applet.c: GetSystemMetrics). Off Windows that is the desktop's
+/// main display (host/posix/win32_posix.c, display_sdl.c), which is the screen the window opens on; the renderer has no
+/// GetSystemMetrics there, and takes it from the host's screens. {0, 0} when none is known: 16:9, for the host as well
+Out main_screen() {
+#ifdef _WIN32
+    return Out{(uint32_t)std::max(GetSystemMetrics(SM_CXSCREEN), 0), (uint32_t)std::max(GetSystemMetrics(SM_CYSCREEN), 0)};
+#else
+    return screen_opening() ? screen_opening()->native : Out{0, 0};
+#endif
+}
+/// The connected screens of a size, as the game takes them, by name: "LG ULTRAGEAR", "2x LG ULTRAGEAR", "DELL U2720Q, LG
+/// ULTRAGEAR"; one the system gives no name is "Screen". "" when no screen has that size
+std::string screen_names(Out size) {
+    std::vector<std::pair<std::string, int>> names;
+    for (const Screen& s : screens) {
+        if (s.used.w != size.w || s.used.h != size.h) continue;
+        const std::string name = s.name.empty() ? "Screen" : s.name;
+        const auto at = std::find_if(names.begin(), names.end(), [&](const auto& n) { return n.first == name; });
+        if (at == names.end()) names.push_back({name, 1});
+        else at->second++;
+    }
+    std::string all;
+    for (const auto& [name, count] : names)
+        all += (all.empty() ? "" : ", ") + (count > 1 ? std::to_string(count) + "x " : std::string()) + name;
+    return all;
+}
+/// HOS_OUTPUT_SIZE's size, which the host takes over the Custom rows for the run: true and the sides while it is set (a
+/// value that is not <w>x<h>: 0 x 0, no size, as the host)
+bool custom_env(long* w = nullptr, long* h = nullptr) {
+    const char* e = getenv("HOS_OUTPUT_SIZE");
+    if (!e) return false;
+    long ew = 0, eh = 0;
+    if (!output_parse_size(e, &ew, &eh)) ew = eh = 0;
+    if (w) *w = ew;
+    if (h) *h = eh;
+    return true;
+}
+/// Custom's size as the game takes it: the Output width and Output height rows' (HOS_OUTPUT_SIZE's over them) within what a
+/// picture can be, output_size_used; {0, 0} for none (a HOS_OUTPUT_SIZE that is not a size)
+Out custom_size() {
+    long w = opts.output_width, h = opts.output_height;
+    custom_env(&w, &h);
+    unsigned uw = 0, uh = 0;
+    return output_size_used(w, h, &uw, &uh) ? Out{uw, uh} : Out{0, 0};
+}
+/// The Custom rows' values from the options file's output_width= and output_height= (0: no line), at menu_init: as written
+/// where the rows can hold them, else the size the game takes them as (output_size_used: its shape kept, which keeping each
+/// row to its own ends would not), so that the menu shows and saves what the host ran (host/nn_applet.c flex_read)
+void custom_rows_read(long w, long h) {
+    output_custom_read(&w, &h);
+    unsigned uw = 0, uh = 0;
+    const bool held = w >= OUTPUT_MIN_W && w <= OUTPUT_MAX_W && h >= OUTPUT_MIN_H && h <= OUTPUT_MAX_H;
+    if (!held && output_size_used(w, h, &uw, &uh)) w = uw, h = uh;
+    opts.output_width = (int)w, opts.output_height = (int)h;
+}
+// While a screen occupies the two active output fields, retain the player's unrounded Custom input.
+Out remembered_custom{};
+void restore_custom() {
+    if (!remembered_custom.h) return;
+    opts.output_width = (int)remembered_custom.w;
+    opts.output_height = (int)remembered_custom.h;
+    remembered_custom = {};
+}
+void choose_screen(Out size) {
+    if (!remembered_custom.h) remembered_custom = Out{(unsigned)opts.output_width, (unsigned)opts.output_height};
+    unsigned w, h;
+    if (output_size_used(remembered_custom.w, remembered_custom.h, &w, &h) && w == size.w && h == size.h) {
+        restore_custom();
+        return;
+    }
+    opts.output_width = (int)size.w;
+    opts.output_height = (int)size.h;
+}
+void read_remembered_custom(const char* text) {
+    long w = 0, h = 0;
+    if (output_parse_size(text, &w, &h) &&
+        w >= OUTPUT_MIN_W && w <= OUTPUT_MAX_W && h >= OUTPUT_MIN_H && h <= OUTPUT_MAX_H)
+        remembered_custom = Out{(unsigned)w, (unsigned)h};
+}
+/// The size of a saved value: a fixed one's, Custom's, or the old Screen's ({0, 0}: none)
+Out row_size(int v) {
+    v = output_choice(v);
+    if (v == OUTPUT_SCREEN) return screen_opening() ? screen_opening()->used : Out{0, 0};   // (the old Screen value: as the host)
+    return v < OUTPUT_SCREEN ? kOutputs[v] : custom_size();
+}
+/// The size a choice runs at: the row's, 2560x1440 when Screen or Custom has none, as the host
+Out output_size_of(int v) {
+    const Out s = row_size(v);
+    return s.h ? s : kOutputs[1];
+}
+/// Whether a choice's size has a shape of its own, not 16:9: its picture is that size, and the Ultrawide row has nothing to
+/// choose (docked only: the handheld profile runs the game's own output)
+bool output_shaped(int v) {
+    const Out s = output_size_of(v);
+    return opts.output_res != merged_rows::kHandheldOutput && output_size_shaped(s.w, s.h);
+}
+/// The game's frame for a choice, its HUD, menus and story movies: the size, or 16:9 at its height when it has another shape
+Out output_frame(int v) {
+    const Out s = output_size_of(v);
+    return output_size_shaped(s.w, s.h) ? Out{output_frame_width(s.h), s.h} : s;
+}
+/// HOS_ASPECT's shape, which the host takes over the Output resolution's and the Ultrawide row's for the run; 0 when not set
+float aspect_env() {
+    const char* e = getenv("HOS_ASPECT");
+    return e ? (float)atof(e) : 0.0f;
+}
+/// The picture the options give at the next start, as host/hos_main.c makes it (output_picture): the Output resolution's size
+/// when it has its own shape, else its height in the Ultrawide row's shape (HOS_ASPECT's over both). 2048x1152 is the game's
+/// 2560x1440 at its graphics scale 0.8 (host/nn_applet.c), its wider picture too
+Out output_picture_of(int v, int ultrawide_row) {
+    v = output_choice(v);
+    const Out size = output_size_of(v), frame = v ? output_frame(v) : kOutputs[1];
+    const bool env = getenv("HOS_ASPECT") != nullptr;
+    const bool sized = !env && output_size_shaped(size.w, size.h);
+    const double want = env ? aspect_env() : sized ? (double)size.w / (double)size.h : ultrawide_row_ratio(ultrawide_row);
+    unsigned w = 0, h = 0;
+    if (!output_picture(frame.h, want, sized, &w, &h)) return v ? frame : kOutputs[0];
+    return v ? Out{w, h} : Out{w * 4 / 5, h * 4 / 5};
+}
+// The row's choices: the fixed sizes, each connected screen's size that is not one of those (once for screens of one size), and
+// Custom where its size is not a screen's. Smallest to largest, by width and then height; of one size a fixed one first; one
+// with no size at the end. A choice is saved as its value: a fixed size's number, or OUTPUT_CUSTOM with the size in the Output
+// width and Output height rows, which choosing a screen's size fills in with the size the game takes that screen at (size;
+// native: that screen's own, {0, 0} for a choice that is no screen's)
+struct OutEntry {
+    int id;
+    Out size, native;
+};
+std::vector<OutEntry> output_entries() {
+    std::vector<OutEntry> e;
+    const auto has = [&](int id, Out s) {
+        return std::any_of(e.begin(), e.end(), [&](const OutEntry& x) { return x.id == id && x.size.w == s.w && x.size.h == s.h; });
+    };
+    // (a screen of a fixed size is that fixed choice, the same picture; but not of 2048x1152, which is the game's 2560x1440 at
+    // its own scale and not a 2048x1152 picture)
+    const auto fixed = [](Out s) {
+        for (int v = 1; v < OUTPUT_FIXED_N; v++)
+            if (v != merged_rows::kHandheldOutput && kOutputs[v].w == s.w && kOutputs[v].h == s.h) return true;
+        return false;
+    };
+    for (int v = 0; v < OUTPUT_FIXED_N; v++) e.push_back(OutEntry{v, kOutputs[v], Out{0, 0}});
+    // (HOS_OUTPUT_SIZE is Custom's size for the run: a screen's size cannot be chosen then)
+    for (const Screen& s : screens)
+        if (!custom_env() && !fixed(s.used) && !has(OUTPUT_CUSTOM, s.used)) e.push_back(OutEntry{OUTPUT_CUSTOM, s.used, s.native});
+    // (the old Screen value, only while it is still what is chosen: menu_init makes it the screen's size, output_adopt_screen)
+    if (output_choice(opts.output_res) == OUTPUT_SCREEN) e.push_back(OutEntry{OUTPUT_SCREEN, row_size(OUTPUT_SCREEN), Out{0, 0}});
+    // A fixed choice can have a remembered Custom in an edited file. Only the remembered pair is restored.
+    if ((opts.output_res == OUTPUT_CUSTOM || !remembered_custom.h || custom_env()) && !has(OUTPUT_CUSTOM, custom_size()))
+        e.push_back(OutEntry{OUTPUT_CUSTOM, custom_size(), Out{0, 0}});
+    if (remembered_custom.h && !custom_env()) {
+        unsigned w, h;
+        if (output_size_used(remembered_custom.w, remembered_custom.h, &w, &h) && !has(OUTPUT_CUSTOM, Out{w, h}))
+            e.push_back(OutEntry{OUTPUT_CUSTOM, Out{w, h}, Out{0, 0}});
+    }
+    const auto key = [](const OutEntry& x) { return x.size.h ? (uint64_t)x.size.w << 32 | x.size.h : ~0ull; };
+    std::stable_sort(e.begin(), e.end(), [&](const OutEntry& a, const OutEntry& b) { return key(a) < key(b); });
+    return e;
+}
+/// The choice the options have now: the saved value's, and for Custom the one of its size (a screen's, or Custom itself)
+int output_entry_now(const std::vector<OutEntry>& e) {
+    const int v = output_choice(opts.output_res);
+    const Out c = custom_size();
+    for (size_t i = 0; i < e.size(); i++)
+        if (e[i].id == v && (v != OUTPUT_CUSTOM || (e[i].size.w == c.w && e[i].size.h == c.h))) return (int)i;
+    return 0;
+}
+/// A choice as the row shows it: the size, with the names of the connected screens that have it ("3840x1600 (LG ULTRAGEAR)");
+/// Custom with its size
+std::string output_label(const OutEntry& x) {
+    if (!x.size.h) return x.id == OUTPUT_SCREEN ? "Screen (not known)" : "Custom (not set)";
+    if (x.id == merged_rows::kHandheldOutput) return "1536x864 (handheld)";
+    const std::string size = std::to_string(x.size.w) + "x" + std::to_string(x.size.h);
+    if (x.id == OUTPUT_CUSTOM && !x.native.h) return "Custom (" + size + ")";
+    if (x.id == 0) return size;   // (the game's own: no screen's size, output_entries)
+    const std::string names = screen_names(x.size);
+    return names.empty() ? (x.id == OUTPUT_SCREEN ? "Screen (" + size + ")" : size) : size + " (" + names + ")";
+}
+/// One choice down or up the row (dir -1 or 1): false at its end. With apply the options take it: its value, and a
+/// screen's size as Custom's
+bool output_step(int dir, bool apply) {
+    const std::vector<OutEntry> e = output_entries();
+    const int at = output_entry_now(e), to = std::clamp(at + dir, 0, (int)e.size() - 1);
+    if (to == at) return false;
+    if (apply) {
+        opts.output_res = e[to].id;
+        // (the size as the game takes it, which the rows can always hold: a 7680x4320 screen's is 5120x2880, not each side cut
+        // to the rows' ends, which would be another shape)
+        if (e[to].native.h) choose_screen(e[to].size);
+        else restore_custom();
+    }
+    return true;
+}
+/// An options file's output_res=8, Screen (and HOS_OUTPUT_RES=8): the size of the screen the window opens on, which
+/// is what the host ran it as at this start (host/nn_applet.c). The menu keeps it as that size, Custom's, so that the next
+/// save writes a size and not "whichever screen" (a fixed size's number where it is one); with no screen known, the
+/// 2560x1440 the host ran. Left alone while
+/// HOS_OUTPUT_SIZE is Custom's size
+void output_adopt_screen() {
+    if (output_choice(opts.output_res) != OUTPUT_SCREEN || custom_env()) return;
+    const Screen* s = screen_opening();
+    opts.output_res = s ? OUTPUT_CUSTOM : 1;
+    for (int v = 1; s && v < OUTPUT_FIXED_N; v++)   // (a screen of a fixed size: that fixed choice)
+        if (v != merged_rows::kHandheldOutput && kOutputs[v].w == s->used.w && kOutputs[v].h == s->used.h) opts.output_res = v;
+    if (s && opts.output_res == OUTPUT_CUSTOM) choose_screen(s->used);
+}
+/// The picture the menu's sizes are shown for (the Render resolution's, the performance panel's)
+Out shown_output() {
+    return opts.output_res == merged_rows::kHandheldOutput ? Out{1536, 864} : output_picture_of(opts.output_res, opts.ultrawide);
+}
 // The size the game draws the 3D at for a fixed scale of its output, a twelfth of it: every twelfth asked came out exact at the three
 // outputs (2048x1152: 0.58 drew 1195x672, 0.6667 1366x768). So the scale the game is given is the twelfth too: 0.67 drew 2615x1471 at
 // 3840x2160, not the 2560x1440 of 8/12.
@@ -561,6 +788,7 @@ const char* hn_resolution(int v, int variant) {
 /// (Triforce) The Anti-aliasing row (aa_rows.h, vk_aa.h): its choice, RX_VK_AA's for the run over it; while DLSS or FSR
 /// draws, whose anti-aliasing the picture has instead
 const char* tx_aa(int v) {
+    if (n64_in_front() != n64_rules::OFF) return "N64 Classic";   // ((Triforce, N64 Classic) its grid smooths the edges)
     const int up = upscaler();
     if (ur::is_dlss(up)) return "DLSS's own";
     if (aa_rows::upscaler_own(up)) return "FSR's own";
@@ -583,11 +811,14 @@ const char* hn_aa(int v, int variant) {
     static const char* const missing =
         "No frame of the last minute had the game's own anti-aliasing pass to replace (a screen without the 3D, or another "
         "version of the game): the picture is the game's.";
+    static const char* const n64 =   // ((Triforce, N64 Classic) variant 5)
+        "N64 Classic draws the 3D on its own grid, which smooths the edges: nothing to set here while it is on. The choice is "
+        "kept for when it is off.";
     if (variant < 0) {
         const int up = upscaler();
         const bool asked = aa_rows::chosen(v, aa_env_choice()) != aa_rows::GAME;
-        variant = ur::is_dlss(up) ? 1 : aa_rows::upscaler_own(up) ? 2 : asked && aa_state() == aa_rows::MISSING ? 4
-                  : aa_env_choice() >= 0 ? 3 : 0;
+        variant = n64_in_front() != n64_rules::OFF ? 5 : ur::is_dlss(up) ? 1 : aa_rows::upscaler_own(up) ? 2
+                  : asked && aa_state() == aa_rows::MISSING ? 4 : aa_env_choice() >= 0 ? 3 : 0;
     }
     switch (variant) {
     case 0: return t[v >= 0 && v < aa_rows::kValues ? v : 0];
@@ -595,34 +826,162 @@ const char* hn_aa(int v, int variant) {
     case 2: return own[1];
     case 3: return env;
     case 4: return missing;
+    case 5: return n64;
     default: return nullptr;
     }
 }
+int shape_owner();
+// ---- ((Triforce, 11-22, N64 Classic, step 5) its row and the Remembered page (n64_rules.h; vk_n64.cpp) ----
+void save();   // (below)
+/// The N64 Classic row: its value's name, RX_VK_N64's for the run over it
+const char* tx_n64(int v) { return n64_rules::name(n64_env_set() ? n64_preset() : v); }
+/// The N64 Classic row: the value chosen (variant 0), or that RX_VK_N64 set it for this run (1)
+const char* hn_n64(int v, int variant) {
+    static const char* const t[n64_rules::kPresets] = {
+        "The remake as it is.",
+        "The 1998 cartridge on a TV of then: the 3D on 240 lines with 16-bit colour and its dither, blurry textures, scanlines "
+        "and a curved screen, at 20 frames a second. Always the same.",
+        "How you remember it: sharper and richer than the real thing. Set it to your taste in Remembered settings."};
+    static const char* const env = "Set for this run by RX_VK_N64, whatever is chosen here.";
+    if (variant < 0) variant = n64_env_set() ? 1 : 0;
+    if (variant == 0) return t[v >= 0 && v < n64_rules::kPresets ? v : 0];
+    return variant == 1 ? env : nullptr;
+}
+const char* tx_n64_fps(int v) {
+    static const char* const t[] = {"Frame rate cap", "60", "30", "20 (1998)", "17 (1998, 50 Hz)"};
+    return t[std::clamp(v, 0, 4)];
+}
+const char* tx_n64_lines(int v) {
+    static const char* const t[] = {"240 lines", "360 lines", "480 lines", "720 lines"};
+    return t[std::clamp(v, 0, 3)];
+}
+const char* tx_n64_colour(int v) {
+    static const char* const t[] = {"15-bit (1998)", "18-bit", "Full"};
+    return t[std::clamp(v, 0, 2)];
+}
+const char* tx_n64_dither(int v) {
+    static const char* const t[] = {"Off", "Light", "Full"};
+    return t[std::clamp(v, 0, 2)];
+}
+const char* tx_n64_blur(int v) {
+    static char b[16];
+    if (v <= 0) return "Off";
+    snprintf(b, sizeof b, "+%.1f", v * n64_rules::kBlurStep);
+    return b;
+}
+const char* tx_n64_mask(int v) {
+    static const char* const t[] = {"Auto", "Off", "Aperture grille", "Slot mask", "Shadow mask"};
+    return t[std::clamp(v, 0, 4)];
+}
+const char* tx_n64_bleed(int v) {
+    static const char* const t[] = {"Off", "Light", "Composite"};
+    return t[std::clamp(v, 0, 2)];
+}
+const char* tx_n64_curve(int v) {
+    static const char* const t[] = {"Flat", "Slight", "Curved", "Very curved"};
+    return t[std::clamp(v, 0, 3)];
+}
+/// A Remembered page row's place in n64_rules::Rows (its value is opts.n64_rem's), -1 for any other value
+int n64_rem_row(const int* value) {
+    const int* first = &opts.n64_rem[0];
+    return value && value >= first && value < first + n64_rules::kRows ? (int)(value - first) : -1;
+}
+/// The Graphics tab's row that opens the Remembered page (the TAB_N64 rows), as the Motion row opens the Motion page
+bool is_n64_page_row(const Row& r) { return r.tab == TAB_GRAPHICS && !r.value && !strcmp(r.name, "Remembered settings"); }
+/// The Remembered page's two actions: 1 Copy Faithful, 2 Reset to defaults; 0 another row
+int n64_action(const Row& r) {
+    if (r.tab != TAB_N64 || r.value) return 0;
+    return !strcmp(r.name, "Copy Faithful") ? 1 : !strcmp(r.name, "Reset to defaults") ? 2 : 0;
+}
+/// An action pressed: Faithful's values into Remembered's rows (20 frames a second too), or Remembered's defaults; saved
+void n64_act(int action) {
+    if (action != 1 && action != 2) return;
+    const n64_rules::Rows to = action == 1 ? n64_rules::kFaithful : n64_rules::defaults();
+    std::copy(std::begin(to.v), std::end(to.v), opts.n64_rem);
+    save();
+}
 /// A row with nothing else to choose here: shown without its arrows, Left and Right leave it (and the saved value) alone
 bool row_fixed(const int* value) {
+    // ((Triforce) the Ultrawide row while the Output resolution's own shape or HOS_ASPECT is the picture's; the Custom rows
+    // while HOS_OUTPUT_SIZE is Custom's size)
+    if (value == &opts.ultrawide && shape_owner() != 0) return true;
+    if ((value == &opts.output_width || value == &opts.output_height) && custom_env()) return true;
     // ((Triforce, options_version 7) the rows that showed fixed where they could do nothing (Reflex, Anti-Lag, the window's
     // filter, the Render resolution with a native AA) are hidden there, or gone: row_shown)
     return (value == &opts.aa && aa_rows::fixed(upscaler(), aa_env_choice() >= 0)) ||
            (value == &opts.dlss && ur::upscaler_fixed(upscalers_available())) ||
-           (value == &opts.dlss_model && ur::model_fixed(upscaler(), dlss_preset_env() != nullptr));
+           (value == &opts.dlss_model && ur::model_fixed(upscaler(), dlss_preset_env() != nullptr)) ||
+           // ((Triforce, 11-22, N64 Classic) the Upscaler and the Anti-aliasing while its 3D pass draws in their place; its own
+           // row with RX_VK_N64 set for the run; a Remembered row with nothing to do (n64_rules.h row_fixed)
+           ((value == &opts.dlss || value == &opts.aa) && n64_in_front() != n64_rules::OFF) ||
+           (value == &opts.n64_classic && n64_env_set()) ||
+           (n64_rem_row(value) >= 0 && n64_rules::row_fixed(n64_rules::rows_of(opts.n64_rem), n64_rem_row(value)));
 }
 const char* tx_output_res(int v) {
-    static char b[32];
+    static char b[200];
+    const std::vector<OutEntry> e = output_entries();
     v = output_choice(v);
     if (v == merged_rows::kHandheldOutput) return "1536x864 (handheld)";
-    const Out o = kOutputs[v];
-    snprintf(b, sizeof b, "%ux%u", o.w, o.h);   // ((Triforce, 11-16) the size alone; the hint says which is the game's own)
+    size_t at = (size_t)output_entry_now(e);
+    if (e[at].id != v) {   // (not the value chosen: a fixed size's own choice, or Custom's)
+        for (size_t i = 0; i < e.size(); i++)
+            if (e[i].id == v && (e[at].id != v || !e[i].native.h)) at = i;
+    }
+    snprintf(b, sizeof b, "%s", output_label(e[at]).c_str());
     return b;
 }
+/// (Triforce) The Output width and Output height rows (output_width=, output_height=): a side in pixels as chosen, or
+/// HOS_OUTPUT_SIZE's while it is set. What the game makes of the two is the Output resolution row's Custom (custom_size)
+const char* tx_custom_side(int v, bool height) {
+    static char b[2][16];
+    long w = 0, h = 0;
+    if (custom_env(&w, &h)) v = (int)(height ? h : w);
+    if (v > 0) snprintf(b[height], sizeof b[height], "%d", v);
+    else snprintf(b[height], sizeof b[height], "Not set");
+    return b[height];
+}
+const char* tx_custom_width(int v) { return tx_custom_side(v, false); }
+const char* tx_custom_height(int v) { return tx_custom_side(v, true); }
 const char* tx_speed(int v) { return v ? "Real time" : "Per frame"; }
 const char* tx_text_speed(int v) {
     static const char* t[] = {"Normal", "2x", "4x", "Instant"};
     if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
     return t[v];
 }
-const char* tx_ultrawide(int v) {   // (Triforce: 1 to 3, the fixed shapes, ultrawide_rows.h; host/hos_main.c ultrawide_ratio)
-    static const char* const t[] = {"16:9", "16:10", "21:9", "32:9"};
-    return t[std::min(std::max(v, 0), 3)];
+const char* tx_ultrawide(int v) {   // (Triforce: 1 to 4, the fixed shapes, ultrawide_rows.h; host/hos_main.c ultrawide_ratio)
+    static const char* const t[] = {"16:9", "16:10", "21:9", "32:9", "4:3"};
+    return t[std::min(std::max(v, 0), 4)];
+}
+/// A shape, width over height, by name: one of the Ultrawide row's where it is that one, else its width for a height of 1
+/// (3840x1600: 2.40:1)
+const char* shape_name(double ratio) {
+    static char b[16];
+    for (int row = 1; row <= 3; row++)
+        if (fabs(ratio / (double)ultrawide_row_ratio(row) - 1.0) < 0.001) return tx_ultrawide(row);
+    snprintf(b, sizeof b, "%.2f:1", ratio);
+    return b;
+}
+/// What decides the picture's shape at the next start, as host/hos_main.c takes it: 2 HOS_ASPECT, 1 the Output resolution's
+/// own shape (a size that is not 16:9), 0 the Ultrawide row
+int shape_owner() { return getenv("HOS_ASPECT") ? 2 : output_shaped(opts.output_res) ? 1 : 0; }
+/// The picture's shape at the next start by name: the Ultrawide row's choice v, or the shape that is the picture's whatever
+/// is chosen there (shape_owner)
+const char* shape_now(int v) {
+    const int owner = shape_owner();
+    if (owner == 0) return tx_ultrawide(v);
+    if (owner == 2) return aspect_env() > 1.0f && !output_shape_is_game(aspect_env()) ? shape_name(aspect_env()) : tx_ultrawide(0);
+    const Out o = output_size_of(opts.output_res);
+    return shape_name((double)o.w / (double)o.h);
+}
+/// The Ultrawide row's value: its choice, or the shape the picture has whatever is chosen here, with where it comes from
+const char* tx_shape(int v) {
+    static char b[48];
+    const int owner = shape_owner();
+    if (owner == 0) return tx_ultrawide(v);
+    const Out o = output_size_of(opts.output_res);
+    if (owner == 2) snprintf(b, sizeof b, "%s (HOS_ASPECT)", shape_now(v));
+    else snprintf(b, sizeof b, "%s (%ux%u)", shape_now(v), o.w, o.h);
+    return b;
 }
 const char* tx_wide_hud(int v) { return v ? "Screen edges" : "Middle"; }
 const char* tx_prompts(int v) {
@@ -861,10 +1220,12 @@ MENU_HINTS(hn_output_res, 0, "The game's own size.",
            "The sharpest on a 2560x1440 screen: nothing to scale to the window.",
            "The sharpest on a 3840x2160 screen. The game's render targets get a bigger GPU pool, so a full-size 3D fits.",
            "The sharpest on a 1920x1080 screen: the HUD and text pixel for pixel, nothing to scale to the window.",
-           "The sharpest on a 5120x1440 ultrawide screen: the whole frame pixel for pixel. The game's render targets get a bigger GPU pool, so a full-size 3D fits.",
+           "A 32:9 picture, the sharpest on a 5120x1440 ultrawide screen: pixel for pixel, the HUD in its 16:9 shape in the middle. The game's render targets get a bigger GPU pool, so a full-size 3D fits.",
            "The sharpest on a 5120x2880 (5K) screen: the whole frame pixel for pixel. The game's render targets get a bigger GPU pool, so a full-size 3D fits.",
-           "The sharpest on a 5120x2160 ultrawide screen: the whole frame pixel for pixel. The game's render targets get a bigger GPU pool, so a full-size 3D fits.",
-           "The game's handheld profile, as if the console were undocked: lighter on the graphics card, and softer.")
+           "A 21:9 picture, the sharpest on a 5120x2160 ultrawide screen: pixel for pixel, the HUD in its 16:9 shape in the middle. The game's render targets get a bigger GPU pool, so a full-size 3D fits.",
+           "The game's handheld profile, as if the console were undocked: lighter on the graphics card, and softer.",
+           "The size of the screen the game opens on, whatever its shape: pixel for pixel in fullscreen, the HUD in its 16:9 shape in the middle of a wider screen.",
+           "A connected screen's own size, pixel for pixel in fullscreen there, or any size set with Output width and Output height below (HOS_OUTPUT_SIZE over them, when it is set): up to the pixels of 5120x2880, the HUD in its 16:9 shape in the middle of a wider picture.")
 // ((Triforce, options_version 7) the Window scaling filter row is gone, and with it its hint: the sizes choose the filter,
 // upscaler_rows.h window_filter. FSR 1's RCAS follows the Sharpness row: none at 0, vk_framegen.cpp framegen_scale)
 /// Sharpness: off at 0; ((Triforce, S1, S7) else where it sharpens: the upscaler's 3D before the HUD (variant 1), or the
@@ -882,7 +1243,23 @@ MENU_HINTS(hn_ultrawide, 0, "The game's own shape.",
            "A 21:9 picture whatever the screen (64:27, as a 2560x1080 screen): the window opens in that shape, and a screen of "
            "another shape shows it between black bars. The HUD keeps its 16:9 shape in the middle.",
            "A 32:9 picture whatever the screen (as a 5120x1440 screen): the window opens in that shape, and a screen of "
-           "another shape shows it between black bars. The HUD keeps its 16:9 shape in the middle.")
+           "another shape shows it between black bars. The HUD keeps its 16:9 shape in the middle.",
+           // ((Triforce, 11-22, N64 Classic, step 6) the 1998 TV's shape)
+           "A 4:3 picture whatever the screen, the shape of a TV of 1998: the world narrower at the sides, the HUD across its "
+           "width, and a screen of another shape shows it between black bars. With N64 Classic, its 3D is 320 x 240.")
+/// The Ultrawide row's line: its value's (variant 0), or what sets the shape in its place (shape_owner): the Output
+/// resolution's own shape (1), HOS_ASPECT (2)
+const char* hn_shape(int v, int variant) {
+    if (variant < 0) variant = shape_owner();
+    switch (variant) {
+    case 0: return hn_ultrawide(v, 0);
+    case 1:
+        return "The Output resolution's own shape: its size is the whole picture, and the HUD keeps its 16:9 shape in the "
+               "middle of a wider one. Nothing to set here; a 16:9 Output resolution takes its shape from this row.";
+    case 2: return "Set for this run by HOS_ASPECT, whatever is chosen here.";
+    default: return nullptr;
+    }
+}
 const char* tx_wide_menus(int v) {
     static const char* t[] = {"Full width", "Centred, blurred sides", "Centred, black bars"};
     return t[std::min(std::max(v, 0), 2)];
@@ -981,35 +1358,74 @@ bool is_merged(const int* v) { return v == &merged.hdr || v == &merged.framegen 
 achievement_rows::List ach_list;
 achievement_rows::View ach_view;
 constexpr int kAchPage = 10;                // (page: see kModsPage)
-constexpr char kAchRow[] = "Achievements";  // (the row's name in the table below: is_ach_row tells it by it)
+constexpr char kAchRow[] = "View achievements";  // (the row's name in the table below: is_ach_row tells it by it)
 constexpr int64_t kAchNoticeMs = 4000;      // (how long a notice stays: host/achievements.c waits a little longer between two)
 int ach_columns = 2, ach_capacity = 8;      // (the page's cards as last drawn: the keys move by them)
 int ach_notice = -1;                        // (the achievement the notice shows, -1 none)
 int64_t ach_notice_at = 0;                  // (and since when, prof_now)
+// (Triforce) Save files, as the Nintendo 64 game had them (host/save_files.c keeps them, on unless HOS_SAVE_FILES=0, and names
+// them for the menu: menu_option_set, HOS_OPT_FILES_*; save_file_rows.h has the list). The game reads its saves once, at its
+// start, so a file is a start: the game starts on the file played last and shows its title as ever, and the title's list has
+// an entry of ours under Mods, Save Select (draw_files_row), which opens the file select, kFilesPage. There the file this
+// run plays goes on at once; another is asked of the host and the game restarts on it. (It opened by itself over the
+// title's list at first: he did not want that.) The System tab's Save files row opens the same page; not shown until the
+// host has named the files
+save_file_rows::List save_files;
+constexpr int kFilesPage = 11;              // (page: see kModsPage)
+constexpr char kFilesRow[] = "Save files";  // (the row's name in the table below: is_files_row tells it by it)
+int files_choice = 0;                       // (the card chosen)
+bool files_at_title = false;                // (the page was opened by the title, not by its row: Back and Play give the game its list)
+int files_wait = -1;                        // (the file asked of the host, until it answers)
+bool files_failed = false;                  // (the host could not keep the last choice)
+bool is_files_row(const Row& r) { return r.tab == TAB_SYSTEM && !r.value && !strcmp(r.name, kFilesRow); }
 /// The System tab's Achievements row: confirm opens their page
 bool is_ach_row(const Row& r) { return r.tab == TAB_SYSTEM && !r.value && !strcmp(r.name, kAchRow); }
+// ((Triforce, 11-22, N64 Classic, step 5) a row of the Remembered page: its value opts.n64_rem's, its range and step
+// n64_rules.h kSpec's (its key kSpec's too, through ini_key's table of names), taken at once
+#define N64_ROW(row, title, text, help)                                                                                       \
+    {TAB_N64, title, &opts.n64_rem[n64_rules::row], n64_rules::kSpec[n64_rules::row].lo, n64_rules::kSpec[n64_rules::row].hi, \
+     n64_rules::kSpec[n64_rules::row].step, text, help, nullptr, false, true}
 
+constexpr char kUseWindowSize[] = "Use current window size";
 Row rows[] = {
     // ---- Display ----
     MENU_HEADING(TAB_DISPLAY, "Screen"),
     {TAB_DISPLAY, "Fullscreen", &opts.fullscreen, 0, 1, 1, tx_onoff,
      "The game fills the whole screen, without the window's border. F10 and Alt+Enter do the same.", nullptr, false, true},
     {TAB_DISPLAY, "Output resolution", &opts.output_res, 0, kLastOutput, 1, tx_output_res,
-     "The size of the game's whole frame, HUD included, before it is scaled to the window. Applies after a restart.",
+     "The picture's size, before it is scaled to the window: the fixed sizes, and the size of each connected screen by its "
+     "name. A size that is not 16:9 is a wider or narrower picture: the HUD, menus and story movies keep their 16:9 shape at its "
+     "height. Docked only. Applies after a restart.",
      hn_output_res, true},
+    // ((Triforce) the Custom size's two sides, output_width= and output_height= by their names, shown while Custom or a
+    // screen's size is chosen: row_shown. No line about the value: the Output resolution row above shows the size the game
+    // makes of the two)
+    {TAB_DISPLAY, kUseWindowSize, nullptr, 0, 0, 0, nullptr,
+     "Copy the current window's pixel size to Custom. In fullscreen this uses the fullscreen size. Applies after a restart."},
+    {TAB_DISPLAY, "Output width", &opts.output_width, OUTPUT_MIN_W, OUTPUT_MAX_W, 8, tx_custom_width,
+     "The output resolution's width in pixels, where it is a screen's size or Custom; hold Left or Right to move faster. Output "
+     "resolution shows the size the game takes: 5:4 to 32:9 in shape, at most the pixels of 5120x2880. Applies after a restart.",
+     nullptr, true},
+    {TAB_DISPLAY, "Output height", &opts.output_height, OUTPUT_MIN_H, OUTPUT_MAX_H, 8, tx_custom_height,
+     "The output resolution's height in pixels, where it is a screen's size or Custom; hold Left or Right to move faster. Output "
+     "resolution shows the size the game takes: 5:4 to 32:9 in shape, at most the pixels of 5120x2880. Applies after a restart.",
+     nullptr, true},
     {TAB_DISPLAY, "GPU device", &opts.gpu_device, 0, 8, 1, tx_gpu,
      "Which graphics card the game runs on. Applies after a restart.", hn_gpu, true, true},
     MENU_HEADING(TAB_DISPLAY, "Ultrawide"),
-    {TAB_DISPLAY, "Aspect ratio", &opts.ultrawide, 0, 3, 1, tx_ultrawide,
-     "The shape of the picture: the game's own 16:9, or 16:10, 21:9 or 32:9 for a screen of that shape. A screen of another "
-     "shape shows it between black bars. Applies after a restart.", hn_ultrawide, true},
-    // (Triforce: host/oot_wide_hud.c. Shown with a shape wider than 16:9: row_shown)
+    {TAB_DISPLAY, "Aspect ratio", &opts.ultrawide, 0, 4, 1, tx_shape,
+     "The picture's shape for a 16:9 Output resolution: the game's own 16:9, or a fixed 16:10, 21:9 or 32:9 at the same height, "
+     "for a screen or a window of that shape, or 4:3, a TV's of 1998. A screen of another shape shows the picture between black bars. An Output "
+     "resolution that is not 16:9 has its own shape, shown here. Applies after a restart.", hn_shape, true},
+    // (Triforce: host/oot_wide_hud.c)
     {TAB_DISPLAY, "HUD position", &opts.wide_hud, 0, 1, 1, tx_wide_hud,
-     "Where the hearts, the item buttons and the map sit. Middle: in the middle 16:9, as on a normal screen. Screen edges: "
-     "in the screen's corners. Applies after a restart.", nullptr, true, true},
+     "With a picture wider than 16:9: where corner HUD elements, tips and notices sit. Middle: in the "
+     "middle 16:9, as on a normal screen. Screen edges: out in the screen's corners. Applies after a restart.", nullptr,
+     true, true},
     {TAB_DISPLAY, "Menu sides", &opts.wide_menus, 0, 2, 1, tx_wide_menus,
-     "What is beside the pause, item and map menus, loading screens and movies, which are 16:9. Changes at once.",
-     hn_wide_menus},
+     "With a picture wider than 16:9: the pause, item and map menus, and what shows beside them. Loading screens and story movies, "
+     "which draw no world either, get the same sides (the title's movie fills the picture up to 12:5); a fade always covers the "
+     "whole screen. Changes at once.", hn_wide_menus},
     MENU_HEADING(TAB_DISPLAY, "HDR"),
     // (HDR and RenoDX HDR in one row: merged_rows.h. Off, Expanded and Native change at once, as the HDR row did; Native +
     // RenoDX, which the scene's format and RenoDX's shaders are chosen for at the start (host/nn_vi.c hos_scene_rgba16f),
@@ -1100,6 +1516,40 @@ Row rows[] = {
     {TAB_GRAPHICS, "Anti-aliasing", &opts.aa, 0, aa_rows::kValues - 1, 1, tx_aa,
      "How the 3D's edges are smoothed: the game's own SMAA, none, FXAA, or SMAA at its Ultra preset. Changes at once.", hn_aa,
      false, true},
+    // ((Triforce, 11-22, N64 Classic, step 5) the 1998 look (n64_rules.h, vk_n64.cpp): Off, Faithful (fixed), Remembered (its
+    // page). Taken at each frame; F7 turns it between Off and the last preset (n64_classic_last); RX_VK_N64 over it
+    MENU_HEADING(TAB_GRAPHICS, "N64 Classic"),
+    {TAB_GRAPHICS, "N64 Classic", &opts.n64_classic, 0, n64_rules::kPresets - 1, 1, tx_n64,
+     "The game as the 1998 cartridge on a TV of then. F7 turns it on and off. Changes at once.", hn_n64, false, true},
+    {TAB_GRAPHICS, "Remembered settings", nullptr, 0, 0, 0, nullptr,   // (opens the Remembered page, the TAB_N64 rows)
+     "Remembered's frame rate, its 3D and its TV, each to your taste."},
+    // (the Remembered page (TAB_N64), which Remembered settings opens: Remembered's own look and pace, every row taken at
+    // once. N64_ROW takes each row's range, step and key from n64_rules.h kSpec; row_fixed greys those with nothing to do)
+    MENU_HEADING(TAB_N64, "Pace"),
+    N64_ROW(FPS, "Frame rate", tx_n64_fps,
+            "How many frames a second the game runs at with Remembered: the Frame rate cap's, or fewer. 20 is the 1998 "
+            "cartridge's, 17 its own on a 50 Hz TV. Movies keep the cap's."),
+    MENU_HEADING(TAB_N64, "The 3D"),
+    N64_ROW(LINES, "3D resolution", tx_n64_lines, "How many lines the 3D is drawn on. 240 is the console's; more is sharper."),
+    N64_ROW(COLOUR, "Colour", tx_n64_colour, "How many colours the 3D has. 15-bit is the console's 16-bit picture."),
+    N64_ROW(DITHER, "Dither", tx_n64_dither,
+            "The fine pattern that hides the steps between fewer colours. Nothing to dither with full colour."),
+    N64_ROW(BLUR, "Texture blur", tx_n64_blur,
+            "How much less detail the textures show, in steps of half a mip level, as the console's small textures did."),
+    MENU_HEADING(TAB_N64, "The TV"),
+    N64_ROW(TV, "CRT TV", tx_onoff, "The TV over the picture. Off: the 3D's look alone, for a real CRT or a capture card."),
+    N64_ROW(SCANLINES, "Scanlines", tx_percent, "How dark the gaps between the TV's lines are."),
+    N64_ROW(MASK, "Mask", tx_n64_mask,
+            "The pattern of the TV's red, green and blue phosphors. Auto: the slot mask on a picture 1440 lines tall or more, "
+            "none on smaller screens."),
+    N64_ROW(MASK_STRENGTH, "Mask strength", tx_percent, "How strongly the mask shows."),
+    N64_ROW(BLEED, "Colour bleed", tx_n64_bleed, "Colour smeared sideways, as a composite cable carried it; brightness stays sharp."),
+    N64_ROW(GLOW, "Glow", tx_percent, "Light glowing around the bright parts of the picture."),
+    N64_ROW(CURVATURE, "Curvature", tx_n64_curve, "How curved the screen is. A curved one has darker, rounded corners."),
+    N64_ROW(SATURATION, "Colour saturation", tx_percent, "How rich the colours are. 100% is the game's."),
+    MENU_HEADING(TAB_N64, "Start again"),
+    {TAB_N64, "Copy Faithful", nullptr, 0, 0, 0, nullptr, "Remembered set to Faithful's values: a start for your own."},
+    {TAB_N64, "Reset to defaults", nullptr, 0, 0, 0, nullptr, "Remembered as it was at first."},
     MENU_HEADING(TAB_GRAPHICS, "Frame generation"),
     // (Frame generation and DLSS frame generation in one row, merged_rows.h: the renderer's own, AMD FSR 4 where its library
     // makes the frames, NVIDIA DLSS where it can run (vk_dlssg.cpp: read at the start, so it takes a restart))
@@ -1139,6 +1589,20 @@ Row rows[] = {
      "How the game's mesh-shader draws run. Try Compute fallback on an AMD card that shows glowing walls or loses the GPU. "
      "Applies after a restart.", hn_mesh, true},
 
+    // ---- System ----
+    // ((Triforce) 11-23, his "can we move [achievements] to a more pronounced place for people to find (and disable or
+    // enable)": a group of their own, the tab's first. The list's page (host/achievements.c's list; shown once the host has
+    // named it), whether anything is earned, and whether one earned shows its notice. They were a row under Saves &
+    // reports, and off only by HOS_ACHIEVEMENTS=0 in triforce_env.txt)
+    MENU_HEADING(TAB_SYSTEM, "Achievements"),
+    {TAB_SYSTEM, "View achievements", nullptr, 0, 0, 0, nullptr,   // (kAchRow)
+     "Every achievement, and the ones you have earned. They are earned as you play; nothing is set here."},
+    {TAB_SYSTEM, "Achievements", &opts.achievements, 0, 1, 1, tx_onoff,
+     "Whether things you do in the game are marked as earned. Off: nothing is checked or earned, and what you have earned "
+     "is kept.", nullptr, false, true},
+    {TAB_SYSTEM, "Achievement notices", &opts.achievement_notices, 0, 1, 1, tx_onoff,
+     "Whether a notice and a sound tell you when you earn one. Off: they are still earned, and listed under View "
+     "achievements.", nullptr, false, true},
     // ---- System: the game's ----
     MENU_HEADING(TAB_SYSTEM, "Game"),
     // (Triforce: language.txt's choice, not the options file's. Its entries are counted when the file is read: lang_load)
@@ -1177,9 +1641,10 @@ Row rows[] = {
     {TAB_SYSTEM, "Bug capture (F8)", nullptr, 0, 0, 0, nullptr,
      "Writes what a problem report needs into a folder of its own under captures in the game folder: a picture, your "
      "settings, the end of the log and your save. F8 does the same while you play."},
-    // (Triforce: host/achievements.c's list, on a page of its own; shown once the host has named it)
-    {TAB_SYSTEM, "Achievements", nullptr, 0, 0, 0, nullptr,   // (kAchRow)
-     "Every achievement, and the ones you have earned in this game folder. They are earned as you play; nothing is set here."},
+    // (Triforce: host/save_files.c's files, the title's file select again; shown once the host has named them)
+    {TAB_SYSTEM, "Save files", nullptr, 0, 0, 0, nullptr,   // (kFilesRow)
+     "Your save files: each is a playthrough of its own, with its own saves and autosaves. Choosing another restarts the game "
+     "on it, so save first."},
     MENU_HEADING(TAB_SYSTEM, "Online"),
     {TAB_SYSTEM, "Discord status", &opts.discord, 0, 1, 1, tx_onoff,
      "Shows \"Playing Triforce\" and the time played in your Discord status, while Discord runs on this PC.", nullptr, false,
@@ -1365,6 +1830,8 @@ Row rows[] = {
     {TAB_HIDDEN, "Steady frame rate", &opts.steady_fps, 0, 2, 1, tx_steady_fps, nullptr},
     {TAB_HIDDEN, "NVIDIA Reflex", &opts.reflex, 0, 2, 1, tx_latency, nullptr},
     {TAB_HIDDEN, "AMD Anti-Lag 2", &opts.antilag, 0, 1, 1, tx_onoff, nullptr},
+    // ((Triforce, N64 Classic, step 5) F7's preset from Off (n64_rules.h Toggle): saved as n64_classic_last, its name's key)
+    {TAB_HIDDEN, "N64 Classic last", &opts.n64_last, n64_rules::FAITHFUL, n64_rules::REMEMBERED, 1, nullptr, nullptr},
 
 };
 constexpr int kRowsEnd = sizeof rows / sizeof rows[0];   // (the table's end: tests read the table up to here)
@@ -1473,6 +1940,11 @@ void quit_gone() { quit_ask = false, quit_open_ns = 0, quit_shut_ns = 0; }
 /// (its Out still playing)
 bool quit_closing() { return !quit_ask && quit_shut_ns && prof_now() - quit_shut_ns < focus_anim::kOutNs; }
 bool quit_entry_shown() { return (mods_list_bits.load(std::memory_order_relaxed) & HOS_MODS_LIST_TITLE) == 0; }
+/// (Triforce) Save Select, the entry under Mods on the title's list while the host has named the save files (host/save_files.c):
+/// where Quit is under the System list's Mods, and mods_row_sel 1 as it is. Not on the pause menu: a file is changed at the title
+bool files_row_shown() {
+    return save_files.shown() > 0 && (mods_list_bits.load(std::memory_order_relaxed) & HOS_MODS_LIST_TITLE) != 0;
+}
 std::atomic<int64_t> game_frames{0};   // (the game's frames shown: menu_note_frame)
 /// ((Triforce, 11-19) the lab's "one DOWN from Options on the title did nothing and logged nothing": with the game's window
 /// behind another one its frames came 80 to 235 ms apart, and a list told of at each of them counted as gone after 150 ms, so
@@ -1709,7 +2181,7 @@ const char* cheat_confirm(int i) {
 constexpr int kRows = sizeof rows / sizeof rows[0];
 
 int cur_tab = TAB_DISPLAY;
-int tab_selected[TAB_COUNT + 1] = {};   // (and the Motion page's)
+int tab_selected[TAB_N64 + 1] = {};   // (and the Motion page's, ((Triforce, N64 Classic) and the Remembered page's)
 bool is_motion_row(const Row& r) { return r.tab == TAB_CONTROLS && !r.value && !strcmp(r.name, "Motion"); }
 
 // (Triforce) The System tab's rows that act on a press, after NX2navi's: Export save, Export save for a bug report, Import a
@@ -1793,9 +2265,14 @@ bool restart_changed(const Row& r) {
     const int slot = restart_slot_of(r);
     return r.value && r.restart && slot >= 0 && restart_value_of(r) != restart_state.start[slot];
 }
+/// (Triforce) A row whose value the game does not read as the options are: the Custom size's two sides while the Output
+/// resolution is a fixed size (walking the row past a screen's size leaves that size in them). Such a row asks for no restart
+bool restart_inert(const Row& r) {
+    return (r.value == &opts.output_width || r.value == &opts.output_height) && output_choice(opts.output_res) != OUTPUT_CUSTOM;
+}
 void restart_values(int* now) {
     for (int i = 0; i < kRows; i++)
-        if (restart_slot[i] >= 0) now[restart_slot[i]] = restart_value_of(rows[i]);
+        if (restart_slot[i] >= 0) now[restart_slot[i]] = restart_inert(rows[i]) ? restart_state.start[restart_slot[i]] : restart_value_of(rows[i]);
 }
 /// The rows whose value is not the one the game runs with (a bit a slot)
 unsigned restart_pending() {
@@ -1915,12 +2392,18 @@ bool group_shown(int heading);
 bool row_shown(int i) {
     const int up = rows[i].value == &opts.upscale_pre || rows[i].value == &opts.dlss_model || rows[i].value == &opts.aa ? upscaler() : ur::GAME;
     return (rows[i].cheat < 0 || cheats_on()) &&
+           (rows[i].name != kUseWindowSize || (opts.output_res == OUTPUT_CUSTOM && !custom_env())) &&
+           // ((Triforce) the Custom size's two sides only while the Output resolution is Custom)
+           ((rows[i].value != &opts.output_width && rows[i].value != &opts.output_height) ||
+            output_choice(opts.output_res) == OUTPUT_CUSTOM) &&
            (rows[i].value != &opts.dlss || ur::upscaler_shown(dlss_built() || fsr4_built(), fsr3::supported())) &&
            // ((Triforce, options_version 7) the DLSS model with NVIDIA DLSS as the Upscaler alone; Upscale before bloom with any
            // upscaler but the game's own, which it does nothing with (vk_temporal.cpp pre_wanted); Anti-aliasing with the game's
            // own alone: DLSS and FSR smooth the edges themselves (aa_rows.h))
            (rows[i].value != &opts.dlss_model || (ur::model_shown(dlss_built()) && ur::is_dlss(up))) &&
            (rows[i].value != &opts.upscale_pre || up != ur::GAME) && (rows[i].value != &opts.aa || up == ur::GAME) &&
+           // ((Triforce, 11-22, N64 Classic) Remembered settings with Remembered chosen)
+           (!is_n64_page_row(rows[i]) || n64_preset() == n64_rules::REMEMBERED) &&
            // (local, RenoDX port: its rows with HDR Native, in a build with its shaders; Triforce: and its own row on, and
            // of the rows one tonemapper alone reads those of the one chosen. (options_version 7) The UI brightness is one of them:
            // without RenoDX the HUD's white is the picture's, Paper white)
@@ -1929,7 +2412,7 @@ bool row_shown(int i) {
            // shape wider than 16:9 (21:9 and 32:9: 16:10 is narrower, ultrawide_rows.h); Sprint mode with a sprint button, Walk
            // scale with a walk key; Low latency where Reflex or Anti-Lag 2 runs)
            ((rows[i].value != &opts.hdr_white && rows[i].value != &opts.hdr_peak) || opts.hdr != 0) &&
-           ((rows[i].value != &opts.wide_hud && rows[i].value != &opts.wide_menus) || ultrawide_row_wider(opts.ultrawide)) &&
+           ((rows[i].value != &opts.wide_hud && rows[i].value != &opts.wide_menus) || (output_picture_of(opts.output_res, opts.ultrawide).w > output_picture_of(opts.output_res, opts.ultrawide).h * (16.0 / 9.0) * 1.01)) &&
            (rows[i].value != &opts.sprint_mode || opts.sprint_button != 0) && (rows[i].value != &opts.walk_scale || opts.walk_key != 0) &&
            (rows[i].value != &merged.latency || latency_vendor() != mr7::LATENCY_NONE) &&
 #ifndef _WIN32   // (Triforce: the lazy write-back's fault handler pays on Windows only, vk_memory.cpp)
@@ -1943,6 +2426,8 @@ bool row_shown(int i) {
            (!rows[i].heading || strcmp(rows[i].name, kModCheatHeading) || mod_cheats.shown() > 0) &&
            // (Triforce: the Achievements row once the host has named them: off, or none, and there is no such row)
            (strcmp(rows[i].name, kAchRow) || rows[i].tab != TAB_SYSTEM || ach_list.shown() > 0) &&
+           // (Triforce: and the Save files row once the host has named the files)
+           (strcmp(rows[i].name, kFilesRow) || rows[i].tab != TAB_SYSTEM || save_files.shown() > 0) &&
            (mod_cheat_slot(rows[i].name) < 0 || mod_cheat_slot(rows[i].name) < mod_cheats.shown()) &&
            (!rows[i].heading || rows[i].tab == TAB_DEBUG || group_shown(i));
 }
@@ -1985,9 +2470,9 @@ constexpr int64_t kMarqueeStep = 150000000LL, kMarqueeRest = 1200000000LL;   // 
 int hover_tab = -1;
 int drag_row = -1;
 bool mouse_read = false;   // (the menu has read the mouse since it opened)
-bool is_slider(const Row& r) { return r.value == &opts.sharpness || r.value == &opts.mouse_sens || r.value == &opts.gyro_sens_x || r.value == &opts.gyro_sens_y; }
+bool is_slider(const Row& r) { return r.value == &opts.sharpness || r.value == &opts.mouse_sens || r.value == &opts.gyro_sens_x || r.value == &opts.gyro_sens_y || r.value == &opts.output_width || r.value == &opts.output_height; }
 /// (a scale: the arrows and a click stop at its ends; Rumble strength would go from Off to its strongest)
-bool stops_at_ends(const Row& r) { return r.value == &opts.mouse_sens || r.value == &opts.rumble || r.value == &opts.rumble_curve || r.value == &opts.lstick_dead_zone || r.value == &opts.rstick_dead_zone || r.value == &opts.walk_scale || r.value == &opts.gyro_sens_x || r.value == &opts.gyro_sens_y; }
+bool stops_at_ends(const Row& r) { return r.value == &opts.mouse_sens || r.value == &opts.rumble || r.value == &opts.rumble_curve || r.value == &opts.lstick_dead_zone || r.value == &opts.rstick_dead_zone || r.value == &opts.walk_scale || r.value == &opts.gyro_sens_x || r.value == &opts.gyro_sens_y || r.value == &opts.output_width || r.value == &opts.output_height; }
 /// (the ini's Rumble strength on the menu's steps: 0 to 300, the nearest 25)
 int rumble_step(int v) { return (std::min(std::max(v, 0), 300) + 12) / 25 * 25; }
 std::string ini_path() {
@@ -2011,6 +2496,12 @@ const char* ini_key(const Row& r) {
         {"Hue correction", "renodx_hue_correction"}, {"Color grading", "renodx_color_grading"}, {"Highlights", "renodx_highlights"},
         {"Shadows", "renodx_shadows"}, {"Contrast", "renodx_contrast"}, {"Saturation", "renodx_saturation"},
         {"Bloom", "renodx_bloom"},
+        // ((Triforce, 11-22, N64 Classic) the Remembered page's rows, under n64_rules.h kSpec's keys (tests/test_n64_row.py holds
+        // the two the same; its saturation is Colour saturation, RenoDX's row having Saturation)
+        {"Frame rate", "n64_rem_fps"}, {"3D resolution", "n64_rem_lines"}, {"Colour", "n64_rem_colour"}, {"Dither", "n64_rem_dither"},
+        {"Texture blur", "n64_rem_blur"}, {"CRT TV", "n64_rem_tv"}, {"Scanlines", "n64_rem_scanlines"}, {"Mask", "n64_rem_mask"},
+        {"Mask strength", "n64_rem_mask_strength"}, {"Colour bleed", "n64_rem_bleed"}, {"Glow", "n64_rem_glow"},
+        {"Curvature", "n64_rem_curvature"}, {"Colour saturation", "n64_rem_saturation"},
     };
     for (const auto& k : kept)
         if (r.value && !strcmp(r.name, k[0])) return k[1];
@@ -2200,6 +2691,8 @@ void save() {
     // (hookshot) the lines that are not the menu's are kept: the controls, pad_ and key_ (host/nn_hid.c)
     // (and every other line the menu does not write, such as discord_app_id=: they were dropped at the next save)
     std::string kept, others;
+    // With no remembered size, leave a line first added outside after menu_init to its writer.
+    const bool own_custom = remembered_custom.h || ini_base.count("output_custom_size") || !merge;
     ini_merge::Map disk;   // ((Triforce) the file's lines as they are now)
     if (FILE* f = fopen(ini_path().c_str(), "r")) {
         char line[256];
@@ -2212,7 +2705,7 @@ void save() {
             const char* eq = strchr(line, '=');
             if (!eq || eq == line) continue;
             const std::string key(line, (size_t)(eq - line));
-            bool mine = key == "microphone_device" || key == "options_version" || key == "debug_tab" || key == "gpu_device_name";
+            bool mine = (key == "output_custom_size" && own_custom) || key == "microphone_device" || key == "options_version" || key == "debug_tab" || key == "gpu_device_name";
             // (Triforce: the RivaTuner limit row of the test builds is gone, RivaTuner being the limiter wherever it can be:
             // its line is read by nothing and is not written again. (options_version 7) Nor are the lines of the rows whose job
             // is done otherwise now: merged_rows.h kDropped, read once by menu_init's migration)
@@ -2236,6 +2729,8 @@ void save() {
     };
     for (const Row& r : rows)
         if (ini_row(r)) put(ini_key(r), std::to_string(*r.value));
+    if (remembered_custom.h) put("output_custom_size", std::to_string(remembered_custom.w) + "x" + std::to_string(remembered_custom.h));
+    else if (own_custom && disk.count("output_custom_size")) put("output_custom_size", "");
     if (!mic_want.empty()) put("microphone_device", mic_want);   // (hookshot: also while it is unplugged)
     // ((Triforce) 11-20) the GPU device row's card by its name beside its number: the chosen card's as this run lists them;
     // a choice past the list (the card taken out) keeps the name it had; Auto writes none
@@ -2251,7 +2746,8 @@ void save() {
     // see merged_rows.h migrate (the 436f9ac-based builds wrote 7 for that: such a file has none of the dropped lines, so
     // migrate leaves it as it is))
     static_assert(merged_rows::kVersion == 8, "the options file's version as merged_rows.h migrates to it");
-    out += "options_version=8\n";
+    // (Triforce) 9: stock and native output numbers share one schema, see output_sizes.h)
+    out += "options_version=9\n";
     out += others;
     if (!can_bind()) out += kept;
     for (int i = 0; i < HOS_KEY_N && can_bind(); i++) {   // (the keys-only controls, HOS_KEY_*, have no pad_ line)
@@ -2301,12 +2797,13 @@ void set_row(Row& r, int v, int dir, bool keep = true) {
         v = to.resolution;
         if (to.upscaler != upscaler()) upscaler_now = to.upscaler;   // (Native (100%) on or off: the engine's native AA)
     }
-    if (r.value == &opts.output_res) {   // (smallest to largest: kOutputOrder)
-        v = step_output_choice(*r.value, dir);
-        if (v == *r.value) return;
+    if (r.value == &opts.output_res) {   // (smallest to largest, the screens' sizes among the fixed ones: output_entries)
+        if (!output_step(dir, true)) return;
+        v = *r.value;
     }
     if (is_merged(r.value)) v = merged_step(r.value, *r.value, dir);   // ((Triforce, options_version 7) its choices here)
     if (stops_at_ends(r)) v = std::min(std::max(v, r.lo), r.hi);   // (a scale: it stops at its ends)
+    if ((r.value == &opts.output_width || r.value == &opts.output_height) && v != *r.value) remembered_custom = {};
     if (r.value == &opts.pad_layout) {
         if (v > 2) v = dir > 0 ? 0 : 2;
         if (v < 0) v = 2;
@@ -2326,6 +2823,18 @@ void set_row(Row& r, int v, int dir, bool keep = true) {
         restart_state.note(now);
     }
     if (keep) save();
+}
+
+// Snapshot the drawable in pixels when confirmed. Both dimensions share one save and restart prompt.
+void use_window_size(unsigned width, unsigned height) {
+    unsigned w, h;
+    if (!output_size_used(width, height, &w, &h)) return;
+    remembered_custom = {};
+    for (Row& dimension : rows) {
+        if (dimension.value == &opts.output_width) set_row(dimension, (int)w, 1, false);
+        if (dimension.value == &opts.output_height) set_row(dimension, (int)h, 1, false);
+    }
+    save();
 }
 
 // ---- (hookshot) the Controls page: what presses each of the Switch's buttons, a gamepad input and up to two keys ----
@@ -2544,13 +3053,16 @@ struct PerfView {
     perf_stats::Base base;
 } perf_view;
 menu_hit::Map hits;      // (the menu's controls as last drawn: the mouse's, menu_tick)
-float scroll_at[TAB_MOTION + 2];   // (the first row shown, eased toward the selection: the options' tabs and the Motion page, then
-                                   // the Controls page: kControlsSlot)
+// ((Triforce, 11-22, N64 Classic) the options were drawn under its TV at the last present (menu_tv_layer): the mouse is
+// taken through the TV's curve to where they were drawn (vk_n64.h n64_screen_point). The presenting thread's, as hits is
+bool options_under_tv = false;
+float scroll_at[TAB_N64 + 1];   // (the first row shown, eased toward the selection: the options' tabs and the Motion page, then
+                                // the Controls page: kControlsSlot; ((Triforce, N64 Classic) then the Remembered page)
 constexpr int kControlsSlot = TAB_MOTION + 1;
-int wheel_rows[TAB_MOTION + 2];   // (the mouse wheel's notches since the last drawing, a slot each: scroll_rows scrolls by them)
-int scrolled_to[TAB_MOTION + 2] = {-1, -1, -1, -1, -1, -1, -1, -1};   // (the selection scroll_rows last brought into view)
-static_assert(TAB_MOTION + 2 == 8, "scrolled_to: a slot for each tab, the Motion page and the Controls page");
-float scroll_want[TAB_MOTION + 2];   // (where scroll_at is going: the wheel moves it, a new selection too)
+int wheel_rows[TAB_N64 + 1];   // (the mouse wheel's notches since the last drawing, a slot each: scroll_rows scrolls by them)
+int scrolled_to[TAB_N64 + 1] = {-1, -1, -1, -1, -1, -1, -1, -1, -1};   // (the selection scroll_rows last brought into view)
+static_assert(TAB_N64 + 1 == 9, "scrolled_to: a slot for each tab, the Motion page, the Controls page and the Remembered page");
+float scroll_want[TAB_N64 + 1];   // (where scroll_at is going: the wheel moves it, a new selection too)
 float ease_step = 0;     // (this drawing's share of the way: the time since the last one)
 bool ease_live = false;  // ((Triforce) menu_record steps the easing: a window's frames. Without them a still is drawn settled)
 
@@ -3001,7 +3513,8 @@ void draw_options(ui::Ctx& c) {
     const float s = c.s, hh = banner_h(c);
     header_layer(c, true);   // ((Triforce, 11-19) over the Full panel inside the game's Options screen: draw_menu)
     ui::banner(c, hh);
-    draw_tabs(c, cur_tab == TAB_MOTION ? TAB_CONTROLS : cur_tab, embed_open, true);   // (the Motion page: under Controls)
+    // (the Motion page: under Controls; ((Triforce, N64 Classic) the Remembered page: under Graphics)
+    draw_tabs(c, cur_tab == TAB_MOTION ? TAB_CONTROLS : cur_tab == TAB_N64 ? TAB_GRAPHICS : cur_tab, embed_open, true);
     header_layer(c, false);
     // the rows, in the column; the caption beside it
     float cx0, cx1, hx0, hx1;
@@ -3024,8 +3537,10 @@ void draw_options(ui::Ctx& c) {
     int prompts_n = 3;
     if (!selr.value) prompt_list[0] = {ui::kConfirm, confirms ? (pending == &selr ? "Confirm" : selr.name) : "Open"};
     if (share_row(selr)) prompt_list[0] = {ui::kConfirm, share_label(share_row(selr))};
+    if (n64_action(selr)) prompt_list[0] = {ui::kConfirm, "Apply"};   // ((Triforce, N64 Classic) Copy Faithful, Reset to defaults)
     if (sel_cheat >= 0) prompt_list[0] = {ui::kLeftRight, "Change"};   // (Triforce: a mod's cheat, On | Off)
     if (cur_tab == TAB_MOTION) prompt_list[1] = {ui::kBack, "Back"}, prompts_n = 2;   // (Esc: to Controls)
+    if (cur_tab == TAB_N64) prompt_list[1] = {ui::kBack, "Back"}, prompts_n = 2;   // ((Triforce, N64 Classic) Esc: to Graphics)
     if (selr.cheat >= 0) {   // (a debug tool: Change when Left and Right do something, then what confirm does)
         prompts_n = 0;
         if (selr.cheat <= 1 || selr.cheat == 7 || cheat_chooses(selr.cheat) || age_shown(selr.cheat))
@@ -3097,10 +3612,10 @@ void draw_options(ui::Ctx& c) {
         } else if (!r.value) {   // (a page, or Restart and Quit: Confirm until the second press)
             const bool ends = false;
             if (pending == &r) choice_cell(c, va, vb, "Press again", selected, false, false);
-            else action_cell(c, va, vb, ends ? r.name : share_row(r) ? share_label(share_row(r)) : "Open", selected);
+            else action_cell(c, va, vb, r.name == kUseWindowSize ? "Copy" : ends ? r.name : share_row(r) ? share_label(share_row(r)) : "Open", selected);
         } else {
             const bool fixed = row_fixed(r.value);
-            if (is_slider(r)) {
+            if (is_slider(r) && !fixed) {   // ((Triforce) a fixed one: its value alone, as a choice with nothing to choose)
                 slider_cell(c, va, vb, r.text(*r.value), menu_hit::slider_permille(*r.value, r.lo, r.hi), selected, &t0, &t1);
                 t0 = t1 = 0;   // (no track to drag: the arrows step it)
             } else if (r.text == tx_onoff && !fixed) {   // (a toggle as the game's: On at the left, Off at the right)
@@ -3108,8 +3623,8 @@ void draw_options(ui::Ctx& c) {
                 vm = halves_meet(va, vb);
             } else {
                 const bool output_row = r.value == &opts.output_res;
-                const bool left = !fixed && (!output_row || step_output_choice(*r.value, -1) != *r.value) && (!stops_at_ends(r) || *r.value > r.lo);
-                const bool right = !fixed && (!output_row || step_output_choice(*r.value, 1) != *r.value) && (!stops_at_ends(r) || *r.value < r.hi);
+                const bool left = !fixed && (!output_row || output_step(-1, false)) && (!stops_at_ends(r) || *r.value > r.lo);
+                const bool right = !fixed && (!output_row || output_step(1, false)) && (!stops_at_ends(r) || *r.value < r.hi);
                 choice_cell(c, va, vb, r.text(*r.value), selected, left, right, fixed);
             }
         }
@@ -4567,15 +5082,18 @@ constexpr ImU32 kTitleInkSel = ui::rgba(255, 255, 255);   // (T_Btn_02's: white)
 constexpr ImU32 kTitleDecoInk = ui::rgba(131, 115, 22);   // (P_Deco_*_00's: colour 4, linear 0.227 0.173 0.008)
 constexpr ImU32 kTitleGlow = ui::rgba(120, 140, 255);
 mods_entry::Anim title_anim;
+// ((Triforce) Save Select under it is the same part with its own label and animation: draw_title_files sets these for its call)
+const char* title_label = "Mods";
+int title_entry = 0;   // (0 Mods, 1 Save Select: its hit, and Mods' Decide and place are Mods' alone)
 void draw_title_mods(ui::Ctx& c, bool sel, float cx, float cy, float k, float pitch) {
     const int64_t now = prof_now(), age = mods_list_age();
     title_anim.step(now, sel, std::min<int64_t>(age, mods_entry::kListShownNs), mods_list_shown());
     const float show = title_anim.shown, f = title_anim.focus;
     const ImVec2 m = ui::at(c, cx, cy);
-    const char* const label = "Mods";
+    const char* const label = title_label;
     const float px = ui::lu(c, kTitleText * ui::kType * k), tw = ui::size_of(c.f.body, px, label).x;
     const float deco_x = tw * 0.5f + ui::lu(c, kTitleDecoGap * k);
-    const mods_entry::Decide d = mods_entry::decide_at(mods_decide_ns ? now - mods_decide_ns : -1);
+    const mods_entry::Decide d = mods_entry::decide_at(mods_decide_ns && !title_entry ? now - mods_decide_ns : -1);
     if (f > 0 && show > 0) {
         const float hw = deco_x + ui::lu(c, kTitleBandPast * k), hh = ui::lu(c, kTitleBandH * 0.5f * k);
         const ImVec2 a(m.x - hw, m.y - hh), b(m.x + hw, m.y + hh);
@@ -4647,9 +5165,19 @@ void draw_title_mods(ui::Ctx& c, bool sel, float cx, float cy, float k, float pi
     }
     // (the entry's hit: across the line as the host takes the game's (host/oot_menu.c list_boxes: 1100 wide), a pitch high)
     const float hw = ui::lu(c, 550 * k), hh = ui::lu(c, pitch * 0.5f);
-    hits.add(m.x - hw, m.y - hh, m.x + hw, m.y + hh, menu_hit::kButton, 0);
+    hits.add(m.x - hw, m.y - hh, m.x + hw, m.y + hh, menu_hit::kButton, title_entry);
+    if (title_entry) return;
     mods_entry_px[0] = m.x - hw, mods_entry_px[1] = m.y - hh, mods_entry_px[2] = m.x + hw, mods_entry_px[3] = m.y + hh;
     mods_entry_px[4] = ui::lu(c, pitch);
+}
+/// (Triforce) Save Select on the title's list: the same entry a pitch under Mods, with its own animation
+mods_entry::Anim files_title_anim;
+void draw_title_files(ui::Ctx& c, bool sel, float cx, float cy, float k, float pitch) {
+    std::swap(title_anim, files_title_anim);
+    title_label = "Save Select", title_entry = 1;
+    draw_title_mods(c, sel, cx, cy, k, pitch);
+    title_label = "Mods", title_entry = 0;
+    std::swap(title_anim, files_title_anim);
 }
 
 /// (Triforce) The Mods entry, under the game list's last button by the list's own pitch (host/oot_menu.c): on the pause menu's
@@ -4684,6 +5212,8 @@ void draw_mods_row(ui::Ctx& c, bool sel) {
     }
     // (the list's scale: the part's 60-unit hit box as the host finds it; one not told, the part's own size)
     const float k = x1 - x0 > 6 && x1 - x0 < 600 ? (x1 - x0) / 60.0f : 1.0f;
+    // ((Triforce) Save Select under it while the save files are on: the cursor is on one of the two)
+    if (files_row_shown()) draw_title_files(c, sel && mods_row_sel == 1, cx, cy - pitch, k, pitch), sel = sel && mods_row_sel == 0;
     draw_title_mods(c, sel, cx, cy, k, pitch);
 }
 
@@ -4920,16 +5450,256 @@ void draw_achievements(ui::Ctx& c) {
     ui::prompt_bar(c, prompts, (int)(sizeof prompts / sizeof prompts[0]));
 }
 
+/// (Triforce) A save file's picture and time on its card: those of its newest save, as the game's own load list shows them.
+/// Each of the file's slots has a caption file (the host names where they are: host/save_files.c), in which the game keeps
+/// the save's picture, a JPEG, and when it was made. Looked for once a run, when the file select first opens: every slot's
+/// caption read whole, its time found (save_file_rows.h caption_time), and of the one saved last the JPEG (jpeg_in) decoded
+/// with Windows' own decoder (vk_mods.h: none on Linux, and no picture then); its texture made at the first drawing. The
+/// saves are only read. A file none of whose slots tells a time shows its first slot's picture and the folder's date
+struct FilePicture {
+    int state = 0;   // (0 not looked for, 1 its pixels wait for their texture, 2 shown, 3 none)
+    std::vector<unsigned char> rgba;
+    int w = 0, h = 0;
+    ImTextureData* texture = nullptr;
+    char when[32] = "";   // (the newest save's own time, as the game writes one; "" not found: the host's, the folder's date)
+};
+FilePicture file_pictures[save_file_rows::kSlots];
+void files_pictures_load() {
+    for (int i = 0, n = save_files.shown(); i < n; i++) {
+        FilePicture& p = file_pictures[i];
+        if (p.state) continue;
+        p.state = 3;
+        if (!save_files.pictures[i][0]) continue;
+        std::string newest;   // (the newest save's picture, as it is in its caption)
+        save_file_rows::SaveTime latest;
+        int from = -1, slots = 0;
+        // ((Triforce) 11-18, his picture: "the date doesn't match lol neither does the picture": a time of 2093 was found among
+        // a caption's other bytes. The slot the game saved in last is known where the file was played with this: the host saw
+        // it written and kept it with the card (host/save_files.c hos_save_card_wrote). That slot's picture and that time,
+        // then; a file not saved in since: the latest time a caption tells that can be a save's, 2025 to now, as before)
+        const int known = save_files.slots[i];
+        const time_t now = time(nullptr) + 86400;
+        const tm* const now_tm = localtime(&now);
+        const int max_year = now_tm ? now_tm->tm_year + 1900 : 2100;
+        for (int slot = 0; slot < 12; slot++) {   // (the game looks for slot_00 to slot_11)
+            if (known >= 0 && slot != known) continue;
+            char path[save_file_rows::kPath + 32];
+            snprintf(path, sizeof path, "%s%02d\\caption.sav", save_files.pictures[i], slot);
+            FILE* f = fopen(path, "rb");
+            if (!f) continue;
+            std::string bytes(size_t(1) << 20, '\0');   // (a save's caption is some tens of kilobytes)
+            bytes.resize(fread(bytes.data(), 1, bytes.size(), f));
+            fclose(f);
+            slots++;
+            size_t at = 0, len = 0;
+            const bool pictured = save_file_rows::jpeg_in((const unsigned char*)bytes.data(), bytes.size(), &at, &len);
+            const save_file_rows::SaveTime t =
+                save_file_rows::caption_time((const unsigned char*)bytes.data(), bytes.size(), pictured ? at : bytes.size(), pictured ? len : 0, max_year,
+                                             (int64_t)now);
+            if (from >= 0 && !t.after(latest)) continue;   // (the first slot, until one tells a later time)
+            from = slot, latest = t;
+            newest = pictured ? bytes.substr(at, len) : std::string();
+        }
+        if (from < 0) continue;
+        if (known >= 0) snprintf(p.when, sizeof p.when, "%s", save_files.made[i]);
+        else if (latest.kind == 1) save_file_rows::game_time(p.when, sizeof p.when, latest.year, latest.month, latest.day, latest.hour, latest.minute);
+        else if (latest.kind == 2) {
+            const time_t made = (time_t)latest.seconds;
+            if (const tm* local = localtime(&made))
+                save_file_rows::game_time(p.when, sizeof p.when, local->tm_year + 1900, local->tm_mon + 1, local->tm_mday, local->tm_hour, local->tm_min);
+        }
+        if (known >= 0) logf("menu: save file %d: slot_%02d is the one the game saved in last, %s (kept with its card)", i + 1, from, p.when);
+        else
+            logf("menu: save file %d: of its %d slots slot_%02d is the newest%s%s%s", i + 1, slots, from,
+                 latest.kind ? ", saved " : ": none of them tells when it was saved (its first slot is shown, and the folder's date)", p.when,
+                 latest.kind == 1 ? " (a calendar time in its caption)" : latest.kind == 2 ? " (a count of seconds in its caption)" : "");
+        if (newest.empty()) {
+            logf("menu: save file %d: no picture found in that save", i + 1);
+            continue;
+        }
+        if (mods::decode_image(newest, 512, p.rgba, &p.w, &p.h) && p.w > 0 && p.h > 0 && p.rgba.size() == (size_t)p.w * p.h * 4) p.state = 1;
+        else logf("menu: save file %d: its save's picture could not be read (%zu bytes of it)", i + 1, newest.size());
+    }
+}/// The file select opened: the choice on the file this run plays
+void files_open(bool at_title) {
+    page = kFilesPage, files_at_title = at_title, files_wait = -1, files_failed = false;
+    files_choice = std::max(0, save_files.current());
+    files_pictures_load();
+}
+/// (Triforce) The file select (kFilesPage): a card for each file the host named, its number, its name and when it was last
+/// saved; the one this run plays is marked. The caption says what choosing the chosen one does
+void draw_files(ui::Ctx& c) {
+    const float s = c.s;
+    const int n = save_files.shown(), cur = save_files.current();
+    files_choice = std::clamp(files_choice, 0, std::max(0, n - 1));
+    const bool here = files_choice == cur, waiting = files_wait >= 0;
+    const float hh = title_banner(c, "Select a file", nullptr);
+    const char* act = here ? "Play" : "Switch file";
+    const ui::Prompt prompts[] = {{ui::kUpDown, "Move"}, {ui::kConfirm, act}, {ui::kBack, "Back"}};
+    float cx0, cx1, hx0, hx1;
+    bool narrow;
+    columns(c, &cx0, &cx1, &hx0, &hx1, &narrow);
+    column(c, cx0, cx1, hh);
+    const float bar = ui::prompt_bar_top(c);
+    const float left = cx0 + 24 * s, right = cx1 - 24 * s, top = hh + 22 * s, pitch = 124 * s;
+    if (n > 0) {
+        const bool saved = save_files.saved(files_choice);
+        char when[64] = "No save in it yet.";
+        const char* const made = file_pictures[files_choice].when[0] ? file_pictures[files_choice].when : save_files.whens[files_choice];
+        if (saved && made[0]) snprintf(when, sizeof when, "Last saved %s", made);
+        else if (saved) snprintf(when, sizeof when, "Has a save.");
+        const char* help = here ? "The file the game is playing now. Its saves and autosaves are its own." :
+                           saved ? "Another file, with its own saves and autosaves. The game starts again to play it: what is not saved in "
+                                   "the file you are playing now is lost." :
+                                   "An empty file: a new game of its own. The game starts again to play it.";
+        caption(c, hx0, hx1, save_files.names[files_choice], help, when,
+                waiting ? "Starting the game on this file..." : files_failed ? "The choice could not be kept: nothing changed." : nullptr);
+    }
+    for (int i = 0; i < n; ++i) {
+        const ImVec2 a(left, top + i * pitch), b(right, a.y + pitch - 12 * s);
+        const bool saved = save_files.saved(i);
+        ui::plate(c, a, b, i == cur);
+        const float my = (a.y + b.y) * 0.5f;
+        // (its save's picture at the left, 16:9; a file without one: a dark plate that says so)
+        const float ph = b.y - a.y - 20 * s, pw = ph * 16.0f / 9.0f;
+        const ImVec2 pa(a.x + 12 * s, a.y + 10 * s), pb(pa.x + pw, pa.y + ph);
+        FilePicture& pic = file_pictures[i];
+        if (pic.state == 1) {   // (its texture, at the first drawing)
+            pic.texture = IM_NEW(ImTextureData)();
+            pic.texture->Create(ImTextureFormat_RGBA32, pic.w, pic.h);
+            memcpy(pic.texture->GetPixels(), pic.rgba.data(), pic.rgba.size());
+            pic.texture->UseColors = true;
+            ImGui::RegisterUserTexture(pic.texture);
+            pic.rgba.clear(), pic.rgba.shrink_to_fit();
+            pic.state = 2;
+        }
+        c.d->AddRectFilled(pa, pb, ui::rgba(18, 13, 8, 255));
+        if (pic.state == 2 && pic.texture) {
+            const float iw = (float)pic.w, ih = (float)pic.h;
+            ImVec2 uv0(0, 0), uv1(1, 1);
+            if (iw / ih > pw / ph) { const float k = (ph / pw) * iw / ih; uv0.x = (1 - 1 / k) * 0.5f, uv1.x = 1 - uv0.x; }   // (wider: its sides cut)
+            else { const float k = (pw / ph) * ih / iw; uv0.y = (1 - 1 / k) * 0.5f, uv1.y = 1 - uv0.y; }
+            c.d->AddImage(pic.texture->GetTexRef(), pa, pb, uv0, uv1);
+        } else {
+            ui::text_mid_centre(c, c.f.body, 13 * s, (pa.x + pb.x) * 0.5f, my, ui::kDim, saved ? "No picture" : "New game");
+        }
+        c.d->AddRect(pa, pb, ui::alpha(ui::kEdge, 0.9f), 0, std::max(1.0f, s));
+        // (Triforce, 11-18, his picture of the game's own load list: "can we show progress of the latest autosave like this?")
+        // The card as the game's: the save's time over the place it was played last, a line, the hearts under it, and at the
+        // right the plate with the six medallions round the three Spiritual Stones, each in its place when held. The file's
+        // name on the tag where the game says Autosave. What the host kept as the file was played (host/save_files.h
+        // SaveCard): a file not played with this yet has its name and its time alone
+        namespace ar = achievement_rows;
+        const bool carded = saved && (save_files.places[i][0] || save_files.items[i] || save_files.hearts[i]);
+        const float R = 44 * s, tx = pb.x + 18 * s;
+        const ImVec2 wc(b.x - 18 * s - R, my);
+        const float text_right = carded ? wc.x - R - 16 * s : b.x - 16 * s;
+        {   // (the tag: the file's name; the one this run plays in gold, "Playing" before it)
+            const float tw = ui::size_of(c.f.strong, 13.5f * s, save_files.names[i]).x + 22 * s;
+            const ImVec2 g(text_right - tw, a.y + 10 * s);
+            c.d->AddRectFilled(g, g + ImVec2(tw, 23 * s), i == cur ? ui::kAccent : ui::alpha(ui::kAccent, 0.45f), 4 * s);
+            ui::text_mid_centre(c, c.f.strong, 13.5f * s, g.x + tw * 0.5f, g.y + 11.5f * s, ui::kGoldInk, save_files.names[i]);
+            if (i == cur) ui::text_mid_right(c, c.f.strong, 13.5f * s, g.x - 10 * s, g.y + 11.5f * s, ui::kGoldHi, "Playing");
+        }
+        c.d->PushClipRect(ImVec2(tx, a.y), ImVec2(text_right, b.y), true);
+        ui::text_mid(c, c.f.body, 15 * s, tx, a.y + 21 * s, saved ? ui::kSoft : kCardOff,
+                     saved ? (pic.when[0] ? pic.when : save_files.whens[i][0] ? save_files.whens[i] : "Saved") : "No save yet");
+        const char* const place = !saved ? "New game" : save_files.places[i][0] ? save_files.places[i] : "Saved game";
+        ui::text_mid(c, c.f.strong, 23 * s, tx, a.y + 50 * s, saved ? ui::kInkBright : ui::kSoft, place);
+        c.d->PopClipRect();
+        c.d->AddLine(ImVec2(tx, a.y + 71 * s), ImVec2(text_right, a.y + 71 * s), ui::alpha(ui::kEdge, 0.7f), std::max(1.0f, s));
+        for (int k = 0, hearts = carded ? save_files.hearts[i] : 0; k < hearts; k++) {   // (a heart: two lobes over a point)
+            const float w = 15 * s, hx = tx + w * 0.5f + k * (w + 4 * s), hy = a.y + 90 * s;
+            if (hx + w * 0.5f > text_right) break;
+            if (const ui::Art* heart = ui::art("HeartBase_00")) {   // (the game's own heart: its base in its red, its frame over it)
+                // ((Triforce) 11-18, his picture: the hearts were small and grey. The game's heart is a pale picture in the middle
+                // of a square of margin, which its layout colours and draws larger than its slot: twice the slot's width here,
+                // a slot apart, the base in the load list's red-orange and the frame's line over it a shade lighter)
+                const float slot_w = 21 * s, hw = slot_w * 2.1f, hh2 = hw * heart->h / heart->w, mx = tx + slot_w * 0.5f + k * slot_w;
+                if (mx + slot_w * 0.5f > text_right) break;
+                const ImVec2 ha(mx - hw * 0.5f, hy - hh2 * 0.5f), hb(mx + hw * 0.5f, hy + hh2 * 0.5f);
+                // ((Triforce) 11-18, his next picture: the frame came out right, an orange outline, but the heart inside it dark
+                // brown. HeartBase_00 is the heart's dark ground, not its red: the game lays the fill over it from other layers.
+                // The fill is drawn here, in the load list's red-orange with a lighter upper half, inside the game's own frame)
+                (void)heart;
+                const float fw = slot_w * 0.80f, fy = hy - fw * 0.02f;
+                const ImU32 fill = ui::rgba(238, 92, 48), lit = ui::rgba(250, 128, 70);
+                c.d->AddCircleFilled(ImVec2(mx - fw * 0.24f, fy - fw * 0.13f), fw * 0.27f, fill, 20);
+                c.d->AddCircleFilled(ImVec2(mx + fw * 0.24f, fy - fw * 0.13f), fw * 0.27f, fill, 20);
+                c.d->AddTriangleFilled(ImVec2(mx - fw * 0.49f, fy - fw * 0.02f), ImVec2(mx + fw * 0.49f, fy - fw * 0.02f), ImVec2(mx, fy + fw * 0.50f), fill);
+                c.d->AddCircleFilled(ImVec2(mx - fw * 0.24f, fy - fw * 0.17f), fw * 0.15f, lit, 16);
+                c.d->AddCircleFilled(ImVec2(mx + fw * 0.24f, fy - fw * 0.17f), fw * 0.15f, lit, 16);
+                if (const ui::Art* frame = ui::art("HeartFrame_00")) ui::image(c, frame, ha, hb, ui::rgba(255, 150, 96));
+                continue;
+            }
+            const ImU32 red = ui::rgba(236, 86, 52), rim = ui::rgba(140, 34, 22);
+            c.d->AddCircleFilled(ImVec2(hx - w * 0.25f, hy - w * 0.14f), w * 0.31f, rim, 16), c.d->AddCircleFilled(ImVec2(hx + w * 0.25f, hy - w * 0.14f), w * 0.31f, rim, 16);
+            c.d->AddTriangleFilled(ImVec2(hx - w * 0.55f, hy + w * 0.02f), ImVec2(hx + w * 0.55f, hy + w * 0.02f), ImVec2(hx, hy + w * 0.60f), rim);
+            c.d->AddCircleFilled(ImVec2(hx - w * 0.25f, hy - w * 0.14f), w * 0.25f, red, 16), c.d->AddCircleFilled(ImVec2(hx + w * 0.25f, hy - w * 0.14f), w * 0.25f, red, 16);
+            c.d->AddTriangleFilled(ImVec2(hx - w * 0.46f, hy + w * 0.01f), ImVec2(hx + w * 0.46f, hy + w * 0.01f), ImVec2(hx, hy + w * 0.50f), red);
+            c.d->AddCircleFilled(ImVec2(hx - w * 0.28f, hy - w * 0.20f), w * 0.08f, ui::rgba(255, 190, 160, 200), 8);
+        }
+        if (carded) {   // (the plate: the medallions of light, forest, fire, water, spirit and shadow round it from the top, the stones in its middle)
+            static const int medal_tones[save_file_rows::kMedals] = {ar::kYellow, ar::kGreen, ar::kRed, ar::kBlue, ar::kOrange, ar::kPurple};
+            static const int stone_tones[save_file_rows::kStones] = {ar::kGreen, ar::kRed, ar::kBlue};
+            // (the game's own pictures of them, DataFileImportantIcon_00 to _08, when its archive gave them. kFileIcon: the
+            // picture's number for each of the items' bits. The stones first (forest, fire, water), then the medallions as the
+            // plate has them round it from the top: light, forest, fire, water, spirit, shadow. (11-18: taken first to be in
+            // gpu/vk/oot_cheat_items.h's order, light last: his card had Shadow's picture where Light is held and Light's where
+            // Forest is. _03 is Light, then, and the six go round the plate; _08, Shadow's, was drawn for Light))
+            static const int kFileIcon[save_file_rows::kStones + save_file_rows::kMedals] = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+            const auto game_icon = [&](int bit, ImVec2 m, float r) {
+                char name[32];
+                snprintf(name, sizeof name, "DataFileImportantIcon_%02d", kFileIcon[bit]);
+                const ui::Art* t = ui::art(name);
+                if (!t || t->mask) return false;   // (a mask is a shape without its colours: the drawn icon then)
+                const float hw = r * 1.45f, hh2 = hw * t->h / t->w;
+                ui::image(c, t, ImVec2(m.x - hw, m.y - hh2), ImVec2(m.x + hw, m.y + hh2));
+                return true;
+            };
+            const ImU32 socket = ui::rgba(30, 22, 12, 230);
+            c.d->AddNgonFilled(wc, R, ui::rgba(74, 56, 30, 240), 6);
+            c.d->AddNgon(wc, R, ui::alpha(ui::kEdge, 0.9f), 6, std::max(1.0f, 1.3f * s));
+            for (int k = 0; k < save_file_rows::kMedals; k++) {
+                const float ang = -1.5707963f + k * 1.0471976f, r = R * 0.19f;
+                const ImVec2 m(wc.x + std::cos(ang) * R * 0.66f, wc.y + std::sin(ang) * R * 0.66f);
+                if (!(save_files.items[i] >> (save_file_rows::kStones + k) & 1)) c.d->AddCircleFilled(m, r, socket, 24);
+                else if (game_icon(save_file_rows::kStones + k, m, r)) {}
+                else ach_icon(c, m, r, ar::kMedal | medal_tones[k] << 4, true);
+            }
+            for (int k = 0; k < save_file_rows::kStones; k++) {
+                const float r = R * 0.17f;
+                const ImVec2 m(wc.x + (k - 1) * R * 0.36f, wc.y);
+                if (!(save_files.items[i] >> k & 1)) c.d->AddCircleFilled(m, r, socket, 24);
+                else if (game_icon(k, m, r)) {}
+                else ach_icon(c, m, r, ar::kGem | stone_tones[k] << 4, true);
+            }
+        }
+        if (i == files_choice) ui::glow(c, a, b);
+        hits.add(a.x, a.y, b.x, b.y, menu_hit::kListLine, i);
+    }
+    if (n > 0 && !waiting) {   // (the chosen file's action, for the mouse)
+        const float my = bar - 14 * s - 29 * s, bw = ui::size_of(c.f.strong, 18 * s, "Switch file").x + 36 * s;
+        const ImVec2 a(right - bw, my - 17 * s), b(right, my + 17 * s);
+        ui::button(c, a, b, act, false);
+        hits.add(a.x, a.y, b.x, b.y, menu_hit::kButton, 0);
+    }
+    ui::prompt_bar(c, prompts, (int)(sizeof prompts / sizeof prompts[0]));
+}
+
 /// (Triforce) The notice of an achievement earned: a plate at the top of the screen, its icon, "Achievement earned" and its
-/// name, slid in from above and out again (achievement_rows.h notice_in). Over the game and over the options alike
+/// name, slid in from above and out again (achievement_rows.h notice_in). Over the game and over the options alike.
+/// ((Triforce) 11-23: and under the name where the list is, kAchWhere: the moment a player wants to know)
+constexpr char kAchWhere[] = "See all: Options > System";
 void draw_ach_notice(ui::Ctx& c) {
     const int slot = ach_notice;
     if (slot < 0 || slot >= ach_list.shown()) return;
     const float k = achievement_rows::notice_in((prof_now() - ach_notice_at) / 1000000, kAchNoticeMs);
     if (k <= 0) return;
     const float s = c.s, in = 1 - (1 - k) * (1 - k), r = 26 * s, pad = 16 * s;
-    const float text_w = std::max(ui::size_of(c.f.strong, 21 * s, ach_list.names[slot]).x, ui::size_of(c.f.strong, 13.5f * s, "Achievement earned").x);
-    const float w = pad + 2 * r + 16 * s + text_w + 28 * s, h = 76 * s;
+    const float text_w = std::max({ui::size_of(c.f.strong, 21 * s, ach_list.names[slot]).x, ui::size_of(c.f.strong, 13.5f * s, "Achievement earned").x,
+                                   ui::size_of(c.f.body, 12 * s, kAchWhere).x});
+    const float w = pad + 2 * r + 16 * s + text_w + 28 * s, h = 94 * s;
     const ImVec2 a((c.w - w) * 0.5f, -h + (h + 34 * s) * in), b(a.x + w, a.y + h);
     // ((Triforce) 11-18: the game's own plate, as the file select's cards and the Achievements page's, with a gold rim; it was a
     // dark rounded box of the menu's own)
@@ -4939,6 +5709,7 @@ void draw_ach_notice(ui::Ctx& c) {
     const float tx = a.x + pad + 2 * r + 16 * s;
     ui::text_mid(c, c.f.strong, 13.5f * s, tx, a.y + 25 * s, ui::kGoldHi, "Achievement earned");
     ui::text_mid(c, c.f.strong, 21 * s, tx, a.y + 51 * s, ui::kInkBright, ach_list.names[slot]);
+    ui::text_mid(c, c.f.body, 12 * s, tx, a.y + 75 * s, ui::kSoft, kAchWhere);
 }
 
 void draw_ask(ui::Ctx& c) {
@@ -5141,6 +5912,7 @@ void draw_menu(ui::Ctx& c, bool perf_under) {
     else if (page == 6) draw_names(k);   // ((Triforce) Game flags, Cutscenes, Scan amiibo)
     else if (page == kModsPage) draw_mods(k);
     else if (page == kAchPage) draw_achievements(k);   // ((Triforce) the System tab's Achievements)
+    else if (page == kFilesPage) draw_files(k);        // ((Triforce) the title's file select, and the System tab's Save files)
     else draw_options(k);
     if (on_game) c.d->PopClipRect();
     int perf0 = 0, perf1 = 0;   // (the Full panel's vertices: in the window's pixels already)
@@ -5511,6 +6283,15 @@ void menu_init() {
         const char* hearts = getenv("HOS_OOT_PROTECT_HEARTS");
         protect_hearts.store(hearts && !strcmp(hearts, "1"));
     }
+    if (host && host->screens) {   // ((Triforce) the connected screens, as the host found them at the start: before the file,
+                                   // which an old Ultrawide row is read with)
+        MkwVkScreen list[16];
+        const int n = host->screens(list, 16);
+        for (int i = 0; i < n; i++) {
+            list[i].name[sizeof list[i].name - 1] = 0;
+            screen_add(list[i].w, list[i].h, list[i].name, list[i].opens != 0);
+        }
+    }
     if (FILE* f = fopen(ini_path().c_str(), "r")) {
         has_options = true;
         char line[80];
@@ -5541,9 +6322,18 @@ void menu_init() {
             if (!strcmp(line, "gpu_device_name")) gpu_want = mic_key(eq + 1);   // ((Triforce) 11-20: the GPU device row's card, by its name)
         }
         fclose(f);
+        {   // ((Triforce) Custom's size from the file's own two numbers, not each kept to its row's ends: custom_rows_read)
+            const auto side = [](const char* key) {
+                const auto at = ini_base.find(key);
+                return at == ini_base.end() ? 0L : atol(at->second.c_str());
+            };
+            custom_rows_read(side("output_width"), side("output_height"));
+            const auto remembered = ini_base.find("output_custom_size");
+            if (remembered != ini_base.end()) read_remembered_custom(remembered->second.c_str());
+        }
         // ((Triforce) options_version 8 (7 in the 436f9ac-based builds; v0.5.1's 7 still had the rows): the handheld profile is
         // an Output resolution, the shared stick dead zone each stick's own; the other rows that went keep nothing to move (merged_rows.h kDropped). Before the values at the start are taken)
-        merged_rows::migrate(version, before7, opts.output_res, opts.lstick_dead_zone, opts.rstick_dead_zone);
+
         hdr_at_start = opts.hdr;   // (local, RenoDX port: vk_menu.h)
         renodx_at_start = opts.renodx, upscale_pre_at_start = opts.upscale_pre;
         tex_detail_at_start = opts.tex_detail;
@@ -5582,12 +6372,16 @@ void menu_init() {
         if (version < 7) opts.pace = 1;
         // ((Triforce, 11-16, the owner: "remove monitors shape as a option keep 16:9 16:10 21:9 32:9") Before options_version 6
         // the Ultrawide row's 1 was Monitor's shape; now it is 16:10. Such a file's 1 becomes the shape nearest the main
-        // monitor's, as host/hos_main.c read it at this start (ultrawide_rows.h)
-#ifdef _WIN32
-        opts.ultrawide = ultrawide_row_read(opts.ultrawide, version, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
-#else
-        opts.ultrawide = ultrawide_row_read(opts.ultrawide, version, 0, 0);
-#endif
+        // monitor's, as host/hos_main.c read it at this start (ultrawide_rows.h), on every system (main_screen)
+        opts.ultrawide = ultrawide_row_read(opts.ultrawide, version, (int)main_screen().w, (int)main_screen().h);
+        // ((Triforce) Before options_version 8 the sizes 5120x1440 and 5120x2160 were the game's frame, and the Ultrawide row
+        // gave the picture's shape there too: with the row on another shape than theirs, the 16:9 size of their height, which
+        // gives that picture now, as host/nn_applet.c read it at this start (output_sizes.h output_res_read))
+        const bool legacy_output = output_legacy_file(version, ini_base.count("output_width") || ini_base.count("output_height") || ini_base.count("output_custom_size"));
+        opts.output_res = output_file_read(opts.output_res, version, opts.ultrawide,
+                                          ini_base.count("output_width") || ini_base.count("output_height") || ini_base.count("output_custom_size"));
+        merged_rows::migrate(legacy_output && version == 8 ? 7 : version, before7,
+                             opts.output_res, opts.lstick_dead_zone, opts.rstick_dead_zone);
     }
     // An opt-in profile for 4 GB cards: keep existing options authoritative, but make a first run usable on
     // low-VRAM hardware without requiring the menu to render first. ((Triforce, options_version 7) What the Quality preset's
@@ -5610,6 +6404,7 @@ void menu_init() {
     if (const char* e = getenv("HOS_REALTIME_STEP")) opts.realtime = atoi(e) != 0;
     if (const char* e = getenv("HOS_DYNRES")) opts.resolution = atoi(e) != 0 ? 0 : 1;
     if (const char* e = getenv("HOS_OUTPUT_RES")) opts.output_res = output_choice(atoi(e));
+    output_adopt_screen();   // (an old file's Screen: that screen's size, as a size)
     lang_load();   // (Triforce: the Game language row, from language.txt)
     merged_sync();   // ((Triforce, options_version 7) the merged rows from what was read)
     restart_init();   // (what this run started with: the rows that take a restart differ from it once changed)
@@ -5695,6 +6490,7 @@ int menu_take_amiibo_ask() {
     return amiibo_ask.take();
 }
 int menu_take_mod_cheat() { return mod_cheats.take(); }   // (Triforce: a mod's cheat the player switched, for the host)
+int menu_take_file_ask() { return save_files.take_ask(); }   // (Triforce: the save file chosen that is not this run's, for the host)
 
 // ---- (Triforce) the options' own sounds: the game's interface sounds, after NX2navi's menu sounds. menu_tick says which
 // (menu_sound_events.h), the host's sound thread takes them (vk_api.h HOS_OPT_MENU_SOUND) and plays them from the player's
@@ -5710,6 +6506,13 @@ static_assert(menu_sound::kOpen == HOS_MENU_SOUND_OPEN && menu_sound::kClose == 
 static_assert(menu_sound::kPageAsk == 5, "the restart question is page 5");
 static menu_sound::Queue sound_queue;
 constexpr int kSoundPageMotion = 7;   // (the Motion page is a tab no strip shows, opened from a row of Controls: a page, to the ear)
+// ((Triforce, 11-22, N64 Classic, after the owner's test: "do a pass for the SfX playing in the new sub menu") and the
+// Remembered page, opened from a row of Graphics, likewise. As Graphics' rows alone its opening and its Back were silent:
+// both take their press for themselves (press[7], press[5] false again by the sound's turn), and the row and value the
+// cursor stood on could be the same number on both)
+constexpr int kSoundPageN64 = 10;
+static_assert(kSoundPageN64 != kModsPage && kSoundPageN64 != kModsRowPage && kSoundPageN64 != kSoundPageMotion,
+              "the Remembered page's page, to the ear, is a number of its own");
 /// What the options show now, as far as their sounds go (menu_sound::State): menu_tick takes it before and after its input
 static menu_sound::State sound_state() {
     menu_sound::State s;
@@ -5717,8 +6520,9 @@ static menu_sound::State sound_state() {
     if (!s.open) return s;
     s.embedded = embed_open || game_options_shown();
     const bool motion = page == 0 && cur_tab == TAB_MOTION;
-    s.page = motion ? kSoundPageMotion : page;
-    s.tab = motion ? (int)TAB_CONTROLS : cur_tab;
+    const bool n64_page = page == 0 && cur_tab == TAB_N64;   // ((Triforce, N64 Classic) the Remembered page)
+    s.page = motion ? kSoundPageMotion : n64_page ? kSoundPageN64 : page;
+    s.tab = motion ? (int)TAB_CONTROLS : cur_tab == TAB_N64 ? (int)TAB_GRAPHICS : cur_tab;   // ((Triforce, N64 Classic) under Graphics)
     auto hashed = [](const std::string& t) {
         int64_t h = 1469598103934665603LL;
         for (const char ch : t) h = (h ^ (unsigned char)ch) * 1099511628211LL;
@@ -5759,12 +6563,16 @@ static menu_sound::State sound_state() {
         s.mode = names_edit ? menu_sound::kModeEdit : menu_sound::kModeNone;
     } else if (page == kAchPage) {
         s.cursor = ach_view.choice, s.group = ach_view.page;
+    } else if (page == kFilesPage) {
+        s.cursor = files_choice, s.mode = files_wait >= 0 ? menu_sound::kModeConfirm : menu_sound::kModeNone;
     }
     return s;
 }
 int menu_take_sound() { return sound_queue.take(prof_now()); }   // (the options' next sound, for the host's sound thread)
 void mods_sound(int id) { if (opts.menu_sounds > 0) sound_queue.put(id, prof_now()); }   // ((Triforce) the Mods entry's and screen's own sounds
-int menu_mods_selected() { return open_now.load(std::memory_order_relaxed) && (page == kModsRowPage || page == kModsPage); }
+int menu_mods_selected() {   // ((Triforce) and the file select opened from Save Select, the entry under Mods on the title)
+    return open_now.load(std::memory_order_relaxed) && (page == kModsRowPage || page == kModsPage || (page == kFilesPage && files_at_title));
+}
 /// ((Triforce, 11-20) the owner: "have the in game mods menu in the title screen play the shop theme quietly in the
 /// background ... it mutes the title screen music's audio while in the mod menu and fades in/out". What the host's sound
 /// thread asks each block (host/mods_music.c): 2 while the Mods screen is open from the title's list, 1 while that list is
@@ -5795,13 +6603,14 @@ void menu_note_present_sizes(uint32_t picture_w, uint32_t picture_h, uint32_t wi
     const PresentAspect aspect{host && host->aspect_ratio ? host->aspect_ratio() : 0.0f};
     const PresentRect place = present_rect(picture_w, picture_h, nullptr, window_w, window_h, aspect);
     const bool native_hdr = dev.hdr && opts.hdr == 2;
-    const int filter = ur::window_filter(picture_w, picture_h, place.w, place.h, native_hdr);
+    // ((Triforce, 11-22, N64 Classic, step 4) its TV in the filter's place while it runs, at 1:1 too (upscaler_rows.h tv_filter)
+    const int filter = ur::tv_filter(ur::window_filter(picture_w, picture_h, place.w, place.h, native_hdr), n64_tv_now(native_hdr));
     const bool same = picture_w == place.w && picture_h == place.h;
     const int tell = filter * 4 + native_hdr * 2 + same;
     static int told = -1;
     if (tell != told)
         logf("menu: the window's filter: %s (the picture %ux%u, shown at %ux%u)",
-             filter == 3 ? "AMD FSR 1" : same ? "none, the sizes are the same"
+             filter == ur::kTvFilter ? "N64 Classic's TV" : filter == 3 ? "AMD FSR 1" : same ? "none, the sizes are the same"
              : native_hdr ? "the plain copy (HDR Native: its 10 bits kept)" : "the plain copy",
              picture_w, picture_h, place.w, place.h);
     told = tell;
@@ -6013,10 +6822,11 @@ static void perf_sample(double shown, double game) {
         if (holder != mkwvk::pace::GAME) strncat(t, holder == mkwvk::pace::RTSS ? " (RivaTuner)" : " (NVIDIA Reflex)", sizeof t - strlen(t) - 1);
         set(4, t);
         set(5, tx_onoff(opts.vsync));
-        set(6, tx_ultrawide(opts.ultrawide));
+        set(6, shape_now(opts.ultrawide));   // ((Triforce) the Output resolution's own shape where it has one)
         unsigned ow = 0, oh = 0;
         t[0] = 0;
-        if (sscanf(tx_output_res(opts.output_res), "%ux%u", &ow, &oh) == 2 && oh) snprintf(t, sizeof t, "%up", oh);
+        oh = shown_output().h, ow = shown_output().w;   // ((Triforce) Screen's and Custom's too)
+        if (ow && oh) snprintf(t, sizeof t, "%up", oh);
         set(7, t);
         set(8, tx_hdr(opts.hdr));
         set(9, perf_framegen_text(t, sizeof t));   // (what makes the frames, by name, as NX2navi's)
@@ -6075,6 +6885,19 @@ void menu_option_set(int id, int value) {
     if (id == HOS_OPT_GAME_OPTIONS) {   // (Triforce: the game's own Options screen runs: each frame it does)
         game_options_ns.store(value ? prof_now() : 0, std::memory_order_relaxed);
         game_options_from_pause.store(value == 2, std::memory_order_relaxed);
+        return;
+    }
+    // (Triforce: the save files, named by the host once this renderer answers, and its word on a file chosen: host/save_files.c)
+    if (id == HOS_OPT_FILES_TEXT) return save_files.text(value);
+    if (id == HOS_OPT_FILES_ADD) return save_files.add(value);
+    if (id == HOS_OPT_FILES_COUNT) {
+        save_files.done(value);
+        menu_refresh = true;
+        return;
+    }
+    if (id == HOS_OPT_FILES_SAID) {
+        save_files.said(value);
+        menu_refresh = true;
         return;
     }
     // (Triforce: the achievements, named by the host once this renderer answers, and each one earned as it is:
@@ -6249,7 +7072,7 @@ void tab_move(int dir) {
     int entry[TAB_COUNT + 2], n = 0;
     for (int t = 0; t < TAB_DEBUG; t++) entry[n++] = t;
     if (debug_shown()) entry[n++] = TAB_DEBUG;
-    const int from = page == kModsPage ? kModsTab : cur_tab == TAB_MOTION ? TAB_CONTROLS : cur_tab;
+    const int from = page == kModsPage ? kModsTab : cur_tab == TAB_MOTION ? TAB_CONTROLS : cur_tab == TAB_N64 ? TAB_GRAPHICS : cur_tab;
     int at = 0;
     while (at < n - 1 && entry[at] != from) at++;
     if (embed_open && ((dir < 0 && at == 0) || (dir > 0 && at == n - 1))) {
@@ -6560,7 +7383,8 @@ void menu_tick() {
             page = enter == 2 && !decide ? kModsPage : kModsRowPage;
             // ((Triforce) 11-19: 3, Quit clicked: its dialog opens; 4, the mouse moved onto Quit: it has the cursor)
             mods_row_sel = enter == 3 || enter == 4 ? 1 : 0, quit_gone(), quit_sel = 0;
-            if (enter == 3) quit_open();
+            if (enter == 3 && !mods_title_list()) quit_open();
+            if (enter == 3 && files_row_shown()) files_open(true);   // ((Triforce) on the title it is Save Select: the file select at once)
             entered_by_down = enter == 1 || enter == 5;
             // ((Triforce, 11-19) 5: a Down held from higher up the game's list, its repeat onto Mods: held on, it repeats
             // on at the step (the repeat below takes it as held past the first delay), as the game's list went on)
@@ -6579,6 +7403,18 @@ void menu_tick() {
             logf("menu: the host's word %d for the Mods entry not taken: %s", enter,
                  open_now.load() ? "the menu is open" : "the game's list was last told of too long ago");
         }
+    }
+    // (Triforce) the host's word on a file chosen at the file select: kept as the next start's, the game restarts as Restart now does; or not kept)
+    if (const int said = save_files.take_said()) {
+        files_wait = -1, menu_refresh = true;
+        if (said == save_file_rows::kRestart) {
+            save();
+            pipeline_cache_save(true);
+            memory_trial_orderly_end();
+            logf("menu: restart (another save file)");
+            open_now = false, page = 0;
+            if (const HWND window = app_window()) PostMessageA(window, WM_APP + 9, 0, 0);
+        } else files_failed = true;
     }
     if (!open_now.load() || page != kModsPage) {   // ((Triforce) no text taken off the Mods screen: none kept for it either)
         mods_text_wanted.store(false, std::memory_order_relaxed);
@@ -6742,6 +7578,24 @@ void menu_tick() {
             next = next[n] == ',' ? next + n + 1 : nullptr;
         }
     }
+    {   // ((Triforce, 11-22, N64 Classic, step 5) F7: N64 Classic between Off and the last preset (n64_rules.h Toggle, the last
+        // kept as n64_classic_last), saved as the row is, said at the foot of the screen; not while RX_VK_N64 sets it for the run.
+        // The last preset follows the row too, whoever chose it
+        static bool f7_held = false;
+        if (opts.n64_classic == n64_rules::FAITHFUL || opts.n64_classic == n64_rules::REMEMBERED) opts.n64_last = opts.n64_classic;
+        const bool f7_down = mine && (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+        if (f7_down && !f7_held && !n64_env_set()) {
+            n64_rules::Toggle toggle;
+            toggle.last = opts.n64_last;
+            opts.n64_classic = toggle.pressed(opts.n64_classic);
+            opts.n64_last = toggle.last;
+            save();
+            snprintf(notice_text, sizeof notice_text, "N64 Classic: %s", n64_rules::name(opts.n64_classic));
+            notice_until = prof_now() + 2000000000LL;
+            logf("menu: F7: N64 Classic %s", n64_rules::name(opts.n64_classic));
+        }
+        f7_held = f7_down;
+    }
     {   // (Triforce) F8, a bug capture. The window's key handler asks the host for it itself (host/display.c); where the host has
         // no queue of key presses (Linux) the key is read here, and asked for as the rows ask
         static bool f8_held = false;
@@ -6756,7 +7610,8 @@ void menu_tick() {
         notice_until = prof_now() + 4000000000LL;
     }
     // ((Triforce) an achievement earned: its notice, from now for kAchNoticeMs)
-    if (const int earned = ach_list.take_fresh(); earned >= 0) ach_notice = earned, ach_notice_at = prof_now();
+    // ((Triforce) 11-23: not with the Achievement notices row Off; the list has it as earned all the same)
+    if (const int earned = ach_list.take_fresh(); earned >= 0 && opts.achievement_notices) ach_notice = earned, ach_notice_at = prof_now();
     if (cur_tab == TAB_DEBUG && !debug_shown()) cur_tab = TAB_DISPLAY;
     {   // (Triforce) presses the host passed on while the Mods entry or its screen has the cursor (a test's scripted ones)
         const int mp = mods_press.exchange(0, std::memory_order_relaxed);
@@ -6883,6 +7738,8 @@ void menu_tick() {
             if (!game_tab_read) gp.pressed = 0, game_tab_read = true;   // (pressed before the tabs were shown: not theirs)
             int ix = 0, iy = 0;
             menu_hit::to_image(gp.x, gp.y, gp.width, gp.height, (int)dev.swap_extent.width, (int)dev.swap_extent.height, &ix, &iy);
+            // ((Triforce, 11-22, N64 Classic) the tabs drawn under its TV: the cursor where the curve showed them)
+            if (options_under_tv) n64_screen_point(&ix, &iy, (int)dev.swap_extent.width, (int)dev.swap_extent.height);
             const menu_hit::Hit hit = on ? hits.at(game_tab_map.back_x((float)ix), game_tab_map.back_y((float)iy)) : menu_hit::Hit{};
             hover_tab = hit.part == menu_hit::kTab && hit.index != kGameTab ? hit.index : -1;
             if (on && (gp.pressed & HOS_MOUSE_LEFT)) {
@@ -6921,6 +7778,8 @@ void menu_tick() {
         int ix = 0, iy = 0;
         menu_hit::to_image(ptr.x, ptr.y, ptr.width, ptr.height, (int)dev.swap_extent.width, (int)dev.swap_extent.height,
                            &ix, &iy);
+        // ((Triforce, 11-22, N64 Classic) the options drawn under its TV: the cursor where the curve showed them)
+        if (options_under_tv) n64_screen_point(&ix, &iy, (int)dev.swap_extent.width, (int)dev.swap_extent.height);
         if (mouse) mx = (int)std::floor(menu_map.back_x((float)ix)), my = (int)std::floor(menu_map.back_y((float)iy));   // (the menu's column's pixels: draw_menu)
         // ((Triforce) the first read takes no click: one from before the menu opened is not its own. The window keeps the
         // clicks on the game's Options screen for its tabs over the header, host/display.c game_menu_press)
@@ -7119,6 +7978,30 @@ void menu_tick() {
             else teleport_choice = std::clamp(teleport_step_rows(teleport_choice, rows) + (press[4] - press[3]), 0, kTeleports - 1);
             if (teleport_choice != was) teleport_follow = true, changed = true;
         }
+    } else if (open_now.load() && page == kFilesPage) {   // (Triforce) the file select: the choice moves, confirm plays the file
+        const int n = save_files.shown();
+        if (mouse) {   // (a card chosen by a click, the button plays it; a right click goes back)
+            const menu_hit::Hit hit = hits.at((float)mx, (float)my);
+            if ((ptr.pressed & HOS_MOUSE_LEFT) && hit.part == menu_hit::kListLine && hit.index >= 0 && hit.index < n && files_wait < 0)
+                changed |= files_choice != hit.index, files_choice = hit.index;
+            else if ((ptr.pressed & HOS_MOUSE_LEFT) && hit.part == menu_hit::kButton && hit.index == 0) press[7] = true;
+            if (ptr.pressed & HOS_MOUSE_RIGHT) press[5] = true;
+        }
+        // (Back from the title's: the cursor on Save Select again; Play there, or the list gone: the game's list. From its row:
+        // the System tab, the row still selected)
+        const auto leave = [&](bool play) {
+            if (files_at_title && !play && mods_list_fresh() && files_row_shown()) page = kModsRowPage, mods_row_sel = 1;
+            else if (files_at_title) open_now = false, page = 0;
+            else page = 0;
+            changed = true;
+        };
+        if (files_wait >= 0) {}   // (asked of the host: its word comes at the next tick or two, menu_tick's top)
+        else if (press[5] || !n) leave(false);
+        else if (press[7]) {
+            files_failed = false;
+            if (save_files.choose(files_choice)) leave(true);   // (the file this run plays: on with it)
+            else files_wait = files_choice, changed = true;
+        } else changed |= save_file_rows::move(files_choice, press[2] - press[1], press[15], press[16], n);
     } else if (open_now.load() && page == kAchPage) {   // (Triforce) the Achievements page: nothing to set, the choice moves
         const int n = ach_list.shown();
         if (mouse) {   // (a card chosen by a click, the page arrows, the wheel a page; a right click goes back)
@@ -7142,7 +8025,9 @@ void menu_tick() {
         }
     } else if (open_now.load() && page == kModsRowPage) {   // (Triforce) the cursor on the entries under the game's list
         const bool quit_here = quit_entry_shown();
-        if (!quit_here) mods_row_sel = 0, quit_gone();
+        const bool files_here = files_row_shown();   // ((Triforce) on the title Save Select is under Mods, as Quit is here)
+        if (!quit_here && !files_here) mods_row_sel = 0;
+        if (!quit_here) quit_gone();
         // ((Triforce, 11-19) the dialog takes input once its In has played, as the game's: what comes before is not kept)
         const bool quit_ready = quit_ask && focus_anim::window_ready(prof_now() - quit_open_ns);
         if (mouse) {   // (the cursor on an entry or a dialog button chooses it; a click is A)
@@ -7177,6 +8062,10 @@ void menu_tick() {
                 changed = true;
             } else if (press[5] || press[0] || press[6]) quit_cancel(), mods_sound(HOS_MENU_SOUND_CANCEL), changed = true;
             press[1] = press[2] = press[5] = press[0] = press[6] = false, tab_left = tab_right = false;
+        } else if (press[7] && files_here && mods_row_sel == 1) {   // ((Triforce) A on Save Select: the file select)
+            files_open(true), mods_sound(HOS_MENU_SOUND_SYS_DECIDE), changed = true;
+        } else if (press[2] && files_here && mods_row_sel == 0) {   // ((Triforce) Down from the title's Mods: Save Select)
+            mods_row_sel = 1, mods_sound(HOS_MENU_SOUND_SYS_CURSOR), changed = true;
         } else if (press[7]) {   // (A: Mods opens; on Quit its dialog)
             if (mods_row_sel == 1) quit_open(), mods_sound(HOS_MENU_SOUND_SYS_DECIDE), changed = true;
             else if (mods_title_list()) mods_decide_ns = prof_now(), mods_sound(HOS_MENU_SOUND_SYS_DECIDE), changed = true;   // (its Decide first)
@@ -7253,12 +8142,15 @@ void menu_tick() {
             if (ptr.wheel && drag_row < 0) wheel_rows[cur_tab] += ptr.wheel, changed = true;
         }
         if (press[5] && cur_tab == TAB_MOTION) cur_tab = TAB_CONTROLS, press[5] = false, changed = true;   // (back)
+        if (press[5] && cur_tab == TAB_N64) cur_tab = TAB_GRAPHICS, press[5] = false, changed = true;   // ((Triforce, N64 Classic) back)
         if (press[5] && pending) pending = nullptr, changed = true;   // (a Restart or Quit waiting for its second press: cancelled)
         else if (press[5] && cur_tab == TAB_MOTION) cur_tab = TAB_CONTROLS, press[5] = false, changed = true;   // (back)
+        else if (press[5] && cur_tab == TAB_N64) cur_tab = TAB_GRAPHICS, press[5] = false, changed = true;   // ((Triforce, N64 Classic))
         else if (press[5] && restart_ask()) page = 5, ask_sel = 0, changed = true;   // (the restart question first)
         else if (press[5]) open_now = false;
         // (the tabs: LB and RB, Q and E, or Tab; from the Motion page, as from Controls)
         if ((tab_left || tab_right) && cur_tab == TAB_MOTION) cur_tab = TAB_CONTROLS;
+        if ((tab_left || tab_right) && cur_tab == TAB_N64) cur_tab = TAB_GRAPHICS;   // ((Triforce, N64 Classic) as from Graphics)
         if (tab_left || tab_right) {   // (inside the game's Options: past our first or last tab is the game's own again; Mods
                                        // after System: tab_move)
             tab_move(tab_left ? -1 : 1);
@@ -7293,7 +8185,17 @@ void menu_tick() {
         else if (mod_cheat_slot(r.name) >= 0) changed |= mod_cheats.press(mod_cheat_slot(r.name), press[3], press[4], press[7]);
         else if (press[7] && share_row(r)) share_press(share_row(r)), press[7] = false, changed = true;   // (Triforce: the host does it)
         else if (press[7] && is_ach_row(r)) page = kAchPage, ach_view.reveal(ach_capacity), press[7] = false, changed = true;
+        else if (press[7] && r.name == kUseWindowSize) {
+            use_window_size(dev.swap_extent.width, dev.swap_extent.height);
+            press[7] = false;
+            changed = true;
+        }
+        else if (press[7] && is_files_row(r)) files_open(false), press[7] = false, changed = true;
         else if (press[7] && is_motion_row(r)) cur_tab = TAB_MOTION, tab_selected[TAB_MOTION] = 0, press[7] = false, changed = true;
+        // ((Triforce, 11-22, N64 Classic) Remembered settings opens its page; the page's two actions act on a press)
+        else if (press[7] && is_n64_page_row(r)) cur_tab = TAB_N64, tab_selected[TAB_N64] = 0, press[7] = false, changed = true;
+        // (its press kept: the sound's confirm, kDecide. The row has no value, and nothing after this takes press[7] for it)
+        else if (press[7] && n64_action(r)) n64_act(n64_action(r)), changed = true;
         else if (press[7] && !r.value && can_bind()) page = 1, csel = 0, ccol = 0, changed = true;
         if ((press[3] || press[4] || press[7]) && r.value) {   // (Enter, or A, as Right)
             if (press[7]) press[4] = true;
@@ -7463,20 +8365,113 @@ void draw_bench(ui::Ctx& c, const MkwVkBench& b) {
     if (b.phase < MKWVK_BENCH_DONE) c.d->AddText(body, small, ImVec2(x0, y), faint, "Esc stops the benchmark");
 }
 
-void menu_record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h) {
-    const bool start = startup_on.load(std::memory_order_acquire);
-    static MkwVkBench bench;   // ((Triforce) benchmark mode: its panel over everything else)
-    const bool bench_on = bench_now(&bench);
-    if (!start) bugshot_record(cmd, index, w, h);   // (Triforce: a bug capture's picture of this frame, before anything is drawn over it)
-    const bool fps = opts.show_fps && !start;   // (no game frames yet: not "0 FPS" over the start-up screen)
-    const bool open = open_now.load(std::memory_order_relaxed);
-    const bool note = !open && !start && notice_text[0] && prof_now() < notice_until;
+namespace {
+/// (Triforce) What the overlays show at a present, asked once (menu_tv_layer's, or menu_record's)
+struct Showing {
+    bool start = false, fps = false, open = false, note = false, game_tab = false, mods_row = false, bench_on = false;
+    bool earned = false;   // ((Triforce, 11-23) an achievement's notice (draw_ach_notice), flat over the TV as the notice
+};
+MkwVkBench overlay_bench;   // ((Triforce) benchmark mode: its panel over everything else)
+Showing showing_now() {
+    Showing s;
+    s.start = startup_on.load(std::memory_order_acquire);
+    s.bench_on = bench_now(&overlay_bench);
+    s.fps = opts.show_fps && !s.start;   // (no game frames yet: not "0 FPS" over the start-up screen)
+    s.open = open_now.load(std::memory_order_relaxed);
+    s.note = !s.open && !s.start && notice_text[0] && prof_now() < notice_until;
     // (Triforce: the game's own Options screen is up and none of our tabs: its header's tabs alone)
     const int64_t game_seen = game_options_ns.load(std::memory_order_relaxed);
-    const bool game_tab = !open && !start && embed_allowed() && game_seen && prof_now() - game_seen < 250000000LL && embed_since;
-    const bool mods_row = !open && !start && (mods_list_fresh() || mods_title_fading());   // ((Triforce) the Mods entry under the game's list)
-    const bool earned = !start && ach_notice >= 0 && prof_now() - ach_notice_at < kAchNoticeMs * 1000000;   // ((Triforce) an achievement's notice)
-    if (!start && !fps && !open && !note && !game_tab && !mods_row && !bench_on && !earned) {   // (nothing shows: no ImGui frame, no render pass)
+    s.game_tab = !s.open && !s.start && embed_allowed() && game_seen && prof_now() - game_seen < 250000000LL && embed_since;
+    s.mods_row = !s.open && !s.start && (mods_list_fresh() || mods_title_fading());   // ((Triforce) the Mods entry under the game's list)
+    s.earned = !s.start && ach_notice >= 0 && prof_now() - ach_notice_at < kAchNoticeMs * 1000000;   // ((Triforce) an achievement's notice)
+    return s;
+}
+/// The overlays of a w x h window, after ui::begin. ((Triforce, 11-22, N64 Classic) under: the list the options' own screens
+/// go into (the open menu, the game tab's header, the Mods entry; the Full panel while it is under them), for N64 Classic's TV
+/// to take in (menu_tv_layer); null: one list for all, as before. The FPS counter, the notice and benchmark mode's panel stay
+/// over the window, flat: a counter in a corner the curve takes away is no counter)
+void draw_overlays(uint32_t w, uint32_t h, const Showing& s, ImDrawList* under) {
+    {   // (the easing's step: the time since the last drawing, a quarter of the way in 1/60 s)
+        static int64_t last = 0;
+        const int64_t now = prof_now();
+        ease_step = last ? std::min(1.0f, (float)((now - last) / 1e9) * 15.0f) : 1.0f;
+        last = now;
+        ease_live = true;
+    }
+    ui::Ctx c = menu_ctx(w, h);
+    prebake(c);   // (the menu's glyphs at this size, before it opens: no hitch then)
+    if (s.start) {   // (under the menu, in the overlay's own fonts)
+        ui::Ctx sc = ui_ctx(w, h);
+        draw_startup(sc);
+    }
+    ui::Ctx m = c;   // (the options' own screens)
+    if (under) m.d = under;
+    // ((Triforce) Full: NX2navi's panel alone, no counter beside it (its perf_draw), and under the options or the game tab's
+    // header while they show (its BringWindowToDisplayBack): the open menu covers it)
+    const bool full = s.fps && opts.show_fps == 2;
+    // ((Triforce, 11-19) the Mods entry's page: the panel over Quit's dialog and its dim, as over the game's own dialogs, which
+    // the game draws under every overlay. The lab's "its dim covers the left part of the stats overlay")
+    const bool over_row = s.open && page == kModsRowPage;
+    if (s.open) draw_menu(m, full && !over_row);
+    else {
+        if (full) draw_perf(s.game_tab || s.mods_row ? m : c);   // (under the header or the entry: in their list)
+        if (s.game_tab) draw_game_tab(m);
+        else if (s.mods_row) draw_mods_row_shut(m);
+    }
+    if (full && over_row) draw_perf(c);
+    if (s.fps && !full) draw_fps(c, (s.open && page != kModsRowPage) || s.game_tab);   // ((Triforce) the Mods entry: the counter stays where the game list has it)
+    if (s.note) draw_notice(c);
+    if (s.earned) draw_ach_notice(c);   // ((Triforce, 11-23) flat on top, as the notice
+    if (s.bench_on) {   // ((Triforce) benchmark mode's panel, in the overlay's own fonts, over the rest
+        ui::Ctx bc = ui_ctx(w, h);
+        draw_bench(bc, overlay_bench);
+    }
+}
+// ((Triforce, 11-22, N64 Classic) this present's overlays were drawn by menu_tv_layer: menu_record draws what is left of them
+// (tv_drawn); or it asked what shows and drew nothing: menu_record takes its answer, so benchmark mode is asked once a present)
+bool tv_drawn = false;
+bool tv_layer = false;   // (...and the options are in its layer: the mouse goes through the TV's curve to them)
+bool tv_asked = false;
+Showing tv_showing;
+} // namespace
+
+VkImageView menu_tv_layer(VkCommandBuffer cmd) {
+    tv_drawn = tv_layer = tv_asked = false;
+    static const bool on = !(getenv("RX_VK_N64_TV_MENU") && *getenv("RX_VK_N64_TV_MENU") && atoi(getenv("RX_VK_N64_TV_MENU")) == 0);
+    uint32_t x = 0, y = 0, pw = 0, ph = 0, w = 0, h = 0;
+    if (!on || !n64_screen_place(&x, &y, &pw, &ph, &w, &h)) return VK_NULL_HANDLE;   // (a shot's window pass: no window under it)
+    tv_showing = showing_now(), tv_asked = true;
+    const Showing& s = tv_showing;
+    // (none of the options' own screens; or a bug capture waits for this frame's picture, which is taken before the
+    // overlays; or an HDR10 window, whose overlays' pictures are made in its codes (vk_imgui.cpp pixels), not the SDR
+    // picture's the TV draws in: menu_record then, as before)
+    if (s.start || !(s.open || s.game_tab || s.mods_row) || bugshot_state() == 1 || dev.hdr || !ui::begin(w, h))
+        return VK_NULL_HANDLE;
+    draw_overlays(w, h, s, ImGui::GetBackgroundDrawList());
+    ::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);   // (Dear ImGui records into cmd directly, its backend through its own pointers: what this thread recorded through vk_work.h reaches cmd first)
+    const VkImageView layer = ui::record_layer(cmd, x, y, pw, ph);
+    tv_drawn = true, tv_layer = layer != VK_NULL_HANDLE, tv_asked = false;
+    static bool told = false;
+    if (layer && !told)
+        told = true, logf("menu: the options' own screens drawn under N64 Classic's TV, in a layer of the picture's place (%ux%u at "
+                          "%u,%u of %ux%u); the FPS counter over it (RX_VK_N64_TV_MENU=0: all over the TV, as before)", pw, ph, x, y, w, h);
+    return layer;
+}
+
+void menu_record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h) {
+    if (tv_drawn) {   // ((Triforce, 11-22, N64 Classic) the options went under the TV this present: the rest over the window
+        tv_drawn = false;
+        options_under_tv = tv_layer;   // (no layer made: they went over the window, flat, as before)
+        bugshot_record(cmd, index, w, h);   // (a copy under way goes on; none was waiting for this frame: menu_tv_layer)
+        ::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);
+        ui::record_rest(cmd, index, w, h);
+        return;
+    }
+    options_under_tv = false;
+    const Showing s = tv_asked ? tv_showing : showing_now();
+    tv_asked = false;
+    if (!s.start) bugshot_record(cmd, index, w, h);   // (Triforce: a bug capture's picture of this frame, before anything is drawn over it)
+    if (!s.start && !s.fps && !s.open && !s.note && !s.game_tab && !s.mods_row && !s.bench_on && !s.earned) {   // (nothing shows: no ImGui frame, no render pass)
         // (but a new window size or Menu size since the last bake: one frame with nothing drawn that bakes the menu's glyphs
         // and measures its page for the new size, so the next open has no hitch whatever was resized while nothing showed)
         if (prebake_needed(w, h) && ui::begin(w, h)) {
@@ -7490,39 +8485,7 @@ void menu_record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h) {
         return;
     }
     if (!ui::begin(w, h)) return;
-    {   // (the easing's step: the time since the last drawing, a quarter of the way in 1/60 s)
-        static int64_t last = 0;
-        const int64_t now = prof_now();
-        ease_step = last ? std::min(1.0f, (float)((now - last) / 1e9) * 15.0f) : 1.0f;
-        last = now;
-        ease_live = true;
-    }
-    ui::Ctx c = menu_ctx(w, h);
-    prebake(c);   // (the menu's glyphs at this size, before it opens: no hitch then)
-    if (start) {   // (under the menu, in the overlay's own fonts)
-        ui::Ctx sc = ui_ctx(w, h);
-        draw_startup(sc);
-    }
-    // ((Triforce) Full: NX2navi's panel alone, no counter beside it (its perf_draw), and under the options or the game tab's
-    // header while they show (its BringWindowToDisplayBack): the open menu covers it)
-    const bool full = fps && opts.show_fps == 2;
-    // ((Triforce, 11-19) the Mods entry's page: the panel over Quit's dialog and its dim, as over the game's own dialogs, which
-    // the game draws under every overlay. The lab's "its dim covers the left part of the stats overlay")
-    const bool over_row = open && page == kModsRowPage;
-    if (open) draw_menu(c, full && !over_row);
-    else {
-        if (full) draw_perf(c);
-        if (game_tab) draw_game_tab(c);
-        else if (mods_row) draw_mods_row_shut(c);
-    }
-    if (full && over_row) draw_perf(c);
-    if (fps && !full) draw_fps(c, (open && page != kModsRowPage) || game_tab);   // ((Triforce) the Mods entry: the counter stays where the game list has it)
-    if (note) draw_notice(c);
-    if (earned) draw_ach_notice(c);
-    if (bench_on) {   // ((Triforce) benchmark mode's panel, in the overlay's own fonts, over the rest
-        ui::Ctx bc = ui_ctx(w, h);
-        draw_bench(bc, bench);
-    }
+    draw_overlays(w, h, s, nullptr);
     ::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);   // (Dear ImGui records into cmd directly, its backend through its own pointers: what this thread recorded through vk_work.h reaches cmd first)
     ui::record(cmd, index, w, h);
 }

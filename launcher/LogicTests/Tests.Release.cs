@@ -294,6 +294,24 @@ static partial class Tests
         File.Delete(Path.Combine(t2.Folder, Tools.BaseHave));
         Check(!Tools.HasBase(b2, t2.Folder, null), "a real base file changed still is not");
         Check(Tools.Regenerated(@"python\Lib\x\__pycache__\a.pyc") && !Tools.Regenerated("python/Lib/os.py"), "what counts as rewritten");
+
+        // (11-22, v0.7.0's update stop "The tools' base lacks python/Lib/.../__pycache__/...pyc (or it has another size)": HasBase
+        // kept a base whose caches Python had rewritten, and UnpackParts' last look then wanted them at their packed sizes)
+        var root3 = NewRoot("parts-pyc-unpack");
+        var t3 = new Tools(Ctx(root3));
+        var list3 = BaseList(("python/python.exe", "py"), ("python/Lib/__pycache__/os.cpython-314.pyc", "packed bytes"),
+                             ("python/Lib/__pycache__/gone.cpython-314.pyc", "packed"));
+        var b3 = Tools.ParseBaseList(list3)!;
+        Directory.CreateDirectory(Path.Combine(t3.Folder, "python", "Lib", "__pycache__"));
+        File.WriteAllText(Path.Combine(t3.Folder, "python", "python.exe"), "py");
+        File.WriteAllText(Path.Combine(t3.Folder, "python", "Lib", "__pycache__", "os.cpython-314.pyc"), "rewritten by python, longer");
+        File.WriteAllText(Path.Combine(t3.Folder, "version.txt"), "v0.6.0");
+        Check(Tools.HasBase(b3, t3.Folder, null), "the kept base with rewritten and missing caches");
+        var code3 = Path.Combine(root3, "code.zip");
+        File.WriteAllBytes(code3, Zip(("tools/nx2/make_game.py", "new"), ("tools/base.list", list3)));
+        t3.UnpackParts(code3, null, b3, "v0.7.0", null);
+        Equal("v0.7.0", t3.InstalledVersion, "a code part over a base whose caches Python rewrote");
+        Equal("rewritten by python, longer", File.ReadAllText(Path.Combine(t3.Folder, "python", "Lib", "__pycache__", "os.cpython-314.pyc")), "its caches kept as they were");
     }
 
     static async Task ToolsUpdate()

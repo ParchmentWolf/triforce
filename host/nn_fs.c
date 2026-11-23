@@ -8,6 +8,8 @@
    of guest threads can read one file at once. Results: switchbrew "Error codes" (module 2 = fs). */
 #include "hos.h"
 #include "stall_host.h"   /* ((Triforce, 11-22, OS-51) the host's part of a long frame, counted where it is spent) */
+#include "host_alloc.h"   /* ((Triforce, 11-23) hos_xcalloc: the handles' allocations wait at the commit limit */
+#include "oot_title_movie.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -236,6 +238,7 @@ static void make_dirs(const char *path) {   /* every parent of path */
 typedef struct { char name[HOS_FS_PATH]; int is_dir; uint64_t size; } ExtraEntry;   /* (a listed folder's mod-only entries) */
 typedef struct {
     HANDLE h; int writable; HANDLE find; WIN32_FIND_DATAA fd; int find_done, is_dir; char path[HOS_FS_PATH];
+    enum OotMovieFile movie;
     ExtraEntry *extras; int nextras, extra_pos;
 } Handle;
 static Handle *handles[4096];
@@ -244,7 +247,12 @@ static SRWLOCK handle_lock = SRWLOCK_INIT;
 static uint64_t new_handle(Handle *h) {
     AcquireSRWLockExclusive(&handle_lock);
     for (int i = 0; i < 4096; i++)
-        if (!handles[i]) { handles[i] = h; ReleaseSRWLockExclusive(&handle_lock); return (uint64_t)i + 1; }
+        if (!handles[i]) {
+            handles[i] = h;
+            oot_movie_file_change(h->movie, 1);
+            ReleaseSRWLockExclusive(&handle_lock);
+            return (uint64_t)i + 1;
+        }
     ReleaseSRWLockExclusive(&handle_lock);
     hos_fatal(NULL, "fs: out of handles");
     return 0;
@@ -256,7 +264,10 @@ static Handle *get_handle(Ctx *c, uint64_t id) {
 }
 static void free_handle(uint64_t id) {
     AcquireSRWLockExclusive(&handle_lock);
-    if (id && id <= 4096) handles[id - 1] = NULL;
+    if (id && id <= 4096 && handles[id - 1]) {
+        oot_movie_file_change(handles[id - 1]->movie, -1);
+        handles[id - 1] = NULL;
+    }
     ReleaseSRWLockExclusive(&handle_lock);
 }
 
@@ -353,7 +364,7 @@ static int tx_mount(const char *name, const char *uid, char *root, size_t cap) {
     if (!save_tx_enabled()) return 0;
     static int at_exit;
     int ok = 0, locked = 1;
-    char note[256] = "";
+    char note[HOS_FS_PATH + 384] = "";   /* ((Triforce, 11-23) room for a failed working copy's file and reason: save_tx.h tx_why) */
     AcquireSRWLockExclusive(&tx_lock);
     const int import_said = tx_import_note[0] != 0;
     if (!at_exit) at_exit = 1, atexit(hos_fs_save_finish);
@@ -587,6 +598,9 @@ HLE(_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci) {
         return;
     }
     { void hos_bench_file_opened(const char *guest); hos_bench_file_opened(g); }   /* ((Triforce) benchmark mode: which save file loads */
+    /* ((Triforce) the file select's cards, host/save_files.c: a slot of the save opened to be written is the slot the game
+       saves in now; nothing while the save files are off) */
+    if (want_write) { void hos_save_card_wrote(const char *guest_path); hos_save_card_wrote(g); }
     /* (mkw-recomp) HOS_NO_MOVIES=1: MKW's WebM movies (cup openings, billboards, emblems) are not found, and the
        game goes on without them (decoded by nn_video.c otherwise) */
     if (!want_write && getenv("HOS_NO_MOVIES")) {
@@ -624,16 +638,33 @@ HLE(_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci) {
     if (open_keep_core) away = hos_vcore_away();   /* ((Triforce, 11-21, IO-24) otherwise given up already, above) */
     HANDLE h = CreateFileA(path, GENERIC_READ | (want_write ? GENERIC_WRITE : 0), FILE_SHARE_READ | FILE_SHARE_WRITE,
                            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    const DWORD open_err = h == INVALID_HANDLE_VALUE ? GetLastError() : 0;   /* (before the core is taken back) */
     if (away) hos_vcore_back();
     if (h == INVALID_HANDLE_VALUE) {
+        /* ((Triforce, 11-23, ticket "Cannot launch into game after 0.7 update", Linux) a file of a writable mount (the save's)
+           that is there but would not open answers "not found" all the same. In the report's log the save had no working copy,
+           the game's save manager looped (some 200,000 core takes a second; an open is one) and the file select never came,
+           and nothing said which file or why. Said for the first 8 such files */
+        static volatile LONG there_said;
+        if (writable && GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES && InterlockedIncrement(&there_said) <= 8)
+            hos_log("fs: OpenFile(%s): %s is there but could not be opened for %s (error %lu): the game is told it is not there",
+                    g, path, want_write ? "writing" : "reading", (unsigned long)open_err);
         if (hos_trace || fs_trace()) hos_log("fs: OpenFile(%s): not found", g);
         RET(R_PATH_NOT_FOUND);
         return;
     }
-    Handle *fh = (Handle *)calloc(1, sizeof *fh);
+    /* ((Triforce, 11-23, ticket 1574276312678408316) at Windows' commit limit this calloc answered NULL and the write
+       below ended the game as "write 0" inside OpenFile, with no word of the memory; now it waits as the host's other
+       tables do (host_alloc.h) and, still refused, ends the game saying why */
+    Handle *fh = (Handle *)hos_xcalloc(1, sizeof *fh);
+    if (!fh) {
+        CloseHandle(h);
+        hos_fatal(c, "fs: OpenFile(%s): out of memory for its handle (Windows is out of RAM and page file)", g);
+    }
     fh->h = h;
     fh->writable = want_write;
     snprintf(fh->path, sizeof fh->path, "%s", g);
+    fh->movie = oot_movie_file(fh->path);
     G64(ARG(0)) = new_handle(fh);
     if (hos_trace || fs_trace()) hos_log("fs: OpenFile(%s)", g);
     RET(0);
@@ -854,7 +885,11 @@ HLE(_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc) {
 /* ---- directories: DirectoryEntry = { char name[0x301]; pad[3]; s8 type at 0x304 (0 directory, 1 file); pad[3]; s64 size at 0x308 } ---- */
 static void add_extra(void *arg, const char *name, int is_dir, uint64_t size) {
     Handle *dh = (Handle *)arg;
-    if (!(dh->nextras & 15)) dh->extras = (ExtraEntry *)realloc(dh->extras, sizeof *dh->extras * (size_t)(dh->nextras + 16));
+    if (!(dh->nextras & 15)) {   /* ((Triforce, 11-23) as OpenFile's handle: waits at the commit limit, NULL ends the game saying why) */
+        ExtraEntry *more = (ExtraEntry *)hos_xrealloc(dh->extras, sizeof *dh->extras * (size_t)(dh->nextras + 16));
+        if (!more) hos_fatal(NULL, "fs: OpenDirectory: out of memory for the mods' entries (Windows is out of RAM and page file)");
+        dh->extras = more;
+    }
     ExtraEntry *e = &dh->extras[dh->nextras++];
     snprintf(e->name, sizeof e->name, "%s", name);
     e->is_dir = is_dir, e->size = size;
@@ -863,7 +898,8 @@ HLE(_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci) {
     char path[HOS_FS_PATH], pat[HOS_FS_PATH];
     if (!host_path(gstr(ARG(1)), path, sizeof path, NULL)) { RET(R_PATH_NOT_FOUND); return; }
     snprintf(pat, sizeof pat, "%s\\*", path);
-    Handle *dh = (Handle *)calloc(1, sizeof *dh);
+    Handle *dh = (Handle *)hos_xcalloc(1, sizeof *dh);   /* ((Triforce, 11-23) as OpenFile's handle, above) */
+    if (!dh) hos_fatal(c, "fs: OpenDirectory(%s): out of memory for its handle (Windows is out of RAM and page file)", gstr(ARG(1)));
     dh->is_dir = (int)ARG(2);   /* mode: 1 directories, 2 files, 3 both */
     snprintf(dh->path, sizeof dh->path, "%s", pat);   /* (for GetDirectoryEntryCount) */
     dh->find = FindFirstFileA(pat, &dh->fd);

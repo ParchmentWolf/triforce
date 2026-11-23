@@ -8,6 +8,9 @@
 #include <string.h>
 #include <time.h>
 #include <windows.h>   /* (the exe's folder; the browser build: the Microsoft C runtime's time functions) */
+#include "../gpu/vk/output_sizes.h"   /* ((Triforce) the Output resolution row's sizes, the menu's too) */
+#include "../gpu/vk/ultrawide_rows.h"   /* ((Triforce) the Ultrawide row as an old options file holds it: output_res_read) */
+#include "hos_screens.h"   /* ((Triforce) the connected screens: the one the window opens on, and each one's size for the log) */
 
 static int64_t boot_ns;
 
@@ -107,37 +110,128 @@ int hos_ini_option(const char *key, int otherwise) {   /* (hookshot: the Insert 
 /* ((Triforce, options_version 7) The Insert menu's handheld profile is the Output resolution row's 1536 x 864: output_res=7,
    or HOS_OUTPUT_RES=7. handheld_profile=1 is a file's from before version 7, the row that was, until the menu writes the file
    again (gpu/vk/merged_rows.h migrate: it becomes output_res=7) */
-static int output_row(void) { return getenv("HOS_OUTPUT_RES") ? atoi(getenv("HOS_OUTPUT_RES")) : ini_option("output_res", 0); }
+static int output_size_fields(void) {
+    return ini_option("output_width", -1) != -1 || ini_option("output_height", -1) != -1 || ini_option("output_custom_size", -1) != -1;
+}
+static int output_row(void) {
+    if (getenv("HOS_OUTPUT_RES")) return atoi(getenv("HOS_OUTPUT_RES"));
+    return output_file_read(ini_option("output_res", 0), ini_option("options_version", 0), 0, output_size_fields());
+}
 static int handheld(void) {
     static int v = -1;
     if (v < 0)
-        v = getenv("HOS_HANDHELD") ? atoi(getenv("HOS_HANDHELD")) != 0 : output_row() == 7 || ini_option("handheld_profile", 0) != 0;
+        v = getenv("HOS_HANDHELD") ? atoi(getenv("HOS_HANDHELD")) != 0 : output_row() == 7 ||
+            ((output_legacy_file(ini_option("options_version", 0), output_size_fields()) || ini_option("options_version", 0) == 9) &&
+             ini_option("handheld_profile", 0) != 0);
     return v;
 }
 /* (hookshot) The Insert menu's Output resolution (output_res=, HOS_OUTPUT_RES over it), docked only: 0 the game's 2048 x 1152,
    1 2560 x 1440, 2 3840 x 2160, 3 1920 x 1080, 4 5120 x 1440, 5 5120 x 2880, 6 5120 x 2160 ((Triforce) after the others: a
-   saved number keeps its size). The game's frame is its display size (2560 x 1440 as shipped;
-   nx2/oot_patches.py apply_output_size asks hos_output_size) times its graphics scale (GetCurrentGraphicsScale: 0 x1, 1 x0.8,
-   2 x0.667). Here it saw scale 1 (x0 left at the call before's answer), so 2048 x 1152; each explicit size uses x1. */
+   saved number keeps its size), 7 handheld, 8 Screen, 9 Custom (gpu/vk/output_sizes.h, with the rule: the size is the picture's, the
+   game's frame 16:9 at its height). The game's frame is its display size (2560 x 1440 as shipped; nx2/oot_patches.py
+   apply_output_size asks hos_output_size) times its graphics scale (GetCurrentGraphicsScale: 0 x1, 1 x0.8, 2 x0.667). Here it
+   saw scale 1 (x0 left at the call before's answer), so 2048 x 1152; each explicit size uses x1. A size that is not 16:9
+   (5120 x 1440, 5120 x 2160, and Screen or Custom of such a shape) is the widescreen picture's (hos_output_ratio,
+   host/hos_main.c).
+   The menu lists every connected screen's size as a choice and saves the one chosen as Custom's size (9 with
+   output_width= and output_height=): a size, which means the same whichever screens are connected at the next start. 8,
+   Screen, is what an options file from before that has, and HOS_OUTPUT_RES=8: the size of the screen the window opens on,
+   as it always was; the menu saves it as that size */
+static unsigned flex_wh[2][2];   /* (Triforce) Screen's and Custom's sizes as used, 0 x 0 for none: flex_read */
+static void flex_read(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    int sw = 0, sh = 0;
+    hos_screen_size(&sw, &sh);
+    long w = sw, h = sh;
+    if (!output_size_used(w, h, &flex_wh[0][0], &flex_wh[0][1])) flex_wh[0][0] = flex_wh[0][1] = 0;
+    else if ((long)flex_wh[0][0] != w || (long)flex_wh[0][1] != h)
+        hos_log("oe: the screen's %ldx%ld is taken as %ux%u (gpu/vk/output_sizes.h: the sides, the shape and the pixels a picture can have)",
+                w, h, flex_wh[0][0], flex_wh[0][1]);
+    const char *e = getenv("HOS_OUTPUT_SIZE");
+    w = h = 0;
+    if (e) {
+        if (!output_parse_size(e, &w, &h)) hos_log("oe: HOS_OUTPUT_SIZE=%s is not <width>x<height>: not taken", e);
+    } else {   /* (the file's two numbers, as the menu reads them: gpu/vk/vk_menu.cpp custom_rows_read) */
+        w = ini_option("output_width", 0), h = ini_option("output_height", 0);
+        output_custom_read(&w, &h);
+    }
+    if (!output_size_used(w, h, &flex_wh[1][0], &flex_wh[1][1])) flex_wh[1][0] = flex_wh[1][1] = 0;
+    else if ((long)flex_wh[1][0] != w || (long)flex_wh[1][1] != h)
+        hos_log("oe: the custom output size %ldx%ld is taken as %ux%u (gpu/vk/output_sizes.h: the sides, the shape and the pixels a picture can have)",
+                w, h, flex_wh[1][0], flex_wh[1][1]);
+}
+/* (the log: every connected screen with the size the game would take it at, and whether Custom's size is one of them) */
+static void screens_log(int custom) {
+    HosScreen list[16];
+    const int n = hos_screens(list, 16);
+    int found = 0;
+    for (int i = 0; i < n; i++) {
+        unsigned w = 0, h = 0;
+        if (!output_size_used(list[i].w, list[i].h, &w, &h)) continue;
+        hos_log("oe: screen %dx%d%s%s%s%s", list[i].w, list[i].h, list[i].name[0] ? " \"" : "", list[i].name, list[i].name[0] ? "\"" : "",
+                list[i].opens ? ", the one the window opens on" : "");
+        if (custom && w == flex_wh[1][0] && h == flex_wh[1][1]) found = 1;
+    }
+    if (custom && n && !found)
+        hos_log("oe: output resolution Custom %ux%u is no connected screen's size: taken as it is", flex_wh[1][0], flex_wh[1][1]);
+}
+static unsigned out_wh[2];   /* (the Output resolution's size, the picture's: output_mode) */
 static int output_mode(void) {
     static int v = -1;
     if (v < 0) {
-        static const char *const names[] = {"2048x1152 (the game's)", "2560x1440", "3840x2160", "1920x1080", "5120x1440", "5120x2880", "5120x2160"};
-        v = output_row();
-        if ((unsigned)v >= sizeof names / sizeof *names || handheld()) v = 0;   /* (7, the handheld profile's: handheld() sizes it) */
-        hos_log("oe: output resolution %s", handheld() ? "the handheld profile's (1536x864)" : names[v]);
+        static const char *const names[] = {"2048x1152 (the game's)", "2560x1440", "3840x2160", "1920x1080", "5120x1440", "5120x2880", "5120x2160", "1536x864 (handheld)", "Screen", "Custom"};
+        if (getenv("HOS_OUTPUT_RES")) {
+            v = atoi(getenv("HOS_OUTPUT_RES"));
+        } else {   /* (a file from before options_version 8: 5120 x 1440 and 5120 x 2160 as it had them, output_res_read) */
+            const int version = ini_option("options_version", 0);
+            const int row = ultrawide_row_read(ini_option("ultrawide", 0), version, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+            const int saved = ini_option("output_res", 0);
+            v = output_file_read(saved, version, row, output_size_fields());
+            if (v != saved) {
+                if (saved == 7 || saved == 8)
+                    hos_log("oe: output resolution %s (%d) from native 0.5.2: now %d under options_version %d, the same choice",
+                            saved == 7 ? "Screen" : "Custom", saved, v, OUTPUT_OPTIONS_VERSION);
+                else
+                    hos_log("oe: output resolution %s with Ultrawide on another shape, from before options_version %d: %s now, the same picture",
+                            names[saved], OUTPUT_OPTIONS_VERSION, names[v]);
+            }
+        }
+        if ((unsigned)v > OUTPUT_LAST || handheld()) v = 0;
+        if (v >= OUTPUT_SCREEN) {
+            flex_read();
+            const unsigned *s = flex_wh[v - OUTPUT_SCREEN];
+            if (!s[1]) {   /* (no size: the screen's not known, or HOS_OUTPUT_SIZE is not one) */
+                hos_log("oe: output resolution %s: %s, so 2560x1440", names[v],
+                        v == OUTPUT_SCREEN ? "the screen's size is not known" : "HOS_OUTPUT_SIZE is not a size");
+                v = 1;
+            } else {
+                out_wh[0] = s[0], out_wh[1] = s[1];
+            }
+        }
+        /* (0, the game's own 2048 x 1152: its display size 2560 x 1440 at its graphics scale x0.8, above) */
+        if (v < OUTPUT_SCREEN) out_wh[0] = output_fixed_size(v ? v : 1, 0), out_wh[1] = output_fixed_size(v ? v : 1, 1);
+        if (v >= OUTPUT_SCREEN) hos_log("oe: output resolution %s %ux%u", names[v], out_wh[0], out_wh[1]);
+        else hos_log("oe: output resolution %s", names[v]);
+        screens_log(v == OUTPUT_CUSTOM);
+        if (output_size_shaped(out_wh[0], out_wh[1]))
+            hos_log("oe: %ux%u is the picture: the game's frame is %ux%u in its middle", out_wh[0], out_wh[1],
+                    output_frame_width(out_wh[1]), out_wh[1]);
     }
     return v;
 }
+/* The game's frame: the Output resolution's size, or 16:9 at its height when the size has another shape */
 uint32_t hos_output_size(int height) {
-    switch (output_mode()) {
-    case 2: return height ? 2160 : 3840;
-    case 3: return height ? 1080 : 1920;
-    case 4: return height ? 1440 : 5120;
-    case 5: return height ? 2880 : 5120;
-    case 6: return height ? 2160 : 5120;   /* ((Triforce) 5120 x 2160) */
-    default: return height ? 1440 : 2560;
-    }
+    output_mode();
+    if (height) return out_wh[1];
+    return output_size_shaped(out_wh[0], out_wh[1]) ? output_frame_width(out_wh[1]) : out_wh[0];
+}
+/* (Triforce, host/hos_main.c) The Output resolution's own shape, width over height, when it is not 16:9: the picture is then
+   that size, and the Ultrawide row does not apply. 0 for a 16:9 size (the row's shape, or the game's own picture) */
+float hos_output_ratio(void) {
+    output_mode();
+    return output_size_shaped(out_wh[0], out_wh[1]) ? (float)((double)out_wh[0] / (double)out_wh[1]) : 0.0f;
 }
 /* (hookshot) The render targets' GPU pool (nx2/oot_patches.py), 0x13100000 bytes as shipped, for 2560 x 1440: a 3840x2160 3D at
    the 4K output ran out of it. Scaled with the output's pixels, or the widescreen picture's when it has more (host/hos_main.c:
@@ -153,7 +247,7 @@ uint32_t hos_output_size(int height) {
    output with RenoDX HDR boots and played in the world, 17,160 presents at about 50 fps, RenoDX's four shaders in place, no
    error from the pool (one short session, not every area; its scene target and each copy are 118 MB there). */
 /* ((Triforce, 11-21, the performance audit's TEX-85) Whether the render targets' heap is held to a size, with no room to
-   give: HOS_RT_POOL_MB set, or the 5120-wide outputs' 900 MB. -1 until hos_rt_pool_size has run. host/shadow_slot.h reserves
+   give: HOS_RT_POOL_MB set, or a picture limited to the 900 MB cap. -1 until hos_rt_pool_size has run. host/shadow_slot.h reserves
    no stepped storage there unless asked to) */
 static int rt_pool_pinned = -1;
 int hos_rt_pool_pinned(void) { return __atomic_load_n(&rt_pool_pinned, __ATOMIC_RELAXED); }
@@ -166,21 +260,25 @@ uint64_t hos_rt_pool_size(uint64_t game) {
     const uint64_t scaled = px > 2560 * 1440 ? (game * px / (2560 * 1440) + 0xfffff) & ~0xfffffULL : game;
     const uint64_t minimum = 512ULL << 20, five_k = 900ULL << 20;
     /* ((Triforce) and the 5120 x 2160 output: scaled, its pool is 915 MB, more than any pool known to pass the game's reservation
-       at a 5120-wide output; 900 MB ran the 3D at the full 5120 x 2880, a third more pixels) */
-    const int is_five_k = hos_output_size(0) == 5120 && hos_output_size(1) >= 2160;
+       at a 5120-wide output; 900 MB ran the 3D at the full 5120 x 2880, a third more pixels. So any output of more pixels than
+       3840 x 2160's, whether they are the frame's or the widescreen picture's: a 5120 x 2160 picture has the frame 3840 x 2160,
+       and scaled for the picture its pool would be those 915 MB (the 1.4 GB of a 7680 x 2160 picture failed the reservation
+       too, host/hos_main.c). gpu/vk/output_sizes.h keeps a picture to 5120 x 2880's pixels, the most the 900 MB are known to
+       hold) */
+    const int is_five_k = px > 3840ull * 2160ull;
     extern int hos_scene_rgba16f(void);
     /* (local, RenoDX port) the scene's colour target at 8 bytes a pixel in place of 4: room for it and its copies, at 3840 x 2160 33 MB each */
     const uint64_t rgba16f = hos_scene_rgba16f() ? 128ULL << 20 : 0;
     const uint64_t asked = (e ? strtoull(e, NULL, 0) << 20 : scaled < minimum ? minimum : is_five_k && scaled > five_k ? five_k : scaled) + (e ? 0 : rgba16f);
     /* (the 5120 x 2880 output: 900 MB for the whole pool, see above; an explicit HOS_RT_POOL_MB still wins) */
     const uint64_t v = !e && is_five_k && asked > five_k ? five_k : asked;
-    __atomic_store_n(&rt_pool_pinned, e != NULL || v != asked || (is_five_k && scaled > five_k), __ATOMIC_RELAXED);   /* ((Triforce, 11-21, TEX-85)) */
+    __atomic_store_n(&rt_pool_pinned, e != NULL || (is_five_k && v == five_k), __ATOMIC_RELAXED);   /* ((Triforce, 11-21, TEX-85)) */
     static int logged;
     if (!logged++) {
         hos_log("applet: render target pool %llu MB (the game's %llu MB)", (unsigned long long)(v >> 20), (unsigned long long)(game >> 20));
         if (v != asked)
-            hos_log("applet: render target pool: %llu MB asked (the %ux%u output), kept to %llu MB: more fails the game's reservation at boot",
-                    (unsigned long long)(asked >> 20), hos_output_size(0), hos_output_size(1), (unsigned long long)(v >> 20));
+            hos_log("applet: render target pool: %llu MB asked (%llu pixels), kept to %llu MB: more fails the game's reservation at boot",
+                    (unsigned long long)(asked >> 20), (unsigned long long)px, (unsigned long long)(v >> 20));
     }
     return v;
 }

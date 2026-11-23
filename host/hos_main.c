@@ -16,7 +16,9 @@
 #include "../gpu/vk/oot_cheat_items.h"
 #include "../gpu/vk/oot_debug_link.h"   /* ((Triforce) the Game flags and Cutscenes pages' lines) */
 #include "achievements.h"               /* ((Triforce) what an achievement asks of the save data: host/achievements.c) */
+#include "save_files.h"                 /* ((Triforce) the title's file select: host/save_files.c) */
 #include "../gpu/vk/ultrawide_rows.h"   /* ((Triforce) the Ultrawide row's shapes: ultrawide_ratio) */
+#include "../gpu/vk/output_sizes.h"   /* ((Triforce) the picture for the Output resolution and a shape: output_picture) */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -417,6 +419,10 @@ static int env_line_allowed(const char *name, const char *value) {
     if (!strncmp(name, "SDL_", 4) && (strstr(name, "_LIB") || strstr(name, "GL_DRIVER"))) return 0;
     for (const char *p = name; *p; p++)
         if (!((*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '_')) return 0;
+    /* ((Triforce, 11-23) HOS_LOG_FILE is a switch, not a file's name: 1, the log into triforce_log.txt whatever stderr is, so
+       a player whose game is started from a terminal, Steam or a script can have the log file; the file is always the one
+       beside the game) */
+    if (!strcmp(name, "HOS_LOG_FILE")) return (value[0] == '0' || value[0] == '1') && !value[1];
     /* (hookshot) the switches that name a file to write or a folder take no value here, not even a bare name: one
        resolves in the game's folder (HOS_SAMPLE_FILE=triforce_vk.dll emptied the renderer) */
     const size_t nl = strlen(name);
@@ -1204,6 +1210,49 @@ static void oot_teleport_followup(Ctx *c) {
             events && recomp_load64(c, events + 104) ? 1 : 0);
 }
 
+/* ---- (Triforce) A save file's card on the file select (host/save_files.c, on unless HOS_SAVE_FILES=0): what the game's own
+   load list shows of a save, told from the running game and not read out of the save. Every two seconds at Link's update,
+   while a save is loaded: the map he is on (Sequence_CurrentBanc, as the teleport reads it), which Spiritual Stones and
+   medallions he holds (their Pouch names are gpu/vk/oot_cheat_items.h's), and the game's count of his life. Nothing is
+   written into the game.
+   His life: the Int of GameData that holds his most life, in quarters of a heart. Its name is not known to this
+   repository, and none of the game's is taken from its files: the names below are the ones games of this engine have used,
+   tried once a run, the first the save data has taken, and the log says which (or that none is: the card has no hearts
+   then) */
+static int oot_max_life(Ctx *c) {
+    static const char *const names[] = {"PlayerStatus.MaxLife", "MaxLife", "Player.MaxLife", "PlayerStatus.MaxHeart", "MaxHeart"};
+    static uint32_t hash;
+    static int tried;
+    const uint64_t mgr = oot_singleton(c, OOT_GAMEDATA_SLOT);
+    if (!mgr) return 0;
+    if (!tried) {
+        tried = 1;
+        for (unsigned i = 0; i < sizeof names / sizeof names[0] && !hash; i++) {
+            const uint64_t entry = oot_gd_int(c, mgr, oot_murmur3(names[i]));
+            if (!entry) continue;
+            hash = oot_murmur3(names[i]);
+            hos_log("save files: the card's hearts: the save data's %s is %d", names[i], (int)recomp_load32(c, entry + 0x1c));
+        }
+        if (!hash) hos_log("save files: the card's hearts: the save data has none of the names tried for Link's life: no hearts on the cards");
+    }
+    const uint64_t entry = hash ? oot_gd_int(c, mgr, hash) : 0;
+    return entry ? (int)recomp_load32(c, entry + 0x1c) : 0;
+}
+static void oot_save_card_tick(Ctx *c, int64_t now) {
+    static const char *const held[SAVE_CARD_ITEMS] = {"Item_Stone_Forest", "Item_Stone_Fire",  "Item_Stone_Water",  "Item_Medal_Light", "Item_Medal_Forest",
+                                                      "Item_Medal_Fire",   "Item_Medal_Water", "Item_Medal_Spirit", "Item_Medal_Shadow"};
+    static int64_t next;
+    if (!hos_save_files_on() || now < next) return;
+    next = now + 2000000000LL;
+    if (oot_pouch_count(c, oot_item_names[0]) < 0) return;   /* (no save loaded: GameData holds a new game's values) */
+    char map[64];
+    int items = 0;
+    oot_gamedata_string(c, 0x1d6189dau, map, sizeof map);   /* Sequence_CurrentBanc */
+    for (int i = 0; i < SAVE_CARD_ITEMS; i++)
+        if (oot_item_get(c, held[i]) > 0) items |= 1 << i;
+    hos_save_card_note(map, items, oot_max_life(c), now);
+}
+
 /* ---- (Triforce) Game flags by name and events by name: the Debug tab's two pages ----
    After NX2navi's F9 panel (its flags by name and its cutscene starter; that code is not the owner's and none of it
    is here: this is written on what the tools above already had of build e0f3ccfa). A flag is a Bool of GameData, which
@@ -1409,6 +1458,7 @@ static void oot_update_player_cheats(Ctx *c, uint64_t actor, uint64_t components
     oot_inventory_refresh(c, now);
     oot_link_tick(c, actor, now);   /* ((Triforce) the Game flags and Cutscenes pages) */
     oot_achievements_tick(c, now);   /* ((Triforce) host/achievements.c) */
+    oot_save_card_tick(c, now);      /* ((Triforce) host/save_files.c: this save file's card) */
     if (action >= OOT_CHEAT_ITEM_ACTION && action < OOT_CHEAT_ITEM_ACTION + 256 * (int)OOT_ITEM_COUNT) {
         oot_inventory_edit(c, action);
     } else if (action == OOT_AGE_ACTION) {
@@ -2033,6 +2083,7 @@ static int game_main(int argc, char **argv) {
     }
 #endif
     static char beside_image[MAX_PATH], beside_romfs[MAX_PATH], beside_user[MAX_PATH];
+    const int user_given = hos_user_dir != NULL;   /* (--user) */
     if (!image) {   /* (hookshot) started with nothing, as a game is: everything beside the executable (the builder's folder) */
         char dir[MAX_PATH];
         const DWORD len = hos_game_path_a(dir, MAX_PATH);
@@ -2052,6 +2103,9 @@ static int game_main(int argc, char **argv) {
 #else
                 if (!hos_user_dir) hos_user_dir = beside_user;
 #endif
+                /* ((Triforce) the title's file select, host/save_files.c: the folder of the file last chosen; off, or a
+                   folder named with --user: the one above) */
+                if (!user_given) hos_user_dir = hos_save_files_start(dir, hos_user_dir);
             }
         }
     }
@@ -2101,14 +2155,22 @@ static int game_main(int argc, char **argv) {
         return 1;
     }
     hos_mem_init(hos_image_end);
-    {   /* (hookshot) Widescreen and ultrawide (nx2/oot_wide.py): HOS_ASPECT=<ratio> (2.3889 for 3440x1440), else the Insert menu's
-           Ultrawide (off unless set: a fixed 16:10, 21:9 or 32:9, ultrawide_ratio). The game's picture takes that shape at its own height (the
+    {   /* (hookshot) Widescreen and ultrawide (nx2/oot_wide.py): HOS_ASPECT=<ratio> (2.3889 for 3440x1440), else the Output
+           resolution's own shape when it is not 16:9 (5120 x 1440, 5120 x 2160, Screen or Custom: the picture is that size,
+           host/nn_applet.c hos_output_ratio, gpu/vk/output_sizes.h), else the Insert menu's Ultrawide (off unless set: a fixed
+           16:10, 21:9 or 32:9, ultrawide_ratio). The game's picture takes that shape at its own height (the
            world wider at the sides on an ultrawide screen, narrower on a 16:10 or 4:3 one), its 16:9 cameras the picture's ratio. Wider
            than 16:9 the HUD, menus and movies keep the middle 16:9; narrower they fill the picture's width. Until now the one 16:9
            constant in the game's data was changed and the 16:9 picture stretched to the window. */
         const char *e = getenv("HOS_ASPECT");
         float want = e ? (float)atof(e) : 0.0f;
+        int sized = 0;   /* (the shape is the Output resolution's own: the picture is its size) */
         if (!e) {
+            float hos_output_ratio(void);
+            want = hos_output_ratio();
+            sized = want > 0.0f;
+        }
+        if (!e && !sized) {
             int row = 0, version = 0;
             char path[MAX_PATH];
             const DWORD len = hos_game_path_a(path, MAX_PATH);
@@ -2138,18 +2200,15 @@ static int game_main(int argc, char **argv) {
         /* (a screen narrower than 16:9 too, 16:10 to 5:4: the picture keeps the game's height and is narrower, the
            cameras take its ratio, and the HUD fills its width instead of a middle 16:9 wider than the screen. A 4:3 CRT
            at the 1440 output: picture 1920 x 1440, scene 1440 x 1080, HUD 100%) */
-        if (want > game * 1.01 || (want > 1.0f && want < game * 0.99)) {
-            double r = want > 32.0 / 9.0 ? 32.0 / 9.0 : want < 5.0 / 4.0 ? 5.0 / 4.0 : want;
-            uint32_t hos_output_size(int height);   /* (host/nn_applet.c: the Output resolution's height, 1440 as shipped) */
-            unsigned oh = hos_output_size(1), ow = (unsigned)(oh * r / 8 + 0.5) * 8;   /* (whole multiples of 8 pixels) */
-            /* (at most 3840 x 2160's pixels, the shape kept: the game's render targets come from a pool sized for its picture
-               (host/nn_applet.c hos_rt_pool_size), and a 32:9 screen at the 4K output made a 7680 x 2160 one. Its pool at the
-               output's size ran out as Kokiri Forest loaded (a null pointer, issue 1031); a pool for the whole picture, 1.4 GB,
-               failed the game's own reservation at boot. 5400 x 1520 there, more than the 5120 x 1440 screens it was seen on) */
-            if ((double)ow * oh > 3840.0 * 2160.0) {
-                oh = (unsigned)(sqrt(3840.0 * 2160.0 / r) / 8) * 8;
-                ow = (unsigned)(oh * r / 8) * 8;
-            }
+        uint32_t hos_output_size(int height);   /* (host/nn_applet.c: the Output resolution's height, 1440 as shipped) */
+        unsigned ow = 0, oh = 0;
+        /* (gpu/vk/output_sizes.h output_picture: whole multiples of 8 pixels. A shape of the row's or HOS_ASPECT's at most
+           3840 x 2160's pixels, the shape kept: the game's render targets come from a pool sized for its picture
+           (host/nn_applet.c hos_rt_pool_size), and a 32:9 screen at the 4K output made a 7680 x 2160 one. Its pool at the
+           output's size ran out as Kokiri Forest loaded (a null pointer, issue 1031); a pool for the whole picture, 1.4 GB,
+           failed the game's own reservation at boot. 5400 x 1520 there, more than the 5120 x 1440 screens it was seen on.
+           A size's own shape: that size) */
+        if (output_picture(hos_output_size(1), want, sized, &ow, &oh)) {
             const unsigned sh = oh * 3 / 4, sw = (unsigned)(ow * 0.75 / 8 + 0.5) * 8;   /* (the scene, 3/4 of the picture as shipped) */
             hos_wide_out = (uint64_t)oh << 32 | ow;
             hos_wide_scene = (uint64_t)sh << 32 | sw;

@@ -140,9 +140,9 @@ int main(int argc, char **argv) {
     /* a Commit killed before each of its steps, then the next start */
     int reached_end = 0;
     for (int at = 1; at <= 12 && !reached_end; at++) {
-        char sub[32];
-        snprintf(sub, sizeof sub, "%s\\k%d", argv[1], at);
-        snprintf(user, sizeof user, "%s", sub);
+        /* (each step its own folder: a 32-byte name cut every temporary path to the same C:\Users\<name>\AppData\Local\T,
+           so the steps shared one folder there, and test runs at the same time wrote into each other's) */
+        snprintf(user, sizeof user, "%s\\k%d", argv[1], at);
         save_tx_paths(&p, user, "0123456789abcdef0000000000000001");
         new_run();
         CHECK(save_tx_mount(&p, NULL, 0) == 1);

@@ -3,7 +3,8 @@
 The game draws a 2560x1440 picture whatever the screen and renders its scene at 1920x1080; its cameras use a 16:9 ratio.
 With these patches the picture takes the window's shape (the height stays the game's, the width grows on an ultrawide
 screen and shrinks on a 16:10 or 4:3 one), the 16:9 cameras take the picture's ratio, the HUD and menus keep their 16:9
-shape in the middle of a wider picture (a narrower one: its whole width), pre-rendered movies play in that middle 16:9,
+shape in the middle of a wider picture (a narrower one: its whole width), story movies play in that middle 16:9,
+title movies fill the picture up to 12:5,
 and the picture a save keeps shows that middle 16:9 (a narrower picture: its middle band, at the texture's shape). Every patch reads host globals
 (host/hos_wide.c) that stay 0 for a 16:9 window, so the game runs as shipped then.
 
@@ -51,7 +52,11 @@ HUD = ("{ extern volatile float hos_wide_squeeze; if (hos_wide_squeeze > 0.0f) {
        "   /* (nx2/oot_wide.py: HUD in the middle 16:9, or at the screen's edges) */"
        % (UI_M00, UI_M11))
 
-MOVIE = ("{ extern volatile float hos_wide_margin; const float _m = hos_wide_margin; if (_m > 0.0f) { "
+# Within f_83b7c710 the movie site (main+0x3b5c758) and its SetViewport (main+0x284824) run
+# on the same thread. Between 0x83b7c758 and the unconditional call at 0x83b7c78c, only f_809ebaf0 runs; it calls no viewport helper.
+# Leave the scissor full width and consume the mark only at SetViewport.
+MOVIE = ("{ extern int hos_movie_cover_begin(float); extern volatile float hos_wide_ratio; "
+         "extern volatile float hos_wide_margin; const float _m = hos_wide_margin; if (!hos_movie_cover_begin(hos_wide_ratio) && _m > 0.0f) { "
          "const uint64_t _vp = c->x[29] - 40; uint32_t _ua = (uint32_t)recomp_load32(c, _vp + 8), _ub = (uint32_t)recomp_load32(c, _vp + 16); "
          "float _a, _b; memcpy(&_a, &_ua, 4); memcpy(&_b, &_ub, 4); const float _in = (_b - _a) * _m; _a += _in; _b -= _in; "
          "memcpy(&_ua, &_a, 4); memcpy(&_ub, &_b, 4); recomp_store32(c, _vp + 8, _ua); recomp_store32(c, _vp + 16, _ub); } }"
@@ -63,7 +68,8 @@ MOVIE = ("{ extern volatile float hos_wide_margin; const float _m = hos_wide_mar
 # ratio over 16:9, centred: the middle 16:9 fills the texture (the scissor keeps the texture's), as a 16:9 window would show.
 # Narrower than 16:9 (4:3, 16:10) it is made taller instead, by 16:9 over the picture's ratio: the picture's middle band fills
 # the texture at its own shape, neither squeezed nor with bars.
-THUMB = ("{ extern volatile float hos_wide_ratio; const float _r = hos_wide_ratio; if (_r > 0.0f && (uint32_t)c->x[1] == 0 "
+THUMB = ("{ extern int hos_movie_cover_viewport(uint64_t *, uint64_t *); "
+         "extern volatile float hos_wide_ratio; const float _r = hos_wide_ratio; if (!hos_movie_cover_viewport(&c->x[2], &c->x[4]) && _r > 0.0f && (uint32_t)c->x[1] == 0 "
          "&& (uint32_t)c->x[2] == 0 && (uint32_t)c->x[3] == 543 && (uint32_t)c->x[4] == 306) { "
          "if (_r > 16.0f / 9.0f) { const int _w = (int)(543.0f * _r / (16.0f / 9.0f) + 0.5f); "
          "c->x[1] = (uint32_t)((543 - _w) / 2); c->x[3] = (uint32_t)_w; } "

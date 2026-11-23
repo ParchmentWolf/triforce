@@ -190,7 +190,10 @@ public static class Startup
 
         var result = new StartupResult { Args = a, Screen = StartScreen.Check, Lock = held, GameFolder = a.UpdateFolder ?? a.LaunchFolder, SignalUpWhenShown = a.Relaunched };
         if (!ctx.IsWindows)
+        {
+            if (a.LaunchFolder != null && a.UpdateFolder == null) UseLaunchFolder(ctx, a.LaunchFolder);
             return a.LaunchFolder != null && a.UpdateFolder == null ? Same(result, StartScreen.Launch) : result;
+        }
 
         // (TRIFORCE_DEV=1: run in place, without installing, for testing)
         if (ctx.RunningInstalled || ctx.Env("TRIFORCE_DEV") == "1") return result;
@@ -213,6 +216,24 @@ public static class Startup
             }
         }
         return Same(result, StartScreen.Install);
+    }
+
+    /// <summary>((Triforce, 11-23, ticket "[Linux] Non-default dir for triforce not generating log files") Linux --launch &lt;dir&gt;:
+    /// that folder becomes the launcher's game folder (Settings.GameFolder), as a build there makes it. The folder's own
+    /// "triforce" script (its menu entry, desktop shortcut and Steam shortcut) starts the launcher so, and the launcher read
+    /// the folder and never used it: Home, Play, the saves and Game logs were the last built folder's. A game in a folder
+    /// of its own was played from that other folder, whose triforce_log.txt it wrote, and nothing was written beside it.
+    /// Only a folder that holds a game. TRIFORCE_LAUNCH_SAVED_FOLDER=1: the saved folder stays, as before.</summary>
+    static void UseLaunchFolder(TriforceContext ctx, string folder)
+    {
+        if (ctx.Env("TRIFORCE_LAUNCH_SAVED_FOLDER") == "1") return;
+        string full;
+        try { full = Path.GetFullPath(folder); } catch (Exception) { return; }
+        if (new Game(ctx).FindExe(full) == null) { ctx.Log.Write("start: --launch " + full + " holds no game: the saved game folder stays"); return; }
+        var was = ctx.Settings.GameFolder;
+        if (was != null && TriforceContext.SamePath(was, full)) return;
+        ctx.Settings.GameFolder = full;
+        ctx.Log.Write("start: --launch " + full + ": the game folder now (it was " + (was ?? "none") + ")");
     }
 
     static StartupResult Same(StartupResult r, StartScreen screen) => new()

@@ -26,6 +26,7 @@ FIXTURE = r"""
 #include <string.h>
 typedef struct { uint64_t x[32]; } Ctx;
 volatile float hos_wide_ratio;
+int hos_movie_cover_viewport(uint64_t *y, uint64_t *h) { (void)y; (void)h; return 0; } /* no movie drew */
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); exit(1); } } while (0)
 static void site(Ctx *c) {
 SITE_C

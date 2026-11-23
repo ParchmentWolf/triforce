@@ -13,6 +13,7 @@ static partial class Tests
     public static IEnumerable<(string Name, Func<Task> Run)> GameOptionsTests()
     {
         (string, Func<Task>) Sync(string n, Action a) => (n, () => { a(); return Task.CompletedTask; });
+        yield return Sync("game options: output migration", OutputMigration);
         yield return Sync("game options: schema matches vk_menu.cpp's table", GameOptionsMatchMenu);
         yield return Sync("game options: keys, labels, choices, no Hookshot", GameOptionsLabels);
         yield return Sync("game options: the real triforce_options.ini (read only)", GameOptionsRealFile);
@@ -121,7 +122,7 @@ static partial class Tests
         Check(table.Count > 100, "the table read: " + table.Count + " entries");
         var symbols = new Dictionary<string, int>
         {
-            ["kLastOutput"] = 7, ["ur::kValues - 1"] = 6, ["ur::kUpscalers - 1"] = 6, ["ur::kModels - 1"] = 3, ["aa_rows::kValues - 1"] = 3,
+            ["kLastOutput"] = 9, ["OUTPUT_MIN_W"] = 640, ["OUTPUT_MAX_W"] = 7680, ["OUTPUT_MIN_H"] = 360, ["OUTPUT_MAX_H"] = 2880, ["ur::kValues - 1"] = 6, ["ur::kUpscalers - 1"] = 6, ["ur::kModels - 1"] = 3, ["aa_rows::kValues - 1"] = 3,
             ["2 + kMaxMics"] = 18, ["HOS_PROMPT_N"] = 6, ["mr7::FG_DLSS_LAST"] = 12, ["framegen_rows::kRowMax"] = 9,
         };
         int Num(string s, string what) => int.TryParse(s, out var v) ? v : symbols.TryGetValue(s, out v) ? v : throw new TestFailed(what + ": a symbol the test does not know, " + s);
@@ -182,7 +183,9 @@ static partial class Tests
         Equal(string.Join("|", names), string.Join("|", GameOptionsSchema.All.Select(r => r.Name)), "the rows, in the menu's order");
         // (the lines the game's save drops, merged_rows.h kDropped: kept keys, read once to move them)
         var mr = File.ReadAllText(Path.Combine(dir!, "merged_rows.h"));
-        Check(mr.Contains("kVersion = " + GameOptionsSchema.CurrentVersion + ";"), "merged_rows.h's kVersion is CurrentVersion");
+        Check(mr.Contains("kVersion = 8;"), "merged rows retain stock version 8");
+        var sizes = File.ReadAllText(Path.Combine(dir!, "output_sizes.h"));
+        Check(sizes.Contains("#define OUTPUT_OPTIONS_VERSION " + GameOptionsSchema.CurrentVersion), "output_sizes.h owns CurrentVersion");
         var dropped = Regex.Match(mr, @"kDropped\[\]\s*=\s*\{([^}]*)\}").Groups[1].Value;
         foreach (Match d in Regex.Matches(dropped, "\"([^\"]+)\""))
             Check(GameOptionsSchema.KeptKeys.ContainsKey(d.Groups[1].Value) && GameOptionsSchema.ByKey(d.Groups[1].Value) == null, d.Groups[1].Value + ": dropped by the game, a kept key here");
@@ -241,7 +244,8 @@ static partial class Tests
         string L(string key, int v) => GameOptionsSchema.Get(key).Label(v);
         string Cs(string key) => string.Join("|", GameOptionsSchema.Get(key).Choices.Select(c => c.Value + "=" + c.Label));
         Equal("-3=30|-2=40|-1=45|0=60 (the console's)|1=90|2=120|3=144|4=165|5=240|6=Monitor's rate", Cs("frame_rate_cap"), "fps cap");
-        Equal("7=1536x864 (handheld)|3=1920x1080|0=2048x1152|1=2560x1440|2=3840x2160|4=5120x1440|6=5120x2160|5=5120x2880", Cs("output_res"), "output sizes, smallest first");
+        Equal("7=1536x864 (handheld)|3=1920x1080|0=2048x1152|1=2560x1440|2=3840x2160|4=5120x1440|6=5120x2160|5=5120x2880|8=Screen|9=Custom (2560x1440)", Cs("output_res"),
+            "output sizes, smallest first, then Screen and Custom");
         Equal("0=Game|1=NVIDIA DLSS|3=AMD FSR 3.1|4=AMD FSR 4", Cs("dlss"), "upscalers: the engines, in the menu's order");
         Equal("0=Auto (dynamic)|1=100% (2048x1152)|2=75% (1536x864)|3=67% (1366x768)|4=50% (1024x576)", Cs("resolution"), "render resolution, the game's own");
         Equal("0=Off|1=Default", Cs("microphone"), "microphone without devices");
@@ -281,6 +285,123 @@ static partial class Tests
         Equal("NVIDIA DLSS", L("dlss", 2), "DLAA reads as its engine");
         Equal("AMD FSR 3.1", L("dlss", 6), "FSR 3.1's native AA too");
         Equal("Native (100%)", L("resolution", GameOptionsSchema.NativeStep), "the Render resolution's Native");
+        Equal("3440", L("output_width", 3440), "Custom's width, in pixels");
+
+        // (the Output resolution is the picture's size, output_sizes.h: Screen and Custom show theirs as the game takes it, a size
+        // that is not 16:9 has its own shape, which the Ultrawide row then shows with nothing to choose, and the Render
+        // resolution's sizes are the picture's)
+        var wide = GameOptionsFile.Load(NewGameFolder("game-options-wide", "output_res=8\nultrawide=2\nresolution=2\noptions_version=9\n"), (3840, 1600));
+        Equal("Screen (3840x1600)", wide.Label("output_res"), "Screen: the main monitor's size");
+        Equal("2.40:1 (3840x1600)", wide.Label("ultrawide"), "its own shape, not the row's 21:9");
+        Equal("2=2.40:1 (3840x1600)", string.Join("|", wide.ChoicesOf("ultrawide").Select(c => c.Value + "=" + c.Label)), "nothing to choose there");
+        Equal("75% (2880x1200)", wide.Label("resolution"), "the 3D's size is the picture's share");
+        Check(wide.ChoicesOf("output_res").Any(c => c.Label == "Custom (2560x1440)"), "Custom before its rows are set");
+        wide.Set("output_res", 9);
+        wide.Set("output_width", 3437);
+        Equal(3440, wide.Get("output_width"), "the width on its steps of 8");
+        wide.Set("output_height", 1440);
+        Equal("Custom (3440x1440)", wide.Label("output_res"), "Custom: its rows' size");
+        Equal("2.39:1 (3440x1440)", wide.Label("ultrawide"), "3440x1440 is not 64:27");
+        wide.Set("output_width", 7680);
+        wide.Set("output_height", 2880);
+        Equal("Custom (6248x2344)", wide.Label("output_res"), "more pixels than 5120x2880's: smaller, in its shape");
+        wide.Set("output_res", 4);
+        Equal("32:9 (5120x1440)", wide.Label("ultrawide"), "5120x1440 is a 32:9 picture by itself");
+        wide.Set("output_res", 6);
+        Equal("21:9 (5120x2160)", wide.Label("ultrawide"), "5120x2160 a 21:9 one");
+        Equal("75% (3840x1620)", wide.Label("resolution"), "of the whole 5120x2160");
+        wide.Set("output_res", 2);
+        Equal("21:9", wide.Label("ultrawide"), "a 16:9 size: the row's shape");
+        Equal(4, wide.ChoicesOf("ultrawide").Count, "and its four choices");
+        Equal("75% (3312x1398)", wide.Label("resolution"), "the row's 21:9 at the 4K output: kept to 3840x2160's pixels");
+        wide.Set("ultrawide", 0);
+        Equal("75% (2880x1620)", wide.Label("resolution"), "the game's own picture");
+        wide.Set("output_res", 8);
+        wide.Set("output_res", 7);
+        Equal("16:9", wide.Label("ultrawide"), "the handheld profile runs the game's own output: the row's shape");
+        // (output_custom_size: the Custom size the game's menu keeps while a screen's size is in the two rows. A kept key; a
+        // Custom size written here is the entered one from now on and empties it, so the menu does not offer both; another
+        // Output resolution chosen takes it back into the rows, as walking the menu's row does; any other change leaves it)
+        Check(GameOptionsSchema.IsKept("output_custom_size"), "output_custom_size is a kept key");
+        const string screenChosen = "output_res=9\noutput_width=3840\noutput_height=1600\noutput_custom_size=3437x1440\noptions_version=9\n";
+        var kept = NewGameFolder("game-options-kept", screenChosen);
+        var kf = GameOptionsFile.Load(kept);
+        Equal("", string.Join(",", kf.UnknownKeys), "no key nobody knows");
+        Equal((3437, 1440), kf.EnteredCustomSize!.Value, "the entered size, as the menu reads it");
+        kf.Set("sharpness", 30);
+        kf.Save();
+        Check(File.ReadAllText(Path.Combine(kept, GameOptionsSchema.FileName)).Contains("output_custom_size=3437x1440\n"), "another row: the line as it was");
+        kf.Set("output_width", 3440);
+        kf.Set("output_height", 1440);
+        Equal(null, kf.EnteredCustomSize, "used up by a size written here");
+        kf.Save();
+        Equal("output_res=9\noutput_width=3440\noutput_height=1440\noutput_custom_size=\nsharpness=30\noptions_version=9\n",
+            File.ReadAllText(Path.Combine(kept, GameOptionsSchema.FileName)), "a Custom size written by the launcher: the kept one emptied");
+        var left = NewGameFolder("game-options-left", screenChosen);
+        var lf = GameOptionsFile.Load(left);
+        lf.Set("output_res", 1);
+        Equal(3437, lf.Get("output_width"), "leaving Custom: the entered size back in the rows");
+        lf.Save();
+        Equal("output_res=1\noutput_width=3437\noutput_height=1440\noutput_custom_size=\noptions_version=9\n",
+            File.ReadAllText(Path.Combine(left, GameOptionsSchema.FileName)), "and the line emptied");
+        // (read under any Output resolution, as the menu does: under a fixed size with a screen's size in the rows, Custom
+        // is the size kept aside, and choosing it, or another fixed size, takes it back into the rows)
+        const string fixedChosen = "output_res=1\noutput_width=3840\noutput_height=1600\noutput_custom_size=3437x1440\noptions_version=9\n";
+        var ff = GameOptionsFile.Load(NewGameFolder("game-options-kept-fixed", fixedChosen));
+        Equal((3437, 1440), ff.EnteredCustomSize!.Value, "read under a fixed size too");
+        Check(ff.ChoicesOf("output_res").Any(c => c.Value == 9 && c.Label == "Custom (3440x1440)"), "Custom offered as the size it takes back, not the screen's in the rows");
+        ff.Set("output_res", 9);
+        Equal("Custom (3440x1440)", ff.Label("output_res"), "chosen: that size");
+        Equal(3437, ff.Get("output_width"), "as entered, in the rows");
+        ff.Save();
+        Equal("output_res=9\noutput_width=3437\noutput_height=1440\noutput_custom_size=\noptions_version=9\n", File.ReadAllText(ff.Path), "written, the line emptied");
+        var f2 = GameOptionsFile.Load(NewGameFolder("game-options-kept-fixed2", fixedChosen));
+        f2.Set("output_res", 3);
+        f2.Save();
+        Equal("output_res=3\noutput_width=3437\noutput_height=1440\noutput_custom_size=\noptions_version=9\n", File.ReadAllText(f2.Path), "another fixed size: taken back as well");
+        var f3 = GameOptionsFile.Load(NewGameFolder("game-options-kept-fixed3", fixedChosen));
+        f3.Set("sharpness", 30);
+        f3.Save();
+        Check(File.ReadAllText(f3.Path).Contains("output_width=3840\noutput_height=1600\noutput_custom_size=3437x1440\n"), "any other row: all three as they were");
+        Equal(null, GameOptionsFile.Load(NewGameFolder("game-options-kept-bad", "output_res=9\noutput_custom_size=100x100\noptions_version=9\n")).EnteredCustomSize,
+            "nor a size the rows cannot hold");
+        var none = NewGameFolder("game-options-kept-none", "output_res=9\noutput_width=3840\noutput_height=1600\noptions_version=9\n");
+        var nf8 = GameOptionsFile.Load(none);
+        nf8.Set("output_width", 3440);
+        nf8.Save();
+        Check(!File.ReadAllText(Path.Combine(none, GameOptionsSchema.FileName)).Contains("output_custom_size"), "no line where the file has none");
+
+        // (a size keeps its shape: one past the rows' ends is made smaller in it, as the game reads the file's two numbers)
+        var tall = GameOptionsFile.Load(NewGameFolder("game-options-tall", "output_res=9\noutput_width=10000\noutput_height=5000\noptions_version=9\n"));
+        Equal("Custom (5424x2712)", tall.Label("output_res"), "10000x5000 is 2:1 at 5120x2880's pixels");
+        Equal(5424, tall.Get("output_width"), "and the rows hold that size");
+        Equal("2.00:1 (5424x2712)", tall.Label("ultrawide"), "its shape kept");
+        // (the pair is shown as the game takes it, so one side changed is written with the other as shown: 3840 beside the
+        // file's 4320 would be 16:18 by the file, 5:4 for the game, where the launcher showed 3840x2880)
+        var pair = NewGameFolder("game-options-pair", "output_res=9\noutput_width=7680\noutput_height=4320\noptions_version=9\n");
+        var pf = GameOptionsFile.Load(pair);
+        Equal("Custom (5120x2880)", pf.Label("output_res"), "7680x4320 in the file: 5120x2880");
+        Equal(2880, pf.Get("output_height"), "the rows hold the size taken");
+        pf.Set("output_width", 3840);
+        Equal("Custom (3840x2880)", pf.Label("output_res"), "the width changed, beside the height shown");
+        pf.Save();
+        Equal("output_res=9\noutput_width=3840\noutput_height=2880\noptions_version=9\n", File.ReadAllText(Path.Combine(pair, GameOptionsSchema.FileName)),
+            "both sides written: the size shown");
+        Equal("Custom (3840x2880)", GameOptionsFile.Load(pair).Label("output_res"), "and read back as shown");
+        var one = NewGameFolder("game-options-one-side", "output_res=9\noutput_height=1600\noptions_version=9\n");
+        var of1 = GameOptionsFile.Load(one);
+        of1.Set("output_height", 1440);
+        of1.Save();
+        Equal("output_res=9\noutput_height=1440\noutput_width=2560\noptions_version=9\n", File.ReadAllText(Path.Combine(one, GameOptionsSchema.FileName)),
+            "a side the file has no line for: written too");
+        Equal("Screen (5120x2880)", GameOptionsFile.Load(NewGameFolder("game-options-8k", "output_res=8\noptions_version=9\n"), (7680, 4320)).Label("output_res"),
+            "a 7680x4320 screen: 16:9 still");
+        Equal("Custom (2560x1440)", GameOptionsFile.Load(NewGameFolder("game-options-nosize", "output_res=9\noutput_width=0\noutput_height=-3\noptions_version=9\n")).Label("output_res"),
+            "a side that is not a size: its default");
+        Equal("Screen", GameOptionsFile.Load(NewGameFolder("game-options-noscreen", "output_res=8\noptions_version=9\n")).Label("output_res"),
+            "Screen where the launcher does not know the monitor");
+        Equal("Screen (1368x768)", GameOptionsFile.Load(NewGameFolder("game-options-1366", "output_res=8\noptions_version=9\n"), (1366, 768)).Label("output_res"),
+            "a 16:9 screen: the game's frame at its height");
 
         // (the GPU device row: the names the launcher gives it)
         var before = GameOptionsSchema.GpuNames;
@@ -397,7 +518,7 @@ static partial class Tests
         "fps_counter=1\r\nhdr=0\r\nhdr_paper_white=400\r\nhdr_peak_brightness=4000\r\nrenodx_midgray=2\r\nrenodx_color_space=2\r\nquality_preset=0\r\n" +
         "resolution=1\r\ntexture_detail=1\r\ndlss=0\r\ndlss_model=1\r\nanti-aliasing=1\r\nsharpness=50\r\nupscaling=2\r\nframe_pacing=1\r\nnvidia_reflex=0\r\n" +
         "robust_buffers=1\r\nmicrophone=1\r\nmouse_sensitivity=125\r\ncontroller_in_background=1\r\nlayout_preset=1\r\nbutton_prompts=2\r\ndebug_tools=0\r\n" +
-        "replay_helper_threads=0\r\ntail_early=1\r\noptions_version=7\r\nmenu_size=1\r\npad_a=0\r\nkey_a=69,0\r\nkey_cam_right=39,76\r\n";
+        "replay_helper_threads=0\r\ntail_early=1\r\noptions_version=9\r\nmenu_size=1\r\npad_a=0\r\nkey_a=69,0\r\nkey_cam_right=39,76\r\n";
 
     static string NewGameFolder(string name, string content)
     {
@@ -510,23 +631,23 @@ static partial class Tests
         Check(merged.Contains("\r\nhdr=2\r\nzz_tool_line=5\r\n"), "the outside change and its new line kept in place");
         Check(merged.StartsWith("fullscreen=1\r\n"), "the launcher's change in its line");
         Check(merged.Contains("\r\nsharpness=70\r\n"), "a row changed on both sides: the launcher's (the later writer)");
-        Equal(outside.Replace("fullscreen=0", "fullscreen=1").Replace("sharpness=20", "sharpness=70").Replace("options_version=7", "options_version=8"), merged,
+        Equal(outside.Replace("fullscreen=0", "fullscreen=1").Replace("sharpness=20", "sharpness=70").Replace("options_version=7", "options_version=9"), merged,
             "every other line as the file had it (the version 7 file brought up to 8: nothing of it moves)");
         Equal("zz_tool_line", a.UnknownKeys.Single(), "an unknown key, kept");
         Equal(2, a.Get("hdr"), "this object holds the file as written");
 
         // (a row with no line goes in before options_version; duplicates all take the value)
-        var d = NewGameFolder("game-options-dup", "sharpness=10\nsharpness=20\n#note\noptions_version=7\nmenu_size=1\n");
+        var d = NewGameFolder("game-options-dup", "sharpness=10\nsharpness=20\n#note\noptions_version=9\nmenu_size=1\n");
         var df = GameOptionsFile.Load(d);
         Equal(20, df.Get("sharpness"), "the last line wins, as the game reads it");
         df.Set("sharpness", 30);
         df.Set("vsync", 0);
         df.Save();
-        Equal("sharpness=30\nsharpness=30\n#note\nvsync=0\noptions_version=8\nmenu_size=1\n", File.ReadAllText(Path.Combine(d, GameOptionsSchema.FileName)), "LF kept, line added, comment kept, brought up to 8");
+        Equal("sharpness=30\nsharpness=30\n#note\nvsync=0\noptions_version=9\nmenu_size=1\n", File.ReadAllText(Path.Combine(d, GameOptionsSchema.FileName)), "LF kept, line added, comment kept");
 
         // (a device's name in UTF-8: its bytes as they were, its label as text)
         var mic = "microphone_device=Mikrofon (Ä USB)";
-        var micBytes = Encoding.UTF8.GetBytes("microphone=2\r\n" + mic + "\r\noptions_version=7\r\n");
+        var micBytes = Encoding.UTF8.GetBytes("microphone=2\r\n" + mic + "\r\noptions_version=9\r\n");
         var mg = Path.Combine(NewRoot("game-options-mic"), "game");
         Directory.CreateDirectory(mg);
         File.WriteAllBytes(Path.Combine(mg, GameOptionsSchema.FileName), micBytes);
@@ -559,7 +680,7 @@ static partial class Tests
         Equal(10000, f.Set("hdr_peak_brightness", 12345), "past the end: the end");
         Equal(130, f.Set("mouse_sensitivity", 125), "onto the steps: the nearest, the larger on a tie");
         Equal(50, f.Set("rumble_strength", 60), "rumble on 25s");
-        Equal(0, f.Set("output_res", 9), "an output past the list: the first");
+        Equal(0, f.Set("output_res", 10), "an output past the list: the first");
         Equal(7, f.Set("output_res", 7), "the handheld profile's output");
         Equal(-1, f.Set("left_stick_dead_zone", -7), "a range below 0");
         Equal(-3, f.Set("frame_rate_cap", -3), "the cap's 30");
@@ -648,14 +769,38 @@ static partial class Tests
         Equal(1, f.Get("frame_pacing"), "pacing on, as the game reads a file before 7");
         Equal(2, f.Get("ultrawide"), "the monitor's shape at 2560x1080: 21:9");
         Equal(0, f.Get("nvidia_reflex"), "Reflex as saved from 5 on");
-        Equal(0, GameOptionsFile.Load(g).Get("ultrawide"), "without the screen: 16:9, as the game where it cannot ask");
+        // (without the screen, as the launcher is off Windows: the row is the game's to read, which knows its screen and reads
+        // 21:9 on this one. Not shown as a guess; and a save keeps the file at its version with its old lines, where it
+        // wrote ultrawide=0 and the current version, which the game then took as the player's 16:9)
+        var blind = NewGameFolder("game-options-v5-blind", "frame_pacing=0\r\nultrawide=1\r\noutput_res=4\r\nsharpness=20\r\noptions_version=5\r\n");
+        var bf = GameOptionsFile.Load(blind);
+        Equal(1, bf.Get("ultrawide"), "without the screen: the row as the file has it, for the game");
+        Equal(4, bf.Get("output_res"), "and the 5120x1440 that depends on it");
+        Equal(1, bf.Get("frame_pacing"), "the file's other old rules still read");
+        bf.Set("sharpness", 30);
+        bf.Save();
+        Equal("frame_pacing=0\r\nultrawide=1\r\noutput_res=4\r\nsharpness=30\r\noptions_version=5\r\n",
+            File.ReadAllText(Path.Combine(blind, GameOptionsSchema.FileName)), "saved at its version: nothing guessed, nothing migrated");
+        Equal(5, GameOptionsFile.Load(blind).Version, "still 5");
+        // (the row set here is a choice among the current shapes: the file is brought up to date with it)
+        bf.Set("ultrawide", 2);
+        bf.Save();
+        Equal("frame_pacing=1\r\nultrawide=2\r\noutput_res=4\r\nsharpness=30\r\noptions_version=9\r\n",
+            File.ReadAllText(Path.Combine(blind, GameOptionsSchema.FileName)).Replace("tail_early=1\r\n", ""),
+            "the row chosen here: up to date, beside the 5120x1440 the launcher showed");
+        // (with the screen known nothing waits, as before; nor from version 6 on, where 1 is 16:10)
+        Equal(1, GameOptionsFile.Load(NewGameFolder("game-options-v6-blind", "ultrawide=1\noptions_version=6\n")).Get("ultrawide"), "from 6 on: 16:10");
+        var v6 = GameOptionsFile.Load(NewGameFolder("game-options-v6-save", "ultrawide=1\nsharpness=20\noptions_version=6\n"));
+        v6.Set("sharpness", 30);
+        v6.Save();
+        Check(File.ReadAllText(v6.Path).Contains("options_version=9"), "a version 6 file is brought up to date without a screen");
         f.Set("sharpness", 30);
         f.Save();
-        Equal("frame_pacing=1\r\nultrawide=2\r\nnvidia_reflex=0\r\nsharpness=30\r\noptions_version=8\r\npad_a=0\r\n",
+        Equal("frame_pacing=1\r\nultrawide=2\r\nnvidia_reflex=0\r\nsharpness=30\r\noptions_version=9\r\npad_a=0\r\n",
             File.ReadAllText(Path.Combine(g, GameOptionsSchema.FileName)).Replace("tail_early=1\r\n", ""), "brought up to 8 as the game would read it");
-        Check(File.ReadAllText(Path.Combine(g, GameOptionsSchema.FileName)).Contains("tail_early=1\r\noptions_version=8"), "the Debug tab's tail_early too, before the version");
+        Check(File.ReadAllText(Path.Combine(g, GameOptionsSchema.FileName)).Contains("tail_early=1\r\noptions_version=9"), "the Debug tab's tail_early too, before the version");
         var again = GameOptionsFile.Load(g);
-        Equal(8, again.Version, "now 8");
+        Equal(9, again.Version, "now 8");
         again.Set(GameOptionsSchema.PacingKey, 0);
         again.Save();
         Equal(0, GameOptionsFile.Load(g).Get("frame_pacing"), "and from 7 on the choice is read as it is");
@@ -671,7 +816,7 @@ static partial class Tests
         Equal("", string.Join(",", hf.UnknownKeys), "the old rows' lines: known");
         hf.Set("vsync", 0);
         hf.Save();
-        Equal("output_res=7\nhandheld_profile=1\nstick_dead_zone=3\nright_stick_dead_zone=12\nquality_preset=4\nupscaling=2\nvsync=0\nleft_stick_dead_zone=15\noptions_version=8\n",
+        Equal("output_res=7\nhandheld_profile=1\nstick_dead_zone=3\nright_stick_dead_zone=12\nquality_preset=4\nupscaling=2\nvsync=0\nleft_stick_dead_zone=15\noptions_version=9\n",
             File.ReadAllText(Path.Combine(h, GameOptionsSchema.FileName)), "brought up to 8: the moved values written, the old lines left for the game to drop");
         var h8 = GameOptionsFile.Load(h);
         h8.Set("output_res", 1);
@@ -681,6 +826,23 @@ static partial class Tests
         var n7 = GameOptionsFile.Load(NewGameFolder("game-options-n7", "output_res=3\nleft_stick_dead_zone=-1\noptions_version=7\n"));
         Equal(3, n7.Get("output_res"), "no handheld line: the output as it is");
         Equal(-1, n7.Get("left_stick_dead_zone"), "no shared line: the default");
+        // (options_version 7: 5120x1440 and 5120x2160 were the game's frame, and the Ultrawide row gave the picture's shape there
+        // too. With the row on another shape than theirs: the 16:9 size of their height, the same picture; else as they are)
+        var w7 = NewGameFolder("game-options-v7", "output_res=4\r\nultrawide=2\r\nsharpness=20\r\noptions_version=7\r\n");
+        var wf7 = GameOptionsFile.Load(w7);
+        Equal(1, wf7.Get("output_res"), "5120x1440 with the row on 21:9: 2560x1440, whose 21:9 picture it was");
+        Equal("21:9", wf7.Label("ultrawide"), "and the row's shape still");
+        wf7.Set("sharpness", 30);
+        wf7.Save();
+        Equal("output_res=1\r\nultrawide=2\r\nsharpness=30\r\noptions_version=9\r\n", File.ReadAllText(Path.Combine(w7, GameOptionsSchema.FileName)),
+            "written as the game reads it, at 8");
+        Equal(4, GameOptionsFile.Load(NewGameFolder("game-options-v7b", "output_res=4\nultrawide=3\noptions_version=7\n")).Get("output_res"), "its own shape: as it is");
+        Equal(4, GameOptionsFile.Load(NewGameFolder("game-options-v7c", "output_res=4\nultrawide=0\noptions_version=7\n")).Get("output_res"), "16:9 there: as it is, now its picture");
+        Equal(2, GameOptionsFile.Load(NewGameFolder("game-options-v7d", "output_res=6\nultrawide=3\noptions_version=7\n")).Get("output_res"), "5120x2160 with 32:9: 3840x2160");
+        Equal(6, GameOptionsFile.Load(NewGameFolder("game-options-v7e", "output_res=6\nultrawide=2\noptions_version=7\n")).Get("output_res"), "5120x2160 with its 21:9");
+        Equal(4, GameOptionsFile.Load(NewGameFolder("game-options-v8", "output_res=4\nultrawide=2\noptions_version=9\n")).Get("output_res"), "from 8 on as chosen: the row is not read there");
+        Equal(4, GameOptionsFile.Load(NewGameFolder("game-options-v5b", "output_res=4\nultrawide=1\noptions_version=5\n"), (5120, 1440)).Get("output_res"),
+            "before 6 the row's 1 was the monitor's shape: 32:9 on a 5120x1440 one, 5120x1440's own");
 
         // (no options_version line: Game speed real time; no resolution line but the old dynamic_resolution)
         var o = NewGameFolder("game-options-v0", "game_speed=0\ndynamic_resolution=0\n");
@@ -704,7 +866,7 @@ static partial class Tests
         nf.Set(GameOptionsSchema.PacingKey, 3);
         nf.Save();
         var nl = OperatingSystem.IsWindows() ? "\r\n" : "\n";
-        Equal("vsync=0" + nl + "steady_frame_rate=2" + nl + "master_volume=85" + nl + "options_version=8" + nl, File.ReadAllText(nf.Path),
+        Equal("vsync=0" + nl + "steady_frame_rate=2" + nl + "master_volume=85" + nl + "options_version=9" + nl, File.ReadAllText(nf.Path),
             "a new file: the values in the menu's order (a merged row's parts at its place; frame_pacing at its default not written), then the version");
         Check(nf.Exists, "now there");
     }

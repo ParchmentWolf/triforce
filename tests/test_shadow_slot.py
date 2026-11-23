@@ -93,9 +93,9 @@ def main():
           "the storage alignment is not the larger of the texture's own and its slot's")
     applet = (HOST / "nn_applet.c").read_text(encoding="utf-8")
     pool = block(applet, "uint64_t hos_rt_pool_size(uint64_t game) {")
-    check("__atomic_store_n(&rt_pool_pinned, e != NULL || v != asked || (is_five_k && scaled > five_k)," in pool and
+    check("__atomic_store_n(&rt_pool_pinned, e != NULL || (is_five_k && v == five_k)," in pool and
           "static int rt_pool_pinned = -1;" in applet and "int hos_rt_pool_pinned(void) {" in applet,
-          "the target heap does not say whether it is pinned (HOS_RT_POOL_MB, the 5120-wide cap), or not that it is not known yet")
+          "the target heap does not say whether it is pinned (HOS_RT_POOL_MB, the picture pixel cap), or not that it is not known yet")
     dev = (ROOT / "docs" / "development.md").read_text(encoding="utf-8")
     check("`HOS_SHADOW_BUCKET=<step>`" in dev, "docs/development.md: HOS_SHADOW_BUCKET is not in the switches table")
 

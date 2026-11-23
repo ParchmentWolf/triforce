@@ -3,6 +3,8 @@
    executable. Decided at rx_start, before any other rx_* call; a DLL that is missing or finds no usable Vulkan
    device leaves the WebGPU renderer in place (logged). */
 #include "hos.h"
+#include "oot_title_movie.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #define WIN32_LEAN_AND_MEAN
@@ -60,6 +62,7 @@ void hos_mic_select(int mode, const char *name, int index);
 void hos_bind(int set, int button, int slot, int code);
 int hos_prompts_face(void);         /* prompts.c */
 int hos_prompts_pad_face(void);
+#include "hos_screens.h"   /* ((Triforce) display.c: the connected screens, for the Insert menu's Output resolution) */
 #if defined(A64_WRITE_TRACK) && !defined(__EMSCRIPTEN__)
 void hos_mark_written(const void *p, size_t n);
 #endif
@@ -275,8 +278,17 @@ static float host_wide_menus(uint32_t keep_mask) {   /* (MkwVkHost.wide_menus) *
     static int looked;
     if (!looked) looked = 1, forced = getenv("HOS_WIDE_KEEP");
     hos_wide_keep_mask = forced ? (uint32_t)strtoul(forced, NULL, 16) : keep_mask;
-    return hos_wide_margin;
+    /* ((Triforce) no sides beside the filled title movie, but those the row asks for beside a menu opened over it: both
+       asked every time, each says its own changes in the log) */
+    int rx_option(int id, int otherwise);
+    const int covers = oot_movie_cover_recent(), menu = oot_menu_over_movie() || rx_option(HOS_OPT_MODS_MUSIC, 0) == 2;
+    return oot_wide_menu_margin(hos_wide_margin, covers, menu);
 }
+static int host_wide_backdrop(void) {
+    int rx_option(int id, int otherwise);
+    /* The renderer owns Mods over the title; no guest screen class reports it to oot_menu_screen_tick. */
+    return oot_menu_backdrop_runs() || rx_option(HOS_OPT_MODS_MUSIC, 0) == 2;
+}   /* (MkwVkHost.wide_backdrop) */
 int hos_mouse_pointer(MkwVkPointer *out);   /* display.c, posix/display_sdl.c */
 int hos_sdl_gyro_status(void);   /* pad_sdl.c */
 extern const char *hos_romfs_dir;   /* nn_fs.c, set by hos_main.c */
@@ -297,6 +309,18 @@ int hos_vk_take_key_press(int key) {
 #define host_take_key_press NULL
 #endif
 
+/* ((Triforce) MkwVkHost.screens: the window code's list, as the interface has a screen) */
+static int host_screens(MkwVkScreen *out, int cap) {
+    HosScreen list[16];
+    int n = hos_screens(list, cap < 16 ? cap : 16);
+    for (int i = 0; i < n; i++) {
+        memset(&out[i], 0, sizeof out[i]);
+        out[i].w = list[i].w > 0 ? (uint32_t)list[i].w : 0, out[i].h = list[i].h > 0 ? (uint32_t)list[i].h : 0;
+        out[i].opens = list[i].opens;
+        snprintf(out[i].name, sizeof out[i].name, "%s", list[i].name);
+    }
+    return n;
+}
 static const MkwVkHost vk_host = {
     MKWVK_API_VERSION, host_log, hos_guest_base, hos_guest_size, hos_gpu_ptr, nvn_gpu_guest, nvn_gpu_read,
     nvn_gpu_write, host_collect, host_free_pages, host_mark_written, hos_ticks, hos_now_ns, nvn_tex_layout,
@@ -304,7 +328,7 @@ static const MkwVkHost vk_host = {
     hos_gpu_maps_generation, nvn_vmap_generation, hos_reserved_cpus, host_collect_in, host_guest_alloc,
     host_watch_guest_writes, hos_pad_raw, hos_binding, hos_bind, host_aspect_ratio, host_take_key_press,
     hos_mouse_pointer, hos_mic_count, hos_mic_name, hos_mic_select, hos_sdl_gyro_status, hos_log_flush, hos_prompts_face,
-    host_romfs_dir, host_wide_menus, hos_bench_state, hos_prompts_pad_face,
+    host_romfs_dir, host_wide_menus, hos_bench_state, hos_prompts_pad_face, host_screens, host_wide_backdrop,
 };
 
 static const MkwVkRenderer *vk;   /* the Vulkan back end, when it was chosen and started */
@@ -704,6 +728,9 @@ int rx_memory_holders(char *out, size_t n) {
 }
 /* (nvn_native.c: the CPU set an event's value) in order with the submits, for the GPU's waits on it */
 int rx_option(int id, int otherwise) { return vk && vk->option ? vk->option(id) : otherwise; }
+/* ((Triforce, 11-22, N64 Classic) the cursor under its TV's curve: where the game's picture under it was drawn (vk_api.h
+   screen_point); as it is without the renderer's answer */
+void rx_screen_point(int *x, int *y, int w, int h) { if (vk && vk->screen_point) vk->screen_point(x, y, w, h); }
 void rx_option_set(int id, int value) { if (vk && vk->option_set) vk->option_set(id, value); }
 void rx_nvn_event_signal(uint64_t gpu, uint32_t value) {
     if (vk && vk->nvn_event_signal) vk->nvn_event_signal(gpu, value);

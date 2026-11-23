@@ -11,6 +11,7 @@
    the game gets none of it; the capture it had comes back when the menu closes. */
 #include "../hos.h"
 #include "../hos_sdl.h"
+#include "../hos_screens.h"   /* ((Triforce) the connected screens, for the Output resolution) */
 
 /* (the window's app id: the applications menu's entry names it as its StartupWMClass, builder/linux/hookshot_builder.py) */
 #define HOS_APP_ID "io.github.NotRexed.Hookshot"
@@ -178,6 +179,34 @@ static void menu_mouse(int open) {
         captured_before_menu = 0;
     }
 }
+/* ((Triforce) host/hos_screens.h) Every connected display, read once on the main thread in hos_display_init (SDL's video
+   calls belong to it): SDL's list with the main display first, which is the one the window opens on as far as the host
+   can say (the compositor places it); from an SDL without the list, the main display alone, by the size already read */
+static HosScreen screens[16];
+static int screens_n;
+static void screens_read(int main_w, int main_h) {
+    HosSdlDisplay d[16];
+    const int n = hos_sdl_displays(d, 16);
+    screens_n = 0;
+    for (int i = 0; i < n; i++) {
+        if (d[i].w <= 0 || d[i].h <= 0) continue;
+        HosScreen *s = &screens[screens_n];
+        memset(s, 0, sizeof *s);
+        s->w = d[i].w, s->h = d[i].h, s->opens = screens_n == 0;
+        snprintf(s->name, sizeof s->name, "%s", d[i].name);
+        screens_n++;
+    }
+    if (!screens_n && main_w > 0 && main_h > 0) {
+        memset(&screens[0], 0, sizeof screens[0]);
+        screens[0].w = main_w, screens[0].h = main_h, screens[0].opens = 1;
+        screens_n = 1;
+    }
+}
+int hos_screens(HosScreen *out, int cap) {
+    const int n = screens_n < cap ? screens_n : cap;
+    memcpy(out, screens, (size_t)n * sizeof *out);
+    return n;
+}
 static int sdl_ready;
 int hos_display_owns_sdl(void) { return sdl_ready; }   /* (controllers stay on this thread while it runs SDL) */
 
@@ -205,11 +234,17 @@ int hos_display_init(void) {
         fprintf(stderr, "display: SDL_Init: %s: no window\n", hos_sdl_error());
         return -1;
     }
-    int w, h;
+    int w = 0, h = 0;
     if (hos_sdl_desktop_size(&w, &h)) hos_posix_window[1] = w, hos_posix_window[2] = h;
+    screens_read(w, h);   /* ((Triforce) every display, on this thread: the game's asks later, hos_screens) */
     sdl_ready = 1;
     return 1;
 }
+
+/* (Triforce) The size, in pixels, of the display the game's window opens on, for the Output resolution
+   (host/nn_applet.c): the desktop's main display, as hos_display_init read it before the game; 0 x 0 with no SDL or no
+   display (HOS_HEADLESS). A window on another display keeps the picture it started with, fitted into it. */
+void hos_screen_size(int *w, int *h) { *w = hos_posix_window[1], *h = hos_posix_window[2]; }
 
 /* the game's thread, when NVN is up (hos_main.c): the window is made on the main thread, which waits for this */
 void hos_display_start(void) {
@@ -229,7 +264,7 @@ void hos_display_loop(void) {
     HosSdlEvent e;
     while (!__atomic_load_n(&start_asked, __ATOMIC_ACQUIRE)) hos_sdl_wait_event(&e, 10);   /* (nothing to show yet) */
     extern float hos_aspect_ratio;
-    /* (the picture's shape when Monitor's shape set one, wider or narrower than 16:9: 960 x 720 for 4:3, 1720 x 720 for 21:9) */
+    /* (the picture's shape when it is not 16:9, the Output resolution's own or the Ultrawide row's: 960 x 720 for 4:3, 1728 x 720 for 3840 x 1600) */
     int win_w = hos_aspect_ratio > 0.0f ? (int)(720 * hos_aspect_ratio + 0.5f) : 1280, win_h = 720;
     if (getenv("HOS_WINDOW_SIZE")) {
         int w = 0, h = 0;

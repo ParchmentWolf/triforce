@@ -281,9 +281,12 @@ inline bool make_skin(std::vector<unsigned char>&& bntx_bytes, Skin& skin) {
     // archive lists them under: the Spiritual Stones and the medallions as the load list shows them, a song's icon, a Gold
     // Skulltula's mark, a rupee. Taken when the archive has them and they are of a form this reads; the skin is whole
     // without them, and the icons are then drawn
+    // ((Triforce) 11-18) and for the file select's cards (vk_menu.cpp draw_files): a heart, the "Autosave" tag's plate
     static const char* const more[] = {
         "DataFileImportantIcon_00", "DataFileImportantIcon_01", "DataFileImportantIcon_02", "DataFileImportantIcon_03", "DataFileImportantIcon_04",
         "DataFileImportantIcon_05", "DataFileImportantIcon_06", "DataFileImportantIcon_07", "DataFileImportantIcon_08",
+        "HeartBase_00", "HeartFrame_00", "NumBaseAutoSave_00",
+        // (and for the achievements' icons, vk_menu.cpp ach_icon: a song's, a Gold Skulltula's mark, a rupee)
         "OcarinaMelodyIcon_00", "MapIconCollectSkullSign_00", "RupeeIconNew_00"};
     for (const char* n : more) {
         const Bntx::Entry* e = bntx.find(n);

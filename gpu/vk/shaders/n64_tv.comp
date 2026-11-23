@@ -1,0 +1,114 @@
+#version 450
+// (Triforce, 11-22) N64 Classic's TV (n64-classic-mode-plan.md, step 4): the window pass in the filter's place
+// (vk_framegen.cpp framegen_scale, upscaler_rows.h window_filter's kTvFilter), from the finished picture, HUD and all, to its
+// place in the window at the window's own pixels. ((11-22, the owner's test) The options' own screens go under it with the
+// game's: drawn into a layer of the picture's place before it (vk_menu.cpp menu_tv_layer), laid over the picture here, before
+// any of the TV, as the game's own HUD is in the picture. The FPS counter is drawn after it, flat.)
+//
+// Per window pixel: ((step 8) at a switch, the picture squashed to a line, then a dot, and its flash: n64_rules.h anim) the
+// screen's curve (where the picture is under it; off the picture, black), the composite signal's
+// colour blurred sideways more than its brightness, then in linear light the saturation, the beam across the TV line (240
+// lines over the picture, lined up with the 3D pass's grid; wider where bright), the phosphor mask at the window's own
+// pixels, the glow from the picture at 1/8 (the copy the ultrawide menu sides use), the vignette and the rounded corners.
+// The picture is sRGB-encoded, as the window pass's other shaders and hdr_encode.comp take it: decoded here, encoded again,
+// with less than a step of 8 bits of noise against banding (fg_scale.comp's).
+#extension GL_GOOGLE_include_directive : require
+#include "n64_common.glsl"
+#include "n64_tv.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D src;      // the picture (or, beside ultrawide's menu sides, the window-size image with them)
+layout(binding = 1, rgba8) uniform writeonly image2D dst;
+layout(binding = 2) uniform sampler2D small;    // the picture at 1/8
+// ((11-22) the options' layer: the picture's place, colours premultiplied by their cover and encoded as the picture is
+// (vk_imgui.cpp record_layer); bound to something else, and not read, when there is none (menu 0)
+layout(binding = 3) uniform sampler2D menu;
+// ((11-22, the owner's second look: the game's own panes showed through the options' plates, blurred) menu 2: this dispatch
+// makes the glow's 1/8 copy again, dst the small image: the picture with the options' layer over it, each pixel its 8 x 8
+// block's mean as fg_scale.comp's side 3 makes it. The glow then comes from what the screen shows, not from what the game
+// drew under the options)
+layout(push_constant) uniform P {
+    float lines;        // the TV's lines over the picture (240)
+    float scan;         // the scanlines' strength on this screen (n64_rules.h scanline_strength)
+    float mask;         // the mask's strength
+    float bleed;        // how far the colour blurs sideways, in the picture's widths (n64_rules.h tv_bleed_uv)
+    float glow;
+    float curve;
+    float saturation;
+    int mask_type;      // n64_rules.h mask_shown's: 1 none, 2 aperture grille, 3 slot mask, 4 shadow mask
+    float anim_x;       // ((step 8) the TV switching off and on, n64_rules.h anim: the picture's width and height, shares of
+    float anim_y;       // the whole (1, 1 at rest), and the light added, 0 to 1)
+    float flash;
+    int menu;           // ((11-22) 1: the options' layer is over the picture; 2: the 1/8 copy with it, into dst)
+} pc;
+
+// (the picture at uv, the options' layer over it: everything below takes the two as one, as it takes the game's HUD)
+vec3 encoded(vec2 uv) {
+    vec3 c = clamp(textureLod(src, uv, 0.0).rgb, 0.0, 1.0);
+    if (pc.menu != 0) {
+        const vec4 m = clamp(textureLod(menu, uv, 0.0), 0.0, 1.0);
+        c = m.rgb + c * (1.0 - m.a);
+    }
+    return clamp(c, 0.0, 1.0);
+}
+vec3 decode3(vec3 c) { return vec3(n64_decode(c.r), n64_decode(c.g), n64_decode(c.b)); }
+vec3 encode3(vec3 c) { return vec3(n64_encode(c.r), n64_encode(c.g), n64_encode(c.b)); }
+float dither(ivec2 g) { return (fract(52.9829189 * fract(0.06711056 * float(g.x) + 0.00583715 * float(g.y))) - 0.5) / 255.0; }
+
+void main() {
+    const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 d = imageSize(dst);
+    if (any(greaterThanEqual(g, d))) return;
+    if (pc.menu == 2) {   // (the glow's 1/8 copy: 4 x 4 taps on the corners of each pixel's block's 2 x 2s, its mean)
+        const vec2 at = (vec2(g) + 0.5) / vec2(d), block = 1.0 / vec2(d);
+        vec3 sum = vec3(0.0);
+        for (int y = 0; y < 4; y++)
+            for (int x = 0; x < 4; x++) sum += encoded(at + (vec2(x, y) - 1.5) * 0.25 * block);
+        imageStore(dst, g, vec4(sum / 16.0, 1.0));
+        return;
+    }
+    vec2 p = (vec2(g) + 0.5) / vec2(d) * 2.0 - 1.0;
+    // (the TV switching off and on: the whole picture squashed into the middle, to a line, then a dot; around it the tube is dark)
+    if (abs(p.x) > pc.anim_x || abs(p.y) > pc.anim_y) {
+        imageStore(dst, g, vec4(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+    p /= vec2(pc.anim_x, pc.anim_y);
+    const vec2 w = vec2(n64_warp(p.x, p.y, pc.curve), n64_warp(p.y, p.x, pc.curve));
+    if (abs(w.x) > 1.0 || abs(w.y) > 1.0) {
+        imageStore(dst, g, vec4(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+    const vec2 uv = w * 0.5 + 0.5;
+    // (the composite signal: brightness from here, colour from 5 taps across the bleed)
+    vec3 e = encoded(uv);
+    if (pc.bleed > 0.0) {
+        float i = 0.0, q = 0.0;
+        for (int t = -2; t <= 2; t++) {
+            const vec3 s = encoded(uv + vec2(float(t) * pc.bleed * 0.5, 0.0));
+            i += n64_bleed_weight(t) * n64_i(s.r, s.g, s.b);
+            q += n64_bleed_weight(t) * n64_q(s.r, s.g, s.b);
+        }
+        const float y = n64_y(e.r, e.g, e.b);
+        e = clamp(vec3(n64_red(y, i, q), n64_green(y, i, q), n64_blue(y, i, q)), 0.0, 1.0);
+    }
+    vec3 c = decode3(e);
+    const float luma = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    c = max(mix(vec3(luma), c, pc.saturation), 0.0);
+    // (the beam across its TV line, each channel by its own light)
+    const float f = fract(uv.y * pc.lines) - 0.5;
+    c *= vec3(n64_scan(f, c.r, pc.scan), n64_scan(f, c.g, pc.scan), n64_scan(f, c.b, pc.scan));
+    // (the mask, at the window's own pixels)
+    c *= vec3(n64_mask(g.x, g.y, pc.mask_type, 0, pc.mask), n64_mask(g.x, g.y, pc.mask_type, 1, pc.mask),
+              n64_mask(g.x, g.y, pc.mask_type, 2, pc.mask));
+    // (the glow: the picture at 1/8, four taps a small pixel and a half around, added)
+    if (pc.glow > 0.0) {
+        const vec2 o = 1.5 / vec2(textureSize(small, 0));
+        const vec3 b = (textureLod(small, uv + vec2(-o.x, -o.y), 0.0).rgb + textureLod(small, uv + vec2(o.x, -o.y), 0.0).rgb +
+                        textureLod(small, uv + vec2(-o.x, o.y), 0.0).rgb + textureLod(small, uv + vec2(o.x, o.y), 0.0).rgb) * 0.25;
+        c += pc.glow * decode3(clamp(b, 0.0, 1.0));
+    }
+    c *= n64_vignette(uv.x, uv.y, pc.curve) * n64_corner(w.x, w.y, pc.curve);
+    c = mix(c, vec3(0.9, 0.95, 1.0), clamp(pc.flash, 0.0, 1.0) * 0.8);   // (the switch's flash: the line and the dot glow bluish white)
+    imageStore(dst, g, vec4(encode3(clamp(c, 0.0, 1.0)) + dither(g), 1.0));
+}

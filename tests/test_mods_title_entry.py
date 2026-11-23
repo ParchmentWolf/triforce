@@ -538,7 +538,7 @@ def main():
     check("my < e[1] && my > e[1] - (quit_here ? 6 : 4) * e[4]) mods_row_sel = 0, press[1] = true;" in tick,
           "the mouse moving up off the title's entry does not give the cursor back")
     check(tick.count("(mods_list_fresh() || mods_title_fading())") == 0 and
-          menu.count("mods_row = !open && !start && (mods_list_fresh() || mods_title_fading());") == 1 and
+          menu.count("s.mods_row = !s.open && !s.start && (mods_list_fresh() || mods_title_fading());") == 1 and
           menu.count("mods_row = !open && (mods_list_fresh() || mods_title_fading());") == 1,
           "the title's entry is not drawn on while it fades after its list (menu_record, menu_record_image)")
 

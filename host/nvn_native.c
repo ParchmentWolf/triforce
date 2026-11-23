@@ -2793,6 +2793,8 @@ NV(nvnQueuePresentTexture) {
     { void hos_stall_host_presented(void); hos_stall_host_presented(); }
     void hos_mod_cheats_frame(void);   /* (Triforce) mod_cheats.c: the mods' cheat files, once a game frame; nothing without one */
     hos_mod_cheats_frame();
+    void hos_save_files_frame(void);
+    hos_save_files_frame();   /* ((Triforce) host/save_files.c: the title's file select; nothing while it is off) */
     void hos_achievements_frame(void);
     hos_achievements_frame();   /* ((Triforce) host/achievements.c: its lists read and named to the menu; nothing while it is off) */
 }

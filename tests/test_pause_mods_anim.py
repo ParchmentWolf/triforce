@@ -171,12 +171,16 @@ def main():
           "draw_quit_ask(k);" in dm and dm.index("menu_window_w = c.w, menu_window_h = c.h;") < dm.index("draw_quit_ask(k);"),
           "the dialog is not drawn through its Out, or its dim is not the whole window's")
     # ((11-19) the performance panel over the dialog's dim, as over the game's own dialogs: drawn after the menu on Mods' page)
-    for fn in ("void menu_record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h) {",
-               "void menu_record_image(VkCommandBuffer cmd, VkImage image, VkImageView view, uint32_t w, uint32_t h) {"):
-        rec = function(menu, fn)
-        check("const bool over_row = open && page == kModsRowPage;" in rec and "if (open) draw_menu(c, full && !over_row);" in rec and
-              rec.index("if (open) draw_menu(c, full && !over_row);") < rec.index("if (full && over_row) draw_perf(c);"),
-              "the performance panel is under Quit's dim (" + fn.split("(")[0] + ")")
+    # ((Triforce, 11-22) the window's frames by draw_overlays (menu_record's, and N64 Classic's menu_tv_layer's: m the options'
+    # own screens' context, under its TV when it takes them), the stills by menu_record_image)
+    rec = function(menu, "void draw_overlays(uint32_t w, uint32_t h, const Showing& s, ImDrawList* under) {")
+    check("const bool over_row = s.open && page == kModsRowPage;" in rec and "if (s.open) draw_menu(m, full && !over_row);" in rec and
+          rec.index("if (s.open) draw_menu(m, full && !over_row);") < rec.index("if (full && over_row) draw_perf(c);"),
+          "the performance panel is under Quit's dim (void draw_overlays)")
+    rec = function(menu, "void menu_record_image(VkCommandBuffer cmd, VkImage image, VkImageView view, uint32_t w, uint32_t h) {")
+    check("const bool over_row = open && page == kModsRowPage;" in rec and "if (open) draw_menu(c, full && !over_row);" in rec and
+          rec.index("if (open) draw_menu(c, full && !over_row);") < rec.index("if (full && over_row) draw_perf(c);"),
+          "the performance panel is under Quit's dim (void menu_record_image)")
     # ((11-19) the mouse over the dialog: its buttons only, Mods and Quit under the dim gone from the hit map; none on its Out)
     check("hits.clear(0, 0, c.w, c.h);" in ask and ask.index("hits.clear(0, 0, c.w, c.h);") < ask.index("for (int i = 0; i < 3; i++) {"),
           "Mods and Quit under the dialog's dim still take clicks (a second click on Quit's place is A on Quit Game)")
@@ -185,7 +189,7 @@ def main():
     # the input
     tick = function(menu, "void menu_tick() {")
     enter = tick[tick.index("bool entered_by_down = false;"):tick.index("if (!open_now.load() || page != kModsPage) {")]
-    check("entered_by_down = enter == 1 || enter == 5;" in enter and "if (enter == 3) quit_open();" in enter,
+    check("entered_by_down = enter == 1 || enter == 5;" in enter and "if (enter == 3 && !mods_title_list()) quit_open();" in enter,
           "the enter word does not tell of a Down, or a click on Quit does not open its dialog with its In")
     check("mods_row_sel = enter == 3 || enter == 4 ? 1 : 0," in enter and "const bool clicked = enter == 2 || enter == 3;" in enter and
           "mods_sound(clicked ? HOS_MENU_SOUND_SYS_DECIDE : HOS_MENU_SOUND_SYS_CURSOR);" in enter,

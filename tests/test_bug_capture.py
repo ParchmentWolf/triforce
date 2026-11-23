@@ -86,9 +86,16 @@ def check_sources():
     check("InterlockedCompareExchange(&capture_state, 2, 1) != 1" in work, "a capture can be written twice at once")
     # the picture: before the overlays, not during the start-up screen, three presents before it is read
     record = block(menu, "void menu_record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h) {")
-    call = "if (!start) bugshot_record(cmd, index, w, h);"
-    check(call in record and record.index(call) < min(record.index(s) for s in ("ui::begin(", "ui::idle()", "draw_menu(", "draw_fps(", "ui::record(")),
+    call = "if (!s.start) bugshot_record(cmd, index, w, h);"
+    check(call in record and record.index(call) < min(record.index(s) for s in ("ui::begin(", "ui::idle()", "draw_overlays(", "ui::record(")),
           "the capture's picture is not taken before the overlays are drawn (or is taken of the start-up screen)")
+    # ((Triforce, 11-22, N64 Classic) the options drawn under its TV before the window pass: never while a capture waits for
+    # this frame's picture; a copy under way goes on at menu_record all the same)
+    layer = block(menu, "VkImageView menu_tv_layer(VkCommandBuffer cmd) {")
+    check("bugshot_state() == 1" in layer and layer.index("bugshot_state() == 1") < layer.index("draw_overlays("),
+          "the options are drawn under N64 Classic's TV, into the picture, while a capture waits for it")
+    check(record.index("bugshot_record(cmd, index, w, h);") < record.index("ui::record_rest(cmd, index, w, h);"),
+          "menu_record does not go on with a capture's copy when the options were drawn under the TV")
     rec = block(shot, "void bugshot_record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h) {")
     order = [rec.index(s) for s in ("barrier(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);",
                                     "vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &c);",
