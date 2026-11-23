@@ -1032,6 +1032,22 @@ Row rows[] = {
      hn_output_res, true},
     {TAB_DISPLAY, "GPU device", &opts.gpu_device, 0, 8, 1, tx_gpu,
      "Which graphics card the game runs on. Applies after a restart.", hn_gpu, true, true},
+    MENU_HEADING(TAB_DISPLAY, "Flatscreen 3D"),
+    {TAB_DISPLAY, "3D on the screen", &opts.flat3d, 0, 5, 1, tx_flat3d,
+     "The game in 3D on a flat screen, without a headset (when VR is off or no headset is connected). Red/cyan: glasses with "
+     "a red and a cyan lens. Side by side (3D TV): each eye squeezed into its half, for a 3D TV's side by side mode. Crossed "
+     "eyes: the right eye's picture on the left, for viewing with crossed eyes. Above and below: each eye in its half, one "
+     "over the other. Side by side (Cardboard): each eye's whole picture in its own half, for a phone in a viewer such as "
+     "Google Cardboard, or for showing a stream in 3D; with this one, while VR runs, the desktop shows both of the headset's "
+     "eyes side by side.", nullptr, false, true, -1, false, "flat3d"},
+    {TAB_DISPLAY, "3D depth", &opts.flat3d_depth, 0, 800, 10, tx_percent,
+     "How strong the 3D is on the screen: the eyes' distance, 100% a person's (6.4 cm); the farther you sit from the screen, "
+     "the more it takes. Not VR's Depth.", nullptr, false, true, -1,
+     false, "flat3d_depth"},
+    {TAB_DISPLAY, "Screen distance", &opts.flat3d_screen, 0, 2000, 10, tx_flat3d_screen,
+     "How far into the world the screen sits: things nearer come out of it, farther ones stay behind it. Auto: at the nearest "
+     "thing in the picture's middle, so the world sits behind the screen, as the 3DS does.", nullptr, false, true, -1, false,
+     "flat3d_screen"},
     MENU_HEADING(TAB_DISPLAY, "Ultrawide"),
     {TAB_DISPLAY, "Aspect ratio", &opts.ultrawide, 0, 3, 1, tx_ultrawide,
      "The shape of the picture: the game's own 16:9, or 16:10, 21:9 or 32:9 for a screen of that shape. A screen of another "
@@ -1341,21 +1357,6 @@ Row rows[] = {
     {TAB_VR, "Depth", &opts.vr_depth, 0, 200, 5, tx_percent,
      "How far apart your eyes are in the game's world. 100% matches your own eyes; 0% shows both eyes the same flat "
      "picture.", nullptr, false, true, -1, false, "vr_depth"},
-    {TAB_VR, "Flatscreen 3D", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},
-    {TAB_VR, "3D on the screen", &opts.flat3d, 0, 5, 1, tx_flat3d,
-     "The game in 3D on a flat screen, without a headset (when VR is off or no headset is connected). Red/cyan: glasses with "
-     "a red and a cyan lens. Side by side (3D TV): each eye squeezed into its half, for a 3D TV's side by side mode. Crossed "
-     "eyes: the right eye's picture on the left, for viewing with crossed eyes. Above and below: each eye in its half, one "
-     "over the other. Side by side (Cardboard): each eye's whole picture in its own half, for a phone in a viewer such as "
-     "Google Cardboard, or for showing a stream in 3D; with this one, while VR runs, the desktop shows both of the headset's "
-     "eyes side by side.", nullptr, false, true, -1, false, "flat3d"},
-    {TAB_VR, "3D depth", &opts.flat3d_depth, 0, 400, 5, tx_percent,
-     "How strong the 3D is on the screen: the eyes' distance, 100% a person's (6.4 cm). Not VR's Depth.", nullptr, false, true, -1,
-     false, "flat3d_depth"},
-    {TAB_VR, "Screen distance", &opts.flat3d_screen, 0, 2000, 10, tx_flat3d_screen,
-     "How far into the world the screen sits: things nearer come out of it, farther ones stay behind it. Auto: at the nearest "
-     "thing in the picture's middle, so the world sits behind the screen, as the 3DS does.", nullptr, false, true, -1, false,
-     "flat3d_screen"},
     {TAB_VR, "Eye position", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},
     {TAB_VR, "Height", &opts.vr_eye_up, -30, 30, 1, tx_cm_signed,
      "Moves your eyes up or down from the height of Link's eyes.", nullptr, false, true, -1, false, "vr_eye_up"},
