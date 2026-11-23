@@ -5114,11 +5114,15 @@ bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, 
         xr_began = *cur_state, xr_began_value = value, xr_eye.cb_scene = false, xr_detect_reset(false);
         if (n == xr_scene_n) vk_xr_carry(cmd, 1);   // (what it will carry into the right eye's pass, kept before it)
     }
+    // ((Triforce VR) Stereo Balanced: the frame before's camera moved onto this picture's eye, the eyes being drawn in turn)
+    const float xr_prev = vk_xr_balanced_prev_shift();
+    if (xr_prev != 0.0f) xr_eye.d = xr_prev, xr_eye.prev_only = true, xr_eye.on = true, xr_swaps_reset();
     for (; cb < n; cb++, p = nullptr) {
         if (!handles[cb]) continue;
         stop = replay_handle(cmd, p ? p : reinterpret_cast<const uint8_t*>(handles[cb]), may_stop);
         if (stop) break;
     }
+    if (xr_prev != 0.0f) xr_eye.on = false, xr_eye.prev_only = false;
     if (xr_double && !stop && xr_began_value == value && xr_eye.cb_scene && xr_double_prepare()) {
         static NvnState again;
         again = xr_began;

@@ -117,7 +117,8 @@ bool xr_span_wanted();
 /// (Triforce VR) the other eye while a command buffer is walked again for it (vk_replay.cpp): every uniform buffer bound that
 /// holds a scene camera (the scene's size at 0x120, a perspective projection: the game keeps several, a ring) is a copy with
 /// that camera moved d metres to its right
-struct XrEyeCam { bool on = false; float d = 0; uint32_t w = 0, h = 0; int hits = 0, copies = 0; bool cb_scene = false; };
+struct XrEyeCam { bool on = false; float d = 0; uint32_t w = 0, h = 0; int hits = 0, copies = 0; bool cb_scene = false;
+                  bool prev_only = false; };   // (prev_only: only the frame before's camera moved, d: Stereo Balanced's eyes in turn)
 void xr_swaps_reset();
 extern int xr_n_swaps;
 int xr_swap_copies(float* p, uint64_t n);

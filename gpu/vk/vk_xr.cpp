@@ -2347,6 +2347,18 @@ extern "C" void vk_xr_second_eye(VkCommandBuffer cb, int phase) {
     x.second_now = true;
 }
 
+// Stereo Balanced: the eyes drawn in turn, so the frame before's camera (which the game's temporal passes reproject from) is the
+// other eye's: how far to move it onto this picture's eye, metres along its right (+ for the right eye's picture), 0 not now
+extern "C" float vk_xr_balanced_prev_shift(void) {
+    Xr &x = xr();
+    if (!stereo_balanced() || !x.ok || !x.head_view.load(std::memory_order_relaxed) || !x.running.load(std::memory_order_relaxed))
+        return 0.0f;
+    std::lock_guard<std::mutex> lk(x.frame_mu);
+    if (x.drawn.eye < 0) return 0.0f;
+    const float shift = x.drawn.ipd * 0.01f * (float)cfg_int("VR_DEPTH");
+    return x.drawn.eye == 1 ? shift : -shift;
+}
+
 // Stereo Accurate: how far right of the left eye the right eye's camera is, metres (0: not now)
 extern "C" float vk_xr_accurate_shift(void) {
     Xr &x = xr();

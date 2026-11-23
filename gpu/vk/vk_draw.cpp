@@ -13679,6 +13679,7 @@ void xr_eye_shift(float* c) {
     float before[0x230 / 4];
     std::memcpy(before, c, sizeof before);
     const float d = xr_eye.d;
+    if (!xr_eye.prev_only) {   // (the current camera: Accurate's other eye)
     c[3] -= d;
     const float* P = c + 0x70 / 4;
     const float V[16] = {c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[10], c[11], 0, 0, 0, 1};
@@ -13689,6 +13690,7 @@ void xr_eye_shift(float* c) {
             c[0x30 / 4 + i * 4 + j] = v;
         }
     c[0xb0 / 4 + 3] += d * c[0], c[0xc0 / 4 + 3] += d * c[1], c[0xd0 / 4 + 3] += d * c[2];
+    }
     {   // (the frame before's camera, 0x150 on in the same layout: moved alike, so what reprojects the frame before's pictures
         // (foliage blended over frames, glows) finds this eye's own place then, not a jump of the eyes' distance)
         float* q = c + 0x150 / 4;
