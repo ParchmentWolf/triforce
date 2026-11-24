@@ -376,8 +376,21 @@ bool running_runtime(std::string &manifest, std::string &who) {
     exe[n] = 0;
     std::string dir(exe);
     for (int i = 0; i < k.up + 1 && dir.find('/') != std::string::npos; i++) dir.erase(dir.find_last_of('/'));
-    // (the path as this process sees it where it is there, a system or Steam install's; else through the server's own root, a
-    // Flatpak's /app)
+    // (a Flatpak's server runs from /app: where that is on the disk, its .flatpak-info's app-path. A runtime loaded through
+    // /proc/<pid>/root instead came up without its Vulkan extension)
+    if (dir.compare(0, 5, "/app/") == 0 || dir == "/app") {
+        const std::string info = "/proc/" + std::to_string(best_pid) + "/root/.flatpak-info";
+        if (FILE *f = fopen(info.c_str(), "r")) {
+            char line[1024];
+            while (fgets(line, sizeof line, f))
+                if (!strncmp(line, "app-path=", 9)) {
+                    line[strcspn(line, "\r\n")] = 0;
+                    dir = std::string(line + 9) + dir.substr(4);
+                    break;
+                }
+            fclose(f);
+        }
+    }
     const std::string plain = dir + "/" + k.file;
     const std::string at = plat_file_exists(plain.c_str()) ? plain : "/proc/" + std::to_string(best_pid) + "/root" + plain;
     if (at.back() != '/') {
