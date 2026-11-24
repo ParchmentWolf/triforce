@@ -30,6 +30,18 @@ public sealed record PlaceResult(string Place, double AverageFps, double OnePerc
 {
     public double Low01 { get; init; }
     public IReadOnlyList<double> FrameTimes { get; init; } = Array.Empty<double>();
+    /// <summary>((Triforce) 11-22) the helper-thread test's two halves of this place (null: not tested)</summary>
+    public HelperHalves? Helpers { get; init; }
+}
+
+/// <summary>((Triforce) 11-22) A place measured twice in a row by the helper-thread test (host/hos_bench.c HOS_BENCH_HELPERS):
+/// the replay helper threads off and on, the tuner out of the way; OnFirst: the order (it turns from place to place).</summary>
+public sealed record HelperHalves(double OffFps, double OffLow, double OnFps, double OnLow, bool OnFirst)
+{
+    public IReadOnlyList<double> OffTimes { get; init; } = Array.Empty<double>();
+    public IReadOnlyList<double> OnTimes { get; init; } = Array.Empty<double>();
+    /// <summary>"on" faster by more than the margin: +1; slower by more: -1; else 0 (too close to tell)</summary>
+    public int Verdict => OnFps >= OffFps * Benchmark.HelperMargin ? 1 : OffFps >= OnFps * Benchmark.HelperMargin ? -1 : 0;
 }
 
 /// <summary>One benchmark run as the game wrote it.</summary>
@@ -37,6 +49,9 @@ public sealed record BenchRun(IReadOnlyList<PlaceResult> Scenes, string? Gpu, bo
 {
     /// <summary>((Triforce, 11-19) the places the game would not take Link to, left out (host/hos_bench.c skip_scene)</summary>
     public IReadOnlyList<string> Skipped { get; init; } = Array.Empty<string>();
+    /// <summary>((Triforce) 11-22) the helper-thread test: null not asked for; 0 asked, but the game had no helper threads to
+    /// test (a PC Automatic gives none); else the threads it tested</summary>
+    public int? HelperThreads { get; init; }
 }
 
 /// <summary>A setting the benchmark would change: its triforce_options.ini key, the menu's row name, the value now and the
@@ -79,6 +94,13 @@ public sealed class Benchmark : IBenchmarkRunner
     static readonly (int value, int fps)[] Caps = { (0, 60), (2, 120), (3, 144), (5, 240) };
     public const int UpGame = 0, UpDlss = 1, UpFsr3 = 3, ResQuality = 3, ResBalanced = 5, CapUncapped = 5;
     public const int SteadyRefreshSteps = 2;   // (fps_cap.h: 0 Off, 1 Any rate, 2 Refresh steps)
+    // ((Triforce) 11-22) the Debug tab's Replay helper threads row (gpu/vk/replay_threads.h): 0 Off, 1 to 7 a fixed count
+    // (n + 1 threads), 8 Automatic, also when the file has no such line
+    public const string KHelpers = "replay_helper_threads";
+    public const int HelpersOff = 0, HelpersAutomatic = 8;
+    /// <summary>A place counts as faster one way only by more than this (the run-to-run spread of a place's average on a lab PC,
+    /// about 3 %)</summary>
+    public const double HelperMargin = 1.03;
 
     public string WorkFolder => Path.Combine(ctx.WorkFolder, "benchmark");
     string Marker => Path.Combine(WorkFolder, "restore.txt");
@@ -150,7 +172,8 @@ public sealed class Benchmark : IBenchmarkRunner
     /// <summary>One benchmark run: the game in its benchmark mode (it loads the newest save by itself, visits the scenes with
     /// its own panel on screen, writes its results and quits). Settings for the run: the player's, uncapped and without VSync,
     /// plus <paramref name="upscaler"/> at Quality when given. Stop: the token (the game is closed and writes "stopped").</summary>
-    public async Task<BenchRun> RunOnceAsync(string game, (int upscaler, string name)? upscaler, IProgress<BenchmarkProgress>? progress, CancellationToken token)
+    public async Task<BenchRun> RunOnceAsync(string game, (int upscaler, string name)? upscaler, IProgress<BenchmarkProgress>? progress, CancellationToken token,
+        bool helperTest = false)
     {
         var g = new Game(ctx);
         var exe = g.FindExe(game) ?? throw new BenchmarkException("There is no built game in " + game + ".");
@@ -175,6 +198,9 @@ public sealed class Benchmark : IBenchmarkRunner
         {
             var keys = new Dictionary<string, int> { [KCap] = CapUncapped, [KVsync] = 0, [KSteady] = 0, [KFrameGen] = 0 };
             if (upscaler is { } u) { keys[KUpscaler] = u.upscaler; keys[KResolution] = ResQuality; }
+            // ((Triforce) 11-22) the helper-thread test needs the helper threads there: the row's fixed count as the player has it,
+            // else Automatic's (its Off has none); the game holds them off and on itself, the tuner out of the way
+            if (helperTest && !(BenchIni.Read(ini).TryGetValue(KHelpers, out var hr) && hr is >= 1 and <= 7)) keys[KHelpers] = HelpersAutomatic;
             BenchIni.Set(ini, keys);
             var si = new ProcessStartInfo(exe) { UseShellExecute = false, WorkingDirectory = game, RedirectStandardError = true, RedirectStandardOutput = true };
             foreach (var a in new[] { Path.Combine(game, "image.bin"), "--romfs", Path.Combine(game, "romfs"), "--user", userCopy }) si.ArgumentList.Add(a);
@@ -183,6 +209,7 @@ public sealed class Benchmark : IBenchmarkRunner
             si.Environment["HOS_OOT_PROTECT_HEARTS"] = "1";
             si.Environment["HOS_INPUT_SCRIPT_BACKGROUND"] = "1";
             si.Environment["HOOKSHOT_NO_UPDATE_CHECK"] = "1";
+            if (helperTest) si.Environment["HOS_BENCH_HELPERS"] = "1";
             if (ctx.Env("TRIFORCE_BENCH_GAME_ENV") is { Length: > 0 } extra)   // (tests: e.g. the stand-in game's speed)
                 foreach (var kv in extra.Split(';')) if (kv.IndexOf('=') is var i and > 0) si.Environment[kv[..i]] = kv[(i + 1)..];
             var logPath = Path.Combine(WorkFolder, upscaler == null ? "run.log" : "run-upscaler.log");
@@ -202,7 +229,8 @@ public sealed class Benchmark : IBenchmarkRunner
             p.ErrorDataReceived += (_, e) => Got(e.Data);
             p.OutputDataReceived += (_, e) => Got(e.Data);
             p.BeginErrorReadLine(); p.BeginOutputReadLine();
-            ctx.Log.Write("benchmark: started the game in benchmark mode (pid " + p.Id + ")" + (upscaler is { } up2 ? " with " + up2.name : ""));
+            ctx.Log.Write("benchmark: started the game in benchmark mode (pid " + p.Id + ")" + (upscaler is { } up2 ? " with " + up2.name : "") +
+                (helperTest ? ", with the helper-thread test" : ""));
             using (token.Register(() => { try { if (!p.HasExited && !(p.CloseMainWindow() && p.WaitForExit(15000))) p.Kill(true); } catch { } }))
             {
                 while (!p.HasExited)
@@ -243,14 +271,30 @@ public sealed class Benchmark : IBenchmarkRunner
                 double D(string k) => s.TryGetProperty(k, out var v) && v.TryGetDouble(out var d) ? d : 0;
                 var ft = new List<double>();
                 if (s.TryGetProperty("frametimes_ms", out var f)) foreach (var x in f.EnumerateArray()) if (x.TryGetDouble(out var d)) ft.Add(d);
-                scenes.Add(new PlaceResult(s.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "", D("avg"), D("low1"), false) { Low01 = D("low01"), FrameTimes = ft });
+                HelperHalves? halves = null;
+                if (s.TryGetProperty("helpers", out var h) && h.ValueKind == System.Text.Json.JsonValueKind.Object &&
+                    h.TryGetProperty("off", out var off) && h.TryGetProperty("on", out var on))
+                {
+                    static double H(System.Text.Json.JsonElement e, string k) => e.TryGetProperty(k, out var v) && v.TryGetDouble(out var d) ? d : 0;
+                    static List<double> T(System.Text.Json.JsonElement e)
+                    {
+                        var l = new List<double>();
+                        if (e.TryGetProperty("frametimes_ms", out var a)) foreach (var x in a.EnumerateArray()) if (x.TryGetDouble(out var d)) l.Add(d);
+                        return l;
+                    }
+                    halves = new HelperHalves(H(off, "avg"), H(off, "low1"), H(on, "avg"), H(on, "low1"),
+                        h.TryGetProperty("first", out var fi) && fi.GetString() == "on") { OffTimes = T(off), OnTimes = T(on) };
+                }
+                scenes.Add(new PlaceResult(s.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "", D("avg"), D("low1"), false)
+                    { Low01 = D("low01"), FrameTimes = ft, Helpers = halves });
             }
         var skipped = new List<string>();
         if (r.TryGetProperty("skipped", out var sk) && sk.ValueKind == System.Text.Json.JsonValueKind.Array)
             foreach (var x in sk.EnumerateArray()) if (x.GetString() is { Length: > 0 } name) skipped.Add(name);
+        int? helperThreads = r.TryGetProperty("helper_test", out var ht) && ht.TryGetProperty("threads", out var htn) && htn.TryGetInt32(out var hn) ? hn : null;
         return new BenchRun(scenes, r.TryGetProperty("gpu", out var gpu) ? gpu.GetString() : null,
             r.TryGetProperty("stopped", out var st) && st.ValueKind == System.Text.Json.JsonValueKind.True,
-            r.TryGetProperty("error", out var er) ? er.GetString() : null, took) { Skipped = skipped };
+            r.TryGetProperty("error", out var er) ? er.GetString() : null, took) { Skipped = skipped, HelperThreads = helperThreads };
     }
 
     /// <summary>The old interface: one run, then the rules (the App runs the upscaler pass on its own, when asked).</summary>
@@ -300,6 +344,44 @@ public sealed class Benchmark : IBenchmarkRunner
         // frame generation: never turned on by this (DESIGN 12: only below 60 with DLSS-G / FSR 4 FG, not measured yet)
         recs.Add(new SettingChange(KFrameGen, "Frame generation", Now(KFrameGen, 0), Now(KFrameGen, 0)));
         return recs;
+    }
+
+    /// <summary>((Triforce) 11-22) The helper-thread test's suggestion for the Replay helper threads row, or null (not tested,
+    /// or no place measured both ways): no place faster with them, Off; every place faster, the row as it is when it has
+    /// them (Automatic or a fixed count), else Automatic; some faster and some not, Automatic, where the tuner decides as the
+    /// game runs.</summary>
+    public static SettingChange? RecommendHelpers(IReadOnlyDictionary<string, int> now, IReadOnlyList<PlaceResult> places)
+    {
+        var tested = places.Where(p => p.Helpers != null).Select(p => p.Helpers!.Verdict).ToList();
+        if (tested.Count == 0) return null;
+        var from = now.TryGetValue(KHelpers, out var v) && v is >= 0 and <= 8 ? v : HelpersAutomatic;
+        var to = !tested.Contains(1) ? HelpersOff : tested.All(x => x == 1) ? (from == HelpersOff ? HelpersAutomatic : from) : HelpersAutomatic;
+        return new SettingChange(KHelpers, "Replay helper threads", from, to);
+    }
+
+    /// <summary>((Triforce) 11-22) The places as they run with the row set to <paramref name="row"/>: the "off" half's figures for
+    /// Off, the faster half's otherwise (Automatic's tuner keeps the faster way; a fixed count does too)</summary>
+    public static IReadOnlyList<PlaceResult> AsRecommended(IReadOnlyList<PlaceResult> places, int row) => places.Select(p =>
+        p.Helpers is not { } h ? p
+        : row == HelpersOff || h.OffFps >= h.OnFps ? p with { AverageFps = h.OffFps, OnePercentLow = h.OffLow, FrameTimes = h.OffTimes }
+        : p with { AverageFps = h.OnFps, OnePercentLow = h.OnLow, FrameTimes = h.OnTimes }).ToList();
+
+    /// <summary>((Triforce) 11-22) the verdict's sentence for the helper-thread test ("" when it did not run)</summary>
+    public static string HelperNote(BenchRun run)
+    {
+        if (run.HelperThreads is not { } threads) return "";
+        if (threads < 2) return " The helper-thread test could not run: the game has no replay helper threads on this PC.";
+        var tested = run.Scenes.Where(p => p.Helpers != null).ToList();
+        if (tested.Count == 0) return "";
+        static string Pct(HelperHalves h) => (h.OnFps / h.OffFps - 1).ToString("+0%;-0%;0%", CultureInfo.InvariantCulture);
+        var faster = tested.Where(p => p.Helpers!.Verdict == 1).Select(p => p.Place + " " + Pct(p.Helpers!)).ToList();
+        var slower = tested.Where(p => p.Helpers!.Verdict == -1).Select(p => p.Place + " " + Pct(p.Helpers!)).ToList();
+        var s = $" With the {threads} replay helper threads on: ";
+        if (faster.Count == tested.Count) return s + $"faster everywhere ({string.Join(", ", faster)}).";
+        if (faster.Count == 0)
+            return s + (slower.Count > 0 ? $"faster nowhere, slower in {string.Join(", ", slower)}" : "no place more than 3 % apart") +
+                   ", so they are better off.";
+        return s + $"faster in {string.Join(", ", faster)}, not elsewhere, so Automatic decides as you play.";
     }
 
     /// <summary>((Triforce, 11-19) the verdict's note for places left out ("" when none)</summary>

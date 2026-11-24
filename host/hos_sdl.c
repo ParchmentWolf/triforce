@@ -17,6 +17,7 @@ static struct {
     void *CreateWindow, *SetWindowPosition, *SetWindowFullscreen, *SetRelativeMouseMode, *GetPrimaryDisplay,
         *GetDesktopDisplayMode, *Vulkan_CreateSurface, *PixelSize, *GetKeyboardState, *GetMouseState, *WaitEventTimeout,
         *PollEvent, *GetWindowSize, *LoadPNG, *SetWindowIcon, *DestroySurface, *GetWindowDisplay, *GetCurrentDisplayMode;
+    void *GetDisplays, *GetDisplayName;   /* ((Triforce) optional: every display, hos_sdl_displays) */
     /* sound */
     void *OpenAudioDevice, *PauseAudioDevice, *OpenAudioDeviceStream, *ResumeAudioStreamDevice, *PutAudioStreamData;
     /* controllers */
@@ -79,6 +80,9 @@ static int get_all(HMODULE m, int three) {
     /* ((Triforce) 11-20) a controller's type and name by its place in the list, for the instruments left out (pad_kind.h) */
     *(FARPROC *)&f.JoyTypeOf = GetProcAddress(m, three ? "SDL_GetJoystickTypeForID" : "SDL_JoystickGetDeviceType");
     *(FARPROC *)&f.PadNameOf = GetProcAddress(m, three ? "SDL_GetGamepadNameForID" : "SDL_GameControllerNameForIndex");
+    /* ((Triforce) every connected display and its name: SDL3's list of ids, SDL2's count; without them the main one alone) */
+    *(FARPROC *)&f.GetDisplays = GetProcAddress(m, three ? "SDL_GetDisplays" : "SDL_GetNumVideoDisplays");
+    *(FARPROC *)&f.GetDisplayName = GetProcAddress(m, "SDL_GetDisplayName");
     if (three) {
         GET(SetWindowPosition, "SDL_SetWindowPosition");
         GET(GetPrimaryDisplay, "SDL_GetPrimaryDisplay");
@@ -186,6 +190,42 @@ int hos_sdl_desktop_size(int *width, int *height) {
     if (CALL(int (*)(int, void *), GetDesktopDisplayMode)(0, &m)) return 0;
     *width = m.w, *height = m.h;
     return 1;
+}
+int hos_sdl_displays(HosSdlDisplay *out, int cap) {
+    int n = 0;
+    if (!f.GetDisplays) return 0;
+    if (version == 3) {   /* (SDL_GetDisplays: the ids, freed with SDL_free; SDL_DisplayMode as above) */
+        int count = 0;
+        uint32_t *ids = CALL(uint32_t *(*)(int *), GetDisplays)(&count);
+        /* (the main display first, whatever SDL's order: it is the one hos_sdl_desktop_size reads) */
+        const uint32_t main_id = CALL(uint32_t (*)(void), GetPrimaryDisplay)();
+        for (int i = 1; ids && i < count; i++)
+            if (ids[i] == main_id) ids[i] = ids[0], ids[0] = main_id;
+        for (int i = 0; ids && i < count && n < cap; i++) {
+            const uint8_t *m = CALL(const uint8_t *(*)(uint32_t), GetDesktopDisplayMode)(ids[i]);
+            if (!m) continue;
+            int w, h;
+            float density;
+            memcpy(&w, m + 8, 4), memcpy(&h, m + 12, 4), memcpy(&density, m + 16, 4);
+            if (!(density > 0)) density = 1;
+            const char *name = f.GetDisplayName ? CALL(const char *(*)(uint32_t), GetDisplayName)(ids[i]) : NULL;
+            out[n].w = (int)(w * density + 0.5f), out[n].h = (int)(h * density + 0.5f);
+            snprintf(out[n].name, sizeof out[n].name, "%s", name ? name : "");
+            n++;
+        }
+        if (ids) CALL(void (*)(void *), Free)(ids);
+        return n;
+    }
+    const int count = CALL(int (*)(void), GetDisplays)();   /* (SDL2: by index, 0 the main display) */
+    for (int i = 0; i < count && n < cap; i++) {
+        struct { uint32_t format; int w, h, refresh_rate; void *driverdata; } m;
+        if (CALL(int (*)(int, void *), GetDesktopDisplayMode)(i, &m)) continue;
+        const char *name = f.GetDisplayName ? CALL(const char *(*)(int), GetDisplayName)(i) : NULL;
+        out[n].w = m.w, out[n].h = m.h;
+        snprintf(out[n].name, sizeof out[n].name, "%s", name ? name : "");
+        n++;
+    }
+    return n;
 }
 int hos_sdl_refresh_mhz(void *window) {
     if (!window || !f.GetWindowDisplay || !f.GetCurrentDisplayMode) return 0;

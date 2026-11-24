@@ -83,8 +83,19 @@ def check_source():
     # an open menu (its BringWindowToDisplayBack): draw_menu draws it over its dim, before its pages; the game tab's header over
     # it; (Triforce, 11-19) over the Mods entry's Quit dialog and its dim instead. tests/test_fps_overlay_order.py runs
     # menu_record for the order)
-    for name in ("void menu_record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h) {",
-                 "void menu_record_image(VkCommandBuffer cmd, VkImage image, VkImageView view, uint32_t w, uint32_t h) {"):
+    # ((Triforce, 11-22) the window's frames by draw_overlays, what shows asked by showing_now (menu_record's, and N64 Classic's
+    # menu_tv_layer's: m the options' own screens' context, under its TV when it takes them; the panel with them under the game
+    # tab's header and the Mods entry, the counter over it all)
+    showing = block(menu, "Showing showing_now() {")
+    check("s.fps = opts.show_fps && !s.start;" in showing, "the counter's and the panel's switch is not the row (showing_now)")
+    record = block(menu, "void draw_overlays(uint32_t w, uint32_t h, const Showing& s, ImDrawList* under) {")
+    check("const bool full = s.fps && opts.show_fps == 2;" in record and "if (s.open) draw_menu(m, full && !over_row);" in record and
+          "if (full) draw_perf(s.game_tab || s.mods_row ? m : c);" in record and "if (full && over_row) draw_perf(c);" in record and
+          "if (s.fps && !full) draw_fps(c, (s.open && page != kModsRowPage) || s.game_tab);" in record,
+          "Full does not draw the panel alone, under the menu (draw_overlays)")
+    check(record.index("if (full) draw_perf(") < record.index("if (s.game_tab) draw_game_tab(m);"), "the game tab's header is not over the panel")
+    check(record.count("draw_perf(") == 2, "the panel is drawn more than under the menu and over the Mods entry's dialog")
+    for name in ("void menu_record_image(VkCommandBuffer cmd, VkImage image, VkImageView view, uint32_t w, uint32_t h) {",):
         record = block(menu, name)
         check("const bool fps = opts.show_fps && !start;" in record or "const bool fps = opts.show_fps && !startup_on.load(std::memory_order_acquire);" in record,
               "the counter's and the panel's switch is not the row")
@@ -157,7 +168,7 @@ def check_source():
             'cell(v.frame[3], "%.2f ms", f.shader_ms);', 'cell(v.frame[4], "%.1f per frame", f.uploads);',
             'c.dim = perf_machine::cell_text(c.t, sizeof c.t, fmt, x);',
             'present_sizes.load(std::memory_order_relaxed)', 'set(2, perf_upscaling_text(t, sizeof t));', 'set(3, tx_aa(opts.aa));',
-            'perf_rate_text(tx_fps_cap(opts.fps_cap), t, sizeof t);', 'set(5, tx_onoff(opts.vsync));', 'set(6, tx_ultrawide(opts.ultrawide));',
+            'perf_rate_text(tx_fps_cap(opts.fps_cap), t, sizeof t);', 'set(5, tx_onoff(opts.vsync));', 'set(6, shape_now(opts.ultrawide));',
             'sscanf(tx_output_res(opts.output_res), "%ux%u", &ow, &oh) == 2 && oh) snprintf(t, sizeof t, "%up", oh);', 'set(8, tx_hdr(opts.hdr));',
             'set(9, perf_framegen_text(t, sizeof t));', 'perf_title(v.title, sizeof v.title);'):
         check(needle in sample, "the panel's text is not NX2navi's, or not from where it is measured: " + needle)
@@ -291,7 +302,8 @@ def check_source():
           "the panel's text size is not baked at once when it changes")
     check("ImFont* font = c.f.body ? c.f.body : c.f.strong;   // (draw_perf's)" in block(menu, "void bake_perf(const ui::Ctx& c, float px) {") and
           "ImFont* font = c.f.body ? c.f.body : c.f.strong;" in draw, "the panel's glyphs are baked in another font than draw_perf's")
-    check(record.index("prebake(c);") < record.index("if (open) draw_menu(c, full && !over_row);"), "the bake is not before the drawing")
+    overlays = block(menu, "void draw_overlays(uint32_t w, uint32_t h, const Showing& s, ImDrawList* under) {")   # ((11-22) the drawing's)
+    check(overlays.index("prebake(c);") < overlays.index("if (s.open) draw_menu(m, full && !over_row);"), "the bake is not before the drawing")
     check("if (r == kPerfFG && !v.fg) continue;" in draw, "the FG row shows without frame generation")
     check("if (v.setting[i][0]) label(kPerfSetting[i])" in draw, "a setting without a value is not left out")
     # (no panel of its own making: the options' plate, separator and font; the game's art read at run time from the player's

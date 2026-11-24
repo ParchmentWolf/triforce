@@ -34,8 +34,10 @@
 #include "vk_pace.h"           // (Triforce: whether RivaTuner holds the frames this thread presents)
 #include "vk_present_rect.h"
 #include "vk_temporal.h"      // ((Triforce, S1) temporal_sharpens_3d: the upscaler sharpened the 3D before the HUD)
+#include "wide_sides_rule.h"   // ((Triforce) when ultrawide's menu sides show)
 #include "vk_texture.h"
 #include "sharpen_rules.h"    // ((Triforce, S1, S3-S6) the window pass's Sharpness and filter, the PQ picture's shaders)
+#include "vk_n64.h"          // ((Triforce, N64 Classic, step 4) its TV in the window filter's place: framegen_scale)
 #include <vector>
 
 #include "shaders/fg_copy_comp_spv.h"
@@ -47,6 +49,7 @@
 #include "shaders/fg_luma_comp_spv.h"
 #include "shaders/fg_median_comp_spv.h"
 #include "shaders/fg_scale_comp_spv.h"
+#include "shaders/n64_tv_comp_spv.h"   // ((Triforce, N64 Classic) shaders/n64_tv.comp)
 #include "shaders/fg_synth_comp_spv.h"
 #include "shaders/fsr1_easu_comp_spv.h"
 #include "shaders/fsr1_rcas_comp_spv.h"
@@ -145,6 +148,12 @@ struct ScaleState {
     Img cropped, scaled, small;   // (small: the picture at 1/8, for ultrawide's blurred menu sides)
     Img easu_img;      // (FSR 1: EASU's output, RCAS's input, the window's size)
     uint32_t cropped_w = 0, cropped_h = 0, scaled_w = 0, scaled_h = 0, small_w = 0, small_h = 0;
+    // ((Triforce, N64 Classic, step 4) its TV's pipeline (shaders/n64_tv.comp: init_tv), and beside ultrawide's menu sides the
+    // window-size image the filter draws them into first)
+    Pipe tv;
+    bool tv_tried = false;
+    Img tv_img;
+    uint32_t tv_w = 0, tv_h = 0;
 } scale;
 
 struct HdrState {   // (hookshot) the HDR10 pass (framegen_hdr)
@@ -375,6 +384,21 @@ bool init_scale_pq() {
         drop_pipe(scale.easu16), drop_pipe(scale.rcas16);
     logf("vk: HDR Native: the window's filter takes the 10-bit picture through RGBA16F images%s",
          scale.easu16.pipe ? "" : " (AMD FSR 1 as Catmull-Rom)");
+    return true;
+}
+
+/// ((Triforce, 11-22, N64 Classic, step 4) its TV's pipeline (shaders/n64_tv.comp), made at its first present; rgba8 only (the
+/// TV does not run on HDR Native's PQ picture). False: not made (said once), and the window's filter draws as before
+bool init_tv() {
+    if (scale.tv_tried) return scale.tv.pipe != VK_NULL_HANDLE;
+    scale.tv_tried = true;
+    const VkDescriptorType S = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, I = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    if (!init_scale() || !make_pipe(scale.tv, N64_TV_COMP_SPV, sizeof N64_TV_COMP_SPV, {S, I, S, S}, 48)) {
+        drop_pipe(scale.tv);
+        logf("vk: N64 Classic: its TV pass could not be made: the window's filter draws as before");
+        return false;
+    }
+    logf("vk: N64 Classic: its TV pass is ready");
     return true;
 }
 
@@ -726,15 +750,18 @@ WideSides wide_sides() {
     extern int64_t presents_now;
     extern std::atomic<int64_t> wheel_drawn_at;
     // (no world: a menu. But not the item wheel, whose background is the last frame of play over the whole picture, as on the
-    // console: its sides are left as the game draws them)
-    const bool no_world = presents_now - world_drawn_at.load(std::memory_order_relaxed) > 3 &&
-                          presents_now - wheel_drawn_at.load(std::memory_order_relaxed) > 3;
+    // console: its sides are left as the game draws them. (Triforce) The program that draws it also draws the centred
+    // backdrop of a system menu over the title, which does get the sides: the host says which it is, wide_sides_rule.h)
+    const bool centred_menu = host->wide_backdrop && host->wide_backdrop() != 0;
+    const int side = wide_sides_rule::show(opts.wide_menus, margin, presents_now, world_drawn_at.load(std::memory_order_relaxed),
+                                           wheel_drawn_at.load(std::memory_order_relaxed), centred_menu);
     wide_possible.store(opts.wide_menus && margin > 0.0f, std::memory_order_relaxed);
-    if (opts.wide_menus && margin > 0.0f && no_world) w.x0 = margin, w.side = opts.wide_menus;
+    if (side) w.x0 = margin, w.side = side;
     static int told = 0;
     if (w.side != told) {   // (each change logged: a report of blurred sides in play says when they came and went)
-        logf("vk: ultrawide menu sides %s at present %lld (the world last drawn at present %lld)", w.side ? "on" : "off",
-             (long long)presents_now, (long long)world_drawn_at.load(std::memory_order_relaxed));
+        logf("vk: ultrawide menu sides %s at present %lld (the world last drawn at present %lld, the last picture's blur at %lld%s)",
+             w.side ? "on" : "off", (long long)presents_now, (long long)world_drawn_at.load(std::memory_order_relaxed),
+             (long long)wheel_drawn_at.load(std::memory_order_relaxed), centred_menu ? ", a menu's centred backdrop" : "");
         told = w.side;
     }
     return w;
@@ -772,8 +799,9 @@ VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint
             std::lock_guard qk(dev.present_mu);
             device_wait_idle_locked();
         }
-        drop_img(scale.cropped), drop_img(scale.scaled), drop_img(scale.easu_img), drop_img(scale.small);
+        drop_img(scale.cropped), drop_img(scale.scaled), drop_img(scale.easu_img), drop_img(scale.small), drop_img(scale.tv_img);
         scale.cropped_w = scale.cropped_h = scale.scaled_w = scale.scaled_h = scale.small_w = scale.small_h = 0;
+        scale.tv_w = scale.tv_h = 0;
         scale.format = format;
     }
     const Pipe& filter = pq ? scale.pipe16 : scale.pipe;
@@ -835,6 +863,87 @@ VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint
     }
     // (the size the picture is at: the cropped one when the game drew into part of its texture)
     const uint32_t iw = src == scale.cropped.view ? scale.cropped_w : sw, ih = src == scale.cropped.view ? scale.cropped_h : sh;
+    // ((Triforce, 11-22, N64 Classic, step 4) its TV in the filter's place (upscaler_rows.h kTvFilter; n64_tv_now: not on HDR
+    // Native's PQ picture, nor under DLSS frame generation): from the picture to its place in the window at the window's own
+    // pixels, the glow from the picture at 1/8 (the copy ultrawide's menu sides blur). Beside those sides the filter draws
+    // them first, into an image of the window's size, and the TV goes over it. Its pipeline not made: the filter, as before
+    if (!pq && n64_tv_now(pq) && init_tv()) {
+        const n64_rules::Look look = n64_look();
+        const n64_rules::AnimFrame f = n64_anim();   // ((step 8) the TV switching off and on: 1, 1 and no flash at rest)
+        const uint32_t smw = std::max(1u, source.w / 8), smh = std::max(1u, source.h / 8);
+        if (scale.small_w != smw || scale.small_h != smh) {
+            {
+                std::lock_guard qk(dev.present_mu);
+                device_wait_idle_locked();
+            }
+            drop_img(scale.small);
+            scale.small_w = scale.small_h = 0;
+            if (!make_img(scale.small, smw, smh, scale.format, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)) {
+                drop_img(scale.small);
+                return VK_NULL_HANDLE;
+            }
+            scale.small_w = smw, scale.small_h = smh;
+            to_general(cmd, scale.small.image);
+        }
+        struct { int mode; float sharp; float x0, x1; int side; } sp{0, 0.0f, wide.x0, 1.0f - wide.x0, 3};
+        pass(cmd, filter, {{src, scale.linear}, {scale.small.view, VK_NULL_HANDLE}, {src, scale.linear}}, smw, smh, &sp, sizeof sp);
+        VkImageView picture = src;
+        if (wide.side) {
+            if (scale.tv_w != dw || scale.tv_h != dh) {
+                {
+                    std::lock_guard qk(dev.present_mu);
+                    device_wait_idle_locked();
+                }
+                drop_img(scale.tv_img);
+                scale.tv_w = scale.tv_h = 0;
+                if (!make_img(scale.tv_img, dw, dh, scale.format, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)) {
+                    drop_img(scale.tv_img);
+                    return VK_NULL_HANDLE;
+                }
+                scale.tv_w = dw, scale.tv_h = dh;
+                to_general(cmd, scale.tv_img.image);
+            }
+            sp.side = wide.side;
+            pass(cmd, filter, {{src, scale.linear}, {scale.tv_img.view, VK_NULL_HANDLE}, {wide.side == 1 ? scale.small.view : src, scale.linear}},
+                 dw, dh, &sp, sizeof sp);
+            picture = scale.tv_img.view;
+        }
+        const int mask = n64_rules::mask_shown(look.mask, dh);
+        // ((11-22, the owner's test) the TV's screen for the mouse (vk_n64.h n64_screen_point), and the options' own screens
+        // under it with the game's (vk_menu.cpp menu_tv_layer: their layer of this place, drawn now; null when none shows)
+        n64_screen_drawn(look.curvature, f.scale_x, f.scale_y);
+        const VkImageView menu = menu_tv_layer(cmd);
+        struct { float lines, scan, mask, bleed, glow, curve, saturation; int mask_type; float anim_x, anim_y, flash; int menu; } tp{
+            (float)n64_rules::kTvLines, n64_rules::scanline_strength(look.scanlines, dh), look.mask_strength,
+            n64_rules::tv_bleed_uv(look.bleed, source.w, source.h), look.glow, look.curvature, look.saturation, mask,
+            f.scale_x, f.scale_y, f.flash, menu ? 1 : 0};
+        // ((11-22, the owner's second look) the glow's 1/8 copy made again with the options over the picture (the TV's menu 2):
+        // from the picture alone, the glow added a blur of the game's own panes under them through their plates. After the
+        // ultrawide sides took the copy before it, which stays the picture's)
+        if (menu) {
+            tp.menu = 2;
+            pass(cmd, scale.tv, {{picture, scale.linear}, {scale.small.view, VK_NULL_HANDLE}, {picture, scale.linear}, {menu, scale.linear}},
+                 smw, smh, &tp, sizeof tp);
+            tp.menu = 1;
+        }
+        pass(cmd, scale.tv, {{picture, scale.linear}, {scale.scaled.view, VK_NULL_HANDLE}, {scale.small.view, scale.linear},
+                             {menu ? menu : scale.small.view, scale.linear}}, dw, dh, &tp, sizeof tp);
+        // (each new place, preset, mask or scanline strength said once the switch is over: a report of moire or a dim picture
+        // then says which. (11-22) Before, the place and the mask alone, so the first line, written as the TV switched on with
+        // Off's look still shown, said "scanlines 0%" for good)
+        static uint64_t told = ~0ull;
+        const int shown = n64_shown();
+        const uint64_t now = (uint64_t)dw << 44 | (uint64_t)dh << 28 | (uint64_t)(shown & 3) << 24 | (uint64_t)(mask & 7) << 16 |
+                             (uint64_t)std::lround(std::clamp(tp.scan, 0.0f, 1.0f) * 1000.0f);
+        if (f.done && now != told) {
+            told = now;
+            static const char* const masks[] = {"", "no mask", "the aperture grille", "the slot mask", "the shadow mask"};
+            logf("vk: N64 Classic: the TV (%s) at %ux%u from a %ux%u picture: scanlines %.0f%%, %s%s", n64_rules::name(shown), dw, dh,
+                 source.w, source.h, (double)(tp.scan * 100.0f), masks[mask >= 1 && mask <= 4 ? mask : 1],
+                 wide.side ? ", over ultrawide's menu sides" : "");
+        }
+        return scale.scaled.image;
+    }
     // (Triforce: AMD FSR 1, EvilOOT's own window filter: EASU, the edge-adaptive upscale, then RCAS at the Sharpness row.
     // ((Triforce, S4) only where it enlarges, as AMD's EASU is made for: not at 1:1, where the menu says the filter is not
     // needed, nor to a smaller window; there Catmull-Rom or the plain copy with the other filters' Sharpness. (S6) Nor

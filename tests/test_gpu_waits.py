@@ -87,7 +87,9 @@ def main():
     check(min(order) >= 0 and order == sorted(order), "status_tick: the trace's gpu_waits_ms is not this frame's, from a reader of its own, before lab")
     check('if (f) fputs(",lab\\n", f);' in tick and tick.index("frame_trace::kColumns);") < tick.index('if (f) fputs(",lab\\n", f);'),
           "status_tick: lab is no longer the trace's last column")
-    check(rep.count("gpu_wait_kinds::Reader") == 2, "vk_replay.cpp: the readers of the waits are not the line's and the trace's")
+    # ((Triforce, 11-23) and the dynamic resolution's clock's, ts_dyn_present: tests/test_gpu_busy.py)
+    check(rep.count("gpu_wait_kinds::Reader") == 3 and "static ::gpu_wait_kinds::Reader host_waits;" in rep,
+          "vk_replay.cpp: the readers of the waits are not the line's, the trace's and the dynamic resolution's clock's")
     trace_h = (VK / "frame_trace.h").read_text(encoding="utf-8")
     check('wb_held_ms,qs_bg_ms,"\n    "gpu_waits_ms";' in trace_h and "s.qs_bg, s.gpu_waits);" in trace_h, "frame_trace.h: gpu_waits_ms is not the split's last column")
     kinds = (VK / "gpu_wait_kinds.h").read_text(encoding="utf-8")

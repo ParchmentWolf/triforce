@@ -222,6 +222,7 @@ LOAD = r"""
 #include "@VK@/framegen_rows.h"
 #include "@VK@/merged_rows.h"
 #include "@VK@/ultrawide_rows.h"
+#include "@VK@/output_sizes.h"
 #include "@VK@/replay_threads.h"
 #include "@VK@/ini_merge.h"
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); return 1; } } while (0)
@@ -247,7 +248,7 @@ constexpr int kRows = sizeof rows / sizeof rows[0];
 std::string path;
 std::string ini_path() { return path; }
 ini_merge::Map ini_base;
-std::string mic_want;
+std::string mic_want, gpu_want;
 std::string mic_key(const char* name) { return name; }
 void refresh_mics() {}
 void mic_tell_host() {}
@@ -318,7 +319,7 @@ int main(int argc, char** argv) {
         FILE* w = std::fopen(argv[2], "w");
         for (const Row& r : rows)
             if (ini_row(r)) std::fprintf(w, "%s=%d\n", ini_key(r), *r.value);
-        std::fprintf(w, "options_version=%d\n", mr7::kVersion);
+        std::fprintf(w, "options_version=%d\n", OUTPUT_OPTIONS_VERSION);
         std::fclose(w);
     }
     opts = Options{};
@@ -393,10 +394,12 @@ def load_fixture():
     stubs = "\n".join("const char* %s(int%s) { return nullptr; }" % (n, ", int" if n.startswith("hn_") else "") for n in names)
     mod_rows = menu[menu.index("#define MOD_CHEAT_ROW(i)"):menu.index("static_assert(mod_cheat_rows::kSlots")]
     merged = menu[menu.index("struct Merged {"):menu.index("Row rows[] = {")]
-    out = menu[menu.index("struct Out {"):menu.index("int step_output_choice(int id, int dir) {")]
+    out = menu[menu.index("struct Out {"):menu.index("// The connected screens as the host found them")]
+    out += "\nOut remembered_custom{};\nOut main_screen() { return {2560, 1440}; }\n"
+    out += definition(menu, "void custom_rows_read") + "\n" + definition(menu, "void read_remembered_custom")
     init = definition(menu, "void menu_init")
     reading = block(init, init.index('if (FILE* f = fopen(ini_path().c_str(), "r")) {'))
-    check("merged_rows::migrate(version, before7, opts.output_res, opts.lstick_dead_zone, opts.rstick_dead_zone);" in reading,
+    check("merged_rows::migrate(legacy_output && version == 8 ? 7 : version, before7," in reading,
           "menu_init's reading of the file does not migrate an older one")
     sync = definition(menu, "void merged_sync")
     fixture = LOAD
@@ -415,7 +418,7 @@ def main():
     parser.add_argument("--cxx", default="g++")
     args = parser.parse_args()
     menu = (VK / "vk_menu.cpp").read_text(encoding="utf-8")
-    check('out += "options_version=8\\n";' in definition(menu, "void save"), "save does not write options_version=8")
+    check('out += "options_version=9\\n";' in definition(menu, "void save"), "save does not write options_version=9")
     check("for (const char* dropped : merged_rows::kDropped) mine |= key == dropped;" in definition(menu, "void save"),
           "save writes back the lines of the rows that went")
     with tempfile.TemporaryDirectory(prefix="merged-rows-") as tmp:

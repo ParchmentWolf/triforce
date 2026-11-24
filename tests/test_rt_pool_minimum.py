@@ -3,7 +3,8 @@
 The 305 MiB default crashed in Castle Town's guard house; 512 MiB resolved the
 reported conversation/camera reproduction. Keep existing 4K/ultrawide growth
 and explicit HOS_RT_POOL_MB overrides, including overrides below the floor; the 5120x2880
-output's pool is kept to 900 MiB.
+output's pool is kept to 900 MiB, and so is that of every output of more pixels than
+3840x2160's, whether they are the frame's or the widescreen picture's.
 """
 import argparse
 import importlib.util
@@ -56,7 +57,15 @@ static const struct {
     {3840, 2160, 0, 305, NULL, 687},
     {2560, 1440, WIDE(3440, 1440), 305, NULL, 512},
     {2560, 1440, WIDE(5120, 1440), 305, NULL, 610},
-    {3840, 2160, WIDE(7680, 2160), 305, NULL, 1373},
+    /* ((Triforce) a 7680 x 2160 picture: the 1373 MiB it scales to failed the game's reservation at boot (host/hos_main.c),
+       as every pool over 900 MiB has; host/hos_main.c no longer makes that picture either) */
+    {3840, 2160, WIDE(7680, 2160), 305, NULL, 900},
+    /* ((Triforce) a 5120 x 2160 picture with the frame 3840 x 2160, the Output resolution 5120x2160: 915 MiB scaled, kept to
+       900 as the 5120 x 2160 frame before it; 3840 x 1600 and 5120 x 1440 pictures keep their scaled pools) */
+    {3840, 2160, WIDE(5120, 2160), 305, NULL, 900},
+    {3840, 2160, WIDE(5120, 2160), 305, "1000", 1000},
+    {2848, 1600, WIDE(3840, 1600), 305, NULL, 512},
+    {5120, 2880, WIDE(7224, 2032), 305, NULL, 900},
     {2560, 1440, WIDE(1920, 1080), 305, NULL, 512},
     {2560, 1440, 0, 305, "256", 256},
     {3840, 2160, WIDE(7680, 2160), 305, "768", 768},
@@ -81,6 +90,18 @@ int main(void) {
             failed = 1;
         }
     }
+    /* TEX-85: a cap reached by a widescreen picture pins storage just like a fixed 5K output.
+       A picture over 4K whose scaled pool still has room is not pinned. Explicit budgets always are. */
+    output_width = 3840; output_height = 2160; hos_wide_out = WIDE(5120, 2160); override = NULL;
+    if (hos_rt_pool_size(305 * MIB) != 900 * MIB || rt_pool_pinned != 1) return 3;
+    hos_wide_out = WIDE(4096, 2160);
+    if (hos_rt_pool_size(305 * MIB) >= 900 * MIB || rt_pool_pinned != 0) return 4;
+    scene_rgba16f = 1; hos_wide_out = WIDE(4608, 2160);
+    if (hos_rt_pool_size(305 * MIB) != 900 * MIB || rt_pool_pinned != 1) return 5;
+    scene_rgba16f = 0; hos_wide_out = WIDE(3840, 2400);
+    if (hos_rt_pool_size(360 * MIB) != 900 * MIB || rt_pool_pinned != 1) return 7;   /* exactly at the cap */
+    hos_wide_out = 0; override = "512";
+    if (hos_rt_pool_size(305 * MIB) != 512 * MIB || rt_pool_pinned != 1) return 6;
     /* (local, RenoDX port) an RGBA16F scene: 128 MiB more, but not over an explicit HOS_RT_POOL_MB */
     scene_rgba16f = 1;
     output_width = 2560; output_height = 1440; hos_wide_out = 0;
@@ -111,7 +132,7 @@ int main(void) {
         source.write_text(fixture)
         subprocess.run([compiler, "-std=c11", "-O2", str(source), "-o", str(binary)], check=True)
         subprocess.run([str(binary)], check=True, timeout=5)
-    print("PASS: 512 MiB floor, 4K/ultrawide growth and explicit overrides, the 5120-wide outputs' 900 MiB (16 cases), "
+    print("PASS: 512 MiB floor, 4K/ultrawide growth and explicit overrides, the 900 MiB of the outputs over 3840x2160's pixels, frame or picture (20 cases), "
           "an RGBA16F scene's 128 MiB more, and the 5K output's 900 MiB with it")
 
 

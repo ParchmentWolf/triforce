@@ -5,13 +5,18 @@
 
    - On by default (11-22, the owner's word); HOS_ACHIEVEMENTS=0 (triforce_env.txt) turns them off. While off nothing is
      read, of the game or of the disk.
+   - (11-23) The System tab's Achievements group has two rows of them, read from the renderer at each check: Achievements
+     Off (HOS_OPT_ACH_ON 0) and nothing is asked of the save data or earned, from the next check on, and On again as
+     soon; Achievement notices Off (HOS_OPT_ACH_NOTICES 0) and one earned is kept, said in the log and told to the list,
+     without the sound (the menu shows no notice then).
    - The lists are read at the game's first present (hos_achievements_frame, host/nvn_native.c): the built-in one, then
      achievements.txt in the game folder when there is one. Once the renderer answers they are named to the menu
      (HOS_OPT_ACH_TEXT, _ADD, _COUNT: gpu/vk/achievement_rows.h), which lists them on the System tab's Achievements page.
    - host/hos_main.c asks once a second at Link's update, on the game's thread, while a save is loaded, and hands over
      how the save data is read (hos_achievements_check).
    - An achievement earned is written to triforce_achievements.txt in the game folder at once (the file whole, under
-     another name first), said in the log, and shown: the menu's notice (HOS_OPT_ACH_EARNED) with the system menu's
+     another name first; while the save files are on, host/save_files.c, in the folder of the file played, so that each
+     file has what it earned and no other's: earned_file), said in the log, and shown: the menu's notice (HOS_OPT_ACH_EARNED) with the system menu's
      decide sound (HOS_MENU_SOUND_SYS_DECIDE, at the Menu sounds row's volume; silent where that row is Off. Not the
      item fanfare: most are earned as the game plays that itself). One at a time: a save that earns several at once
      shows them one after the other.
@@ -30,6 +35,7 @@
 
 int rx_option(int id, int otherwise);
 void rx_option_set(int id, int value);
+const char *hos_save_files_dir(int *first);   /* host/save_files.c */
 
 #define EARNED_FILE "triforce_achievements.txt"
 #define OWN_FILE "achievements.txt"
@@ -60,10 +66,20 @@ static int game_file(char *out, size_t cap, const char *name) {
     return snprintf(out, cap, "%.*s%s", (int)(slash + 1 - exe), exe, name) < (int)cap;
 }
 
-/* a text file of the game folder whole, its end a 0 (freed by the caller); NULL when it is not there or over `most` */
-static char *read_text(const char *name, long most) {
-    char path[MAX_PATH + 40];
-    if (!game_file(path, sizeof path, name)) return NULL;
+/* ((Triforce) 11-23, his "I don't want achievements to carry across" the save files.) Where the earned ones are kept: the
+   game folder's triforce_achievements.txt, or, while the save files are on, the one in the folder of the file this run
+   plays. *inherits: that file is File 1 and may start from the game folder's, which is what it earned before there were
+   files (read only: the game folder's is left as it is) */
+static int earned_file(char *out, size_t cap, int *inherits) {
+    int first = 0;
+    const char *dir = hos_save_files_dir(&first);
+    *inherits = dir && first;
+    if (!dir) return game_file(out, cap, EARNED_FILE);
+    return snprintf(out, cap, "%s%c" EARNED_FILE, dir, strchr(dir, '\\') ? '\\' : '/') < (int)cap;
+}
+
+/* a text file whole, its end a 0 (freed by the caller); NULL when it is not there or over `most` */
+static char *read_text(const char *path, long most) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
     char *text = NULL;
@@ -80,9 +96,10 @@ static char *read_text(const char *name, long most) {
 
 static void earned_save(void) {
     static char text[ACH_MAX * (ACH_NAME + 40) + ACH_ORPHANS * ACH_LINE + 200];
-    char path[MAX_PATH + 40], fresh[MAX_PATH + 48];
+    char path[MAX_PATH + 160], fresh[MAX_PATH + 168];
+    int inherits;
     const size_t n = ach_earned_write(&list, text, sizeof text);
-    if (!n || !game_file(path, sizeof path, EARNED_FILE)) return;
+    if (!n || !earned_file(path, sizeof path, &inherits)) return;
     snprintf(fresh, sizeof fresh, "%s.new", path);
     FILE *f = fopen(fresh, "wb");   /* (its lines end the same on Windows and Linux) */
     const int ok = f && fwrite(text, 1, n, f) == n;
@@ -95,10 +112,13 @@ static void earned_save(void) {
 static void lists_read(void) {
     int refused = 0;
     const int built_in = ach_parse(&list, ACH_BUILTIN, &refused);
-    char *own = read_text(OWN_FILE, OWN_MOST);
+    char path[MAX_PATH + 160];
+    int inherits = 0;
+    char *own = game_file(path, sizeof path, OWN_FILE) ? read_text(path, OWN_MOST) : NULL;
     const int own_n = own ? ach_parse(&list, own, &refused) : 0;
     free(own);
-    char *earned = read_text(EARNED_FILE, OWN_MOST);
+    char *earned = earned_file(path, sizeof path, &inherits) ? read_text(path, OWN_MOST) : NULL;
+    if (!earned && inherits && game_file(path, sizeof path, EARNED_FILE)) earned = read_text(path, OWN_MOST);
     const int marked = earned ? ach_earned_read(&list, earned) : 0;
     free(earned);
     hos_log("achievements: %d (%d of " OWN_FILE "%s), %d earned so far%s", list.n, own_n, own ? "" : ", which is not there", marked,
@@ -152,7 +172,8 @@ void hos_achievements_frame(void) {
 /* host/hos_main.c, once a second at Link's update while a save is loaded (now_ns: hos_now_ns): what the save data has
    earned since the last call is marked, kept and shown */
 void hos_achievements_check(AchProbe probe, void *ctx, int64_t now_ns) {
-    if (!hos_achievements_on()) return;
+    if (!hos_achievements_on() || !rx_option(HOS_OPT_ACH_ON, 1)) return;
+    const int quiet = !rx_option(HOS_OPT_ACH_NOTICES, 1);
     lock();
     if (!ready) ready = 1, lists_read();
     int fresh[ACH_MAX];
@@ -162,15 +183,15 @@ void hos_achievements_check(AchProbe probe, void *ctx, int64_t now_ns) {
         if (nwaiting < ACH_MAX) waiting[nwaiting++] = fresh[i];
     }
     if (got) earned_save();
-    if (nwaiting && named && now_ns >= next_shown) {   /* (not before the menu has the list: it shows them by their place in it) */
+    if (nwaiting && named && (quiet || now_ns >= next_shown)) {   /* (not before the menu has the list: it shows them by their place in it) */
         const int at = waiting[0];
         char day[16];
         memmove(waiting, waiting + 1, sizeof waiting[0] * (size_t)--nwaiting);
-        next_shown = now_ns + SHOWN_MS * 1000000LL;
+        next_shown = quiet ? now_ns : now_ns + SHOWN_MS * 1000000LL;   /* (no notice shown: the next need not wait for it) */
         day_of(list.a[at].when, day, sizeof day);
         to_menu(day);
         rx_option_set(HOS_OPT_ACH_EARNED, at);
-        hos_menu_sound_play(HOS_MENU_SOUND_SYS_DECIDE, now_ns);
+        if (!quiet) hos_menu_sound_play(HOS_MENU_SOUND_SYS_DECIDE, now_ns);
     }
     unlock();
 }

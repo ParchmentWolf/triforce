@@ -87,7 +87,7 @@ def main():
     merged = (ROOT / "gpu" / "vk" / "merged_rows.h").read_text(encoding="utf-8")
     check('"stick_dead_zone"' in merged[merged.index("constexpr const char* kDropped[]"):], "an old stick_dead_zone= line is kept")
     check('if (!strcmp(line, "stick_dead_zone")) before7.stick_shared = atoi(eq + 1);' in menu and
-          "merged_rows::migrate(version, before7, opts.output_res, opts.lstick_dead_zone, opts.rstick_dead_zone);" in menu,
+          "merged_rows::migrate(legacy_output && version == 8 ? 7 : version, before7," in menu,
           "menu_init does not move an older file's shared dead zone into each stick's own")
     check("\n| Left stick dead zone, Right stick dead zone | Default (24%), or 0% to 50%" in readme,
           "readme.md's settings table has no Left and Right stick dead zone row")

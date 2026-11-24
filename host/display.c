@@ -19,6 +19,7 @@
 #include "../gpu/render/rx.h"
 void rx_close_asked(void);   /* host/rx_backend.c */
 #include "../gpu/vk/vk_api.h"
+#include "hos_screens.h"   /* ((Triforce) the connected screens, for the Output resolution) */
 
 void hos_relaunch_ask(void);        /* (host/hos_relaunch.c) */
 void hos_bug_capture_key(void);     /* (host/bug_capture.c) */
@@ -109,6 +110,86 @@ static void set_fullscreen(HWND w, int on) {
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
     }
     hos_log("display: %s", on ? "fullscreen" : "windowed");
+}
+
+/* (Triforce) The monitor the game's window opens on, asked before there is a window (the game takes its output size
+   first). The window is made at CW_USEDEFAULT: Windows puts it on the monitor the shell started the game from when it names
+   one (a taskbar or a shortcut on another monitor: STARTUPINFO's hStdOutput is that monitor's handle unless it is a
+   standard handle), else on the main monitor: NULL here. */
+static HMONITOR shell_monitor(void) {
+    STARTUPINFOW si;
+    MONITORINFO mi;
+    memset(&si, 0, sizeof si);
+    si.cb = sizeof si;
+    GetStartupInfoW(&si);
+    mi.cbSize = sizeof mi;
+    if (!(si.dwFlags & STARTF_USESTDHANDLES) && si.hStdOutput && GetMonitorInfoA((HMONITOR)si.hStdOutput, &mi))
+        return (HMONITOR)si.hStdOutput;
+    return NULL;
+}
+/* Its size in pixels (the process is DPI aware by then, host/hos_main.c), 0 x 0 when the system does not say. A window moved
+   to another monitor later keeps the picture it started with: the game makes its render targets once, and the present fits
+   the picture into whatever the window is (gpu/vk/vk_present_rect.h). */
+void hos_screen_size(int *w, int *h) {
+    const HMONITOR shell = shell_monitor();
+    MONITORINFO mi;
+    mi.cbSize = sizeof mi;
+    if (shell && GetMonitorInfoA(shell, &mi)) {
+        *w = (int)(mi.rcMonitor.right - mi.rcMonitor.left), *h = (int)(mi.rcMonitor.bottom - mi.rcMonitor.top);
+        return;
+    }
+    *w = GetSystemMetrics(SM_CXSCREEN), *h = GetSystemMetrics(SM_CYSCREEN);
+}
+/* A monitor's own name ("LG ULTRAGEAR": its EDID's, through the display configuration) by its GDI device ("\\.\DISPLAY1"),
+   UTF-8; "" where there is none (a laptop's panel, a remote session) */
+static void screen_name(const char *device, char *out, int cap) {
+    UINT32 np = 0, nm = 0;
+    out[0] = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) != ERROR_SUCCESS || !np) return;
+    DISPLAYCONFIG_PATH_INFO *paths = (DISPLAYCONFIG_PATH_INFO *)calloc(np, sizeof *paths);
+    DISPLAYCONFIG_MODE_INFO *modes = (DISPLAYCONFIG_MODE_INFO *)calloc(nm ? nm : 1, sizeof *modes);
+    if (paths && modes && QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, paths, &nm, modes, NULL) == ERROR_SUCCESS) {
+        for (UINT32 i = 0; i < np && !out[0]; i++) {
+            DISPLAYCONFIG_SOURCE_DEVICE_NAME src;
+            DISPLAYCONFIG_TARGET_DEVICE_NAME tgt;
+            char gdi[64];
+            memset(&src, 0, sizeof src);
+            src.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, src.header.size = sizeof src;
+            src.header.adapterId = paths[i].sourceInfo.adapterId, src.header.id = paths[i].sourceInfo.id;
+            if (DisplayConfigGetDeviceInfo(&src.header) != ERROR_SUCCESS) continue;
+            if (!WideCharToMultiByte(CP_UTF8, 0, src.viewGdiDeviceName, -1, gdi, sizeof gdi, NULL, NULL) || strcmp(gdi, device)) continue;
+            memset(&tgt, 0, sizeof tgt);
+            tgt.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, tgt.header.size = sizeof tgt;
+            tgt.header.adapterId = paths[i].targetInfo.adapterId, tgt.header.id = paths[i].targetInfo.id;
+            if (DisplayConfigGetDeviceInfo(&tgt.header) != ERROR_SUCCESS || !tgt.flags.friendlyNameFromEdid) break;
+            if (!WideCharToMultiByte(CP_UTF8, 0, tgt.monitorFriendlyDeviceName, -1, out, cap, NULL, NULL)) out[0] = 0;
+        }
+    }
+    free(paths), free(modes);
+}
+struct screen_list {
+    HosScreen *out;
+    int cap, n;
+    HMONITOR shell;
+};
+static BOOL CALLBACK screen_each(HMONITOR m, HDC dc, LPRECT rect, LPARAM param) {
+    struct screen_list *l = (struct screen_list *)param;
+    MONITORINFOEXA mi;
+    (void)dc, (void)rect;
+    mi.cbSize = sizeof mi;
+    if (l->n >= l->cap || !GetMonitorInfoA(m, (MONITORINFO *)&mi)) return TRUE;
+    HosScreen *s = &l->out[l->n++];
+    memset(s, 0, sizeof *s);
+    s->w = (int)(mi.rcMonitor.right - mi.rcMonitor.left), s->h = (int)(mi.rcMonitor.bottom - mi.rcMonitor.top);
+    s->opens = l->shell ? m == l->shell : (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
+    screen_name(mi.szDevice, s->name, (int)sizeof s->name);
+    return TRUE;
+}
+/* (host/hos_screens.h) Every connected monitor: its size in pixels, its name, and which one the window opens on */
+int hos_screens(HosScreen *out, int cap) {
+    struct screen_list l = {out, cap, 0, shell_monitor()};
+    EnumDisplayMonitors(NULL, NULL, screen_each, (LPARAM)&l);
+    return l.n;
 }
 
 static void dpi_aware_thread(void) {
@@ -481,7 +562,7 @@ static DWORD WINAPI display_main(void *p) {
     RegisterClassA(&wc);
     dpi_aware_thread();
     extern float hos_aspect_ratio;
-    /* (the picture's shape when Monitor's shape set one, wider or narrower than 16:9: 960 x 720 for 4:3, 1720 x 720 for 21:9) */
+    /* (the picture's shape when it is not 16:9, the Output resolution's own or the Ultrawide row's: 960 x 720 for 4:3, 1728 x 720 for 3840 x 1600) */
     int win_w = hos_aspect_ratio > 0.0f ? (int)(720 * hos_aspect_ratio + 0.5f) : 1280, win_h = 720;
     if (getenv("HOS_WINDOW_SIZE")) {
         int w = 0, h = 0;

@@ -72,6 +72,8 @@ VkImage framegen_scale(int, VkImageView, VkImage, uint32_t, uint32_t, const int*
     ++scales; scale_w = w; scale_h = h;
     return filtered ? 99 : VK_NULL_HANDLE;
 }
+void n64_screen_begin(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) {}   // ((Triforce, 11-22) N64 Classic's TV's screen: vk_n64.h)
+void n64_screen_end() {}
 void blit_crop_to_rect(int, VkImage src, uint32_t, uint32_t, const int* crop, VkImage, int, PresentRect rect) {
     ++blits; drawn = rect; drawn_crop = crop; drawn_source = src;
 }

@@ -101,7 +101,7 @@ int main() {
             const int64_t ns = h.settle();
             if (ns >= 0) waited += ns, waits++;
             h.hand({k, 0});
-            for (volatile int spin = 0; spin < (k % 3) * 2000; spin = spin + 1) {}   /* (the next frame's build) */
+            for (volatile int spin = 0; spin < (k % 3) * 2000;) { spin = spin + 1; }   /* (the next frame's build) */
         }
         h.settle();
         t.join();
@@ -193,7 +193,9 @@ def check_source():
           "the pacing's wait lets go of a lock the present thread never took")
     # the rule and the switch
     wanted = block(replay, "bool present_thread_wanted() {")
-    check("present_thread_use(present_thread_on(), smooth_mine, framegen_on(), dlssg::active(), antilag_running())" in wanted,
+    # ((Triforce, 11-23) the switch, or the next image acquired ahead (tests/test_acquire_ahead.py))
+    check("present_thread_use(on, smooth_mine, framegen_on(), dlssg::active(), antilag_running())" in wanted and
+          "const bool on = present_thread_on() || (!never && acquire_ahead_wanted());" in wanted,
           "the present thread is not limited to the game's pictures without frame generation, DLSS frame generation or Anti-Lag 2")
     on = block(replay, "bool present_thread_on() {")
     check('getenv("RX_VK_PRESENT_THREAD")' in on and "e && *e && atoi(e) == 1" in on, "RX_VK_PRESENT_THREAD is not off unless =1 (off by default since 11-16)")
@@ -208,8 +210,13 @@ def check_source():
             check("vkQueuePresentKHR(" not in text and "vkAcquireNextImageKHR(" not in text, f.name + " presents or acquires itself")
         if f.name not in ("vk_replay.cpp", "vk_main.cpp"):
             check("create_swapchain(" not in text, f.name + " makes the swapchain")
-    check(replay.count("vkQueuePresentKHR(") == 2 and out.count("vkQueuePresentKHR(") == 2 and replay.count("vkAcquireNextImageKHR(") == 1,
-          "vk_replay.cpp presents or acquires outside present_out and present_image")
+    # ((Triforce, 11-23) and acquire_ahead, on the present thread after its present_out: RX_VK_ACQUIRE_AHEAD, tests/test_acquire_ahead.py)
+    ahead = block(replay, "void acquire_ahead() {")
+    check(replay.count("vkQueuePresentKHR(") == 2 and out.count("vkQueuePresentKHR(") == 2 and replay.count("vkAcquireNextImageKHR(") == 2
+          and ahead.count("vkAcquireNextImageKHR(") == 1,
+          "vk_replay.cpp presents or acquires outside present_out, present_image and acquire_ahead")
+    check(before(main, "present_out(o, qk, true);", "acquire_ahead();", "present_hand.done();"),
+          "the next image is not acquired ahead on the present thread, after its present and before it says so")
     # NVIDIA Reflex: the present's id and markers are the frame's whose submit ended, not the next frame's
     reflex = (vk / "vk_reflex.cpp").read_text(encoding="utf-8")
     ends = block(reflex, "void reflex_submit_ends() {")

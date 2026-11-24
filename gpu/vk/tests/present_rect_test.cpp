@@ -1,6 +1,8 @@
 // Game-free regression for the production Vulkan presentation rectangle helper.
 #include <cstdio>
 #include <cmath>
+#include <cstdint>
+#include <initializer_list>
 #include <limits>
 
 #include "../vk_present_rect.h"
@@ -37,6 +39,31 @@ int main() {
            {0, 0, 5120, 1440});
     expect("logical portrait content", mkwvk::present_rect(1920, 1080, nullptr, 1600, 1000, {0.5}),
            {550, 0, 500, 1000});
+    // (Triforce) An Output resolution of its own shape is the picture (gpu/vk/output_sizes.h), and the host gives its shape as a
+    // float (host/hos_main.c hos_aspect_ratio): on a screen of that size it fills it pixel for pixel, with no bar from the float;
+    // the window it opens in (720 high) has its shape; a screen or a window of another shape shows it whole between bars
+    struct Own {
+        uint32_t w, h;
+    };
+    for (const Own o : {Own{3840, 1600}, Own{3440, 1440}, Own{2560, 1080}, Own{5120, 1440}, Own{5120, 2160}, Own{1920, 1200},
+                        Own{1280, 1024}}) {
+        const PresentAspect own{static_cast<float>((double)o.w / (double)o.h)};
+        expect("an output size's picture on its own screen", mkwvk::present_rect(o.w, o.h, nullptr, o.w, o.h, own), {0, 0, o.w, o.h});
+        const uint32_t win_w = static_cast<uint32_t>(720 * static_cast<float>(own.ratio) + 0.5f);   // (host/display.c)
+        expect("an output size's picture in its starting window", mkwvk::present_rect(o.w, o.h, nullptr, win_w, 720, own),
+               {0, 0, win_w, 720});
+    }
+    constexpr PresentAspect twelve_five{static_cast<float>(3840.0 / 1600.0)};
+    expect("3840x1600 picture, fullscreen on a 3840x2160 screen",
+           mkwvk::present_rect(3840, 1600, nullptr, 3840, 2160, twelve_five), {0, 280, 3840, 1600});
+    expect("3840x1600 picture, fullscreen on a 3440x1440 screen",
+           mkwvk::present_rect(3840, 1600, nullptr, 3440, 1440, twelve_five), {0, 3, 3440, 1433});
+    expect("3840x1600 picture in a 16:9 window", mkwvk::present_rect(3840, 1600, nullptr, 1280, 720, twelve_five),
+           {0, 93, 1280, 533});
+    expect("3440x1440 picture, fullscreen on a 3840x1600 screen",
+           mkwvk::present_rect(3440, 1440, nullptr, 3840, 1600, {static_cast<float>(3440.0 / 1440.0)}), {9, 0, 3822, 1600});
+    expect("1920x1200 picture, fullscreen on a 1920x1080 screen",
+           mkwvk::present_rect(1920, 1200, nullptr, 1920, 1080, {1.6f}), {96, 0, 1728, 1080});
     expect("ultrawide source aspect fits naturally",
            mkwvk::present_rect(3440, 1440, nullptr, 3440, 1440), {0, 0, 3440, 1440});
     expect("ultrawide source remains wider than 16:9",

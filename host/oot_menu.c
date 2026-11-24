@@ -14,6 +14,7 @@
    HOS_MENU_TRACE=1: the focus changes, the screens and what the mouse does logged. */
 #include "hos.h"
 #include "guest_bounds.h"   /* ((Triforce) hos_range_ok: set_item_key's buffer) */
+#include "oot_title_movie.h"   /* ((Triforce) oot_menu_screen_tick: a menu open over the title's filled movie) */
 /* (Triforce) The game's own Options screen (the layout SystemOption_00; the title's Options and the pause menu's are the one
    screen), by its vtable (HOS_MENU_TRACE in a headless run, 2026-11-10: the screen of 15 entries that starts to run when
    Options is chosen, from the title and from the pause menu alike, and stops with Back; L and R do nothing on it). While
@@ -284,6 +285,7 @@ static void focus_locked(uint64_t screen, uint64_t pane, uint64_t lr) {
 void hos_mouse_game_menu(void);   /* (display.c) */
 void hos_mouse_game_menu_gone(void);
 int hos_mouse_game_pointer(int *x, int *y, int *w, int *h, uint32_t *pressed, int *wheel);
+void rx_screen_point(int *x, int *y, int w, int h);   /* (rx_backend.c: N64 Classic's TV's curve) */
 void hos_hid_tap(const char *press);   /* (nn_hid.c) */
 void hos_hid_stick(int lx, int ly, int rx, int ry, int hold_ms);
 void hos_hid_drag(int dx, int dy, int right);   /* (nn_hid.c: as the camera's mouse; the left stick or the right) */
@@ -504,6 +506,8 @@ static void mouse_tick_locked(Ctx *c, uint64_t screen) {
     uint32_t pressed;
     const int got = hos_mouse_game_pointer(&px, &py, &w, &h, &pressed, &wheel);
     if (!got) return;
+    /* ((Triforce, 11-22, N64 Classic) the game's screens under its TV's curve: the cursor where the curve showed them) */
+    rx_screen_point(&px, &py, w, h);
     const int hidden = got == 2;   /* (the cursor hidden while the pad is in use: the wheel only, no pointing) */
     const int pause = screen == pause_screen_now();
     const float scale = 3840.0f / (float)w > 2160.0f / (float)h ? 3840.0f / (float)w : 2160.0f / (float)h;
@@ -873,6 +877,7 @@ extern volatile LONG64 hos_present_count;   /* (display.c: the game's own presen
 static Rect mods_entry;                 /* (the entry's box, as the renderer draws it: under the last button by the pitch) */
 static Rect quit_entry;                 /* ((Triforce, 11-19) Quit's, under Mods by the pitch; empty on the title's list */
 static volatile LONG64 mods_entry_ns;
+int hos_save_files_on(void);            /* ((Triforce) host/save_files.c: on the title the entry under Mods is Save Select then) */
 typedef struct { Rect r[16]; uint64_t b[16]; int n, pause; } ModsList;
 static void mods_list_entry(int i, uint64_t entry, uint64_t button, void *arg) {
     (void)i, (void)entry;
@@ -1018,6 +1023,13 @@ static void mods_list_tick(uint64_t screen, int title, ModsCall *call) {
         mods_entry = (Rect){mx - 550, my - pitch / 2, mx + 550, my + pitch / 2};
     }
     quit_entry = title ? (Rect){0, 0, 0, 0} : (Rect){r.x0, r.y0 - 2 * pitch, r.x1, r.y1 - 2 * pitch};
+    /* ((Triforce) on the title, while the save files are on (host/save_files.c), the entry under Mods is Save Select: a line
+       of the title's list as Mods is one, a pitch lower. Its words are Quit's (3 clicked, 4 the mouse onto it): the renderer
+       knows by the list which of the two it draws there (vk_menu.cpp files_row_shown) */
+    if (title && hos_save_files_on()) {
+        const float mx = (r.x0 + r.x1) / 2, my = (r.y0 + r.y1) / 2 - 2 * pitch;
+        quit_entry = (Rect){mx - 550, my - pitch / 2, mx + 550, my + pitch / 2};
+    }
     if (alpha >= 0.5f) InterlockedExchange64(&mods_entry_ns, (LONG64)now);   /* (the mouse's: an entry not shown yet is not there to click) */
     rx_option_set(HOS_OPT_MODS_ALPHA, (int)(alpha * 1000.0f + 0.5f));
     rx_option_set(HOS_OPT_MODS_X0, (int)r.x0), rx_option_set(HOS_OPT_MODS_X1, (int)r.x1);
@@ -1093,6 +1105,7 @@ static Seen *screen_seen(uint64_t screen, int64_t now) {
 void hos_oot_menu_tick(Ctx *c, uint64_t screen) {
     if (!screen) return;
     if (trace < 0) trace = getenv("HOS_MENU_TRACE") != NULL;
+    oot_menu_screen_tick(peek64(screen));   /* ((Triforce) the screen's class, each frame it runs: oot_title_movie.h) */
     const int64_t now = hos_now_ns();
     AcquireSRWLockExclusive(&seen_lock);
     Seen *me = screen_seen(screen, now);
@@ -1200,6 +1213,7 @@ void hos_oot_menu_tick(Ctx *c, uint64_t screen) {
     static int options_from_pause;
     const int64_t now = hos_now_ns();
     if (vt == PAUSE_SCREEN_VTABLE) __atomic_store_n(&pause_ran_ns, now, __ATOMIC_RELAXED);
+    oot_menu_screen_tick(vt);   /* ((Triforce) the screen's class, each frame it runs: oot_title_movie.h) */
     if (vt != OPTIONS_SCREEN_VTABLE) return;
     static int tabs = -1;
     if (tabs < 0) {

@@ -64,6 +64,9 @@ done
 cd "$folder"
 # (--play already chose Play. The game's own update question stays for a bin/triforce the player started themselves)
 export HOOKSHOT_NO_UPDATE_CHECK=1
+# ((Triforce, 11-23) the log into triforce_log.txt whatever stderr is (a terminal, a pipe, ~/.xsession-errors), as the
+# launcher's Play does: the game writes its log file only when stderr is none. HOS_LOG_FILE=0: stderr, as before)
+export HOS_LOG_FILE="${HOS_LOG_FILE:-1}"
 for game in ./bin/triforce ./bin/hookshot; do
     if [ -x "$game" ]; then
         exec "$game"

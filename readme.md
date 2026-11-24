@@ -134,7 +134,7 @@ Then come your settings, and **Start game**.
 *Choose your path.* Settings live in the game's own **Options** screen (title screen or pause menu): the tabs Display,
 Graphics, Audio, Controls and System sit beside the game's own list, and **L** / **R** switch between them. Each tab's
 settings come in groups under the game's own separator: Display has Screen, Ultrawide, HDR, RenoDX and Overlay; Graphics
-has Upscaling, Anti-aliasing, Frame generation, Frame rate & latency and Textures. A setting that does nothing with the
+has Upscaling, Anti-aliasing, N64 Classic, Frame generation, Frame rate & latency and Textures. A setting that does nothing with the
 others as they are is not shown (Paper white with HDR off, the DLSS model without DLSS). A few apply at the next start;
 the game asks. They're saved in `triforce_options.ini` beside the game.
 
@@ -152,6 +152,7 @@ the game asks. They're saved in `triforce_options.ini` beside the game.
 | Render resolution | Auto (the game's dynamic resolution), 100%, 75%, 67%, 50% with the game's own upscaler; with DLSS and FSR Auto, Native (100%: DLAA, or FSR's native anti-aliasing), Quality, Balanced, Performance, Ultra Performance. Applies at the next start |
 | Anti-aliasing | Game SMAA, Off, FXAA, SMAA Ultra: how the 3D's edges are smoothed with the game's own upscaler. DLSS and FSR smooth them themselves, from frames the game's SMAA has not been over, and the row is then not shown |
 | Sharpness | 0–100% (0, off, by default; around 50% suits DLSS and FSR): with DLSS or AMD FSR as the Upscaler the 3D before the HUD, with the game's own upscaler the picture at the window |
+| N64 Classic | Off, Faithful, Remembered; changes at once, and **F7** turns it on and off (to the last one chosen). The game as the 1998 cartridge on a TV of then: the 3D drawn on a grid of 240 lines in place of the game's upscaler, its textures blurred, and a CRT TV over the picture (scanlines, the phosphor mask, colour bleed, glow, a curved screen). Faithful is always the same, at 20 frames a second; Remembered is set on its own page, **Remembered settings**: Frame rate (Frame rate cap, 60, 30, 20, 17: never above the cap, and movies keep the cap's), 3D resolution (240 to 720 lines), Colour (15-bit, 18-bit, Full), Dither, Texture blur, CRT TV, Scanlines, Mask (Auto, Off, Aperture grille, Slot mask, Shadow mask), Mask strength, Colour bleed, Glow, Curvature, Colour saturation, and Copy Faithful and Reset to defaults. Turning it on or off, or changing it, the TV switches off and on in half a second, as an old one did. While it is on, the Upscaler and the Anti-aliasing say N64 Classic, and these options are shown on the TV too, with the game's own screens (the mouse finds them under the curve; with HDR on they stay flat over it); the FPS counter stays flat over it. The TV is left out with HDR Native and with DLSS frame generation. `RX_VK_N64=0`, `1` or `2` in `triforce_env.txt` over the row |
 | Texture filtering | Game, 2x, 4x, 8x, 16x anisotropic |
 | Texture detail | Automatic, Full, Reduced, Low: how large the game's textures are kept in video memory. Automatic goes by your card; applies at the next start |
 | Fast pipeline link | Off, On (the Debug tab; on by default): new pipelines are first linked from prepared shader libraries, so fewer draws wait for the graphics driver. The first start with it compiles those libraries once; applies at the next start |
@@ -161,8 +162,9 @@ the game asks. They're saved in `triforce_options.ini` beside the game.
 | Opaque textures as BC1 | Off, On (the Debug tab): the game's large textures that have no transparency kept in half the video memory, with the same picture. On by default; applies at the next start |
 | Game language | The game's 16 languages, as `language.txt` beside the game lists them; applies at the next start |
 | Game speed | Real time (keeps normal pace), Per frame (slows down below 60 fps) |
-| Output resolution | 1536x864 (handheld: the game's handheld profile, as if the console were undocked), 1920x1080, 2048x1152 (the game's own), 2560x1440, 3840x2160, 5120x1440, 5120x2160, 5120x2880; applies at the next start. The finished picture is scaled to the window by AMD FSR 1 when it is enlarged (sharpened only by the Sharpness row) and by the plain copy otherwise, and always by the plain copy with HDR Native, which keeps its 10 bits (`RX_VK_UPSCALE=<0..3>` in `triforce_env.txt` fixes the filter) |
-| Aspect ratio | 16:9 (the game's own), 16:10, 21:9, 32:9: the fixed shapes are for a screen or a window of that shape (a screen of another shape shows black bars); applies at the next start. Wider than 16:9, HUD position and Menu sides show too |
+| Output resolution | Connected monitors by name, Custom with editable width and height, Use current window size, and 1536x864 (handheld: the game's handheld profile, as if the console were undocked), 1920x1080, 2048x1152 (the game's own), 2560x1440, 3840x2160, 5120x1440, 5120x2160, 5120x2880; applies at the next start. The finished picture is scaled to the window by AMD FSR 1 when it is enlarged (sharpened only by the Sharpness row) and by the plain copy otherwise, and always by the plain copy with HDR Native, which keeps its 10 bits (`RX_VK_UPSCALE=<0..3>` in `triforce_env.txt` fixes the filter) |
+| Aspect ratio | 16:9 (the game's own), 16:10, 21:9, 32:9, 4:3: the fixed shapes are for a screen or a window of that shape (a screen of another shape shows black bars); 4:3 is a TV's of 1998, for N64 Classic; applies at the next start. Wider than 16:9, HUD position and Menu sides show too |
+| Output shape | 16:9 (the game's own), 16:10, 21:9, 32:9: the picture's shape for a 16:9 Output resolution, at the same height. The fixed shapes are for a screen or a window of that shape (a screen of another shape shows black bars). An Output resolution that is not 16:9 (5120x1440, 5120x2160, or a screen's or Custom size of another shape) has its own shape: the row shows it and has nothing to choose. Applies at the next start |
 | FPS counter | Off, On, Full: On is the frame rate in the top right corner; Full shows NX2navi's performance overlay there in its place (under the options while they are open), in the options' look and see-through: the build, the GPU's and the CPU's load and temperature, video memory and memory, the frame rate with its 1% and 0.1% lows, the frame times and their graph, the GPU's and the replay's time and waits per frame, the picture's settings and the GPU's and CPU's names (a "-" where the PC does not say: temperature and power need an NVIDIA or AMD card). It measures only while shown |
 | Menu sounds | Off, 5% to 100% (80% unless you change it): the game's own interface sounds as you move through these settings, the tabs and the rows, read from your game files (a mod's when a mod replaces them). Under Master volume on the Audio tab; changes at once |
 | Controller in background | Off, On: the pad keeps playing while another window has focus |
@@ -255,14 +257,15 @@ F8 to one of the controls yourself, the key stays the game's and the row takes t
 
 ## <img src="assets/readme/gold.svg" alt="" width="26"> Achievements
 
-*On by default.* `HOS_ACHIEVEMENTS=0` in `triforce_env.txt` beside the game turns them off. Things you do in the game are marked as earned, as a console's or a store's achievements are: a notice at the
+*On by default.* The System tab of the Options opens with an **Achievements** group: **Achievements** turns them off and on, at once, and **Achievement notices** turns off the notice and its sound alone (what you earn is still earned and listed). `HOS_ACHIEVEMENTS=0` in `triforce_env.txt` beside the game turns them off whole. Things you do in the game are marked as earned, as a console's or a store's achievements are: a notice at the
 top of the screen shows the one you earned, with its icon and a sound at the **Menu sounds** row's volume.
 
-- **The list:** **Achievements** on the System tab of the Options opens a page with every achievement, its icon, the
+- **The list:** **View achievements**, the group's first row, opens a page with every achievement, its icon, the
   line about it, and whether and when you earned it. Left, Right, Up and Down move; **L** and **R** turn the page.
+  The notice says where it is.
 
-- **25 come with Triforce:** the Spiritual Stones, the Master Sword, each medallion, the songs, Gold Skulltula tokens
-  and a few items. They are earned by what Link carries, read from the save data once a second while a save is loaded.
+- **35 come with Triforce:** the Spiritual Stones, the Master Sword, each medallion, the songs, Gold Skulltula tokens
+  and a few items, and some odd ones (10 Magic Beans at once, a blade that will not last). They are earned by what Link carries, read from the save data once a second while a save is loaded.
   Nothing in the game or the save is changed.
 - **Earned once, for the game folder:** `triforce_achievements.txt` beside the game keeps them, with the time. Loading
   an older save takes none away; delete the file to start over. `triforce_log.txt` has a line for each one earned.
@@ -284,6 +287,34 @@ top of the screen shows the one you earned, with its icon and a sound at the **M
 - The Debug tab's inventory and flag tools earn them too: they change the same save data.
 
 They are Triforce's own: Steam and Xbox do not see them.
+
+<p align="center"><img src="assets/readme/divider.svg" alt="" width="100%"></p>
+
+## <img src="assets/readme/sapphire.svg" alt="" width="26"> Save files
+
+*On by default.* Your saves so far are File 1, where they always were; nothing is moved. (`HOS_SAVE_FILES=0` in
+`triforce_env.txt` beside the game turns it off.) You have three files to play, as the Nintendo 64 game did, and everything the game saves, its autosaves too, lives in
+the file you chose: three playthroughs side by side.
+
+- **At the title:** the game starts on the file you played last and shows its title as ever. Its list has one more
+  entry under Mods, **Save Select**, which opens **Select a file**. The file marked *Playing* is the one the game
+  started on: choose it and you are back in the game's own list. Choose another and **the game starts again on that
+  file** (it reads its saves only at its start).
+- **Each file's card** is laid out as the game's own load list: **the picture the game kept of the save** (Windows
+  only), when it was last saved, **where you were**, your **hearts**, and the plate with the **medallions and
+  Spiritual Stones** you hold. Triforce notes these as you play a file and keeps them beside it (`triforce_card.txt`):
+  a file shows them once it has been played with save files on. The place is the map's own name, and the hearts
+  appear only where the game's count of them is found (the log says which).
+- **Your save so far is File 1.** Nothing is moved: File 1 is the `user` folder the game always had; File 2 and File 3
+  are `user-2` and `user-3` beside it, made when you first play them. An empty file starts a new game.
+- **While you play:** **Save files** on the System tab of the Options opens the same page. Save first: what is not
+  saved in the file you are playing is lost when the game starts again on another.
+- **Each file has its own achievements:** what a file earned is kept in its folder (`triforce_achievements.txt`), and
+  the Achievements page shows the file you are playing. File 1 starts with what you had earned before.
+- **Names:** `triforce_files.txt` beside the game keeps which file the next start plays and their names, a line each
+  (`1=Spanky`, 24 characters at most). Edit it while the game is closed.
+- **To copy or erase a file,** close the game and copy or delete its folder. The Options' save export and import act on the
+  file you are playing; Triforce Setup's **Convert saves** acts on File 1.
 
 <p align="center"><img src="assets/readme/divider.svg" alt="" width="100%"></p>
 

@@ -19,6 +19,7 @@
 #include "vk_aa.h"
 #include "vk_fsr3.h"       // (fsr3_wanted: AMD FSR 3.1 upscales, with its own anti-aliasing)
 #include "vk_menu.h"
+#include "vk_n64.h"       // ((Triforce, N64 Classic) the game's SMAA left out while its 3D pass draws: choice_now)
 #include "vk_temporal.h"   // (temporal_mode: NVIDIA DLSS or AMD FSR 4 does)
 #include "vk_texture.h"    // (texture_frame_no)
 
@@ -53,6 +54,13 @@ bool keep_passes() {
         return e && *e && strcmp(e, "0") != 0;
     }();
     return on;
+}
+/// The row's choice, RX_VK_AA over it, and ((Triforce, 11-22, N64 Classic) Off while N64 Classic's 3D pass draws the gameplay
+/// upscale (n64_rules.h anti_aliasing): the grid's averaging smooths the edges, so the game's edge and weight passes go
+/// too. RX_VK_AA still goes over it, for an A/B
+int choice_now() {
+    const int choice = ar::chosen(opts.aa, env_choice());
+    return env_choice() >= 0 ? choice : n64_rules::anti_aliasing(n64_in_front(), choice);
 }
 /// What upscales now, as the menu's Upscaler row shows it (vk_menu.cpp upscaler)
 int upscaler_now() {
@@ -358,7 +366,7 @@ int aa_mode() {
     State& s = st();
     std::lock_guard lk(s.mu);
     if (frame_read.load(std::memory_order_relaxed) != frame) {
-        const int choice = ar::chosen(opts.aa, env_choice());
+        const int choice = choice_now();
         // ((Triforce, FSR3-06, FSR4-5) with an upscaler after the bloom, none: aa_rows.h effective)
         const int want = ar::effective(choice, upscaler_now(), temporal_before_bloom(), env_choice() >= 0);
         frame_begun(s, frame, want);
@@ -370,7 +378,7 @@ int aa_mode() {
 
 int aa_env_choice() { return env_choice(); }
 
-bool aa_asked() { return ar::chosen(opts.aa, env_choice()) != ar::GAME || engaged.load(std::memory_order_relaxed) || upscaler_asks(); }
+bool aa_asked() { return choice_now() != ar::GAME || engaged.load(std::memory_order_relaxed) || upscaler_asks(); }
 
 bool aa_leave_out(uint64_t key) {
     if (!aa_asked()) return false;

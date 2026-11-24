@@ -1,10 +1,15 @@
 """The Ultrawide row's shapes by name: the game's own 16:9, and a fixed 16:10, 21:9 or 32:9 for a screen or a window of that
-shape (the owner, 11-16: "remove monitors shape as a option keep 16:9 16:10 21:9 32:9"). An options file from before
+shape (the owner, 11-16: "remove monitors shape as a option keep 16:9 16:10 21:9 32:9"), and ((Triforce, 11-22, N64 Classic) a
+fixed 4:3, a TV's of 1998: the host's path for a shape narrower than 16:9, the HUD across the width). An options file from before
 options_version 6 whose row is 1 had the main monitor's shape, no longer a choice: it is read as the shape nearest the main
 monitor's (gpu/vk/ultrawide_rows.h). host/hos_main.c's own ultrawide_ratio and its widescreen sizes (the block
 tests/test_widescreen_shapes.py checks with screen ratios), cut out and run: the row's value, the file's version and the main
 monitor's size in, the picture, the scene, the camera's ratio and the HUD's share out. And the menu's side: the row's range, what
 it says for each value, and the old row's 1 read the same way in menu_init (gpu/vk/vk_menu.cpp).
+
+The row is the shape of a 16:9 Output resolution. One that is not 16:9 (5120x1440, 5120x2160, a Screen or Custom of such a
+shape) is the picture by itself (gpu/vk/output_sizes.h): the host takes its shape before the row's, and the row then shows
+that shape with nothing to choose, instead of a value the game does not run. tests/test_output_resolution.py runs those.
 
     python -I -B tests/test_ultrawide_shapes.py [--cc gcc] [--cxx g++]
 """
@@ -42,6 +47,7 @@ HOST = r'''
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "gpu/vk/output_sizes.h"
 
 volatile uint64_t hos_wide_out, hos_wide_scene;
 volatile float hos_wide_ratio, hos_wide_squeeze, hos_wide_margin;
@@ -51,7 +57,7 @@ uint32_t hos_output_size(int height) { return height ? out_h : out_h * 16 / 9; }
 static void hos_log(const char *f, ...) { (void)f; }
 @ROWS@
 @RATIO@
-static void wide(float want) {
+static void wide(float want, int sized) {
 @SIZES@
 }
 
@@ -59,7 +65,7 @@ int main(int argc, char **argv) {
     if (argc < 6) return 2;
     out_h = (unsigned)atoi(argv[5]);
     const float want = ultrawide_ratio(atoi(argv[1]), atoi(argv[2]), atoi(argv[3]), atoi(argv[4]));
-    wide(want);
+    wide(want, 0);   /* (the row's shape, at a 16:9 Output resolution) */
     printf("%.4f %llux%llu %llux%llu %.4f %.4f %.4f %.4f\n", (double)want,
            (unsigned long long)(hos_wide_out & 0xffffffffu), (unsigned long long)(hos_wide_out >> 32),
            (unsigned long long)(hos_wide_scene & 0xffffffffu), (unsigned long long)(hos_wide_scene >> 32),
@@ -80,23 +86,27 @@ MENU = r'''
 @HINT@
 int main() {
     CHECK(!std::strcmp(tx_ultrawide(0), "16:9") && !std::strcmp(tx_ultrawide(1), "16:10"));
-    CHECK(!std::strcmp(tx_ultrawide(2), "21:9") && !std::strcmp(tx_ultrawide(3), "32:9"));
+    CHECK(!std::strcmp(tx_ultrawide(2), "21:9") && !std::strcmp(tx_ultrawide(3), "32:9") && !std::strcmp(tx_ultrawide(4), "4:3"));
     CHECK(ultrawide_row_ratio(0) == 0.0f && ultrawide_row_ratio(1) == 1.6f && ultrawide_row_ratio(-2) == 0.0f);   /* (the shapes' ratios) */
-    /* (wider than 16:9, where the HUD position and the menu sides have sides to act on: 21:9 and 32:9, not 16:10) */
+    CHECK(ultrawide_row_ratio(4) == (float)(4.0 / 3.0) && ultrawide_row_ratio(9) == (float)(4.0 / 3.0));   /* (4:3, the row's last) */
+    /* (wider than 16:9, where the HUD position and the menu sides have sides to act on: 21:9 and 32:9, not 16:10 nor 4:3) */
     CHECK(!ultrawide_row_wider(0) && !ultrawide_row_wider(1) && ultrawide_row_wider(2) && ultrawide_row_wider(3));
-    CHECK(!ultrawide_row_wider(-1) && ultrawide_row_wider(4));
-    CHECK(!std::strcmp(tx_ultrawide(-1), "16:9") && !std::strcmp(tx_ultrawide(4), "32:9"));   /* (past the row: its nearest end) */
-    for (int v = 0; v <= 3; v++) CHECK(hn_ultrawide(v, -1) && hn_ultrawide(v, 0) == hn_ultrawide(v, -1) && !hn_ultrawide(v, 1));
+    CHECK(!ultrawide_row_wider(-1) && !ultrawide_row_wider(4) && !ultrawide_row_wider(7));
+    CHECK(!std::strcmp(tx_ultrawide(-1), "16:9") && !std::strcmp(tx_ultrawide(7), "4:3"));   /* (past the row: its nearest end) */
+    for (int v = 0; v <= 4; v++) CHECK(hn_ultrawide(v, -1) && hn_ultrawide(v, 0) == hn_ultrawide(v, -1) && !hn_ultrawide(v, 1));
     CHECK(std::strstr(hn_ultrawide(1, -1), "16:10") && std::strstr(hn_ultrawide(2, -1), "21:9") && std::strstr(hn_ultrawide(3, -1), "32:9"));
-    for (int v = 1; v <= 3; v++) CHECK(std::strstr(hn_ultrawide(v, -1), "black bars"));
-    CHECK(!hn_ultrawide(4, -1) && !hn_ultrawide(-1, -1));
-    for (int v = 0; v <= 3; v++) CHECK(!std::strstr(tx_ultrawide(v), "onitor") && !std::strstr(hn_ultrawide(v, -1), "onitor"));
+    CHECK(std::strstr(hn_ultrawide(4, -1), "4:3") && std::strstr(hn_ultrawide(4, -1), "HUD across"));
+    for (int v = 1; v <= 4; v++) CHECK(std::strstr(hn_ultrawide(v, -1), "black bars"));
+    CHECK(!hn_ultrawide(5, -1) && !hn_ultrawide(-1, -1));
+    for (int v = 0; v <= 4; v++) CHECK(!std::strstr(tx_ultrawide(v), "onitor") && !std::strstr(hn_ultrawide(v, -1), "onitor"));
     /* (the old row's 1, Monitor's shape, read by the main monitor's shape before options_version 6; as chosen from 6 on) */
     CHECK(ultrawide_row_read(1, 5, 2560, 1440) == 0 && ultrawide_row_read(1, 5, 1920, 1200) == 1 && ultrawide_row_read(1, 5, 2560, 1600) == 1);
     CHECK(ultrawide_row_read(1, 5, 3440, 1440) == 2 && ultrawide_row_read(1, 5, 2560, 1080) == 2 && ultrawide_row_read(1, 5, 5120, 1440) == 3);
     CHECK(ultrawide_row_read(1, 5, 1024, 768) == 1 && ultrawide_row_read(1, 5, 0, 0) == 0 && ultrawide_row_read(1, 0, 3440, 1440) == 2);
     CHECK(ultrawide_row_read(1, 6, 3440, 1440) == 1 && ultrawide_row_read(1, 7, 2560, 1440) == 1);
-    for (int r = 0; r <= 3; r++) if (r != 1) CHECK(ultrawide_row_read(r, 5, 3440, 1440) == r && ultrawide_row_read(r, 6, 1920, 1200) == r);
+    for (int r = 0; r <= 4; r++) if (r != 1) CHECK(ultrawide_row_read(r, 5, 3440, 1440) == r && ultrawide_row_read(r, 6, 1920, 1200) == r);
+    /* (an old file's Monitor's shape on a 4:3 monitor: still the nearest of the first four, as before the row had 4:3) */
+    CHECK(ultrawide_row_read(1, 5, 1600, 1200) == 1);
     std::puts("ultrawide row: all checks passed");
     return 0;
 }
@@ -120,24 +130,54 @@ def main():
           "hos_main.c does not take the picture's shape from the Ultrawide row")
     env = host.index('const char *e = getenv("HOS_ASPECT");')
     check("if (!e) {" in host[env:host.index("want = ultrawide_ratio(", env)], "HOS_ASPECT no longer goes over the Ultrawide row")
+    # the Output resolution's own shape goes before the row's (the size is the picture), and the row is read only without one
+    own = host[env:host.index("want = ultrawide_ratio(", env)]
+    check("want = hos_output_ratio();" in own and "sized = want > 0.0f;" in own and "if (!e && !sized) {" in own,
+          "hos_main.c does not take the Output resolution's own shape before the Ultrawide row's")
+    check("if (output_picture(hos_output_size(1), want, sized, &ow, &oh)) {" in host,
+          "hos_main.c does not make the picture with output_sizes.h's output_picture")
     menu = (ROOT / "gpu/vk/vk_menu.cpp").read_text(encoding="utf-8")
     # ((Triforce, options_version 7) the Ultrawide group's Aspect ratio row; its key is still ultrawide, which hos_main.c reads)
-    row = re.search(r'\{TAB_DISPLAY, "Aspect ratio", &opts\.ultrawide, 0, 3, 1, tx_ultrawide,.*?hn_ultrawide, true\},', menu, re.S)
-    check(row, "the Aspect ratio row is not 16:9, 16:10, 21:9, 32:9 with a restart")
+    row = re.search(r'\{TAB_DISPLAY, "Aspect ratio", &opts\.ultrawide, 0, 4, 1, tx_shape,.*?hn_shape, true\},', menu, re.S)
+    check(row, "the Aspect ratio row is not 16:9, 16:10, 21:9, 32:9, 4:3 with a restart")
     check('{"Aspect ratio", "ultrawide"}' in function(menu, "const char* ini_key(const Row& r) {"),
           "the Aspect ratio row is not kept as ultrawide=")
+    # (its text and its line are the four shapes' while the row decides; what decides in its place is said, and the row fixed)
+    check("if (owner == 0) return tx_ultrawide(v);" in function(menu, "const char* tx_shape(int v) {"),
+          "the Ultrawide row does not show its own choice while it decides the shape")
+    check("case 0: return hn_ultrawide(v, 0);" in function(menu, "const char* hn_shape(int v, int variant) {"),
+          "the Ultrawide row's line is not its value's while it decides the shape")
+    check('int shape_owner() { return getenv("HOS_ASPECT") ? 2 : output_shaped(opts.output_res) ? 1 : 0; }' in menu,
+          "the menu does not take the shape's owner as the host does: HOS_ASPECT, the Output resolution's own shape, the row")
+    check("if (value == &opts.ultrawide && shape_owner() != 0) return true;" in function(menu, "bool row_fixed(const int* value) {"),
+          "the Ultrawide row can be changed while the Output resolution's own shape or HOS_ASPECT decides the picture's")
     check("Monitor's shape" not in function(menu, "const char* tx_ultrawide(int v) {"), "the Ultrawide row still offers Monitor's shape")
     # (the HUD position and the menu sides shown with a shape wider than 16:9 alone: 16:10, the row's 1, is narrower)
     shown = function(menu, "bool row_shown(int i) {")
-    check("((rows[i].value != &opts.wide_hud && rows[i].value != &opts.wide_menus) || ultrawide_row_wider(opts.ultrawide))" in shown,
+    check("((rows[i].value != &opts.wide_hud && rows[i].value != &opts.wide_menus) || (output_picture_of(opts.output_res, opts.ultrawide).w > output_picture_of(opts.output_res, opts.ultrawide).h * (16.0 / 9.0) * 1.01))" in shown,
           "row_shown does not show the HUD position and the menu sides with 21:9 and 32:9 alone")
     init = function(menu, "void menu_init() {")
-    check("opts.ultrawide = ultrawide_row_read(opts.ultrawide, version, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));"
-          in init, "menu_init does not read an old file's Monitor's shape as the nearest shape, as the host does")
+    # (with the main monitor the host reads it by, on every system: off Windows the renderer has no GetSystemMetrics and takes
+    # the screen the window opens on from the host's list, which is what the host's GetSystemMetrics is there; it read 0 x 0,
+    # and the menu showed 16:9 for a picture the host made 21:9)
+    check("opts.ultrawide = ultrawide_row_read(opts.ultrawide, version, (int)main_screen().w, (int)main_screen().h);" in init,
+          "menu_init does not read an old file's Monitor's shape as the nearest shape, as the host does")
+    main_screen = function(menu, "Out main_screen() {")
+    check("#ifdef _WIN32\n    return Out{(uint32_t)std::max(GetSystemMetrics(SM_CXSCREEN), 0), (uint32_t)std::max(GetSystemMetrics(SM_CYSCREEN), 0)};\n"
+          "#else\n    return screen_opening() ? screen_opening()->native : Out{0, 0};\n#endif" in main_screen,
+          "the menu's main monitor is not the host's: GetSystemMetrics on Windows, the screen the window opens on elsewhere")
+    check(init.index("screen_add(list[i].w, list[i].h, list[i].name, list[i].opens != 0);") < init.index("opts.ultrawide = ultrawide_row_read("),
+          "menu_init reads an old Ultrawide row before it has the host's screens")
+    posix = (ROOT / "host/posix/win32_posix.c").read_text(encoding="utf-8")
+    check("if (index == SM_CXSCREEN) return window_state()[1];" in posix and "if (index == SM_CYSCREEN) return window_state()[2];" in posix,
+          "host/posix/win32_posix.c: GetSystemMetrics is no longer the desktop's main display, which the menu takes it to be")
+    check(init.index("opts.output_res = output_file_read(opts.output_res, version, opts.ultrawide,") >
+          init.index("opts.ultrawide = ultrawide_row_read("),
+          "menu_init does not read an old file's 5120-wide output with the Ultrawide row as that file had it")
     readme = (ROOT / "readme.md").read_text(encoding="utf-8")
-    check("| Aspect ratio | 16:9 (the game's own), 16:10, 21:9, 32:9" in readme, "readme.md's settings table does not list the Aspect ratio row's four shapes")
+    check("| Aspect ratio | 16:9 (the game's own), 16:10, 21:9, 32:9, 4:3" in readme, "readme.md's settings table does not list the Aspect ratio row's five shapes")
     guide = (ROOT / "docs/development.md").read_text(encoding="utf-8")
-    check("| `ultrawide` | 0 16:9, 1 16:10, 2 21:9, 3 32:9 (before `options_version` 6, 1 was the monitor's shape" in guide,
+    check("| `ultrawide` | 0 16:9, 1 16:10, 2 21:9, 3 32:9, 4 4:3 (before `options_version` 6, 1 was the monitor's shape" in guide,
           "docs/development.md's options table has no ultrawide")
 
     # (row, the options file's version, the main monitor, the output's height) -> the shape asked, the picture, the scene, the
@@ -165,9 +205,14 @@ def main():
         # 32:9 by name
         ((3, 6, 1920, 1080, 1440), "3.5556 5120x1440 3840x1080 3.5556 0.5000 0.2500 3.5556"),
         ((3, 5, 2560, 1440, 1080), "3.5556 3840x1080 2880x810 3.5556 0.5000 0.2500 3.5556"),
+        # ((Triforce, N64 Classic) 4:3 by name: the game's height, narrower, its cameras 4:3, the HUD across the whole width
+        ((4, 6, 1920, 1080, 1440), "1.3333 1920x1440 1440x1080 1.3333 1.0000 0.0000 1.3333"),
+        ((4, 6, 3440, 1440, 1440), "1.3333 1920x1440 1440x1080 1.3333 1.0000 0.0000 1.3333"),
+        ((4, 5, 1920, 1080, 1080), "1.3333 1440x1080 1080x810 1.3333 1.0000 0.0000 1.3333"),
+        ((4, 6, 1920, 1080, 1152), "1.3333 1536x1152 1152x864 1.3333 1.0000 0.0000 1.3333"),
         # a value past the row: its nearest end, as the menu reads it
         ((-1, 6, 3440, 1440, 1440), "0.0000 0x0 0x0 0.0000 0.0000 0.0000 0.0000"),
-        ((7, 6, 1920, 1080, 1440), "3.5556 5120x1440 3840x1080 3.5556 0.5000 0.2500 3.5556"),
+        ((7, 6, 1920, 1080, 1440), "1.3333 1920x1440 1440x1080 1.3333 1.0000 0.0000 1.3333"),
     )
     with tempfile.TemporaryDirectory(prefix="ultrawide-") as tmp:
         work = Path(tmp)
@@ -175,9 +220,8 @@ def main():
         source.write_text(HOST.replace("@ROWS@", rows_h)
                               .replace("@RATIO@", function(host, "static float ultrawide_ratio(int row, int version, int screen_w, int screen_h) {"))
                               .replace("@SIZES@", sizes(host)), encoding="utf-8")
-        # (the header is pasted in, not included: the menu's own helpers in it, ultrawide_row_wider, go unused by the host's side)
-        subprocess.run([args.cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-variable", "-Wno-unused-function", str(source),
-                        "-o", str(exe), "-lm"], check=True)
+        subprocess.run([args.cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-variable", "-Wno-unused-function", "-I", str(ROOT),
+                        str(source), "-o", str(exe), "-lm"], check=True)
         bad = []
         for case, expect in cases:
             got = subprocess.run([str(exe)] + [str(v) for v in case], capture_output=True, text=True, check=True).stdout.strip()
@@ -186,7 +230,7 @@ def main():
         if bad:
             raise SystemExit("FAIL:\n  " + "\n  ".join(bad))
         # at the 4K output the fixed shapes stay within 3840 x 2160's pixels (the render targets' pool)
-        for r in (1, 2, 3):
+        for r in (1, 2, 3, 4):
             got = subprocess.run([str(exe), str(r), "6", "1920", "1080", "2160"], capture_output=True, text=True, check=True).stdout.split()
             w, h = (int(v) for v in got[1].split("x"))
             check(w * h <= 3840 * 2160 and w % 8 == 0 and h % 8 == 0 and abs(w / h - float(got[0])) < 0.02,
@@ -203,7 +247,7 @@ def main():
                               .replace("@HINT@", hint.group(0)), encoding="utf-8")
         subprocess.run([args.cxx, "-std=c++20", "-Wall", "-Wextra", "-Werror", str(source), "-o", str(exe)], check=True)
         subprocess.run([str(exe)], check=True)
-    print("PASS: the Ultrawide row's 16:9, 16:10, 21:9 and 32:9, and an old file's monitor's shape read as the nearest of them")
+    print("PASS: the Ultrawide row's 16:9, 16:10, 21:9, 32:9 and 4:3, and an old file's monitor's shape read as the nearest of the first four")
 
 
 if __name__ == "__main__":

@@ -97,12 +97,15 @@ void rx_option_set(int id, int value) {
     if (id == HOS_OPT_GAME_OPTIONS) game_options_said = value;
 }
 int rx_option(int id, int otherwise) { return id == HOS_OPT_MODS_SELECTED ? mods_selected : otherwise; }
+int hos_save_files_on(void) { return 0; }   /* ((Triforce) no save files here: no Save Select under Mods (tests/test_save_files.py)) */
 int hos_mouse_wheel_take(void) { const int w = wheel_next; wheel_next = 0; return w; }   /* (the wheel only, mouse kept) */
 int hos_mouse_game_pointer(int *x, int *y, int *w, int *h, uint32_t *pressed, int *wheel) {
     *x = ptr_x, *y = ptr_y, *w = 3840, *h = 2160, *pressed = pressed_next, *wheel = wheel_next;
     pressed_next = 0, wheel_next = 0;
     return pointer_hidden ? 2 : 1;
 }
+/* ((Triforce, 11-22) N64 Classic's TV's curve (rx_backend.c): no TV here, the point as it is */
+void rx_screen_point(int *x, int *y, int w, int h) { (void)x, (void)y, (void)w, (void)h; }
 static char taps[1024];
 void hos_hid_tap(const char *press) { strncat(taps, press, sizeof taps - strlen(taps) - 2), strcat(taps, ";"); }
 void hos_hid_stick(int lx, int ly, int rx, int ry, int hold_ms) { (void)lx, (void)ly, (void)rx, (void)ry, (void)hold_ms; }
@@ -609,7 +612,8 @@ class OotOptionsScreenTests(unittest.TestCase):
             shutil.copy(ROOT / "host" / "oot_menu.c", tmp / "host" / "oot_menu.c")
             shutil.copy(ROOT / "host" / "guest_bounds.h", tmp / "host" / "guest_bounds.h")   # (set_item_key's buffer check)
             (tmp / "host" / "hos_bench.h").write_text(HOS_BENCH_H, encoding="utf-8")   # ((Triforce, 11-19) benchmark mode: off here)
-            (tmp / "host" / "t.c").write_text(OPTIONS_FIXTURE, encoding="utf-8")
+            shutil.copy(ROOT / "host" / "oot_title_movie.h", tmp / "host" / "oot_title_movie.h")   # (oot_menu_screen_tick)
+            (tmp / "host" / "t.c").write_text(OPTIONS_FIXTURE + MENU_TICK, encoding="utf-8")
             binary = tmp / "t.exe"
             other_half = ["-DHOS_OOT_MENU_NO_MOUSE"] if sys.platform == "win32" else []
             build = subprocess.run([compiler, "-std=gnu11", "-Wall", "-O1", "-g", str(tmp / "host" / "t.c")] +
@@ -624,6 +628,9 @@ class OotOptionsScreenTests(unittest.TestCase):
             self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
 
 
+# ((Triforce) host/oot_title_movie.c's, which every menu screen's update tells its class: tests/test_oot_title_movie.py has
+# what is made of it; here only taken)
+MENU_TICK = "\nvoid oot_menu_screen_tick(unsigned long long screen_class) { (void)screen_class; }\n"
 # ((Triforce, 11-19) host/hos_bench.h's two calls oot_menu.c makes, benchmark mode off: the menus as a player has them)
 HOS_BENCH_H = """#pragma once
 #include <stdint.h>
@@ -653,7 +660,8 @@ class OotMenuMouseTests(unittest.TestCase):
             shutil.copy(ROOT / "host" / "oot_menu.c", tmp / "host" / "oot_menu.c")
             shutil.copy(ROOT / "host" / "guest_bounds.h", tmp / "host" / "guest_bounds.h")   # (set_item_key's buffer check)
             (tmp / "host" / "hos_bench.h").write_text(HOS_BENCH_H, encoding="utf-8")   # ((Triforce, 11-19) benchmark mode: off here)
-            (tmp / "host" / "t.c").write_text(FIXTURE, encoding="utf-8")
+            shutil.copy(ROOT / "host" / "oot_title_movie.h", tmp / "host" / "oot_title_movie.h")   # (oot_menu_screen_tick)
+            (tmp / "host" / "t.c").write_text(FIXTURE + MENU_TICK, encoding="utf-8")
             binary = tmp / "t.exe"
             build = subprocess.run([compiler, "-std=gnu11", "-Wall", "-O1", "-g", "-D_WIN32_WINNT=0x0601",
                                     str(tmp / "host" / "t.c"), str(tmp / "host" / "oot_menu.c"), "-o", str(binary)],

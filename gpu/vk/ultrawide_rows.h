@@ -3,7 +3,15 @@
    2 a fixed 21:9 (64:27, the shape of a 2560 x 1080 or a 5120 x 2160 screen), 3 a fixed 32:9. A value past the row is its nearest
    end. Before options_version 6 the row's 1 was "Monitor's shape" (the main monitor's own ratio): such a file's 1 is read as the
    shape nearest the main monitor's, ultrawide_row_nearest, so its picture stays as it was on the common screens (16:9, 16:10,
-   21:9 and 32:9 ones; a 4:3 one gets 16:10). Plain C, no includes: the host's C and the renderer's C++ both take it. */
+   21:9 and 32:9 ones; a 4:3 one gets 16:10).
+   (Triforce) The row is the shape of a 16:9 Output resolution, at its height. A screen of another shape than these four (a
+   3440 x 1440 or a 3840 x 1600 one) is not a fifth value here: its size is an Output resolution (Screen, or Custom), which is
+   then the picture by itself, and the row shows that shape with nothing to choose (gpu/vk/output_sizes.h, vk_menu.cpp
+   tx_shape). ((Triforce, 11-22, N64 Classic, step 6) 4, a fixed 4:3: the 1998 TV's shape, the
+   picture the game's height and narrower, its cameras 4:3, the HUD across its width (host/hos_main.c's path for a shape
+   narrower than 16:9); the nearest shape of an old file's Monitor's shape is still one of the first four.)
+   So the row keeps the four fixed shapes, each the same picture on every PC, and no value of it follows the monitor.
+   Plain C, no includes: the host's C and the renderer's C++ both take it. */
 #ifndef ULTRAWIDE_ROWS_H
 #define ULTRAWIDE_ROWS_H
 
@@ -11,10 +19,11 @@
 static inline float ultrawide_row_ratio(int row) {
     if (row <= 0) return 0.0f;
     if (row == 1) return 1.6f;
+    if (row >= 4) return (float)(4.0 / 3.0);   /* ((Triforce, N64 Classic) 4:3, the row's last) */
     return row == 2 ? (float)(64.0 / 27.0) : (float)(32.0 / 9.0);
 }
 
-/* Whether the row's shape is wider than the game's 16:9: 21:9 and 32:9 (16:10 is narrower, 1.6). The HUD position and the
+/* Whether the row's shape is wider than the game's 16:9: 21:9 and 32:9 (16:10 and 4:3 are narrower). The HUD position and the
    menu sides act only on such a picture's sides (gpu/vk/vk_menu.cpp row_shown) */
 static inline int ultrawide_row_wider(int row) { return ultrawide_row_ratio(row) > (float)(16.0 / 9.0); }
 

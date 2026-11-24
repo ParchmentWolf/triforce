@@ -20,7 +20,14 @@
       renderer told), so the caches are written. Esc (the window in front) or the window closed by the launcher: written
       with "stopped": true.
    4. No save is written while it runs (host/nn_fs.c Commit), the hearts are protected (host/hos_main.c), and the player's
-      devices do not count (host/nn_hid.c): the benchmark's presses count with the window behind other windows. */
+      devices do not count (host/nn_hid.c): the benchmark's presses count with the window behind other windows.
+   5. ((Triforce) 11-22) The helper-thread test (HOS_BENCH_HELPERS=1, the launcher's "Start with the helper-thread test"):
+      each scene is measured twice in a row, its HOS_BENCH_SECONDS with the replay helper threads off and as long with them
+      on (gpu/vk/vk_replay.cpp par_forced, through HOS_OPT_HELPERS_FORCE: the tuner out of the way), each after its own 1.5 s
+      of settling. The order turns from scene to scene (off first in the first, third, ...; on first in the second, ...), so
+      that warming up and a scene that changes favour neither. The scene's own figures are the "off" half's; "helpers" has
+      both halves, and "helper_test" the threads the test used (0: it could not run, the row's Off or a PC Automatic gives
+      none; each scene then measured once, the helpers as the options have them). */
 #include "hos.h"
 #include "hos_paths.h"
 #include "hos_bench.h"
@@ -39,6 +46,7 @@ void hos_hid_tap(const char *press);                                /* host/nn_h
 void hos_hid_stick(int lx, int ly, int rx, int ry, int hold_ms);
 const char *rx_describe(void);                                      /* host/rx_backend.c */
 int rx_option(int id, int otherwise);
+void rx_option_set(int id, int value);
 void hos_window_close(void);                                        /* host/display.c, host/posix/display_sdl.c */
 extern const char *hos_user_dir;                                    /* host/nn_fs.c */
 
@@ -52,12 +60,20 @@ extern const char *hos_user_dir;                                    /* host/nn_f
 #define HIST_BINS 2000              /* (the scene's frame times so far, 0.1 ms each up to 200 ms: the panel's 1% low) */
 
 typedef struct { int action; char name[48]; } Scene;
+/* ((Triforce) 11-22) one half of the helper-thread test's scene: its figures as a scene's */
+typedef struct {
+    int frames, npoints;
+    double seconds, avg, low1, low01, max_ms;
+    float points[GRAPH_POINTS];
+} Half;
 typedef struct {
     int frames;
     double seconds, avg, low1, low01, max_ms;
     float points[GRAPH_POINTS];
     int npoints;
     int scene;   /* ((Triforce, 11-19) the scene it measured: a scene skipped before it shifts no name */
+    int tested, on_first;   /* ((Triforce) 11-22) the helper-thread test: measured both ways, and in which order */
+    Half way[2];            /* (0 off, 1 on) */
 } Result;
 typedef struct { uint64_t screen, vt; int stage, presses, focus_asks; int64_t press_ns, ask_ns; } Screen;
 
@@ -90,6 +106,10 @@ static struct {
     char error[160];
     int written, closing;
     int64_t end_ns;
+    /* ((Triforce) 11-22) the helper-thread test: asked for, the threads it uses (-1 not asked of the renderer yet, 0 none),
+       the scene's half being measured (0, 1), the way it holds (0 off, 1 on), and the halves measured so far */
+    int helpers, helper_threads, half, way, way_set;
+    Half halves[2];
 } B = {SRWLOCK_INIT};
 
 int hos_bench_on(void) { return B.on; }
@@ -133,6 +153,9 @@ void hos_bench_init(void) {
     parse_scenes(scenes && *scenes ? scenes : "1001:Hyrule Field,1003:Castle Town Market,1000:Kokiri Forest,1007:Lake Hylia");
     if (!B.nscenes) parse_scenes("1001:Hyrule Field");
     B.slot = B.newest = -1;
+    const char *helpers = getenv("HOS_BENCH_HELPERS");
+    B.helpers = helpers && atoi(helpers) != 0;
+    B.helper_threads = -1;
     B.t_start = hos_now_ns();
     B.phase = MKWVK_BENCH_BOOT;
     B.on = 1;
@@ -254,11 +277,9 @@ static int64_t rank_of(const int64_t *v, int n, double q) {
     if (r > n) r = n;
     return v[r - 1];
 }
-static void scene_done(void) {   /* (under the lock) */
-    if (B.nresults >= MAX_SCENES) return;
-    Result *r = &B.results[B.nresults++];
+/* the measured intervals' figures (under the lock; sorts B.iv) */
+static void stats_of(Half *r) {
     memset(r, 0, sizeof *r);
-    r->scene = B.scene;
     r->frames = B.n;
     int64_t sum = 0;
     for (int i = 0; i < B.n; i++) sum += B.iv[i];
@@ -283,9 +304,34 @@ static void scene_done(void) {   /* (under the lock) */
             r->low1 = r->low01 = -1;
         }
     }
-    hos_log("benchmark: scene %d of %d, %s: %.1f fps average, 1%% low %.1f, 0.1%% low %.1f, %d frames in %.2f s", B.nresults,
-            B.nscenes, B.scenes[r->scene].name, r->avg, r->low1, r->low01, r->frames, r->seconds);
 }
+static int helper_test(void) { return B.helpers && B.helper_threads >= 2; }
+static void scene_done(void) {   /* (under the lock) */
+    if (B.nresults >= MAX_SCENES) return;
+    Result *r = &B.results[B.nresults++];
+    memset(r, 0, sizeof *r);
+    r->scene = B.scene;
+    Half own;
+    if (helper_test()) {   /* (both halves measured: the scene's own figures are the "off" half's) */
+        r->tested = 1, r->on_first = B.way == 0;   /* (the way held now is the second half's) */
+        r->way[0] = B.halves[0], r->way[1] = B.halves[1];
+        own = B.halves[0];
+    } else {
+        stats_of(&own);
+    }
+    r->frames = own.frames, r->seconds = own.seconds, r->avg = own.avg, r->low1 = own.low1, r->low01 = own.low01;
+    r->max_ms = own.max_ms, r->npoints = own.npoints;
+    memcpy(r->points, own.points, sizeof r->points);
+    hos_log("benchmark: scene %d of %d, %s: %.1f fps average, 1%% low %.1f, 0.1%% low %.1f, %d frames in %.2f s%s", B.nresults,
+            B.nscenes, B.scenes[r->scene].name, r->avg, r->low1, r->low01, r->frames, r->seconds,
+            r->tested ? " (the helper threads off)" : "");
+    if (r->tested)
+        hos_log("benchmark: scene %d of %d, %s, the helper threads on: %.1f fps average, 1%% low %.1f, 0.1%% low %.1f, %d "
+                "frames in %.2f s; off %.1f (measured %s)", B.nresults, B.nscenes, B.scenes[r->scene].name, r->way[1].avg,
+                r->way[1].low1, r->way[1].low01, r->way[1].frames, r->way[1].seconds, r->way[0].avg, r->on_first ? "second" : "first");
+}
+/* ((Triforce) 11-22) a half's figures, as the scene's in the results */
+static void json_half(FILE *f, const Half *h);
 static void json_text(FILE *f, const char *s) {
     fputc('"', f);
     for (; s && *s; s++) {
@@ -361,11 +407,21 @@ static void write_results(int stopped) {   /* (under the lock; once) */
         fprintf(f, ",\"avg\":%.2f,\"low1\":%.2f,\"low01\":%.2f,\"frames\":%d,\"seconds\":%.3f,\"max_ms\":%.2f,\"frametimes_ms\":[",
                 bench_finite(r->avg), bench_finite(r->low1), bench_finite(r->low01), r->frames, bench_finite(r->seconds), bench_finite(r->max_ms));
         for (int p = 0; p < r->npoints; p++) fprintf(f, "%s%.2f", p ? "," : "", bench_finite(r->points[p]));
-        fprintf(f, "]}");
+        fprintf(f, "]");
+        if (r->tested) {   /* ((Triforce) 11-22) the helper-thread test's two halves */
+            fprintf(f, ",\"helpers\":{\"first\":\"%s\",\"off\":", r->on_first ? "on" : "off");
+            json_half(f, &r->way[0]);
+            fprintf(f, ",\"on\":");
+            json_half(f, &r->way[1]);
+            fprintf(f, "}");
+        }
+        fprintf(f, "}");
     }
     fprintf(f, "],\"skipped\":[");
     for (int i = 0; i < B.nskipped; i++) fprintf(f, "%s", i ? "," : ""), json_text(f, B.scenes[B.skipped[i]].name);
-    fprintf(f, "],\"settings\":");
+    fprintf(f, "]");
+    if (B.helpers) fprintf(f, ",\"helper_test\":{\"threads\":%d}", B.helper_threads > 0 ? B.helper_threads : 0);
+    fprintf(f, ",\"settings\":");
     json_settings(f);
     fprintf(f, "}\n");
     const int ok = fflush(f) == 0;
@@ -376,6 +432,12 @@ static void write_results(int stopped) {   /* (under the lock; once) */
     else
         hos_log("benchmark: the results could not be moved to %s", B.path);
     hos_log_flush();
+}
+static void json_half(FILE *f, const Half *h) {
+    fprintf(f, "{\"avg\":%.2f,\"low1\":%.2f,\"low01\":%.2f,\"frames\":%d,\"seconds\":%.3f,\"max_ms\":%.2f,\"frametimes_ms\":[",
+            bench_finite(h->avg), bench_finite(h->low1), bench_finite(h->low01), h->frames, bench_finite(h->seconds), bench_finite(h->max_ms));
+    for (int p = 0; p < h->npoints; p++) fprintf(f, "%s%.2f", p ? "," : "", bench_finite(h->points[p]));
+    fprintf(f, "]}");
 }
 static void fail(int64_t now, const char *why) {   /* (under the lock) */
     if (B.phase >= MKWVK_BENCH_DONE) return;
@@ -485,6 +547,7 @@ int hos_bench_link_wants_state(void) {
 }
 static void go_scene(int64_t now) {   /* (under the lock) the next scene's teleport */
     B.phase = MKWVK_BENCH_TRAVEL, B.t_phase = now;
+    B.half = 0, B.way_set = 0;   /* ((Triforce) 11-22: the helper-thread test's halves begin again) */
     B.want = 1, B.tries = 0, B.resends = 0, B.saw_load = 0, B.retry_ns = 0, B.sent_ns = 0;
     hos_log("benchmark: going to %s (scene %d of %d)", B.scenes[B.scene].name, B.scene + 1, B.nscenes);
 }
@@ -569,6 +632,18 @@ void hos_bench_present(int64_t now) {
         break;
     case MKWVK_BENCH_SETTLE:
         hos_hid_stick(0, 0, PAN, 0, 250);
+        if (B.helpers && B.helper_threads < 0) {   /* ((Triforce) 11-22) the helper-thread test: what it can use, asked once */
+            B.helper_threads = rx_option(HOS_OPT_HELPERS_FORCE, 0);
+            if (helper_test())
+                hos_log("benchmark: the helper-thread test: each scene with %d helper threads off and on", B.helper_threads);
+            else
+                hos_log("benchmark: the helper-thread test cannot run here: no helper threads (the Debug tab's row Off, "
+                        "RX_VK_PARALLEL, or a PC Automatic gives none); each scene measured once");
+        }
+        if (helper_test() && !B.way_set) {   /* (the scene's first half: off first in the first scene, on first in the next) */
+            B.way = B.scene % 2, B.way_set = 1, B.t_phase = now;
+            rx_option_set(HOS_OPT_HELPERS_FORCE, B.way);
+        }
         if (now - B.t_phase >= SETTLE_NS) {
             B.phase = MKWVK_BENCH_MEASURE, B.measure_t0 = now, B.n = 0;
             memset(B.hist, 0, sizeof B.hist);
@@ -587,6 +662,17 @@ void hos_bench_present(int64_t now) {
             B.hist[bin < HIST_BINS ? bin : HIST_BINS]++;
         }
         if (now - B.measure_t0 >= (int64_t)(B.seconds * 1e9)) {
+            if (helper_test()) {   /* ((Triforce) 11-22) a half measured: the other way next, after its own settling */
+                stats_of(&B.halves[B.way]);
+                hos_log("benchmark: %s, the helper threads %s: %.1f fps average over %d frames", B.scenes[B.scene].name,
+                        B.way ? "on" : "off", B.halves[B.way].avg, B.halves[B.way].frames);
+                if (B.half == 0) {
+                    B.half = 1, B.way ^= 1;
+                    rx_option_set(HOS_OPT_HELPERS_FORCE, B.way);
+                    B.phase = MKWVK_BENCH_SETTLE, B.t_phase = now;
+                    break;
+                }
+            }
             scene_done();
             if (++B.scene >= B.nscenes) {
                 B.phase = MKWVK_BENCH_DONE, B.end_ns = now;
@@ -606,6 +692,10 @@ void hos_bench_present(int64_t now) {
         HWND w = GetForegroundWindow();
         if (w) GetWindowThreadProcessId(w, &pid);
         if (pid == GetCurrentProcessId()) stop(now, "Esc pressed");
+    }
+    if (helper_test() && B.phase >= MKWVK_BENCH_DONE && B.way_set >= 0) {   /* ((Triforce) 11-22: the tuner decides again) */
+        rx_option_set(HOS_OPT_HELPERS_FORCE, -1);
+        B.way_set = -1;
     }
     ReleaseSRWLockExclusive(&B.lock);
     if (close) {
@@ -631,10 +721,13 @@ int hos_bench_state(MkwVkBench *out) {
     const int sc = B.scene < B.nscenes ? B.scene : B.nscenes - 1;
     out->scene = B.phase == MKWVK_BENCH_BOOT ? 0 : sc + 1;
     snprintf(out->name, sizeof out->name, "%s", B.phase == MKWVK_BENCH_BOOT ? "" : B.scenes[sc].name);
+    if (helper_test() && B.way_set > 0 && (B.phase == MKWVK_BENCH_SETTLE || B.phase == MKWVK_BENCH_MEASURE))
+        snprintf(out->name, sizeof out->name, "%.30s, helpers %s", B.scenes[sc].name, B.way ? "on" : "off");
     const int64_t now = hos_now_ns();
     double frac = 0;
     if (B.phase == MKWVK_BENCH_MEASURE) frac = (now - B.measure_t0) / (B.seconds * 1e9);
     if (frac > 1) frac = 1;
+    if (helper_test()) frac = (B.half + frac) / 2;   /* ((Triforce) 11-22: a scene is two halves) */
     out->progress = B.phase >= MKWVK_BENCH_DONE && B.phase != MKWVK_BENCH_DONE ? (float)B.nresults / B.nscenes
                     : B.phase == MKWVK_BENCH_DONE ? 1.0f : B.phase == MKWVK_BENCH_BOOT ? 0.0f : (float)((sc + frac) / B.nscenes);
     if (B.phase == MKWVK_BENCH_FAILED) snprintf(out->line, sizeof out->line, "%s", B.error);

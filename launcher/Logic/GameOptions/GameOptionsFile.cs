@@ -21,6 +21,7 @@ public sealed class GameOptionsFile : IGameOptionValues
     Dictionary<string, string> raw = new(StringComparer.Ordinal);   // (each key's last value, trimmed as ini_merge.h does)
     Dictionary<string, int> read = new(StringComparer.Ordinal);     // (each row's value as the game reads this file)
     readonly Dictionary<string, int> set = new(StringComparer.Ordinal);   // (the rows the launcher changed: their new values)
+    bool customSizeUsed;   // (the launcher gave Custom another size, or took the entered one back: Save empties output_custom_size)
 
     GameOptionsFile(string path, (int W, int H)? mainScreen)
     {
@@ -31,12 +32,16 @@ public sealed class GameOptionsFile : IGameOptionValues
 
     /// <summary>The game folder's options. mainScreen: the main monitor's size in pixels, for a file from before
     /// options_version 6 whose Ultrawide is 1 (then "Monitor's shape": the game reads it as the shape nearest the main
-    /// monitor's); without it such a 1 is read as 16:9, as the game does where it cannot ask. A missing file is all defaults.</summary>
+    /// monitor's). Without it (the launcher has none off Windows) that row is the game's to read: the game knows its
+    /// screen on every system, and a guess here would be written as the player's choice. The row then stays 1 and the
+    /// file stays at its version (WaitsForGame). A missing file is all defaults.</summary>
     public static GameOptionsFile Load(string gameFolder, (int W, int H)? mainScreen = null) =>
         new(System.IO.Path.Combine(gameFolder, GameOptionsSchema.FileName), mainScreen);
 
     /// <summary>The file was there when it was last read.</summary>
     public bool Exists { get; private set; }
+    /// <summary>The main monitor's size it was loaded with (the Output resolution's Screen shows it).</summary>
+    public (int W, int H)? Screen => mainScreen;
     /// <summary>Its options_version (0: none, a file from before the line, or no file).</summary>
     public int Version { get; private set; }
 
@@ -47,6 +52,7 @@ public sealed class GameOptionsFile : IGameOptionValues
         var text = Exists ? File.ReadAllText(Path, Encoding.Latin1) : "";
         Parse(text);
         set.Clear();
+        customSizeUsed = false;
     }
 
     void Parse(string text)
@@ -93,6 +99,10 @@ public sealed class GameOptionsFile : IGameOptionValues
         foreach (var p in GameOptionsSchema.Parts.Values)
             v[p.Key] = exists && lines.TryGetValue(p.Key, out var s) ? p.AsRead(Atoi(s)) : p.Default;
         if (!exists) return v;
+        // (Custom's size: the file's own two numbers, not each kept to its row's ends, as the game reads them)
+        (v[GameOptionsSchema.OutputWidthKey], v[GameOptionsSchema.OutputHeightKey]) = GameOptionsSchema.CustomRowsRead(
+            lines.TryGetValue(GameOptionsSchema.OutputWidthKey, out var cw) ? Atoi(cw) : 0,
+            lines.TryGetValue(GameOptionsSchema.OutputHeightKey, out var ch) ? Atoi(ch) : 0);
         foreach (var (key, value) in Migrated(lines)) if (v.ContainsKey(key)) v[key] = value;
         if (!lines.ContainsKey(GameOptionsSchema.ResolutionKey) && lines.TryGetValue("dynamic_resolution", out var dyn))
             v[GameOptionsSchema.ResolutionKey] = Atoi(dyn) != 0 ? 0 : 1;
@@ -100,8 +110,19 @@ public sealed class GameOptionsFile : IGameOptionValues
         return v;
     }
 
+    /// <summary>A file from before options_version 6 with Ultrawide 1, "Monitor's shape", and no main monitor known here to
+    /// read it by: the launcher cannot say which shape that is (on a 3440x1440 display the game reads 21:9). It leaves the
+    /// row for the game: not shown as another value, and Save neither writes the older file's rules' values nor raises its
+    /// options_version, because a file at the current version with ultrawide=1 means 16:10. Until the game has saved the
+    /// file, the game reads the launcher's other changes by that older version's rules. A row the launcher's user sets
+    /// here is a choice among the current shapes, and ends the wait.</summary>
+    bool WaitsForGame(Dictionary<string, string> lines) =>
+        mainScreen == null && (lines.TryGetValue(GameOptionsSchema.VersionKey, out var v) ? Atoi(v) : 0) < 6 &&
+        lines.TryGetValue(GameOptionsSchema.UltrawideKey, out var row) && Atoi(row) == 1;
+
     /// <summary>menu_init's rules for a file of an older options_version, as key and the value the game takes in its place
-    /// (only the keys whose value it changes). The Debug tab's keys too: the game's readers before the menu take the same rules.</summary>
+    /// (only the keys whose value it changes). The Debug tab's keys too: the game's readers before the menu take the same
+    /// rules. Not the Ultrawide row's old 1, nor the Output resolution that depends on it, while that waits for the game.</summary>
     List<(string Key, int Value)> Migrated(Dictionary<string, string> lines)
     {
         var list = new List<(string, int)>();
@@ -111,10 +132,11 @@ public sealed class GameOptionsFile : IGameOptionValues
         {
             if (!lines.TryGetValue(key, out var s) || Atoi(s) != value) list.Add((key, value));
         }
+        var nativeOld = version < 8 || (version == 8 && (lines.ContainsKey(GameOptionsSchema.OutputWidthKey) || lines.ContainsKey(GameOptionsSchema.OutputHeightKey) || lines.ContainsKey(GameOptionsSchema.CustomSizeKey)));
         // ((Triforce, options_version 8) merged_rows.h migrate: the handheld profile is the Output resolution's 1536x864, the
         // shared stick dead zone each stick's own where it had none of its own. The other rows that went move nothing; their
         // lines stay until the game's next save drops them. A 436f9ac-based build's 7 has none of these lines: nothing moves)
-        if (version < 8)
+        if (nativeOld)
         {
             if (lines.TryGetValue("handheld_profile", out var hh) && Atoi(hh) != 0) Force(GameOptionsSchema.OutputResKey, GameOptionsSchema.HandheldOutput);
             var old = lines.TryGetValue("stick_dead_zone", out var sz) ? Atoi(sz) : 0;
@@ -135,9 +157,24 @@ public sealed class GameOptionsFile : IGameOptionValues
         if (version < 6)
         {
             Force("tail_early", 1);
-            if (lines.TryGetValue("ultrawide", out var uw) && Atoi(uw) == 1) Force("ultrawide", NearestShape(mainScreen));
+            if (!WaitsForGame(lines) && lines.TryGetValue("ultrawide", out var uw) && Atoi(uw) == 1) Force("ultrawide", NearestShape(mainScreen));
         }
         if (version < 7) Force("frame_pacing", 1);
+        // (before 8 the Output resolution's 5120x1440 and 5120x2160 were the game's frame, and the Ultrawide row gave the
+        // picture's shape there too: output_sizes.h output_res_read, with the row as the game reads it)
+        if (version < 9 && !WaitsForGame(lines) && lines.TryGetValue(GameOptionsSchema.OutputResKey, out var res))
+        {
+            var row = lines.TryGetValue(GameOptionsSchema.UltrawideKey, out var shape) ? Math.Clamp(Atoi(shape), 0, 3) : 0;
+            if (version < 6 && row == 1) row = NearestShape(mainScreen);
+            var legacy = nativeOld;
+            var now = GameOptionsSchema.OutputResRead(Atoi(res), legacy ? version : 7, row);
+            if (legacy && now is 7 or 8) now++;
+            if ((version < 8 || legacy) && lines.TryGetValue("handheld_profile", out var handheld) && Atoi(handheld) != 0) now = 7;
+            if (now != Atoi(res)) Force(GameOptionsSchema.OutputResKey, now);
+        }
+        // Native 0.6 still wrote the old profile row in version 9. Stock version 8 ignores it.
+        if (version == 9 && lines.TryGetValue("handheld_profile", out var profile) && Atoi(profile) != 0)
+            Force(GameOptionsSchema.OutputResKey, 7);
         return list;
     }
 
@@ -180,7 +217,8 @@ public sealed class GameOptionsFile : IGameOptionValues
     public string? Raw(string key) => raw.GetValueOrDefault(key);
 
     /// <summary>A row's value's label as the game's menu shows it, the other rows as they are here (the Render resolution's
-    /// sizes, the Anti-aliasing while an upscaler draws, the Microphone's device).</summary>
+    /// sizes, the Anti-aliasing while an upscaler draws, the Microphone's device, Screen's and Custom's sizes, the shape of
+    /// an Output resolution that has its own).</summary>
     public string Label(string key) => GameOptionsSchema.Get(key).Label(Get(key), this);
 
     /// <summary>The values a row offers with the other rows as they are here: the Upscaler's engines (the one chosen by its
@@ -197,6 +235,8 @@ public sealed class GameOptionsFile : IGameOptionValues
             GameOptionsSchema.ResolutionKey => GameOptionsSchema.ResolutionSteps(Value(GameOptionsSchema.UpscalerKey)).ToList(),
             GameOptionsSchema.UpscalerKey => GameOptionsSchema.UpscalerOrder.Select(e => e == GameOptionsSchema.Engine(now) ? now : e).ToList(),
             GameOptionsSchema.MicKey => Raw(GameOptionsSchema.MicDeviceKey) is { Length: > 0 } ? new List<int> { 0, 1, 2 } : new List<int> { 0, 1 },
+            // (an Output resolution of its own shape: the row has nothing to choose, as in the menu)
+            GameOptionsSchema.UltrawideKey when GameOptionsSchema.OutputShaped(this) => new List<int> { Get(key) },
             _ => row.Choices.Select(c => c.Value).ToList(),
         };
         if (!values.Contains(now)) values.Add(now);
@@ -208,6 +248,23 @@ public sealed class GameOptionsFile : IGameOptionValues
         }
         if (key == GameOptionsSchema.MicKey && now >= 2) values = values.Where(v => v < 2 || v == now).ToList();
         return values.Select(v => new GameOptionChoice(v, row.Label(v, this))).ToList();
+    }
+
+    /// <summary>The Custom size the game's menu keeps beside a screen's (output_custom_size, read as the menu reads it,
+    /// read_remembered_custom: under any Output resolution, a size the two rows can hold), null when there is none or the
+    /// launcher has used it up.</summary>
+    public (int W, int H)? EnteredCustomSize
+    {
+        get
+        {
+            if (customSizeUsed) return null;
+            if (Raw(GameOptionsSchema.CustomSizeKey) is not { } text) return null;
+            var x = text.IndexOfAny(new[] { 'x', 'X' });
+            if (x <= 0 || !text.All(c => c is >= '0' and <= '9' or 'x' or 'X') || text.Count(c => c is 'x' or 'X') != 1) return null;
+            int w = Atoi(text[..x]), h = Atoi(text[(x + 1)..]);
+            var (width, height) = (GameOptionsSchema.Get(GameOptionsSchema.OutputWidthKey), GameOptionsSchema.Get(GameOptionsSchema.OutputHeightKey));
+            return w >= width.Lo && w <= width.Hi && h >= height.Lo && h <= height.Hi ? (w, h) : null;
+        }
     }
 
     /// <summary>The saved values the launcher changed since the file was read, by their keys in the file (a merged row's are
@@ -274,7 +331,17 @@ public sealed class GameOptionsFile : IGameOptionValues
             Put(Res, row.Clamp(value));
             return Get(key);
         }
-        Put(key, row.Clamp(value));
+        var next = row.Clamp(value);
+        var changed = Get(key) != next;
+        // Custom edits replace the remembered pair; choosing another output restores it, as the game's menu does.
+        if (changed && key is GameOptionsSchema.OutputWidthKey or GameOptionsSchema.OutputHeightKey) customSizeUsed = true;
+        if (changed && key == GameOptionsSchema.OutputResKey && EnteredCustomSize is { } entered)
+        {
+            Put(GameOptionsSchema.OutputWidthKey, entered.W);
+            Put(GameOptionsSchema.OutputHeightKey, entered.H);
+            customSizeUsed = true;
+        }
+        Put(key, next);
         return Get(key);
     }
 
@@ -307,13 +374,14 @@ public sealed class GameOptionsFile : IGameOptionValues
     /// get its value, every other line stays exactly as the file has it (so a line changed outside since Load is kept, as
     /// the game's merge keeps it), a changed row the file has no line for is added before options_version. A file of an
     /// older options_version is brought up to the current one as the game would read it (the values its rules give are
-    /// written, options_version=8), so the game does not read the launcher's values by the old rules. The whole file is
+    /// written, options_version=9), so the game does not read the launcher's values by the old rules; not while an old
+    /// Monitor's shape waits for the game (WaitsForGame). The whole file is
     /// written beside it as .new and then put in its place: a reader never meets half a file, and a failure leaves the old
     /// one (IOException). Nothing to write: nothing written. The caller refuses while the game runs (Game.IsRunning).
     /// Afterwards this object holds the file as written.</summary>
     public void Save()
     {
-        if (set.Count == 0) return;
+        if (set.Count == 0) { customSizeUsed = false; return; }
         var exists = File.Exists(Path);
         var text = exists ? File.ReadAllText(Path, Encoding.Latin1) : "";
         var disk = SplitLines(text);
@@ -324,18 +392,36 @@ public sealed class GameOptionsFile : IGameOptionValues
 
         var write = new Dictionary<string, string>(StringComparer.Ordinal);
         var hasVersion = diskRaw.TryGetValue(GameOptionsSchema.VersionKey, out var vs);
-        if (exists && (!hasVersion || Atoi(vs!) < GameOptionsSchema.CurrentVersion))
+        // (an old Monitor's shape the launcher cannot read: the file keeps its version and its rules, for the game; unless
+        // the row is set here, which is a choice among the current shapes)
+        var waits = WaitsForGame(diskRaw) && !set.ContainsKey(GameOptionsSchema.UltrawideKey);
+        if (exists && !waits)
         {
             foreach (var (k, v) in Migrated(diskRaw)) write[k] = v.ToString(CultureInfo.InvariantCulture);
             if (!diskRaw.ContainsKey(GameOptionsSchema.ResolutionKey) && diskRaw.TryGetValue("dynamic_resolution", out var dyn))
                 write[GameOptionsSchema.ResolutionKey] = (Atoi(dyn) != 0 ? 0 : 1).ToString(CultureInfo.InvariantCulture);
         }
         foreach (var (k, v) in set) write[k] = v.ToString(CultureInfo.InvariantCulture);
+        // An older native launcher left this line behind. Keep it consistent when the current output row changes.
+        if (!waits && diskRaw.ContainsKey("handheld_profile"))
+        {
+            var output = write.TryGetValue(GameOptionsSchema.OutputResKey, out var written) ? Atoi(written) : Get(GameOptionsSchema.OutputResKey);
+            write["handheld_profile"] = output == GameOptionsSchema.HandheldOutput ? "1" : "0";
+        }
         // ((Triforce) 11-20) the GPU device row's card by its name too: the game finds it by the name first, so the number
         // counted in Windows' order (no triforce_gpus.txt before the game's first run) no longer picks another card. Auto: empty
         if (set.TryGetValue(GameOptionsSchema.GpuKey, out var gpu))
             write[GameOptionsSchema.GpuNameKey] = (GameOptionsSchema.GpuNameOf(gpu) ?? "").Replace('\r', ' ').Replace('\n', ' ');
-        var bump = !exists || !hasVersion || Atoi(vs!) < GameOptionsSchema.CurrentVersion;
+        // (Custom's size is its two sides together: the launcher shows the pair as the game takes it (Effective: 7680x4320 in
+        // the file is 5120x2880), so a change of one side is a change of that pair. Written with only the changed side,
+        // 3840 beside the file's 4320 would be another size than the one shown. Both sides whenever either is written)
+        foreach (var (side, other) in new[] { (GameOptionsSchema.OutputWidthKey, GameOptionsSchema.OutputHeightKey),
+                                              (GameOptionsSchema.OutputHeightKey, GameOptionsSchema.OutputWidthKey) })
+            if (write.ContainsKey(side) && !write.ContainsKey(other)) write[other] = Get(other).ToString(CultureInfo.InvariantCulture);
+        // (emptied, as the menu writes it with none kept; only where the file has the line)
+        if (customSizeUsed && diskRaw.TryGetValue(GameOptionsSchema.CustomSizeKey, out var kept) && kept.Length > 0)
+            write[GameOptionsSchema.CustomSizeKey] = "";
+        var bump = !waits && (!exists || !hasVersion || Atoi(vs!) < GameOptionsSchema.CurrentVersion);
         if (bump) write[GameOptionsSchema.VersionKey] = GameOptionsSchema.CurrentVersion.ToString(CultureInfo.InvariantCulture);
 
         var outLines = new List<string>(disk.Count + write.Count);
@@ -360,6 +446,7 @@ public sealed class GameOptionsFile : IGameOptionValues
         Exists = true;
         Parse(sb.ToString());
         set.Clear();
+        customSizeUsed = false;
     }
 
     static int IndexOf(GameOptionRow r)

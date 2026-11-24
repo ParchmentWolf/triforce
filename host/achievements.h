@@ -86,7 +86,19 @@ typedef int (*AchProbe)(void *ctx, int kind, const char *what);
     "[A Giant's Blade]\nabout: Earn Biggoron's Sword.\nicon: sword\nitem Weapon_Sword_Biggoron\n" \
     "[Deep Pockets]\nabout: Carry the Giant's Wallet.\nicon: token green\nitem Item_Wallet_Large\n" \
     "[Light Against the Dark]\nabout: Receive the Light Arrow.\nicon: star yellow\nitem Item_Arrow_Light\n" \
-    "[Twice as Tough]\nabout: Receive Double Defense.\nicon: shield silver\nitem Item_FairyBless_DefenseDouble\n"
+    "[Twice as Tough]\nabout: Receive Double Defense.\nicon: shield silver\nitem Item_FairyBless_DefenseDouble\n" \
+    "[Honorary Thief]\nabout: Be handed the Gerudo's Card.\nicon: star red\nitem Item_Token_Gerudo\n" \
+    "[Read the Fine Print]\nabout: Buy a blade that will not last.\nicon: sword silver\nitem Weapon_Sword_Giant\n" \
+    "[Something's Buzzing]\nabout: Receive the Stone of Agony.\nicon: gem silver\nitem Item_AgonyStone\n" \
+    "[Fashion Victim]\nabout: Own both tunics and both pairs of boots.\nicon: shield red\nitem Armor_Adult_Goron\nitem Armor_Adult_Zora\n" \
+    "item Armor_Adult_HeavyBoot\nitem Armor_Adult_HoverBoot\n" \
+    "[Jack]\nabout: Carry 10 Magic Beans at once.\nicon: star green\nitem Item_MagicBean 10\n" \
+    "[Going Nuts]\nabout: Carry 40 Deku Nuts.\nicon: star orange\nitem Item_DekuNut 40\n" \
+    "[Demolition Permit]\nabout: Carry 40 Bombs and 50 Bombchus.\nicon: shield orange\nitem Item_Bomb 40\nitem Item_Bombchu 50\n" \
+    "[Three Goddesses]\nabout: Receive Din's Fire, Farore's Wind and Nayru's Love.\nicon: gem yellow\nitem Item_DinFire\n" \
+    "item Item_FaroreWind\nitem Item_NayruLove\n" \
+    "[Rain Dance]\nabout: Learn the Song of Storms.\nicon: note blue\nitem Item_Melody_StormSong\n" \
+    "[Deep End]\nabout: Earn the Golden Scale.\nicon: shield blue\nitem Item_Scale_Gold\n"
 
 /* FNV-1a 32 of a name's bytes */
 static inline uint32_t ach_key(const char *name) {

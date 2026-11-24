@@ -85,6 +85,8 @@ uint8_t *fake_heap;
 static uint64_t heap_top = FAKE_BASE + 0x1000;
 int64_t hos_now_ns(void) { return 1000000000LL; }
 void hos_log(const char *fmt, ...) { (void)fmt; }
+static uint64_t menu_class;
+void oot_menu_screen_tick(uint64_t vt) { menu_class = vt; }
 void rx_option_set(int id, int value) { (void)id, (void)value; }
 void hos_oot_menu_tick(Ctx *c, uint64_t screen);
 static int bench, asked, asked_entry, asked_entries;
@@ -128,11 +130,11 @@ int main(void) {
     const uint64_t title_vt = 0x84c106e8ULL, title = screen_of(title_vt, 4);
     bench = 1;
     hos_oot_menu_tick(&ctx, title);   /* (no button focused yet: the title still fading in) */
-    CHECK(asked == 0 && !taps[0]);
+    CHECK(asked == 0 && !taps[0] && menu_class == title_vt);
     *(uint8_t *)GP(button[2] + 56) = 1;
     bench = 0;
     hos_oot_menu_tick(&ctx, title);   /* (benchmark mode off: a player's menus, nothing pressed) */
-    CHECK(asked == 0 && !taps[0]);
+    CHECK(asked == 0 && !taps[0] && menu_class == title_vt);
     bench = 1;
     hos_oot_menu_tick(&ctx, title);
     CHECK(asked == 1 && asked_screen == title && asked_vt == title_vt && asked_entry == 2 && asked_entries == 4);
@@ -170,6 +172,7 @@ class OotMenuBenchOtherHalfTest(unittest.TestCase):
             (tmp / "gpu" / "vk" / "vk_api.h").write_text(VK_API_H, encoding="utf-8")
             (tmp / "host" / "hos_bench.h").write_text(BENCH_H, encoding="utf-8")
             shutil.copy(SRC, tmp / "host" / "oot_menu.c")
+            shutil.copy(ROOT / "host/oot_title_movie.h", tmp / "host/oot_title_movie.h")
             shutil.copy(ROOT / "host" / "guest_bounds.h", tmp / "host" / "guest_bounds.h")
             (tmp / "host" / "t.c").write_text(FIXTURE, encoding="utf-8")
             binary = tmp / "t.exe"

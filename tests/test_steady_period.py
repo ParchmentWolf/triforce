@@ -128,6 +128,10 @@ int hos_ini_option(const char *key, int otherwise) { return strcmp(key, "steady_
 static int fps_max(void) { return 240; }
 static void movie_pace_decide(void) {}             /* ((Triforce, 11-22, PRESENT-30) no movie plays here: paced by the cap) */
 static int pace_fps(void) { return fps_max(); }
+/* ((Triforce, 11-22, N64 Classic, step 7) its rate (nn_vi.c's, host/n64_pace.h's rule): none here, so the interval is as it
+   was; tests/test_n64_pace.py runs it */
+static int n64_rate;
+static int n64_pace_interval(int rate, int interval) { return rate > 0 ? 1 : interval; }
 void hos_bench_present(int64_t now) { (void)now; }   /* (benchmark mode's note of each present: not on here) */
 /* ---- host/nn_vi.c's state these functions use, and the rest of hos_vi_native_presented's stand-ins ---- */
 static volatile LONG64 presents;

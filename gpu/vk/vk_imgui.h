@@ -51,6 +51,16 @@ void record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h);
 /// The same over another image (TRANSFER_DST_OPTIMAL before and after, colour-attachment use, a view of it; headless, the
 /// shots' RGBA: vk_replay.cpp RX_VK_SHOT_MENU)
 void record_to(VkCommandBuffer cmd, VkImage image, VkImageView view, uint32_t w, uint32_t h);
+/// ((Triforce, 11-22, N64 Classic) The frame's drawing in two, for the options under N64 Classic's TV (vk_menu.cpp
+/// menu_tv_layer): the background list's (the options') into a layer of w x h, the window's place (x, y) at its corner,
+/// cleared first and GENERAL after, for the TV's pass to sample; its colours premultiplied by their cover, encoded as the
+/// picture is. Returns that layer's view, or null: nothing of the options, or no layer (record_rest then draws them over the
+/// window as before). New glyphs and textures are copied in on cmd here, for the whole frame
+VkImageView record_layer(VkCommandBuffer cmd, uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+/// ...and the rest of that frame over the window's image `index` (as record): the foreground list (the FPS counter, the notice,
+/// benchmark mode's panel), and what of the options lies beside the layer's place (black bars of another shape). Nothing
+/// when record_layer did not draw this frame
+void record_rest(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h);
 /// A present with nothing drawn: what record let go is destroyed once the GPU is done with it, all the same
 void idle();
 /// The glyphs (printable ASCII) of every font at these pixel sizes, baked a few sizes a frame from the next begin on: the

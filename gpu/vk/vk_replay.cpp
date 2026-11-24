@@ -31,6 +31,7 @@
 #include <shared_mutex>   // (RX_VK_SEG_EARLY: ub_grow_mu)
 
 #include "vk_dlssg.h"
+#include "vk_n64.h"   // ((Triforce, N64 Classic) its frame rate for the host: HOS_OPT_N64_FPS)
 #include "cpu_count.h"   // ((Triforce, 11-22, OS-49) the threads to size by: HOS_SIM_CPU
 #include "sim_gpu.h"     // ((Triforce, 11-22, OS-49) RX_VK_SIM_GPU_SLOW, a lab switch: a slower GPU, sim_burn
 #include "occ_lean.h"    // ((Triforce, 11-22, DESC-82) the occlusion proxies' census's line, status_tick
@@ -72,6 +73,7 @@
 #include "tail_early.h"       // (Triforce: the early tail's rules, Start next frame early)
 #include "pass_barrier.h"     // (Triforce: the pass barrier's game mode, which RX_VK_EVENT_BARRIER follows when unset)
 #include "replay_prio.h"      // (Triforce: the replay's priority while it records, RX_VK_REPLAY_PRIO: ReplayPin)
+#include "gpu_busy.h"         // ((Triforce, 11-23) the recordings' GPU time as the union of their intervals: ts_dyn_present)
 #include "replay_pin.h"       // (Triforce: the soft pin where the cores are of more than one kind, RX_VK_REPLAY_PIN_SOFT: ReplayPin)
 #include "mesh_ahead.h"       // (Triforce: a run of indirect mesh draws, RX_VK_MESH_AHEAD: mesh_ahead_note)
 #include "gate_wait.h"        // (Triforce: a submission that begins with a wait for the CPU's signal, RX_VK_GATE_WAIT_MS: submit_q)
@@ -668,6 +670,62 @@ int64_t st_gpu_ns, st_gpu_max_ns;
 VkQueryPool ts_up_pool = VK_NULL_HANDLE;
 bool ts_up_pending[kRecordings];
 int64_t st_gpu_up_ns, st_gpu_up_max_ns;
+// ---- (Triforce, 11-23) RX_VK_QUERY_RING: a recording's timestamps read from memory the GPU copied them into, not with
+// vkGetQueryPoolResults. On AMD's Windows driver that call cost about 0.6 ms a frame on the thread that replays the frame (two a
+// recording, ~25 recordings a frame: 7.7% of its running time in a profile of an RX 6700 XT), and with RX_VK_RECORDER=thread each
+// call is a boundary that waits for the recorder thread first. A slot's next use begins with a copy of its last use's timestamps
+// (long done: the slot's fence was waited for) into the ring, each value with its availability word, before the queries are
+// reset (query commands on one queue run in submission order), behind a transfer-to-host barrier; the next time the slot comes
+// round, its fence waited for again, the CPU reads them. So each recording's GPU time arrives one turn of the ring later (48
+// recordings, about two frames) and nothing waits for it: the dynamic resolution's clock and the overlay average over 30
+// presents anyway. Only the recording's own timestamps (ts_pool): the upload command buffer's (ts_up_pool) are reset in that
+// command buffer, which runs before the copy could, and stay read as before. Not without host-coherent memory for the ring (no
+// invalidate, a boundary too). RX_VK_QUERY_RING=0: read with vkGetQueryPoolResults, as before. tests/test_query_ring.py
+constexpr int kRingWords = 8;   // (per slot: up to 3 timestamps, each a value and its availability word, 64 bytes a slot)
+VkBuffer ts_ring = VK_NULL_HANDLE;
+VmaAllocation ts_ring_alloc = nullptr;
+const volatile uint64_t* ts_ring_map = nullptr;
+bool ts_ring_copied[kRecordings];   // (the slot's last use copied its use before's timestamps: read them when it comes round)
+int64_t st_ring_read, st_ring_unavailable;
+bool query_ring_on() {
+    static const bool v = !(getenv("RX_VK_QUERY_RING") && atoi(getenv("RX_VK_QUERY_RING")) == 0);
+    return v;
+}
+/// (with ts_pool, the first time: where gpu_time_begin makes the pools) the ring, mapped and host-coherent, or none
+void query_ring_make() {
+    if (!query_ring_on() || ts_ring) return;
+    void* mapped = nullptr;
+    if (!create_buffer_cached(kRecordings * kRingWords * 8, VK_BUFFER_USAGE_TRANSFER_DST_BIT, ts_ring, ts_ring_alloc, &mapped, true) ||
+        !mapped) {
+        ts_ring = VK_NULL_HANDLE, ts_ring_alloc = nullptr;
+        logf("vk: the timestamps' ring could not be made: read with vkGetQueryPoolResults (RX_VK_QUERY_RING)");
+        return;
+    }
+    VkMemoryPropertyFlags flags = 0;
+    alloc_memory_type(ts_ring_alloc, &flags);
+    if (!(flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {   // (an invalidate would be a recorder boundary: the old way instead)
+        destroy_buffer(ts_ring, ts_ring_alloc);
+        ts_ring = VK_NULL_HANDLE, ts_ring_alloc = nullptr;
+        logf("vk: no host-coherent memory for the timestamps' ring: read with vkGetQueryPoolResults (RX_VK_QUERY_RING)");
+        return;
+    }
+    std::memset(mapped, 0, kRecordings * kRingWords * 8);
+    ts_ring_map = (const volatile uint64_t*)mapped;
+    logf("vk: the recordings' timestamps go through a ring the GPU copies them into, read a turn later without a driver call "
+         "(RX_VK_QUERY_RING=0: vkGetQueryPoolResults)");
+}
+// ((Triforce, 11-23) gpu_busy.h: the same intervals as one union, for the dynamic resolution's clock; gpu_busy_mu: read back on more
+// than one thread)
+std::mutex gpu_busy_mu;
+::mkwvk::gpu_busy::Union gpu_busy_union;
+void gpu_busy_add(uint64_t begin, uint64_t finish) {
+    std::lock_guard lk(gpu_busy_mu);
+    gpu_busy_union.add(begin, finish);
+}
+int64_t gpu_busy_ns() {
+    std::lock_guard lk(gpu_busy_mu);
+    return (int64_t)((double)gpu_busy_union.ticks * (double)dev.props.limits.timestampPeriod);
+}
 // (Triforce, 11-15) the parallel replay's segments have their timestamps too (they had none: in the owner's test8 the GPU
 // time line read 2.2 to 2.8 ms a frame while the helpers recorded, 6.4 without them), and their share is counted apart
 int64_t st_gpu_seg_ns;
@@ -801,21 +859,38 @@ void gpu_time_collect(Recording& r) {
         if (vkGetQueryPoolResults(dev.device, ts_up_pool, 2 * r.slot, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
             t[1] > t[0]) {
             const int64_t ns = (int64_t)((t[1] - t[0]) * (double)dev.props.limits.timestampPeriod);
+            gpu_busy_add(t[0], t[1]);   // (Triforce, 11-23)
             st_gpu_up_ns += ns;
             st_gpu_up_max_ns = std::max(st_gpu_up_max_ns, ns);
             if (r.segment) st_gpu_seg_ns += ns;
         }
     }
-    if (!ts_pool || !ts_pending[r.slot]) return;
-    ts_pending[r.slot] = false;
-    // ((Triforce, 11-22, OS-49) ts_count: three with RX_VK_SIM_GPU_SLOW, the last the recording's end: sim_collect)
+    // ((Triforce, 11-23) RX_VK_QUERY_RING: the timestamps the slot's last use copied (those of its use before), from memory)
     const int tn = ts_count();
     uint64_t t[3] = {0, 0, 0};
-    const bool got = vkGetQueryPoolResults(dev.device, ts_pool, tn * r.slot, tn, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS;
+    bool got = false;
+    if (ts_ring_map) {
+        if (!ts_ring_copied[r.slot] || !r.submitted) return;   // (nothing copied, or the copy never went to the GPU)
+        ts_ring_copied[r.slot] = false;
+        const volatile uint64_t* w = ts_ring_map + (size_t)r.slot * kRingWords;
+        got = true;
+        for (int i = 0; i < tn; i++) {
+            t[i] = w[2 * i];
+            got = got && w[2 * i + 1] != 0;   // (each value's availability word)
+        }
+        st_ring_read++;
+        if (!got) st_ring_unavailable++;
+    } else {
+        if (!ts_pool || !ts_pending[r.slot]) return;
+        ts_pending[r.slot] = false;
+        // ((Triforce, 11-22, OS-49) ts_count: three with RX_VK_SIM_GPU_SLOW, the last the recording's end: sim_collect)
+        got = vkGetQueryPoolResults(dev.device, ts_pool, tn * r.slot, tn, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS;
+    }
     if (tn == 3) sim_collect(r, got ? t : nullptr);
     if (!got) return;
     if (t[tn - 1] <= t[0]) return;
     const int64_t ns = (int64_t)((t[tn - 1] - t[0]) * (double)dev.props.limits.timestampPeriod);
+    gpu_busy_add(t[0], t[tn - 1]);   // (Triforce, 11-23)
     st_gpu_ns += ns;
     st_gpu_max_ns = std::max(st_gpu_max_ns, ns);
     if (r.segment) st_gpu_seg_ns += ns;
@@ -829,6 +904,21 @@ void gpu_time_begin(Recording& r) {
         if (!ts_pool) return;
         qi.queryCount = 2 * kRecordings;
         if (vkCreateQueryPool(dev.device, &qi, nullptr, &ts_up_pool) != VK_SUCCESS) ts_up_pool = VK_NULL_HANDLE;
+        query_ring_make();   // (Triforce, 11-23)
+    }
+    // ((Triforce, 11-23) RX_VK_QUERY_RING: the slot's last use's timestamps (done: its fence was waited for) into the ring, before the
+    // reset below, the command buffer just begun (no pass open); read when the slot comes round again, gpu_time_collect)
+    if (ts_ring_map && ts_pending[r.slot]) {
+        ts_pending[r.slot] = false;
+        vkCmdCopyQueryPoolResults(r.cmd, ts_pool, ts_count() * r.slot, ts_count(), ts_ring, (VkDeviceSize)r.slot * kRingWords * 8, 16,
+                                  VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+        VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        mb.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        mb.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT, mb.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+        VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        di.memoryBarrierCount = 1, di.pMemoryBarriers = &mb;
+        vkCmdPipelineBarrier2(r.cmd, &di);
+        ts_ring_copied[r.slot] = true;
     }
     vkCmdResetQueryPool(r.cmd, ts_pool, ts_count() * r.slot, ts_count());
     vkCmdWriteTimestamp2(r.cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, ts_pool, ts_count() * r.slot);
@@ -1629,27 +1719,58 @@ uint64_t ts_anchor_ns = 0;   // (the last present's time: counter timestamps are
 // own controller reads these reports, and it runs only on Auto. RX_VK_DYNRES_GPU=0 (or RX_VK_TS_SCALE set): the fixed scale
 uint64_t ts_first_ns = 0, ts_last_ns = 0;   // (this frame's first and last timestamp report, real clock)
 double ts_ema_gpu_ns = 0, ts_ema_span_ns = 0, ts_dyn_scale = 0.1;
+double ts_ema_behind_ns = 0;   // ((Triforce, 11-23) the host's waits for the GPU a present, averaged as the two above)
+bool ts_gpu_limited = false;   // ((Triforce, 11-23) the card the frame's limit: ts_dyn_present, with its two thresholds)
 int64_t ts_gpu_last = 0;
+// (Triforce, 11-23) The frames' GPU time is the union of the recordings' intervals (gpu_busy.h): their sum counted the overlaps of
+// AMD's early first timestamps again, and Auto stepped the 3D down on a card half idle. RX_VK_DYNRES_UNION=0: the sum, as before.
+// The union alone was not enough: a recording that waits on the GPU for an event the CPU sets later (the stream's waits, ev_values)
+// counts that wait as GPU time too, and on an RX 6700 XT with the replay the frame's limit the union came to 19.8 ms against a
+// 5.9 ms span (11-22): the clock read the CPU's time as the card's. So while the replay does not wait for the GPU (no recording
+// slot waited for: st_wait_ns, the GPU behind), the card is not the frame's limit, and the clock says at most the span; only a
+// GPU that holds the replay back can step the 3D down. RX_VK_DYNRES_UNION=0 also takes this rule away
+bool ts_dyn_union() {
+    static const bool v = !(getenv("RX_VK_DYNRES_UNION") && atoi(getenv("RX_VK_DYNRES_UNION")) == 0);
+    return v;
+}
 bool ts_dyn_on() {
     static const bool v = !getenv("RX_VK_TS_SCALE") && !(getenv("RX_VK_DYNRES_GPU") && atoi(getenv("RX_VK_DYNRES_GPU")) == 0);
     return v;
 }
 void ts_dyn_present() {   // (once a present, before the anchor moves)
     if (!ts_dyn_on()) return;
-    const int64_t g = st_gpu_ns + st_gpu_up_ns;
+    const int64_t g = ts_dyn_union() ? gpu_busy_ns() : st_gpu_ns + st_gpu_up_ns;
     const double dg = (double)(g - ts_gpu_last);
     ts_gpu_last = g;
     const double span = ts_last_ns > ts_first_ns ? (double)(ts_last_ns - ts_first_ns) : 0.0;
     ts_first_ns = ts_last_ns = 0;
+    static int64_t waited_last = 0;   // ((Triforce, 11-23) the replay's waits for a recording slot: the GPU behind)
+    // ((Triforce, 11-23) and every other host wait for the GPU, on all threads (gpu_wait_kinds.h: the game's fences and sync points,
+    // a frame's fence; the compositor's image excluded, image_free). With the 3D at 1920 x 1080 on an RX 6700 XT the slot waits
+    // stayed at 0.03 ms a frame while the host waited 6 to 17 ms a frame for the GPU elsewhere and submits blocked for up to 45
+    // ms (11-23): the card was a limit the slot waits did not see, and Auto stayed at its top level)
+    static ::gpu_wait_kinds::Reader host_waits;
+    const double dw = (double)(st_wait_ns - waited_last) + (double)host_waits.take(nullptr, nullptr);
+    waited_last = st_wait_ns;
     if (dg <= 0 || dg > 200e6 || span <= 0) return;   // (no GPU time read this present, or no frame of reports)
     const double k = 1.0 / 30.0;
     ts_ema_gpu_ns = ts_ema_gpu_ns ? ts_ema_gpu_ns + k * (dg - ts_ema_gpu_ns) : dg;
     ts_ema_span_ns = ts_ema_span_ns ? ts_ema_span_ns + k * (span - ts_ema_span_ns) : span;
-    ts_dyn_scale = std::clamp(ts_ema_gpu_ns / ts_ema_span_ns, 0.02, 8.0);
+    ts_ema_behind_ns += k * (std::max(0.0, dw) - ts_ema_behind_ns);
+    // ((Triforce, 11-23) the card the frame's limit: the host waited for it, 2 ms a frame or more on average, until the waits fall
+    // under 1 ms (two thresholds, so that the 3D is not stepped down and back up again around one). Not GPU-bound, the waits for
+    // a frame's fence and the game's sync points come to 0.4 to 1.3 ms a frame (the same card at 854 x 480, 11-22))
+    if (ts_ema_behind_ns >= 2e6) ts_gpu_limited = true;
+    else if (ts_ema_behind_ns < 1e6) ts_gpu_limited = false;
+    const bool gpu_limit = !ts_dyn_union() || ts_gpu_limited;
+    ts_dyn_scale = std::clamp(ts_ema_gpu_ns / ts_ema_span_ns, 0.02, gpu_limit ? 8.0 : 1.0);
     static int64_t n = 0;
     if (++n % 1200 == 0)
-        logf("vk: dynamic resolution's clock: the frame's GPU time %.2f ms, the replay's span between its timestamp reports %.2f ms: "
-             "scale %.3f (RX_VK_DYNRES_GPU=0: 0.1)", ts_ema_gpu_ns / 1e6, ts_ema_span_ns / 1e6, ts_dyn_scale);
+        logf("vk: dynamic resolution's clock: the frame's GPU time %.2f ms (%s), the replay's span between its timestamp reports "
+             "%.2f ms, the host's waits for the GPU %.2f ms: scale %.3f%s (RX_VK_DYNRES_GPU=0: 0.1)", ts_ema_gpu_ns / 1e6,
+             ts_dyn_union() ? "the recordings' intervals as one union; RX_VK_DYNRES_UNION=0: their sum" : "the recordings' intervals summed",
+             ts_ema_span_ns / 1e6, ts_ema_behind_ns / 1e6, ts_dyn_scale,
+             ts_dyn_union() && !ts_gpu_limited ? ", at most 1: the card is not the frame's limit" : "");
 }
 
 /// A GPU-timeline write of guest memory (the stream's own writes: they reach memory in command order)
@@ -3371,6 +3492,9 @@ bool par_auto() {
     return v;
 }
 bool par_auto_on = false;   // (the replay thread's: the parallel replay is the one in use now)
+/// ((Triforce) 11-22) the benchmark's helper-thread test (host/hos_bench.c, HOS_OPT_HELPERS_FORCE): -1 the tuner decides, 0 the
+/// replay thread alone, 1 the helper threads in use. Set from the game's thread, applied by par_tune_present at the next present
+std::atomic<int> par_forced{-1};
 int par_threads() {
     const int n = par_threads_max();
     return par_auto() && !par_auto_on ? 0 : n;
@@ -3667,6 +3791,15 @@ void par_tune_present() {
     const double ms = std::chrono::duration<double, std::milli>(now - last).count();
     last = now;
     const replay_threads::Frame fr = par_frame_now(ms);
+    // ((Triforce) 11-22) the benchmark's helper-thread test holds the way: the tuner is not told these frames (its windows
+    // and trials go on from where they were once it decides again)
+    if (const int forced = par_forced.load(std::memory_order_relaxed); forced >= 0) {
+        if (par_auto_on != (forced == 1))
+            logf("vk: parallel replay: the benchmark's helper-thread test has the %s", forced == 1 ? "helper threads in use"
+                                                                                               : "replay thread alone");
+        par_auto_on = forced == 1;
+        return;
+    }
     static replay_threads::Tuner tuner = [] {
         replay_threads::Tuner t;
         t.use_rule = par_rule_on();
@@ -3687,6 +3820,7 @@ void par_tune_present() {
                  "thread %.2f, %.0f%% of it, the GPU %.2f; %.0f of its %.0f draws and dispatches in command buffers to cut, %.2f us "
                  "each: %d threads would take %.2f ms off the replay thread, and the frame %.2f ms at most): %s",
                  (long long)tuner.frames(), s.flip ? "the helper threads on, without a trial"
+                 : s.on_waits ? "the helper threads on once the scene has held three windows (Triforce, 11-23)"
                  : v.kind == replay_threads::Verdict::kOff ? "no trial while this holds" : "the trials decide",
                  w.frame, w.replay, 100.0 * v.share, w.gpu, w.cut, w.draws, w.draws > 0 ? 1000.0 * w.op / w.draws : 0.0,
                  tuner.threads, v.saved, v.gain, v.why);
@@ -3710,6 +3844,14 @@ void par_tune_present() {
                       : s.unsettled ? "as it was, not judged" : (s.ok ? "as it was" : "not measured (a load)"),
              (long long)s.changes, more);
         par_trial_parts((long long)s.trials, s.parts);
+    }
+    if (s.withdrawn) {   // ((Triforce) 11-22: settled, the rule's "on" held against its scene)
+        static int told;
+        if (told++ < 40)
+            logf("vk: parallel replay, the rule's \"on\" withdrawn at present %lld: its scene changed (%.0f draws a frame, the replay "
+                 "thread %.2f ms, the GPU %.2f, against %.0f, %.2f and %.2f with the helper threads first on): the replay thread "
+                 "alone, the rule judges the new scene", (long long)tuner.frames(), s.window.draws, s.window.replay, s.window.gpu,
+                 s.ref.draws, s.ref.replay, s.ref.gpu);
     }
     if (s.settle) {   // (Triforce, 11-22: after a trial the scene moved under)
         static int told;
@@ -7242,6 +7384,7 @@ void do_present(const nvn_tex* t, const int crop[4]) {
         const bool native_pq = tex && dev.hdr && opts.hdr == 2 && want_fmt == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
         present_native_pq.store(held ? held_pic.valid && held_pic.pq : native_pq, std::memory_order_relaxed);
         upscale_lod_tick();   // ((Triforce, S8) the texture LOD bias follows DLSS's or FSR's render scale: vk_draw.h)
+        n64_tick(present_native_pq.load(std::memory_order_relaxed));   // ((Triforce, N64 Classic, step 8) the TV's switch, once a present)
         if (held) {   // (Triforce: the held picture's own view, for the same passes)
             if (src && !dev.offscreen && (opts.upscale || opts.sharpness || dev.hdr || wide_sides_possible())) direct_view = held_pic.view;
         } else if (tex && !dev.offscreen && (opts.upscale || opts.sharpness || dev.hdr || wide_sides_possible())) {   // (and ultrawide's menu sides)
@@ -7941,8 +8084,16 @@ bool present_thread_on() {
     return on;
 }
 /// This present goes out from the present thread: one of the game's pictures, with none of the presents of their own
+bool acquire_ahead_wanted();   // ((Triforce, 11-23) below, with the acquire's fence)
 bool present_thread_wanted() {
-    return present_thread_use(present_thread_on(), smooth_mine, framegen_on(), dlssg::active(), antilag_running()) != 0;
+    // (Triforce, 11-23) and with the next image acquired ahead (acquire_ahead_wanted), which only the present thread can do off the
+    // frame's path. RX_VK_PRESENT_THREAD=0: never
+    static const bool never = [] {
+        const char* e = getenv("RX_VK_PRESENT_THREAD");
+        return e && *e && atoi(e) == 0;
+    }();
+    const bool on = present_thread_on() || (!never && acquire_ahead_wanted());
+    return present_thread_use(on, smooth_mine, framegen_on(), dlssg::active(), antilag_running()) != 0;
 }
 /// present_image's first step (present_image_mu held): the present handed over before this one out
 void present_thread_settle() {
@@ -7962,6 +8113,7 @@ int64_t present_waited_ns() { return present_fig.wait_ns.load(std::memory_order_
 static void present_out(const PresentOut& o, std::unique_lock<std::mutex>& qk, bool on_thread);
 
 namespace {
+void acquire_ahead();   // ((Triforce, 11-23) RX_VK_ACQUIRE_AHEAD: below, with the acquire's fence)
 void present_thread_main() {
     SetThreadDescription(GetCurrentThread(), L"mkw_vk present");
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);   // (as frame generation's display thread)
@@ -7972,6 +8124,7 @@ void present_thread_main() {
             std::unique_lock<std::mutex> qk(dev.present_mu, std::defer_lock);
             present_out(o, qk, true);
         }
+        acquire_ahead();   // ((Triforce, 11-23) the next frame's image, while the presenting thread replays that frame)
         smooth_mine = false;
         present_hand.done();
     }
@@ -8025,6 +8178,7 @@ struct HeldImage {
     uint64_t generation = 0;   // (dev.swap_generation of the swapchain it came from)
     int presents = 0;          // (the presents that found it not free yet)
     bool logged = false;       // (its hold logged: the first 16 are)
+    bool free = false;         // ((Triforce, 11-23) acquired ahead and waited free already: acquire_ahead; its fence reset)
 };
 HeldImage held_image;                         // (present_image_mu)
 VkFence acquire_fence_now = VK_NULL_HANDLE;   // (present_image_mu; unsignaled whenever no acquire signals it)
@@ -8046,6 +8200,9 @@ void held_image_drop() {
 /// Whether the image just acquired, or the one held, is free: its fence waited for up to timeout_ns, and reset once signaled
 /// for the next acquire. VK_TIMEOUT: not yet
 VkResult image_free(uint64_t timeout_ns) {
+    // ((Triforce, 11-23) the image back from the compositor at its refresh: pacing, not the GPU's work, so not in the host's waits
+    // for the GPU (gpu_wait_kinds.h) that the dynamic resolution's clock reads, ts_dyn_present)
+    const ::gpu_wait_kinds::Exclude compositor;
     VkResult r = vkWaitForFences(dev.device, 1, &acquire_fence_now, VK_TRUE, timeout_ns);
     if (r == VK_SUCCESS) r = vkResetFences(dev.device, 1, &acquire_fence_now);
     return r;
@@ -8053,6 +8210,64 @@ VkResult image_free(uint64_t timeout_ns) {
 // ((Triforce, 11-22, the performance audit's PRESENT-45, after Source A's) a present on the present thread answered that the
 // window's surface is lost (present_out): the next present_image, the thread that makes the swapchain, lets it go)
 std::atomic<bool> surface_lost_noted{false};
+// ---- (Triforce, 11-23) RX_VK_ACQUIRE_AHEAD: the next frame's swapchain image acquired, and waited free, on the present thread
+// right after its present, while the presenting thread replays that frame. On an RX 6700 XT (AMD's Windows driver, 26.11.2) the
+// image's wait in present_image (image_free, the pacing's wait in the present line) took 2.4 to 4.2 ms of every frame with the
+// game the frame's limit at 45 to 52 fps, and the profile put 16% of the presenting thread in it: AMD presents through DXGI,
+// and an image comes back with the compositor's next refresh. Ahead, the wait overlaps the replay, and present_image finds the
+// image held and free (held_image.free) and records its blit at once. Held images keep their rules: a swapchain made again
+// drops it (present_image's generation check), and one not free in 250 ms is held as before and looked at by the next present.
+// Only on the present thread (present_thread_wanted turns it on for this: the wait on the presenting thread itself would gain
+// nothing), with the acquire's fence (RX_VK_ACQUIRE_FENCE), without DLSS frame generation, on AMD's Windows driver; not while a
+// resize or a lost surface waits for present_image, which makes the swapchain. RX_VK_ACQUIRE_AHEAD=0: off, =1: on any card
+bool acquire_ahead_wanted() {
+#ifdef _WIN32
+    static const int asked = [] {
+        const char* e = getenv("RX_VK_ACQUIRE_AHEAD");
+        return e && *e ? atoi(e) : -1;
+    }();
+    if (asked == 0 || !acquire_fence_on() || dlssg::active()) return false;
+    return asked > 0 || dev.props.vendorID == 0x1002;
+#else
+    return false;
+#endif
+}
+struct AcquireAheadFigures {   // (the present thread's alone: the line every 600 acquires)
+    int64_t acquired = 0, free = 0, held = 0, skipped = 0, wait_ns = 0;
+} acquire_ahead_fig;
+void acquire_ahead() {
+    if (!acquire_ahead_wanted()) return;
+    // (no lock: every present_image settles this thread's work first (present_thread_settle, present_image_mu held) before it
+    // looks at held_image, and hands the next present over only after its own use of the image; between the hand-over and the
+    // next settle this thread alone touches held_image and the fence. present_image_mu here would deadlock with that settle)
+    if (held_image.on || !dev.swapchain || dev.swap_resize.load(std::memory_order_acquire) ||
+        surface_lost_noted.load(std::memory_order_acquire)) {
+        acquire_ahead_fig.skipped++;
+        return;
+    }
+    const VkFence fence = acquire_fence();
+    if (!fence) return;
+    uint32_t index = 0;
+    const VkResult res = vkAcquireNextImageKHR(dev.device, dev.swapchain, UINT64_MAX, VK_NULL_HANDLE, fence, &index);
+    if (res == VK_ERROR_DEVICE_LOST) device_lost();
+    if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR) {   // (out of date, a lost surface: present_image's to handle, as before)
+        acquire_ahead_fig.skipped++;
+        return;
+    }
+    const auto w0 = std::chrono::steady_clock::now();
+    const VkResult ready = image_free(250000000ull);
+    if (ready == VK_ERROR_DEVICE_LOST) device_lost();
+    acquire_ahead_fig.wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - w0).count();
+    held_image = {true, index, dev.swap_generation, 0, false, ready == VK_SUCCESS};
+    acquire_ahead_fig.acquired++, (ready == VK_SUCCESS ? acquire_ahead_fig.free : acquire_ahead_fig.held)++;
+    if (acquire_ahead_fig.acquired % 600 == 0) {
+        logf("vk: the next image acquired ahead on the present thread (RX_VK_ACQUIRE_AHEAD), 600 presents: %lld free when looked at "
+             "(its wait %.2f ms on average, off the frame's path), %lld not free in 250 ms (held), %lld left to present_image",
+             (long long)acquire_ahead_fig.free, acquire_ahead_fig.wait_ns / 600.0 / 1e6, (long long)acquire_ahead_fig.held,
+             (long long)acquire_ahead_fig.skipped);
+        acquire_ahead_fig = {};
+    }
+}
 } // namespace
 
 // (hookshot) One thread in here at a time; the queue's own lock (dev.present_mu, the replay's submits take it too) is held only
@@ -8166,7 +8381,8 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     }
     if (fenced) {   // ((Triforce) RX_VK_ACQUIRE_FENCE: the image free before anything is recorded for it; the wait is the pacing's)
         const auto w0 = std::chrono::steady_clock::now();
-        const VkResult ready = image_free(held_image.on ? 0 : 250000000ull);
+        // ((Triforce, 11-23) acquired ahead and waited free on the present thread: its fence reset already, nothing to wait for)
+        const VkResult ready = held_image.on && held_image.free ? VK_SUCCESS : image_free(held_image.on ? 0 : 250000000ull);
         if (ready == VK_ERROR_DEVICE_LOST) device_lost();
         present_fig.paced_ns.fetch_add(
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - w0).count(),
@@ -8210,7 +8426,10 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
         // The following blit overlaps the clear in the content rectangle.
         image_barrier(f.cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     }
+    // ((Triforce, 11-22, N64 Classic) where the picture goes, for its TV's screen: the options drawn under it, the mouse after it)
+    n64_screen_begin(rect.x, rect.y, rect.w, rect.h, dev.swap_extent.width, dev.swap_extent.height);
     const VkImage scaled = src && view ? framegen_scale(f.cmd, view, src, sw, sh, crop, rect.w, rect.h) : VK_NULL_HANDLE;
+    n64_screen_end();
     // (hookshot) the Insert menu's HDR: the picture (scaled, or the game's own with its crop) to HDR10, copied in as the SDR one is
     // (lab, 11-13) RX_VK_TEST_HDR_PASS=1: the HDR pass on a screen that is not HDR (its colours are wrong there, by design):
     // whether the pass gets a picture at all can be seen without an HDR display
@@ -9374,19 +9593,28 @@ void fill_replay_table(MkwVkRenderer& t) {
         if (id == HOS_OPT_SPRINT_HOLD) return opts.sprint_mode;
         if (id == HOS_OPT_RIGHT_HANDED) return opts.right_handed != 0;
         if (id == HOS_OPT_DISPLAY_CAP) return fps_cap::of_display(display_refresh_mhz());   // (Monitor's rate: host/nn_vi.c fps_max)
+        // ((Triforce, 11-22, N64 Classic, step 7) its frame rate while its 3D pass draws (n64_rules.h fps; host/nn_vi.c n64_pace_decide)
+        if (id == HOS_OPT_N64_FPS) return n64_3d_now() ? n64_rules::fps(n64_look()) : 0;
         if (id == HOS_OPT_PACE_START) return pace::frame_start();   // (Triforce: the game's frame starts, host/nn_vi.c hos_vi_native_acquire)
         if (id == HOS_OPT_PACE_STEADY) return pace::steady_held_us();   // (Triforce: the present's hold for the Steady frame rate row)
         if (id == HOS_OPT_SHARE_ASK) return menu_take_share_ask();   // (Triforce: the System tab's save rows, host/save_share.c)
         if (id == HOS_OPT_BUG_SHOT) return menu_bug_shot();   // (and a bug capture's picture: host/bug_capture.c)
         if (id == HOS_OPT_MODCHEAT_ASK) return menu_take_mod_cheat();   // (Triforce: a mod's cheat switched on its row, host/mod_cheats.c)
+        if (id == HOS_OPT_FILES_ASK) return menu_take_file_ask();   // (Triforce: the save file chosen at the title's file select, host/save_files.c)
+        if (id == HOS_OPT_ACH_ON) return opts.achievements != 0;   // ((Triforce) the Achievements group's rows)
+        if (id == HOS_OPT_ACH_NOTICES) return opts.achievement_notices != 0;
         if (id == HOS_OPT_ACH_ASK) return 1;   // (Triforce: this renderer shows the achievements: host/achievements.c names them)
         if (id == HOS_OPT_MODS_SELECTED) return menu_mods_selected();   // (Triforce: the Mods entry has the cursor, host/oot_menu.c)
         if (id == HOS_OPT_MODS_MUSIC) return menu_mods_music();   // ((Triforce, 11-20) the Mods screen's music, host/mods_music.c)
         if (id == HOS_OPT_TEXT_WANTED) return menu_text_wanted();   // (Triforce: the Mods screen's search takes text, host/display.c)
+        if (id == HOS_OPT_HELPERS_FORCE) return par_auto() ? par_threads_max() : 0;   // ((Triforce) 11-22: host/hos_bench.c)
         return id == 0 ? opts.realtime : id == 1 ? menu_is_open() : id == 2 ? resolution_auto() && !temporal_full_scale() : id == 3 ? (temporal_full_scale() ? 10000 : resolution_scale()) : id == 4 ? opts.pad_background : id == 5 ? opts.text_speed : id == 6 ? opts.mouse_native :
                id == 7 ? opts.mouse_sens : id == 8 ? opts.mouse_invert : id == 9 ? opts.rumble : id == 16 ? opts.invert_cam_x : id == 17 ? opts.invert_cam_y : id == HOS_OPT_GYRO ? opts.gyro : id == HOS_OPT_GYRO_SENS_X ? opts.gyro_sens_x : id == HOS_OPT_GYRO_SENS_Y ? opts.gyro_sens_y : id == HOS_OPT_GYRO_INV_X ? opts.gyro_inv_x : id == HOS_OPT_GYRO_INV_Y ? opts.gyro_inv_y : id == HOS_OPT_GYRO_DEADZONE ? opts.gyro_deadzone :
                id == HOS_OPT_DLSS_JITTER_W || id == HOS_OPT_DLSS_JITTER_H || id == HOS_OPT_DLSS_JITTER_PHASES ? jitter_option(id) : 0;
     };
+    // ((Triforce, 11-22, N64 Classic) a point of the window, the cursor's, to where its TV showed the picture's (host/oot_menu.c:
+    // the game's own menus under the TV's curve)
+    t.screen_point = [](int* x, int* y, int w, int h) { n64_screen_point(x, y, w, h); };
     t.option_set = [](int id, int value) {
         if (id == HOS_OPT_EXITING) {   // ((Triforce, handoff §8) the files threads of their own are writing, finished first)
             const file_writers::Stopped s = file_writers::stop(file_writers::exit_wait_ms());
@@ -9401,6 +9629,7 @@ void fill_replay_table(MkwVkRenderer& t) {
         if (id == HOS_OPT_PACE_PERIOD) return pace::set_period_ns(value);   // (Triforce: the period the host paces by, vk_pace.cpp)
         if (id == HOS_OPT_PACE_MOVIE) return pace::set_movie(value);        // (and whether a movie plays)
         if (id == HOS_OPT_PACE_STEADY) return pace::set_steady(value);      // ((Triforce) and whether it is the Steady frame rate row's)
+        if (id == HOS_OPT_HELPERS_FORCE) return par_forced.store(value < 0 ? -1 : value ? 1 : 0, std::memory_order_relaxed);
         menu_option_set(id, value);
     };
     t.nvn_register_sampler = register_sampler_queued;

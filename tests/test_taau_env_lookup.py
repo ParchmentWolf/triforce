@@ -100,6 +100,18 @@ static bool typed_upscale(VkCommandBuffer cmd,VkImageView input,VkImageView outp
     ++upscale_calls;forwarded_cmd=cmd;forwarded_input=input;forwarded_output=output;forwarded_texture=out;
     forwarded_level=level;forwarded_key=key;forwarded_text=text;forwarded_temporal=temporal;return upscale_result;
 }
+/* ((Triforce, 11-22, N64 Classic) its 3D pass on (vk_n64.cpp n64_3d_now), and the pass itself (vk_draw.cpp n64_upscale),
+   spied as typed_upscale is: it too is refused outside the recording lock */
+static bool n64_now;
+static bool n64_3d_now(){return n64_now;}
+static int n64_calls, n64_lock_depth=-1;
+static const Texture* n64_input;
+static VkImageView n64_in_view, n64_out_view;
+static bool n64_upscale(VkCommandBuffer,VkImageView input,const Texture* in,VkImageView output,Texture* out,uint32_t level){
+    if(lock_depth<=0) return false;
+    ++n64_calls;n64_lock_depth=lock_depth;n64_input=in;n64_in_view=input;n64_out_view=output;forwarded_texture=out;
+    forwarded_level=level;return upscale_result;
+}
 '''
 
 SUFFIX = r'''
@@ -145,6 +157,41 @@ int main(int argc,char** argv){
         check(!run(shares[0],true) && upscale_calls==calls,"Off: a network sampling two textures is left alone");
         check(run(networks[1],true) && upscale_calls==calls+1,"Off: a network known by key is taken whatever its shape");
         printf("%s failures=%u eligible=%d\n",argv[1],failures,upscale_calls);
+        return failures?1:0;
+    }
+    else if(!strcmp(argv[1],"n64")){
+        /* ((Triforce, 11-22, N64 Classic) its 3D pass on, on a card that runs the networks: every gameplay network, by key or
+           by its shape, is drawn by it and not by the stretch, over the upscaler Off too; its input is looked at for the
+           grid's size; the picture is still taken for frame generation; a program that is no network is left alone */
+        Shader::Backend::SPIRV::mma_software=false;
+        dev.push_descriptor=true;dw().imgs={{11},{44}};
+        NvnState state{};Stage stage;stage.info.texture_descriptors={{1,23}};stage.info.image_descriptors={{1,23}};
+        auto run=[&](uint64_t key,bool matrix){Program q{key,{}};stage.info.uses_cooperative_matrix=matrix;q.stages.push_back(stage);
+            return taau_stand_in(19,state,q);};
+        const uint64_t networks[]={0xfd029a317a9a4b94ull,0x9dc98871eb7fc101ull};
+        const uint64_t shares[]={0x6676619641320ba7ull,0xf10782f9e58b6a7cull,0x72ba090c70fe2614ull,0x0775215f8da720e6ull};
+        check(!run(networks[0],true) && !n64_calls && !upscale_calls,"N64 Classic off: none of it");
+        n64_now=true;
+        int calls=0;
+        for(uint64_t k:networks){
+            const int hud=hudless_calls;
+            check(run(k,true) && n64_calls==++calls && !upscale_calls,"N64 Classic: a gameplay network by key is drawn by its 3D pass, not the stretch");
+            check(n64_lock_depth==1 && n64_in_view==11 && n64_out_view==44 && n64_input==&scene_texture && forwarded_texture==&texture &&
+                  forwarded_level==7,"N64 Classic: the network's input view and texture and its output, under the recording lock");
+            check(hudless_calls==hud+1 && hudless_key==k && hudless_lock_depth==0,"N64 Classic: the picture is still taken for frame generation, outside the lock");
+        }
+        check(sample_view_calls==2,"N64 Classic: a network known by key has its input looked at, for the grid's size");
+        for(uint64_t k:shares)check(run(k,true) && n64_calls==++calls && !upscale_calls,"N64 Classic: a share's network (by its shape) is drawn by its 3D pass");
+        check(!run(0x1111111111111111ull,false) && n64_calls==calls,"N64 Classic: a program that is no network is left alone");
+        scene_texture.format=VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+        check(!run(shares[0],true) && n64_calls==calls,"N64 Classic: a network of that shape whose input is not the scene's format is left alone");
+        check(run(networks[0],true) && n64_calls==++calls,"N64 Classic: a network known by key is taken whatever its input's format");
+        off_now=true;
+        check(run(networks[1],true) && n64_calls==++calls && !upscale_calls,"N64 Classic over the upscaler Off");
+        upscale_result=false;
+        const int hud=hudless_calls;
+        check(!run(networks[1],true) && hudless_calls==hud,"N64 Classic: when its pass draws nothing, nothing is taken and the game's network runs");
+        printf("%s failures=%u eligible=%d\n",argv[1],failures,n64_calls);
         return failures?1:0;
     }
     else if(!strcmp(argv[1],"off-software")){
@@ -228,13 +275,13 @@ def main():
             command = [args.cxx, '-std=c++17', '-Wall', '-Wextra', '-Werror', *args.cxx_arg, str(source), '-o', str(exe)]
         subprocess.run(command, cwd=folder, check=True)
         failed = False
-        for case in ('software', 'hardware', 'no-f16', 'empty', 'disabled', 'custom', 'prefixes', 'off', 'off-software'):
+        for case in ('software', 'hardware', 'no-f16', 'empty', 'disabled', 'custom', 'prefixes', 'off', 'off-software', 'n64'):
             result = subprocess.run([str(exe), case], cwd=folder)
             print(case, 'exit', result.returncode, flush=True)
             failed |= result.returncode != 0
         if failed:
             raise SystemExit(1)
-    print('PASS: seven key configurations; rejected lookups removed, eligible per-call forwarding preserved; the upscaler Off')
+    print('PASS: seven key configurations; rejected lookups removed, eligible per-call forwarding preserved; the upscaler Off; N64 Classic\'s 3D pass')
 
 
 if __name__ == '__main__':

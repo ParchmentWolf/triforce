@@ -293,9 +293,10 @@ def main():
     check('snprintf(out, cap, "%s/prompts_auto.txt", hos_user_dir ? hos_user_dir : "user");' in block(prompts, "static void auto_path(")
           and "auto_path(path, sizeof path);" in block(prompts, "static int remembered_face(") and "auto_path(path, sizeof path);" in follow
           and "prompts/auto.txt" not in follow, "Auto's device used last is kept in prompts/, which Setup makes again at an update")
-    check(re.search(r"int \(\*prompt_pad_face\)\(void\);\s*\} MkwVkHost;", api) is not None and
-          "#define MKWVK_API_VERSION 15" in api, "gpu/vk/vk_api.h has no prompt_pad_face last, at version 15")
-    check("hos_bench_state, hos_prompts_pad_face,\n};" in (ROOT / "host/rx_backend.c").read_text(encoding="utf-8"),
+    check(re.search(r"int \(\*prompt_pad_face\)\(void\);", api) is not None and
+          "#define MKWVK_API_VERSION 19" in api, "gpu/vk/vk_api.h has no prompt_pad_face, at version 19 (15 had it; 16-18 ultrawide's "
+          "screens and wide_backdrop, 19 the renderer's screen_point, N64 Classic's)")
+    check("hos_bench_state, hos_prompts_pad_face, host_screens, host_wide_backdrop,\n};" in (ROOT / "host/rx_backend.c").read_text(encoding="utf-8"),
           "host/rx_backend.c does not give the back end hos_prompts_pad_face")
     imgui = (ROOT / "gpu/vk/vk_imgui.cpp").read_text(encoding="utf-8")
     check('"prompts/External.pad." + std::to_string(pad) + ".bfotf.zs"' in imgui and

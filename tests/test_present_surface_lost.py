@@ -148,6 +148,7 @@ bool vk_ft_on() { return false; }
 template <class... A> void vk_ft(const char*, A...) {}
 bool dlssg_active = false;
 namespace dlssg { bool active() { return dlssg_active; } }
+namespace gpu_wait_kinds { struct Exclude {}; }   // ((Triforce, 11-23) image_free's compositor wait, not counted)
 namespace pace {
 int64_t steady_floor_ns() { return 0; }
 void steady_held(int64_t) {}

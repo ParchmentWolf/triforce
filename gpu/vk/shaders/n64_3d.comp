@@ -1,0 +1,61 @@
+#version 450
+// (Triforce, 11-22) N64 Classic's 3D pass (n64-classic-mode-plan.md, step 2), in the gameplay upscale network's place
+// (vk_draw.cpp taau_stand_in, n64_upscale): the 3D drawn the console's way. Two dispatches of this one program:
+//
+//   pass 0, make: over the grid (240 lines and as wide as the picture's shape: 427 x 240 at 16:9). Each grid pixel is the
+//   mean of its footprint of the input, 4 x 4 bilinear taps (8 x 8 texels: a 3D at full size at 1440 is 6 x 6 a pixel),
+//   in linear light, kept at the look's colour depth with the ordered dither (n64_common.glsl), into `grid_img`.
+//   pass 1, show: over the output, at the picture's size. Each pixel takes its grid row whole and a place between two
+//   grid pixels along it: linear along the line, as the console's video chip resampled it, hard between lines.
+//
+// The averaging stands in for the video chip's edge anti-aliasing and its divot filter: edges come out smooth with no
+// single-pixel gaps. The input is what the network samples, the square root of the tone mapped scene (as
+// taau_upscale.comp reads it); the output is the network's, linear, into its B10G11R11 picture, before the HUD.
+#extension GL_GOOGLE_include_directive : require
+#include "n64_common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D src;
+layout(binding = 1, rgba16f) uniform image2D grid_img;
+layout(binding = 2, r11f_g11f_b10f) uniform writeonly image2D dst;
+layout(push_constant) uniform P {
+    ivec2 grid;     // the grid's size
+    ivec2 size;     // the output's
+    int pass;       // 0 make, 1 show
+    int bits;       // bits a channel, 0 full colour
+    float dither;   // the dither's strength, 0 to 1
+} pc;
+
+void make(ivec2 g) {
+    vec3 sum = vec3(0.0);
+    for (int j = 0; j < 4; j++)
+        for (int i = 0; i < 4; i++) {
+            const vec2 uv = (vec2(g) + (vec2(float(i), float(j)) + 0.5) / 4.0) / vec2(pc.grid);
+            const vec3 s = textureLod(src, uv, 0.0).rgb;
+            vec3 c = s * s;
+            if (any(isnan(c)) || any(isinf(c))) c = vec3(0.0);   // (a frame's blown-up texel: none of its light)
+            sum += c;
+        }
+    const vec3 c = sum / 16.0;
+    imageStore(grid_img, g, vec4(n64_keep(c.r, pc.bits, pc.dither, g.x, g.y), n64_keep(c.g, pc.bits, pc.dither, g.x, g.y),
+                                 n64_keep(c.b, pc.bits, pc.dither, g.x, g.y), 1.0));
+}
+
+void show(ivec2 o) {
+    const int row = n64_row(o.y, pc.grid.y, pc.size.y);
+    const float gx = n64_column(o.x, pc.grid.x, pc.size.x);
+    const int x0 = int(floor(gx));
+    const float t = gx - float(x0);
+    const vec3 a = imageLoad(grid_img, ivec2(clamp(x0, 0, pc.grid.x - 1), row)).rgb;
+    const vec3 b = imageLoad(grid_img, ivec2(clamp(x0 + 1, 0, pc.grid.x - 1), row)).rgb;
+    imageStore(dst, o, vec4(mix(a, b, t), 1.0));
+}
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (pc.pass == 0) {
+        if (all(lessThan(p, pc.grid))) make(p);
+    } else if (all(lessThan(p, pc.size))) {
+        show(p);
+    }
+}

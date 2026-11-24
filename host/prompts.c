@@ -508,7 +508,7 @@ static void ring_places(const int *bind, int place[4]) {
    - the ocarina hint's icons moved apart for the wide ones bound (prompts/<face>/hint.bin, nx2/prompt_assets.py HINTS: "HPHN",
      u32 count of pad inputs, each one's icon's extra width (f32), u32 panes; each: u32 offset, u8 slot, 3 bytes, f32 x): each
      icon the one before's extra further on, the last one where it is;
-   - the hearts, the item slot and the small map out at a wide picture's sides (prompts/wide.bin, nx2/prompt_assets.py HUD_SIDE_PANES: "HPWD", u32
+   - the edge-anchored HUD out at a wide picture's sides (prompts/wide.bin, nx2/prompt_assets.py HUD_SIDE_PANES: "HPWD", u32
      count; each: u32 offset, i8 side, 3 bytes, f32 x), with the Insert menu's Ultrawide HUD row on Screen edges
      (host/oot_wide_hud.h);
    none when all are as the game has them (the game's own file) */
@@ -602,7 +602,7 @@ static int build_layouts(char *out, size_t cap) {
         snprintf(path, sizeof path, "%sprompts/Common.blarc", dir);
         snprintf(keypath, sizeof keypath, "%sprompts/Common.blarc.key", dir);
         ok = write_patched(path, out, keypath, h, runs, nruns);
-        hos_log("prompts: the Talk ring's A B X Y at places %d %d %d %d, the ocarina hint %s, the hearts, item slot and map %s%s",
+        hos_log("prompts: the Talk ring's A B X Y at places %d %d %d %d, the ocarina hint %s, edge-anchored HUD %s%s",
                 place[0], place[1], place[2], place[3], xs ? "spread" : "as is", wxs ? "at the picture's sides" : "as is",
                 ok ? "" : ": could not be written");
     }

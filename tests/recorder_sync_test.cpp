@@ -407,6 +407,9 @@ F(vkCmdSetCheckpointNV, (VkCommandBuffer cb, const void* m), handle(cb), handle(
 F(vkCmdWriteTimestamp2, (VkCommandBuffer cb, VkPipelineStageFlags2 s, VkQueryPool p, uint32_t q), handle(cb), put(s), handle(p), put(q);
   fx(cb, 1, (uint64_t)(uintptr_t)p << 16 | q);)
 F(vkCmdResetQueryPool, (VkCommandBuffer cb, VkQueryPool p, uint32_t f, uint32_t n), handle(cb), handle(p), put(f), put(n);)
+// ((Triforce, 11-23) RX_VK_QUERY_RING)
+F(vkCmdCopyQueryPoolResults, (VkCommandBuffer cb, VkQueryPool p, uint32_t f, uint32_t n, VkBuffer b, VkDeviceSize o, VkDeviceSize s,
+  VkQueryResultFlags fl), handle(cb), handle(p), put(f), put(n), handle(b), put(o), put(s), put(fl);)
 
 static VkResult VKAPI_CALL fake_vkBeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBeginInfo* bi) {
     Guard g_(cb, "vkBeginCommandBuffer", false);
@@ -725,6 +728,7 @@ static void frame() {
     const VkPipelineLayout layout = H<VkPipelineLayout>(0x300);
     vkCmdResetQueryPool(up, H<VkQueryPool>(0x400), 0, 64);
     vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, H<VkQueryPool>(0x400), 0);
+    vkCmdCopyQueryPoolResults(cmd, H<VkQueryPool>(0x400), 0, 2, H<VkBuffer>(0x410), 64, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);   // ((Triforce, 11-23))
     copy_runs(up, 0);
     copy_runs(up, 2);
     {

@@ -14,6 +14,7 @@ static partial class Tests
         yield return Sync("linux: the user folder follows the saves (triforce/user, then hookshot, then the game's)", LinuxUserFolder);
         yield return Sync("benchmark: an uneven run gets Steady frame rate Refresh steps, an even one keeps the player's", BenchSteady);
         yield return Sync("benchmark: a place left out is read and said", BenchSkipped);
+        yield return Sync("benchmark: the helper-thread test's halves are read, and the row is suggested from them", BenchHelpers);
         yield return Sync("settings: color scheme, the page's 'color' read", ColorParse);
         yield return Sync("settings: color scheme kept and read back (registry.txt, builder.ini, old files)", ColorKept);
         yield return Sync("settings: color scheme, the launcher's color (--snapshot, commands out of order)", ColorChoice);
@@ -101,6 +102,46 @@ static partial class Tests
         Equal("", Benchmark.SkippedNote(Array.Empty<string>()), "no note without one");
         File.WriteAllText(f, "{\"version\":1,\"stopped\":false,\"scenes\":[]}");
         Equal(0, Benchmark.ReadResults(f, TimeSpan.Zero).Skipped.Count, "an older game's results: none");
+    }
+
+    static void BenchHelpers()
+    {
+        var root = NewRoot("benchhelpers");
+        var f = Path.Combine(root, "results.json");
+        // (as host/hos_bench.c writes it with HOS_BENCH_HELPERS=1: the scene's own figures are the "off" half's)
+        File.WriteAllText(f, "{\"version\":1,\"stopped\":false,\"scenes\":[" +
+            "{\"name\":\"Hyrule Field\",\"avg\":80.2,\"low1\":55,\"frametimes_ms\":[12.5],\"helpers\":{\"first\":\"off\"," +
+            "\"off\":{\"avg\":80.2,\"low1\":55,\"frametimes_ms\":[12.5]},\"on\":{\"avg\":75.3,\"low1\":52,\"frametimes_ms\":[13.3,13.4]}}}," +
+            "{\"name\":\"Castle Town Market\",\"avg\":71.4,\"low1\":40,\"frametimes_ms\":[14],\"helpers\":{\"first\":\"on\"," +
+            "\"off\":{\"avg\":71.4,\"low1\":40,\"frametimes_ms\":[14]},\"on\":{\"avg\":64.4,\"low1\":36,\"frametimes_ms\":[15.5]}}}]," +
+            "\"skipped\":[],\"helper_test\":{\"threads\":3},\"settings\":{}}");
+        var run = Benchmark.ReadResults(f, TimeSpan.FromSeconds(1));
+        Equal(3, run.HelperThreads, "the threads tested");
+        var field = run.Scenes[0].Helpers;
+        Check(field != null && field.OffFps == 80.2 && field.OnFps == 75.3 && !field.OnFirst && field.OnTimes.Count == 2, "the Field's halves");
+        Check(run.Scenes[1].Helpers is { OnFirst: true }, "the order, turned in the second place");
+        Equal(-1, field!.Verdict, "6 % slower with them: slower");
+        // the suggestion: slower everywhere, Off; from Automatic (the file without the line is Automatic too)
+        var none = new Dictionary<string, int>();
+        var off = Benchmark.RecommendHelpers(none, run.Scenes)!;
+        Check(off.Key == Benchmark.KHelpers && off.From == Benchmark.HelpersAutomatic && off.To == Benchmark.HelpersOff, "slower everywhere: Off");
+        Check(Benchmark.HelperNote(run).Contains("faster nowhere"), "the verdict says so");
+        static PlaceResult P(string n, double offFps, double onFps) => new(n, offFps, offFps * 0.8) { Helpers = new HelperHalves(offFps, offFps * 0.8, onFps, onFps * 0.8, false) };
+        var faster = new[] { P("Hyrule Field", 70, 80), P("Kokiri Forest", 60, 66) };
+        Equal(Benchmark.HelpersAutomatic, Benchmark.RecommendHelpers(none, faster)!.To, "faster everywhere: Automatic stays");
+        Equal(Benchmark.HelpersAutomatic, Benchmark.RecommendHelpers(new Dictionary<string, int> { [Benchmark.KHelpers] = 0 }, faster)!.To, "from Off: Automatic");
+        Equal(2, Benchmark.RecommendHelpers(new Dictionary<string, int> { [Benchmark.KHelpers] = 2 }, faster)!.To, "a fixed count stays");
+        var mixed = new[] { P("Hyrule Field", 70, 80), P("Kokiri Forest", 66, 60) };
+        Equal(Benchmark.HelpersAutomatic, Benchmark.RecommendHelpers(new Dictionary<string, int> { [Benchmark.KHelpers] = 0 }, mixed)!.To, "mixed: Automatic decides");
+        Check(Benchmark.HelperNote(new BenchRun(mixed, null, false, null, TimeSpan.Zero) { HelperThreads = 3 }).Contains("Automatic decides"), "mixed: said");
+        var close = new[] { P("Hyrule Field", 70, 71), P("Kokiri Forest", 66, 65) };
+        Equal(Benchmark.HelpersOff, Benchmark.RecommendHelpers(none, close)!.To, "nowhere more than 3 % apart: Off, nothing gained");
+        Equal(null, Benchmark.RecommendHelpers(none, new[] { new PlaceResult("Hyrule Field", 60, 50) }), "not tested: no suggestion");
+        Check(Benchmark.HelperNote(new BenchRun(Array.Empty<PlaceResult>(), null, false, null, TimeSpan.Zero) { HelperThreads = 0 }).Contains("could not run"), "no helper threads: said");
+        Equal("", Benchmark.HelperNote(new BenchRun(faster, null, false, null, TimeSpan.Zero)), "not asked: nothing said");
+        // the other rows are judged by the way suggested
+        var asOff = Benchmark.AsRecommended(faster, Benchmark.HelpersOff);
+        Check(asOff[0].AverageFps == 70 && Benchmark.AsRecommended(faster, Benchmark.HelpersAutomatic)[0].AverageFps == 80, "the way's own figures");
     }
 
     static void BenchSteady()

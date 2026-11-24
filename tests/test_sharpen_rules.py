@@ -20,6 +20,9 @@ no GPU.
    ultrawide sides, and HDR Native's picture goes through RGBA16F images; the bias is in the sampler's key and follows the
    upscaler each present, only in the draws into the scene (the flag from the draw's targets through build_descriptors,
    kept_texture's key and sampler_for's table to sampler_make; never a dispatch); the Sharpness row's text and default.
+   ((Triforce, 11-22, N64 Classic, step 3) And N64 Classic's texture blur: its look's positive bias while its 3D pass
+   draws, taken as it is, never past the card's limit; with it, a draw of a scene's size and shape for the picture the
+   pass drew is the scene (its pass notes both sizes), after the upscalers' own test of the scene.)
    The old lines fail.
 
     python -I -B tests/test_sharpen_rules.py [--cxx g++]
@@ -387,6 +390,22 @@ def checks(t):
           'sharpen_rules::lod_bias_switch(getenv("RX_VK_UPSCALE_LOD_BIAS"), &fixed)' in tick and
           "want = sharpen_rules::lod_bias_want(mode, fixed, upscale_lod_render.load(" in tick,
           "the bias does not follow the upscaler or RX_VK_UPSCALE_LOD_BIAS, or the samplers are not made anew")
+    # ((Triforce, 11-22, N64 Classic, step 3) its texture blur: the look's positive bias while its 3D pass draws, taken as it is,
+    # never past the card's limit; the scene by its size and shape for the picture its pass drew, which n64_upscale notes
+    # with the scene's size; the upscalers' own path as it was
+    check("const bool n64 = n64_3d_now();" in tick and
+          "want = n64_rules::lod_bias(n64_look(), dev.props.limits.maxSamplerLodBias);" in tick and
+          "const float next = n64 ? want : sharpen_rules::lod_bias_step(mode, now, want);" in tick and
+          tick.index("const bool n64 = n64_3d_now();") < tick.index("} else if (!off && (temporal_wanted() || fsr3_wanted())) {"),
+          "N64 Classic's blur is not the tick's while its 3D pass draws, or is not taken as it is")
+    check("if (upscale_lod_bias.load(std::memory_order_relaxed) > 0.0f) {" in scene and
+          "return n64_rules::scene_draw(w, h, (uint32_t)o, (uint32_t)(o >> 32));" in scene and
+          scene.index("sharpen_rules::lod_scene_now(") < scene.index("n64_rules::scene_draw("),
+          "with N64 Classic's blur, a draw of a scene's size and shape for its picture is not the scene")
+    n64_up = function(draw, "static bool n64_upscale(")
+    check("upscale_lod_note(in->width, in->height, ow);" in n64_up and
+          "n64_lod_output.store((uint64_t)oh << 32 | ow, std::memory_order_relaxed);" in n64_up,
+          "N64 Classic's pass does not note the scene's size and its picture's for the blur")
     check("upscale_lod_tick();" in t["replay"], "the bias is not taken at each present")
     check("void sampler_bias_changed() { samp_gen.fetch_add(1, std::memory_order_acq_rel); }" in t["bank"],
           "a change of the bias does not move the samplers' generation")
@@ -425,6 +444,13 @@ MUTATIONS = [
      "color[i] = {at.width, at.height, 0};"),
     ("descriptors across passes", "draw", "    if (last_desc_scene != scene) last_desc_valid = false;\n", ""),
     ("dispatch biased", "draw", "    build_descriptors(s, p);\n", "    build_descriptors(s, p, false, draw_in_scene(at));\n"),
+    ("N64 blur in the upscalers' quarters", "draw", "const float next = n64 ? want : sharpen_rules::lod_bias_step(mode, now, want);",
+     "const float next = sharpen_rules::lod_bias_step(mode, now, want);"),
+    ("N64 blur never the scene", "draw", "        return n64_rules::scene_draw(w, h, (uint32_t)o, (uint32_t)(o >> 32));\n",
+     "        return false;\n"),
+    ("N64 scene size not noted", "draw", "    upscale_lod_note(in->width, in->height, ow);\n", ""),
+    ("N64 blur past the card", "draw", "want = n64_rules::lod_bias(n64_look(), dev.props.limits.maxSamplerLodBias);",
+     "want = n64_look().lod_bias;"),
     ("DLSS unsharpened", "temporal", "s.pre_picture = {picture,", "s.pre_picture = {s.output.view,"),
     ("RCAS over HDR", "temporal", "temporal_sharpness() > 0.0f && sharpen_rules::lone_rcas(pre != nullptr, scene_rgba16f) &&\n",
      "temporal_sharpness() > 0.0f &&\n"),
@@ -470,7 +496,8 @@ def main():
         subprocess.run([a.cxx, "-std=c++20", "-Wall", "-Wextra", "-Werror", "-I", str(VK), str(cpp), "-o", str(exe)], check=True)
         subprocess.run([str(exe)], check=True, timeout=60)
     print("PASS: Sharpness before the HUD (FSR 3.1's RCAS with its boost, FSR 4's own, RCAS over DLSS), none at the window "
-          "then; FSR 1 only where it enlarges and off at 0; HDR Native through RGBA16F; the texture LOD bias under DLSS and FSR")
+          "then; FSR 1 only where it enlarges and off at 0; HDR Native through RGBA16F; the texture LOD bias under DLSS and FSR, "
+          "and N64 Classic's texture blur")
 
 
 if __name__ == "__main__":

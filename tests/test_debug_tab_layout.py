@@ -163,7 +163,7 @@ def main():
     action = function(menu, "void action_cell(")
     check("choice_cell(c, a, b, word, sel, false, !fixed, fixed);" in action, "action_cell is not the orange plate with its arrow")
     check("else action_cell(c, va, vb, v.empty() ? buttons[r.cheat] : v, selected, r.cheat == 9);" in draw
-          and 'else action_cell(c, va, vb, ends ? r.name : share_row(r) ? share_label(share_row(r)) : "Open", selected);' in draw,
+          and 'else action_cell(c, va, vb, r.name == kUseWindowSize ? "Copy" : ends ? r.name : share_row(r) ? share_label(share_row(r)) : "Open", selected);' in draw,
           "the Debug tab's buttons and the page, save, Restart and Quit rows are not one style")
     check(", false, true, false, true)" not in draw, "a row still draws its button as the dark panel")
     # the rows clipped as the other tabs': none under the header
@@ -176,6 +176,10 @@ def main():
     # a still is drawn settled: only menu_record, a window's frames, steps the easing
     image = function(menu, "void menu_record_image(")
     record = function(menu, "void menu_record(VkCommandBuffer cmd, uint32_t index")
+    # ((Triforce, 11-22) the window's frames are drawn by draw_overlays, for menu_record and N64 Classic's menu_tv_layer alike)
+    overlays = function(menu, "void draw_overlays(uint32_t w, uint32_t h, const Showing& s, ImDrawList* under)")
+    check("draw_overlays(w, h, s, nullptr);" in record and "draw_overlays(" not in image, "menu_record does not draw by draw_overlays")
+    record = overlays
     check("if (!ease_live) ease_step = 1.0f;" in image and image.index("if (!ease_live) ease_step = 1.0f;") < image.index("draw_menu(c"),
           "a still does not draw the lists where the selection asks")
     check("ease_live = true;" in record and "ease_live = true" not in image, "the window's frames do not keep their easing")

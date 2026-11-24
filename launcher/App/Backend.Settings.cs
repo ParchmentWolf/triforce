@@ -113,10 +113,11 @@ public sealed partial class Backend
 
     static string Capital(string s) => s.Length > 0 ? char.ToUpperInvariant(s[0]) + s.Substring(1) : s;
 
-    /// <summary>((Triforce) 11-20) The folder the game writes triforce_log.txt in: its program's (Game.FindExe: the game folder on
-    /// Windows, bin/ under it on Linux with the launcher script). Null without a built game.</summary>
+    /// <summary>((Triforce) 11-20) The folder the game writes triforce_log.txt in: the game folder itself. ((Triforce, 11-23) Not
+    /// the folder of Game.FindExe's program: on Linux that is bin/, and the game writes its log beside image.bin, a folder up
+    /// (host/hos_paths.h hos_game_path_a), so the row opened a bin/ with no log in it.) Null without a built game.</summary>
     string? GameLogFolder(string? game) =>
-        game != null && new Game(ctx).FindExe(game) is { } exe ? Path.GetDirectoryName(exe) : null;
+        game != null && new Game(ctx).FindExe(game) != null ? game : null;
 
     string VersionsLine(string? game) =>
         "launcher " + BuildInfo.Version + " · tools " + (new Tools(ctx).InstalledVersion ?? "none") + " · game " + (game != null ? Game.BuiltVersion(game) ?? "unknown" : "not built");

@@ -6,6 +6,7 @@
    +0x1F8, so lifted SDK code that reads it inline finds the same thread the HLE knows. */
 #include "hos.h"
 #include "hos_x3d.h"
+#include "hos_l3_home.h"   /* ((Triforce, 11-23) one L3 for the main thread, the presenting thread and the replay's core) */
 #include "hos_sim_cpu.h"   /* ((Triforce, 11-22, OS-49) HOS_SIM_CPU, a lab switch: fewer of the PC's cores */
 #include "pace_wait.h"   /* ((Triforce) hos_sleep_until_ns: the frame wait to its time) */
 #include "short_sleep.h" /* ((Triforce, 11-21) how sleeps under a millisecond wait, by the PC's processors) */
@@ -728,7 +729,7 @@ static uint64_t pick_reserved_core(const uint64_t *masks, const unsigned char *c
    has a thread of its own (RX_VK_ASYNC=1): hos_x3d.h hos_x3d_keep_replay_core has the rule and Source A's numbers */
 #if defined(_WIN32)
 /* (hos_x3d_pick over what Windows lists for the calling thread's processor group) */
-static uint64_t x3d_detect(HosX3d *out) {
+static uint64_t x3d_detect(HosX3d *out, HosL3Home *home) {
     static HosCache caches[1024];
     static uint64_t cores[256];
     int ncaches = 0, ncores = 0;
@@ -763,9 +764,11 @@ static uint64_t x3d_detect(HosX3d *out) {
         }
         free(buf);
     }
+    hos_l3_home_pick(caches, ncaches, cores, ncores, (uint64_t)proc, (int)GetActiveProcessorGroupCount(), home);   /* (Triforce, 11-23) */
     return hos_x3d_pick(caches, ncaches, cores, ncores, (uint64_t)proc, (int)GetActiveProcessorGroupCount(), out);
 }
 #endif
+static uint64_t l3_home_mask;   /* ((Triforce, 11-23) hos_l3_home.h: the home, 0 for none; set with hos_x3d_cpus' mask) */
 static uint64_t hos_x3d_cpus(void) {
     static uint64_t mask = ~0ull;
     static SRWLOCK lk = SRWLOCK_INIT;
@@ -774,9 +777,10 @@ static uint64_t hos_x3d_cpus(void) {
         mask = 0;
 #if defined(_WIN32)
         HosX3d x;
+        HosL3Home h;
         const char *e = getenv("HOS_X3D");
         const int off = e && *e && !atoi(e);
-        const uint64_t die = x3d_detect(&x);
+        const uint64_t die = x3d_detect(&x, &h);
         if (x.why == HOS_X3D_USED && !off) mask = die;
         if (x.why == HOS_X3D_USED || x.why == HOS_X3D_FEW)   /* (a processor with L3 caches of two sizes: said either way) */
             hos_log("cpu: logical processors %#llx share the largest L3 cache (%llu MB, against %llu MB), %d cores: %s",
@@ -784,6 +788,18 @@ static uint64_t hos_x3d_cpus(void) {
                     x.why == HOS_X3D_FEW ? "fewer than 8, so the game's threads are not kept there"
                     : off ? "not used (HOS_X3D=0)"
                     : "the game's threads are kept there, and the replay's core when one is kept (HOS_X3D=0: as before)");
+        /* ((Triforce, 11-23) hos_l3_home.h: with no cache die, the home for the two threads that hand the frame over) */
+        const char *he = getenv("HOS_L3_HOME");
+        const int home_off = he && *he && !atoi(he);
+        if (!mask && h.why == HOS_L3_HOME_USED && !home_off) l3_home_mask = h.home;
+        if (h.why == HOS_L3_HOME_USED || h.why == HOS_L3_HOME_FEW)
+            hos_log("cpu: logical processors %#llx share one of %d L3 caches (%llu MB each), %d cores: %s",
+                    (unsigned long long)h.home, h.domains, (unsigned long long)(h.bytes >> 20), h.cores,
+                    h.why == HOS_L3_HOME_FEW ? "fewer than 6, so nothing is kept there"
+                    : mask ? "not used (the cache die is)"
+                    : home_off ? "not used (HOS_L3_HOME=0)"
+                    : "the game's main and presenting threads and the replay's core are kept there, the other threads "
+                      "anywhere (HOS_L3_HOME=0: as before)");
 #endif
     }
     const uint64_t m = mask;
@@ -804,6 +820,7 @@ static uint64_t last_fastest_core(int *cores) {
     GROUP_AFFINITY ga;
     const WORD group = GetThreadGroupAffinity(GetCurrentThread(), &ga) ? ga.Group : 0;
     const uint64_t die = hos_x3d_cpus();   /* (Triforce: the cores of the die the game's threads are kept on, when there is one) */
+    const uint64_t home = die ? 0 : l3_home_mask;   /* ((Triforce, 11-23) or of the home, hos_l3_home.h) */
     if (GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len) || GetLastError() != ERROR_INSUFFICIENT_BUFFER)
         return 0;
     char *buf = (char *)malloc(len);
@@ -813,6 +830,7 @@ static uint64_t last_fastest_core(int *cores) {
             if (!e->Size) break;
             if (e->Relationship == RelationProcessorCore && e->Processor.GroupCount && e->Processor.GroupMask[0].Group == group &&
                 (!die || ((uint64_t)e->Processor.GroupMask[0].Mask & die)) &&
+                (!home || ((uint64_t)e->Processor.GroupMask[0].Mask & home)) &&
                 (!sim_cpu_mask || ((uint64_t)e->Processor.GroupMask[0].Mask & sim_cpu_mask))) {   /* ((Triforce, OS-49) inside it) */
                 masks[n] = (uint64_t)e->Processor.GroupMask[0].Mask;
                 classes[n] = e->Processor.EfficiencyClass;
@@ -914,6 +932,12 @@ void hos_thread_pin(void *h, const char *name) {
         DWORD_PTR proc = 0, sys = 0;
         GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys);
         const uint64_t want = hos_x3d_thread_mask((uint64_t)proc, die, reserved);
+        if (want) SetThreadAffinityMask(h, (DWORD_PTR)want);
+    }
+    if (l3_home_mask && hos_l3_home_thread(name)) {   /* ((Triforce, 11-23) the main and presenting threads on the home, hos_l3_home.h) */
+        DWORD_PTR proc = 0, sys = 0;
+        GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys);
+        const uint64_t want = hos_l3_home_thread_mask((uint64_t)proc, l3_home_mask, reserved);
         if (want) SetThreadAffinityMask(h, (DWORD_PTR)want);
     }
     static NameSpec pins[24], prios[24];
@@ -1576,6 +1600,7 @@ static struct {
        threads spinning already); grant to run: from vc_grant until the waiter holds vc_lock again, after a spin and after a
        sleep (NX2navi's "core grant to run", runtime/kernel.c grant_at) */
     int64_t spun, slept, spin_ns, spin_capped, run_spin_ns, run_spin_n, run_sleep_ns, run_sleep_n, run_max_ns;
+    int64_t pin_waits;   /* ((Triforce, 11-23) waits past esc_eq kept to their one core behind a better holder: vc_acquire */
 } vc_st;
 /* ((Triforce, 11-22, the performance audit's OS-51) the waits since the last present, beside vc_st's 5 s: their time summed
    over the threads, how many, the longest. Added to with vc_lock held, taken by the present's look without it
@@ -1669,6 +1694,9 @@ static void vc_stats_locked(int64_t now) {
             (long long)vc_st.slept, vc_st.run_spin_n ? vc_st.run_spin_ns / 1e3 / vc_st.run_spin_n : 0.0,
             (long long)vc_st.run_spin_n, vc_st.run_sleep_n ? vc_st.run_sleep_ns / 1e3 / vc_st.run_sleep_n : 0.0,
             (long long)vc_st.run_sleep_n, vc_st.run_max_ns / 1e3);
+    if (vc_st.pin_waits)   /* ((Triforce, 11-23) vc_acquire: the escapes the one-core rule held back) */
+        hos_log("vcores: %lld waits held to their one core past the escape, behind a holder of better priority there "
+                "(HOS_VCORE_PIN_ESCAPE_MS=0: they escape at HOS_VCORE_ESCAPE_EQ_US, as before)", (long long)vc_st.pin_waits);
     memset(&vc_st, 0, sizeof vc_st);
     vc_st.since = now;
 }
@@ -1722,9 +1750,14 @@ static int vc_spin(HosThread *t, int64_t ns) {
     return 1;
 }
 static void vc_acquire(HosThread *t) {
-    static int64_t esc_better = -1, esc_eq, slice, spin;
+    static int64_t esc_better = -1, esc_eq, slice, spin, pin_esc;
     if (esc_better < 0) {
         esc_eq = vc_env_ns("HOS_VCORE_ESCAPE_EQ_US", 250000);
+        {   /* ((Triforce, 11-23) a waiter held to one core behind a better holder: its escape's backstop, below) */
+            const char *e = getenv("HOS_VCORE_PIN_ESCAPE_MS");
+            const long long ms = e && *e ? atoll(e) : 5000;
+            pin_esc = ms > 0 ? ms * 1000000LL : 0;
+        }
         {   /* ((Triforce) the spin, vc_spin: HOS_VCORE_SPIN_US, up to a second; off where no thread may spin) */
             const int64_t s = vc_env_ns("HOS_VCORE_SPIN_US", 250);
             spin = !vc_spin_max() || s <= 0 ? 0 : s > 1000000000LL ? 1000000000LL : s;
@@ -1751,6 +1784,7 @@ static void vc_acquire(HosThread *t) {
     if (vc_nq < 1024) vc_queue[vc_nq++] = t;
     vc_st.waits++;
     int spun = 0, slept = 0, ended = 0;   /* ((Triforce) the spin tried, a sleep taken, the wait ended in the spin) */
+    int pin_noted = 0;                    /* ((Triforce, 11-23) this wait counted in vc_st.pin_waits */
     for (;;) {
         /* the worst holder worse than t on a core t may use gives it up at its next checkpoint; after
            HOS_VCORE_SLICE_US (2000) of waiting, a holder as good as t does too (a time slice: Horizon would leave
@@ -1797,7 +1831,24 @@ static void vc_acquire(HosThread *t) {
             break;
         }
         const int64_t waited = hos_now_ns() - t0;
-        if (waited > (worst ? esc_better : esc_eq)) {
+        /* ((Triforce, 11-23) A waiter held to one core, behind a holder of better priority there, does not escape at
+           esc_eq: Horizon never runs it then, and the game pins threads to another's core so the two never overlap.
+           0.7.0's load crash in f_80119570 (an effect graph's owner half made, read 0x48 / garbage +0x48) came each time
+           right after PreActorModelCompose escaped core 1 or 2 while BaseProcCreateAndDeleteThread held it. A backstop
+           at HOS_VCORE_PIN_ESCAPE_MS (5000; 0: as before) stays for a holder that never gives the core up at all */
+        int64_t limit = worst ? esc_better : esc_eq;
+        if (!worst && pin_esc && (m & (m - 1)) == 0) {
+            const int k = __builtin_ctz(m);
+            HosThread *h = k < vc_cores() ? vc_owner[k] : NULL;
+            if (h && h->priority < t->priority) {
+                limit = pin_esc;
+                if (waited > esc_eq && !pin_noted) {
+                    pin_noted = 1;
+                    vc_st.pin_waits++;
+                }
+            }
+        }
+        if (waited > limit) {
             vc_dequeue(t);
             vc_st.escapes++;
             static int logged;

@@ -11,14 +11,14 @@
    (oot_hud_row can also move a whole layout out to one side, which the lab's HOS_WIDE_SHIFT uses to find out what a
    screen draws. No layout of the game's is placed that way: see below.)
 
-   The Insert menu's "Ultrawide HUD" row on Screen edges puts the hearts and the item slot in the picture's top corners
-   and the small map at its right edge. Those are moved inside their layouts, by oot_hud_out, because a projection
+   The Insert menu's "Ultrawide HUD" row on Screen edges places the side HUD, notices, and edge-anchored action states at their
+   authored offsets from the picture's edges. Those are moved inside their layouts, by oot_hud_out, because a projection
    cannot do it: PlayerStatus_00 holds the hearts (on a pane at the grid's top left corner) and the item slot (on one at
    its top right) together, and MapMenu_00 is the small map and the pause menu's whole-screen map in one layout, whose
    projection is not set again as the menu opens (tried: the menu's map sat off to the right). nx2/prompt_assets.py
    HUD_SIDE_PANES lists the panes, host/prompts.c build_layouts writes them as the game loads its layouts, so the row is
    read once, at the start. Layouts that follow something in the 3D world (the targeting pointer, an enemy's bar, a
-   speech balloon) and the action buttons stay in the middle. */
+   speech balloon) stay in the middle. Only the right-hand action-button state moves. */
 #ifndef OOT_WIDE_HUD_H
 #define OOT_WIDE_HUD_H
 #include <stdint.h>

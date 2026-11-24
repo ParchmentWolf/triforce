@@ -47,6 +47,30 @@ int main() {
     want("Off, the listed network",          choose(true, true, true, true), true, false, false);
     want("Off, a listed other program",      choose(true, true, false, false), true, true, false);
     want("Off, a listed program of the shape", choose(true, true, false, true), true, true, false);
+    // ((Triforce, 11-22, N64 Classic) its 3D pass on: every gameplay network, by key or by its shape, is its pass's, over Off and
+    // over the list; anything else as without it, and without it every answer as the four-input rule's
+    using upscale_off::Choice;
+    const auto n64 = [](const char* what, Choice c, bool stand_in, bool by_shape, bool is_n64) {
+        checks++;
+        if (c.stand_in != stand_in || (stand_in && (c.temporal == is_n64 && is_n64)) || c.by_shape != by_shape || c.n64 != is_n64)
+            fails++, printf("FAIL %s: stand_in %d temporal %d by_shape %d n64 %d\n", what, c.stand_in, c.temporal, c.by_shape, c.n64);
+    };
+    //                                                  listed off    by_key shaped n64
+    n64("N64, a network by key",                 choose(false, false, true,  true,  true),  true,  false, true);
+    n64("N64, a network by key, any shape",      choose(false, false, true,  false, true),  true,  false, true);
+    n64("N64, a share's network",                choose(false, false, false, true,  true),  true,  true,  true);
+    n64("N64, the listed network",               choose(true,  false, true,  true,  true),  true,  false, true);
+    n64("N64, a listed program of the shape",    choose(true,  false, false, true,  true),  true,  true,  true);
+    n64("N64 and Off, a network by key",         choose(false, true,  true,  true,  true),  true,  false, true);
+    n64("N64, a program that is neither",        choose(false, false, false, false, true),  false, false, false);
+    n64("N64, a listed other program",           choose(true,  false, false, false, true),  true,  false, false);
+    bool same = true;
+    for (int i = 0; i < 16; i++) {
+        const Choice a = choose(i & 1, i & 2, i & 4, i & 8), b = choose(i & 1, i & 2, i & 4, i & 8, false);
+        same &= a.stand_in == b.stand_in && a.temporal == b.temporal && a.by_shape == b.by_shape && !a.n64 && !b.n64;
+    }
+    checks++;
+    if (!same) fails++, printf("FAIL without N64 Classic the five-input rule is not the four-input one\n");
     if (fails) printf("upscale off: FAILED (%d of %d checks)\n", fails, checks);
     else printf("upscale off: all %d checks passed\n", checks);
     return fails != 0;
@@ -69,7 +93,7 @@ def check_source():
     stand = function(draw, "bool taau_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {")
     order = [stand.find(n) for n in (
         "const bool off = upscale_off_on();",
-        "upscale_off::choose(taau_key(p.key), off, gameplay_network(p.key), shaped);",
+        "upscale_off::choose(taau_key(p.key), off, gameplay_network(p.key), shaped, n64);",
         "if (!ch.stand_in) return false;",
         "if (ch.by_shape) {",
         "if (!in || in->format != VK_FORMAT_E5B9G9R9_UFLOAT_PACK32) return false;",

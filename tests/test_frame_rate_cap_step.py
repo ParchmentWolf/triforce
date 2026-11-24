@@ -53,9 +53,11 @@ FIXTURE = r'''#define _CRT_SECURE_NO_WARNINGS
 #include <string.h>
 #include "step_steady.h"
 #include "movie_pace.h"   /* ((Triforce, 11-22, PRESENT-30) realtime_step goes by pace_fps: the cap here, no movie plays) */
+#include "n64_pace.h"     /* ((Triforce, N64 Classic) and no rate of N64 Classic's: n64_rate stays 0 */
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); exit(1); } } while (0)
 static int64_t pace_period_ns;   /* (the period the presents are paced by: hos_vi_native_presented) */
 static int movie_raise;          /* (nn_vi.c's, set once a present by movie_pace_decide: tests/test_movie_pace.py) */
+static int n64_rate;             /* ((Triforce, N64 Classic) nn_vi.c's, set beside it: tests/test_n64_pace.py) */
 static uint8_t guest[0x4000];
 #define GP(a) ((void *)(guest + (a)))
 #define MOD 0x1000u

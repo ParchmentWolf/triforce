@@ -3,7 +3,7 @@
    at 0x80794368), and the Ultrawide HUD row's setting.
 
    The Insert menu's "Ultrawide HUD" row (ultrawide_hud= in the options file): 0 the middle, as before; 1 the screen's
-   edges. HOS_WIDE_HUD=<0|1> over it. Read once, at the start: the hearts', the item slot's and the small map's panes
+   edges. HOS_WIDE_HUD=<0|1> over it. Read once, at the start: the edge-anchored HUD panes
    are moved in the layouts as the game loads them (host/prompts.c build_layouts asks hos_wide_hud_out).
    Lab switches: HOS_WIDE_LOG=1 names each screen class the first time its projection is set (its address and where it
    was put); HOS_WIDE_SHIFT=<class in hex>=<l|r|m>,... moves whole layouts to a side, to find out what a class draws. */

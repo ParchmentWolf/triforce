@@ -121,6 +121,9 @@ $toolsRoot = (Resolve-Path $tools).Path.TrimEnd('\') + '\'
 foreach ($d in $baseDirs) {
     foreach ($f in Get-ChildItem (Join-Path $tools $d) -Recurse -File) {
         $rel = $f.FullName.Substring($toolsRoot.Length).Replace('\', '/')
+        # ((Triforce, 11-22) not the bundled Python's bytecode caches: Python rewrites them as it runs (launcher Tools.Regenerated),
+        # and a listed one at another size stopped v0.7.0's updates of kept bases. They still ship in the zips)
+        if ($rel -match '\.pyc$' -or $rel -match '/__pycache__/') { continue }
         $s = [IO.File]::OpenRead($f.FullName)
         try { $h = -join ($sha.ComputeHash($s) | ForEach-Object { $_.ToString('x2') }) } finally { $s.Dispose() }
         $rows.Add("file`t$($f.Length)`t$h`t$rel")

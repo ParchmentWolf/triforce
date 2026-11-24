@@ -52,7 +52,8 @@ struct Options {
     int resolution = 0;   // the 3D's (Render resolution): 0 Auto (the game's dynamic resolution), else a share of the output,
                           // 1..6 = 100%, 75%, 67%, 50%, 58%, 33% (upscaler_rows.h; nx2/oot_patches.py)
     int output_res = 0;   // the game's whole frame, docked: 0 its 2048x1152, 1 2560x1440, 2 3840x2160, 3 1920x1080, 4 5120x1440, 5 5120x2880, 6 5120x2160;
-                          // (options_version 7) 7 1536x864, the game's handheld profile (merged_rows.h kHandheldOutput); read once, at the start (host/nn_applet.c)
+                          // 8 Screen, 9 Custom (output_sizes.h); 7 1536x864, the game's handheld profile (merged_rows.h kHandheldOutput); read once, at the start (host/nn_applet.c)
+    int output_width = 2560, output_height = 1440;
     int upscale = 0;      // to the window: 0 off (the plain copy), 1 Catmull-Rom, 2 Lanczos, 3 AMD FSR 1 (EASU + RCAS). (options_version 7) No
                           // row: chosen at each present by the picture's size and its place in the window (vk_menu.cpp
                           // menu_note_present_sizes, upscaler_rows.h auto_filter); RX_VK_UPSCALE=<0..3> fixes it for a run
@@ -72,6 +73,13 @@ struct Options {
     int aa = 0;           // (Triforce) Anti-aliasing: 0 the game's own SMAA, as before the row; in its place 1 nothing, 2 FXAA, 3 SMAA at
                           // its Ultra preset (aa_rows.h, vk_aa.cpp; RX_VK_AA over it). Not applied while DLSS, DLAA or FSR
                           // upscales. Taken each frame. Saved as anti-aliasing
+    // ((Triforce, 11-22, N64 Classic, step 5) the 1998 look (n64_rules.h, vk_n64.cpp): 0 Off, 1 Faithful (fixed), 2 Remembered
+    // (the Remembered page's rows below). Taken at each frame; RX_VK_N64 over it. Saved as n64_classic
+    int n64_classic = 0;
+    int n64_last = 1;     // the preset F7 turns on from Off, the last one chosen (n64_rules.h Toggle); saved as n64_classic_last
+    // Remembered's page, by n64_rules::Row: n64_rules.h kSpec's defaults (tests/test_n64_row.py holds the two the same), saved
+    // under kSpec's keys (vk_menu.cpp ini_key)
+    int n64_rem[13] = {0, 2, 2, 0, 3, 1, 35, 0, 15, 1, 25, 1, 110};
     int aniso = 0;        // texture filtering: 0 the game's, 1 2x, 2 4x, 3 8x, 4 16x anisotropic at least (vk_draw.cpp sampler_for)
     int tex_detail = 0;   // (Triforce) Texture detail: 0 Automatic (by the card's video memory), 1 Full, 2 Reduced, 3 Low; read at the
                           // start (tex_detail.h, vk_texture.cpp texture_detail_level; RX_VK_TEX_DETAIL over it)
@@ -79,8 +87,8 @@ struct Options {
                           // half the video memory, when every block of them is opaque; read at the start (tex_bc1.h, vk_texture.cpp
                           // bc1_on; RX_VK_TEX_BC1 over it)
     int realtime = 1;     // game time follows the clock (host/nn_vi.c); 0: per frame (slower frames, slower game)
-    int ultrawide = 0;    // the camera's shape: 0 the game's 16:9, 1 the monitor's when it is wider or narrower, 2 a fixed 21:9, 3 a fixed
-                          // 32:9; read once, at the start (host/hos_main.c ultrawide_ratio)
+    int ultrawide = 0;    // the picture's shape for a 16:9 Output resolution: 0 the game's 16:9, 1 a fixed 16:10, 2 a fixed 21:9, 3 a fixed
+                          // 32:9 (ultrawide_rows.h); read once, at the start (host/hos_main.c ultrawide_ratio)
     int wide_menus = 1;   // ultrawide: the pause, item and map menus 0 at full width (stretched), 1 in the middle 16:9 with the sides
                           // blurred, 2 with black bars (nx2/oot_wide.py, vk_framegen.cpp)
     int show_fps = 0;     // the FPS counter row: 0 off, 1 the counter, 2 (Triforce) Full, NX2navi's full performance overlay in the counter's place:
@@ -145,6 +153,10 @@ struct Options {
     int sprint_button = 0;   // (Triforce) the sprint button: 0 off, 1 the left stick's click, 2 B (host/oot_sprint.h)
     int right_handed = 0;    // (Triforce) Link right-handed: his animation mirrored, what he holds in the other hand (host/vr_body.c)
     int sprint_mode = 0;     // 0 toggle (a press starts it, the next ends it), 1 hold
+    // ((Triforce) 11-23) the System tab's Achievements group (host/achievements.c): whether anything is earned, and whether
+    // one earned shows its notice and plays its sound. HOS_ACHIEVEMENTS=0 still turns them off whole
+    int achievements = 1;
+    int achievement_notices = 1;
     int discord = 1;   // (hookshot) the Discord status (host/discord_rpc.c): 1 on, shown while a Discord client runs on this PC
     int language = 0;  // (Triforce) Game language: the row's entry among the languages language.txt names (game_language.h). Not kept in
                        // the options file: the choice is that file's line, which the host reads at the start (host/nn_applet.c)
@@ -229,6 +241,9 @@ int menu_take_amiibo_ask();
 /// (Triforce) A cheat of a mod's cheat file the player switched on the System tab since the last call: (its row + 1) * 2, plus 1
 /// for on; 0 nothing (vk_api.h HOS_OPT_MODCHEAT_ASK, mod_cheat_rows.h)
 int menu_take_mod_cheat();
+/// (Triforce) The save file the player chose to play that is not this run's, its number (1 the first), since the last call; 0
+/// none (vk_api.h HOS_OPT_FILES_ASK, save_file_rows.h)
+int menu_take_file_ask();
 /// (Triforce) The next of the options' own sounds asked for since the last call, HOS_MENU_SOUND_* (vk_api.h), 0 none: for the
 /// host's sound thread alone (HOS_OPT_MENU_SOUND; menu_sound_events.h's queue, host/menu_sound.c)
 int menu_take_sound();
@@ -250,6 +265,13 @@ void menu_note_present_sizes(uint32_t picture_w, uint32_t picture_h, uint32_t wi
 /// Over the window's image `index` (TRANSFER_DST_OPTIMAL before and after), w x h: the start-up screen, the menu and the FPS
 /// counter, drawn with Dear ImGui (vk_imgui.h, vk_ui.h). Nothing recorded while none of them shows
 void menu_record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h);
+/// ((Triforce, 11-22, N64 Classic, after the owner's test) From N64 Classic's TV pass, before it draws (vk_framegen.cpp
+/// framegen_scale): while the options' own screens show (the menu open, our tabs over the game's Options screen, the Mods
+/// entry), this present's overlays are drawn now, the options into a layer of the picture's place that the TV takes in
+/// with the game's picture (vk_imgui.h record_layer), so they bend, scan and bleed as the game's own screens under them do;
+/// menu_record then draws the rest over the window, flat (the FPS counter). Null: nothing of the options this present, or
+/// no layer; menu_record draws as before. RX_VK_N64_TV_MENU=0: never (the options over the TV, flat, as before)
+VkImageView menu_tv_layer(VkCommandBuffer cmd);
 /// (headless shots, RX_VK_SHOT_MENU) The menu and the counter over another image: TRANSFER_DST_OPTIMAL before and after,
 /// R8G8B8A8_UNORM with colour-attachment use, view a view of it
 void menu_record_image(VkCommandBuffer cmd, VkImage image, VkImageView view, uint32_t w, uint32_t h);

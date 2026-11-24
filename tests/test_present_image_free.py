@@ -82,6 +82,7 @@ struct {
     std::atomic<uint64_t> swap_resize{0};
 } dev;
 namespace dlssg { bool on = false; bool active() { return on; } }
+namespace gpu_wait_kinds { struct Exclude {}; }   // ((Triforce, 11-23) image_free's compositor wait, not counted)
 // (PRESENT-45: a lost surface's handling at the acquire; none is lost here, tests/test_present_surface_lost.py runs it)
 bool surface_recover(VkResult) { return false; }
 void invalidate_lost_surface() {}

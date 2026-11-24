@@ -2025,6 +2025,31 @@ def fsr_wanted(a, out):
 RENODX_MARK = ".hookshot_renodx"   # (in a game folder built with RenoDX's HDR: --update builds it with RenoDX again)
 
 
+def write_mark(path):
+    """A folder's mark (FSR_MARK, RENODX_MARK) for the next --update. It only remembers a choice: a drive that refuses the
+    file (11-23 ticket 108774, OSError [Errno 22] on an X: drive) must not stop the build. A read-only or hidden one left there
+    is cleared and written once more; failing that, a note and the build goes on (Setup passes the switch itself)"""
+    for attempt in (0, 1):
+        try:
+            open(path, "w").close()
+            return True
+        except OSError as e:
+            if attempt == 0 and os.path.exists(path):
+                try:
+                    os.chmod(path, 0o666)
+                    if os.name == "nt":
+                        import ctypes
+                        ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x80)   # (FILE_ATTRIBUTE_NORMAL)
+                    os.remove(path)
+                    continue
+                except OSError:
+                    pass
+            print("note: the folder's mark %s could not be written (%s): the build goes on; the next update needs the same "
+                  "choice in Setup" % (os.path.basename(path), e), flush=True)
+            return False
+    return False
+
+
 def renodx_wanted(a, out):
     """RenoDX's HDR in this build. (Triforce, 11-13: every build has it, not only one that asks with --renodx; --no-renodx
     builds without. It acts only with the Insert menu's HDR set to Native.)"""
@@ -2181,7 +2206,7 @@ def main(a=None):
     if fsr_wanted(a, out):
         os.environ["HOOKSHOT_FSR"] = "1"
         fetch_fsr_runtime(work)   # (AMD's two libraries, for the game folder: place_fsr_runtime at the end)
-        open(os.path.join(out, FSR_MARK), "w").close()
+        write_mark(os.path.join(out, FSR_MARK))
         if os.environ.get("HOOKSHOT_VK_PREBUILT"):   # (the AppImage's back end: built with FSR 4 since 11-20, appimage.sh)
             print("--fsr: this build uses the prebuilt Vulkan back end (HOOKSHOT_VK_PREBUILT), which has AMD FSR 4 built in "
                   "already: the Upscaler row offers it once amd_fidelityfx_upscaler_vk.so is in the game folder", flush=True)
@@ -2200,7 +2225,7 @@ def main(a=None):
             renodx_folder = prepare_renodx(work)
             if renodx_folder:
                 os.environ["HOOKSHOT_RENODX"] = renodx_folder
-                open(os.path.join(out, RENODX_MARK), "w").close()
+                write_mark(os.path.join(out, RENODX_MARK))
             else:
                 os.environ.pop("HOOKSHOT_RENODX", None)
                 if os.path.isfile(os.path.join(out, RENODX_MARK)):

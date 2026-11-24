@@ -16,9 +16,10 @@
 namespace upscale_off {
 
 struct Choice {
-    bool stand_in;   // the stretch draws the dispatch's output; the network is not dispatched
-    bool temporal;   // as the stand-in was before: its history bound and FXAA. false: the plain linear stretch
-    bool by_shape;   // taken for its shape alone: the caller must still see the scene's formats at both ends
+    bool stand_in;     // the stretch draws the dispatch's output; the network is not dispatched
+    bool temporal;     // as the stand-in was before: its history bound and FXAA. false: the plain linear stretch
+    bool by_shape;     // taken for its shape alone: the caller must still see the scene's formats at both ends
+    bool n64 = false;  // ((Triforce, N64 Classic) N64 Classic's 3D pass draws it in place of the stretch: n64_rules.h)
 };
 
 /// listed:  the program is one RX_VK_TAAU_KEYS names (by default fd029a317a9a4b94 on software multiplies);
@@ -29,6 +30,14 @@ constexpr Choice choose(bool listed, bool off, bool by_key, bool shaped) {
     if (off && by_key) return {true, false, false};
     if (off && shaped && !listed) return {true, false, true};
     return {listed, true, false};
+}
+/// ((Triforce, 11-22, N64 Classic, step 2) n64: N64 Classic's 3D pass is on (vk_n64.cpp n64_3d_now). It takes every gameplay
+/// upscale, by key or by its shape, over the stretch and over the list: the mode is the 3D's look, not a cheaper upscale.
+/// Without it, as above
+constexpr Choice choose(bool listed, bool off, bool by_key, bool shaped, bool n64) {
+    if (n64 && by_key) return {true, false, false, true};
+    if (n64 && shaped) return {true, false, true, true};
+    return choose(listed, off, by_key, shaped);
 }
 
 } // namespace upscale_off

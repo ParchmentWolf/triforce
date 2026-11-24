@@ -890,7 +890,7 @@ HINT_FITS = 720   # (the widest advance the game's spacing holds: its own should
 HINT_SCALE = 0.1   # (layout units per font unit: the icons' panes draw the font at 100 per 1000 em)
 
 
-def layout_panes(lay):
+def layout_panes(lay, *, unique=False):
     """a BFFH layout's panes: {name: its record's offset} (the record: rotation, scale at +0x10, translation at +0x1c, size at
     +0x2c); the header gives the offsets of the names' table (+0x118), the records' table (+0x120) and the count (+0x130)"""
     names, recs = struct.unpack_from("<QQ", lay, 0x118)
@@ -899,7 +899,7 @@ def layout_panes(lay):
     for k in range(n):
         name = struct.unpack_from("<Q", lay, names + 8 * k)[0]
         out[lay[name:lay.index(b"\0", name)].decode()] = struct.unpack_from("<Q", lay, recs + 8 * k)[0]
-    return out
+    return {} if unique and len(out) != n else out
 
 
 def hint_panes(blarc):
@@ -952,17 +952,27 @@ def dump(out, face, b, tex, layers):
             decode(b, tex[layer.texture]).save(game)
 
 
-# ---- the hearts, the item slot and the small map on a picture wider than 16:9 (in the same archive, four copies of each
+# ---- the edge-anchored HUD on a picture wider than 16:9 (in the same archive, four copies of each
 # layout). With the Insert menu's Ultrawide HUD row on Screen edges host/prompts.c moves these panes out to the picture's
 # sides (host/oot_wide_hud.h has the rule). They are moved in the layouts because a layout's projection cannot do it:
 # - PlayerStatus_00 hangs the hearts, the magic bar and the D-pad's shortcuts on a pane at the 16:9 grid's top left corner and
 #   the item slot on one at its top right: two sides in one layout;
 # - MapMenu_00 is the small map in the corner and the menu's whole-screen map in one layout, and the game sets a layout's
-#   projection once, not as the menu opens. The small map's own panes go out; its icons' layers (N_PatternFieldMini_01,
-#   N_PatternDungeonMini_01) are put at the small map's place by an animation's keys, which go out with them (layout_keys).
-# prompts/wide.bin: "HPWD", u32 count, then each: u32 offset (an x in prompts/Common.blarc), i8 side (-1 left, 1 right),
+#   projection once, not as the menu opens. The small map's own panes go out; its icons' layers (N_MapIcon_00,
+#   N_PatternDungeonMini_01) are put at the small map's place by an animation's keys, which go out with them (hud_track_keys).
+# prompts/wide.bin: "HPWD", u32 count, then each: u32 offset, i8 displacement multiplier (-1 left, +1 right,
+# or the difference of endpoint multipliers for an animation delta),
 # u8 0 x3, f32 the x
 HUD_SIDE_PANES = {
+    "ActionGuideTips_00": {"N_Guide_00": -1},
+    "Location_00": {"N_SmallDisplay_00": -1},  # the large location card is centred
+    "EventSkip_00": {"W_GuideBg_00": 1, "Pa_Skip_00": 1},
+    # The challenge group is at +660. N_Guide_00 stays at +74; its only children, T_Guide_00 and T_Icon_00, move right.
+    "ChallengeAttention_00": {"N_Challenge_00": 1, "T_Guide_00": 1, "T_Icon_00": 1},
+    # The numeric HUD uses two instances of the same counter and a separate bottle marker group.
+    "NumDisplay_00": {"Pa_Parts_00": 1, "Pa_Parts_01": 1, "A_Bottle_00": 1},
+    "DoCommand_00": {},  # only the right-hand PosType state moves
+    "SaveLoadIcon_00": {"N_InOut_00": -1},
     "PlayerStatus_00": {"N_ScaleL_00": -1, "N_ScaleR_00": 1, "N_VRS_00": 1, "N_SubItemBaseFishing_00": 1},
     "MapMenu_00": {"N_VRS_00": 1, "N_MiniMapCap_00": 1, "N_Field_01": 1, "N_Dungeon_01": 1, "N_MiniMapReplace_00": 1,
                    "P_MiniMapFrame_00": 1, "S_Floor_00": 1, "P_CapDungeon_00": 1},
@@ -970,51 +980,183 @@ HUD_SIDE_PANES = {
 HUD_CORNERS = {"N_ScaleL_00": -1920.0, "N_ScaleR_00": 1920.0}   # (the grid's corners: half its width out)
 
 
-def layout_keys(lay, xs):
-    """the offsets of the animation keys of a layout that put a pane at one of the places xs: a curve's values are an array (u64
-    offset of the floats, u32 count, u32 4, the floats) of (value, slope) pairs; taken when every slope is 0 and every value is
-    0 or one of xs, with one of xs among them. The float 8 bytes before the array, the curve's value past its last key, too"""
+# The BFFH target tokens for pane translations encode the pane's index in the low four bits of
+# the third byte and the high four bits (shifted by three) of the second. Attribute 14 is a curve.
+def hud_translation_path(index):
+    return 0x0160077f + ((index & 15) << 11) + ((index >> 4) << 16)
+
+
+HUD_COUNTER_INSTANCES = {"Pa_Parts_00", "Pa_Parts_01"}
+HUD_X_TRACKS = {
+    "DoCommand_00": [("N_PosType_00", "PosType", 2, {234: 0, 724: 1, 466: 0})],
+    "MapMenu_00": [("N_MapIcon_00", "MapType", 2, {1490: 1}),
+                   ("N_PatternDungeonMini_01", "DungeonMiniMapPattern", 2, {1536: 1})],
+    "SaveLoadIcon_00": [("N_InOut_00", "EnableText", 1, {-1720: -1, 1740: 1})],
+}
+
+
+# The dungeon pattern inherits MapType. Both sets of offsets shipped in the original minimap.
+HUD_NESTED_TRACKS = {("MapMenu_00", "N_PatternDungeonMini_01", "DungeonMiniMapPattern"):
+                     ("N_MapIcon_00", "MapType")}
+
+
+def hud_track_keys(lay, animation, path, places, channels):
+    """Follow the animation's target descriptor to its indexed curve. Reject missing or ambiguous bindings."""
+    name = lay.find(b"\0" + animation.encode() + b"\0") + 1
+    if not name:
+        return None
+    found = []
+    for rec in range(0, len(lay) - 39, 8):
+        if struct.unpack_from("<Q", lay, rec)[0] != name:
+            continue
+        targets, n, stride, curves, nc, cstride = struct.unpack_from("<QIIQII", lay, rec + 8)
+        if stride != 8 or cstride != 8 or targets + 8 * n > len(lay) or curves + 8 * nc > len(lay):
+            continue
+        for i in range(n):
+            desc, = struct.unpack_from("<Q", lay, targets + i * 8)
+            if desc + 16 > len(lay):
+                return None
+            token, index, sentinel, count, attr = struct.unpack_from("<Q4H", lay, desc)
+            if attr != 14 or lay[token:token + 6] != path.to_bytes(6, "little"):
+                continue
+            # The map's first curve reaches 1490 or 1536, the minimap's horizontal positions outside the grid's vertical range.
+            # These authored translation tracks put x at the first curve index and y (if present)
+            # immediately after it. The token binds the vector, not its axis. Check the descriptor
+            # shape and the expected x positions before accepting channel zero.
+            if sentinel != 65535 or count != channels or index + count > nc:
+                return None
+            curve, = struct.unpack_from("<Q", lay, curves + index * 8)
+            if curve + 16 > len(lay):
+                return None
+            values, = struct.unpack_from("<Q", lay, curve + 8)
+            if values + 24 > len(lay):
+                return None
+            at, size, step = struct.unpack_from("<QII", lay, values + 8)
+            if step != 4 or not size or size % 2 or at + size * 4 > len(lay):
+                return None
+            offsets = range(at, at + size * 4, 8)
+            keys = {}
+            previous = None
+            for off in offsets:
+                x, slope = struct.unpack_from("<ff", lay, off)
+                side = places.get(x, 0)
+                if previous and previous[0] != side and (previous[1] or slope):
+                    return None
+                previous = side, slope
+                if x in places:
+                    keys[off] = (places[x], x)
+                elif x != 0:
+                    return None
+            first, = struct.unpack_from("<f", lay, offsets[0])
+            last, = struct.unpack_from("<f", lay, offsets[-1])
+            delta, = struct.unpack_from("<f", lay, values)
+            if delta != last - first:
+                return None
+            shift = places.get(last, 0) - places.get(first, 0)
+            if shift:
+                keys[values] = (shift, delta)
+            if not set(places).issubset(x for _, x in keys.values()):
+                return None
+            found.append({off: item for off, item in keys.items() if item[0]})
+    return found[0] if len(found) == 1 else None
+
+
+def hud_grid_x(lay, records, pane, moving=()):
+    """Translate a local anchor up to the grid. Only unrotated, unit-scale parents preserve our x offset."""
+    x, = struct.unpack_from("<f", lay, pane + 0x1c)
+    parent, = struct.unpack_from("<i", lay, pane + 0x28)
+    seen = set()
+    while parent != -1:
+        if not 0 <= parent < len(records) or parent in seen:
+            return None
+        seen.add(parent)
+        rec = records[parent]
+        if rec in moving or struct.unpack_from("<5f", lay, rec) != (0., 0., 0., 0., 1.):
+            return None
+        x += struct.unpack_from("<f", lay, rec + 0x1c)[0]
+        parent, = struct.unpack_from("<i", lay, rec + 0x28)
+    return x
+
+
+def wide_layout(blarc, name, sides):
+    """Collect all copies together so a changed layout can keep its original placement."""
     out = []
-    for o in range(0, len(lay) - 16, 8):
-        at, n, size = struct.unpack_from("<QII", lay, o)
-        if at != o + 16 or size != 4 or not 2 <= n <= 256 or n % 2 or at + 4 * n > len(lay):
-            continue
-        v = struct.unpack_from(f"<{n}f", lay, at)
-        if any(v[1::2]) or not any(k in xs for k in v[::2]) or any(k and k not in xs for k in v[::2]):
-            continue
-        out += [at + 8 * k for k in range(n // 2) if v[2 * k] in xs]
-        if o >= 8 and struct.unpack_from("<f", lay, o - 8)[0] in xs:
-            out.append(o - 8)
-    return out
+    copies = layout_copies(blarc, name)
+    if not copies:
+        return None
+    for a, z in copies:
+        lay = blarc[a:z]
+        panes = layout_panes(lay, unique=True)
+        tracks = HUD_X_TRACKS.get(name, ())
+        track_names = {p for p, _, _, _ in tracks}
+        moving_names = set(sides) | track_names
+        if not moving_names.issubset(panes):
+            return None
+        side_of, at = {}, {}
+        records = list(panes.values())
+        moving = {panes[p] for p in moving_names}
+        for p, side in sides.items():
+            if p not in track_names and hud_translation_path(records.index(panes[p])).to_bytes(6, "little") in lay:
+                return None
+            x = struct.unpack_from("<f", lay, panes[p] + 0x1c)[0]
+            grid = hud_grid_x(lay, records, panes[p], moving)
+            if name == "NumDisplay_00" and p in HUD_COUNTER_INSTANCES:
+                # These instances have a central origin. Their contents, checked below, sit on the right.
+                if grid != 0:
+                    return None
+                at[panes[p] + 0x1c] = (side, x)
+                continue
+            if grid is None or side * grid <= 640:  # only the outer thirds of the 3840-wide grid
+                return None
+            if x == 0.0 or HUD_CORNERS.get(p, x) != x or side_of.setdefault(x, side) != side:
+                return None
+            at[panes[p] + 0x1c] = (side, x)
+        for pane, animation, channels, places in tracks:
+            exception = HUD_NESTED_TRACKS.get((name, pane, animation))
+            allowed = {panes[p] for p, anim, _, _ in tracks if (p, anim) == exception and p not in sides}
+            grid = hud_grid_x(lay, records, panes[pane], moving - allowed)
+            local, = struct.unpack_from("<f", lay, panes[pane] + 0x1c)
+            if grid != local:  # these animated places are already grid coordinates
+                return None
+            keys = hud_track_keys(lay, animation, hud_translation_path(records.index(panes[pane])), places, channels)
+            if keys is None:
+                return None
+            side_of.update({x: side for x, side in places.items() if side})
+            at.update(keys)
+        widths = {v + 0x2c for v in panes.values()}  # widths can equal a position, but never move
+        for x in side_of:
+            pat = struct.pack("<f", x)
+            if any(lay[o:o + 4] == pat and o not in at and o not in widths for o in range(0, len(lay) - 3, 4)):
+                return None
+        out += [(a + o, side, x) for o, (side, x) in sorted(at.items())]
+    return out or None
 
 
-def wide_panes(blarc):
-    """what goes out to a wide picture's sides, in every copy: [(offset of an x, side, x)], or None when a layout is not the
-    one known: a pane missing, a corner pane not at the grid's corner, a place that two sides share, or one of the places held
-    somewhere else in the layout than in those panes and keys (something else the game would leave where it is)"""
+def wide_panes(blarc, ring=()):
+    ring_bytes = {i for *_, runs in ring or () for off, data in runs for i in range(off, off + len(data))}
     out = []
     for name, sides in HUD_SIDE_PANES.items():
-        copies = layout_copies(blarc, name)
-        if not copies:
-            return None
-        for a, z in copies:
-            lay = blarc[a:z]
-            panes = layout_panes(lay)
-            if any(p not in panes for p in sides):
-                return None
-            side_of, at = {}, {}
-            for p, side in sides.items():
-                x = struct.unpack_from("<f", lay, panes[p] + 0x1c)[0]
-                if x == 0.0 or HUD_CORNERS.get(p, x) != x or side_of.setdefault(x, side) != side:
-                    return None
-                at[panes[p] + 0x1c] = x
-            for o in layout_keys(lay, set(side_of)):
-                at[o] = struct.unpack_from("<f", lay, o)[0]
-            for x in side_of:
-                pat = struct.pack("<f", x)
-                if any(lay[o:o + 4] == pat and o not in at for o in range(0, len(lay) - 3, 4)):
-                    return None
-            out += [(a + o, side_of[x], x) for o, x in sorted(at.items())]
+        entries = wide_layout(blarc, name, sides)
+        if entries and any(i in ring_bytes for off, _, _ in entries for i in range(off, off + 4)):
+            print(f"prompts: {name}: HUD edge position overlaps a Talk ring run, keeping its original placement", file=sys.stderr)
+            continue
+        if entries and name == "NumDisplay_00":
+            # Only the owning HUD's two instances move. Check the visible part's grid on every copy.
+            copies = layout_copies(blarc, "PaNumDisplay_00")
+            if not copies:
+                entries = None
+            for a, z in copies:
+                lay = blarc[a:z]
+                panes = layout_panes(lay, unique=True)
+                for child in ("P_NumBase_00", "A_Num_00", "N_PlusMinus_00"):
+                    grid = hud_grid_x(lay, list(panes.values()), panes[child]) if child in panes else None
+                    if grid is None or grid <= 640:
+                        entries = None
+        if entries:
+            print(f"prompts: {name}: {len(entries)} HUD edge entries", file=sys.stderr)
+            out.extend(entries)
+        else:
+            print(f"prompts: {name}: unknown HUD layout, keeping its original placement", file=sys.stderr)
     return out or None
 
 
@@ -1415,14 +1557,14 @@ def main():
                 dump(a.dump, face, textures, tex, layers)
         print(f"prompts: {face}", file=sys.stderr)
     ring = ring_entries(blarc)
-    wide = wide_panes(blarc)
+    wide = wide_panes(blarc, ring)
     if ring or hint or wide:
         with open(os.path.join(a.out, "Common.blarc"), "wb") as f:
             f.write(blarc)
     if wide:
         write_wide(os.path.join(a.out, "wide.bin"), wide)
     else:
-        print("prompts: the hearts and the item slot stay in the middle of a wide picture (their layout is not the one known)",
+        print("prompts: no known HUD edge positions in the layouts",
               file=sys.stderr)
     speeds = None
     try:

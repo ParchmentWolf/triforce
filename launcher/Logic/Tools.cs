@@ -298,6 +298,9 @@ public sealed class Tools
                 }
             foreach (var f in b.Files)   // (the base whole in the new folder, whichever way it came)
             {
+                // ((Triforce, 11-22, the v0.7.0 update stop "The tools' base lacks python/Lib/.../__pycache__/...pyc") the bytecode
+                // caches as HasBase takes them: rewritten by Python as it runs, so kept bases have them at other sizes or not at all)
+                if (Regenerated(f.Path)) continue;
                 var fi = new FileInfo(Path.Combine(part, f.Path));
                 if (!fi.Exists || fi.Length != f.Size) throw new InvalidDataException("The tools' base lacks " + f.Path + " (or it has another size): they were not changed.");
             }

@@ -185,6 +185,12 @@ inline int auto_filter(unsigned picture_w, unsigned picture_h, unsigned dest_w, 
 inline int window_filter(unsigned picture_w, unsigned picture_h, unsigned dest_w, unsigned dest_h, bool native_hdr) {
     return native_hdr ? 0 : auto_filter(picture_w, picture_h, dest_w, dest_h);
 }
+/// ((Triforce, 11-22, N64 Classic, step 4) opts.upscale's value while N64 Classic's TV runs (vk_framegen.cpp framegen_scale):
+/// its pass in the filter's place, at the window's own pixels, at every present (the TV is the whole picture's look, at 1:1
+/// too). Past the filters RX_VK_UPSCALE can name (0 to 3)
+constexpr int kTvFilter = 4;
+/// The window's filter for a present with the TV: kTvFilter while it runs (tv: vk_n64.cpp n64_tv_now), else window_filter's
+inline int tv_filter(int filter, bool tv) { return tv ? kTvFilter : filter; }
 
 /// The DLSS model row (opts.dlss_model, saved as dlss_model): which of NVIDIA's networks DLSS and DLAA draw with, by its
 /// preset (NVSDK_NGX_DLSS_Hint_Render_Preset_*). 0 the transformer, preset K (the default here, the one tested); 1 the second

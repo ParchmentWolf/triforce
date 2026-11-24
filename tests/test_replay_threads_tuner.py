@@ -19,6 +19,11 @@ par_tune_present at each present). No game, no GPU.
    "settled": (11-22) the rule gives an area's load window, and the first after it, no verdict (with settled off: on at the
    load, as Kaefergeneral's log had it); a settled heavy scene like test4's still turns the helpers on without a trial, a
    window after it settled; a trial the scene changed under changes nothing and the next comes once the scene settles.
+   "calm": (11-22) no trial on a loading screen, a trial due during an arrival waits for the calm scene, one that never calms
+   still has its trials; the rule's "on" in the Market's steady texture load withdrawn when the area comes down, kept where
+   the scene stays, and given again three windows after a withdrawal where the helpers win; (11-23) the rule's "on" needs
+   three windows alike to the first of them, so 0.7's Market arrival, its texture load coming down a window at a time, gets
+   none (with two alike, the gate before: in 20 of 20 runs).
 2. The source read: par_tune_present returns at once unless the tuner decides (the Debug row's Off, RX_VK_PARALLEL), hands
    each frame to Tuner::step with the way in use, and applies its change; the rule is RX_VK_PARALLEL_RULE's to turn off, and
    counts the replay thread among the threads that record segments only where it does (RX_VK_PARALLEL_OWN); the back-off is
@@ -86,20 +91,22 @@ def main():
     check("`RX_VK_PARALLEL_RULE=0`" in guide, "docs/development.md does not say what RX_VK_PARALLEL_RULE=0 does")
     check("`RX_VK_PARALLEL_BACKOFF=0`" in guide, "docs/development.md does not say what RX_VK_PARALLEL_BACKOFF=0 does")
     check("`RX_VK_TUNER_SETTLED=0`" in guide, "docs/development.md does not say what RX_VK_TUNER_SETTLED=0 does")
+    # ((Triforce) 11-22) the rule's "on" withdrawn is logged, as its "on" is
+    check("if (s.withdrawn) {" in tune and "withdrawn at present %lld: its scene changed" in tune, "par_tune_present does not log a withdrawn \"on\"")
     with tempfile.TemporaryDirectory(prefix="replay-tuner-") as tmp:
         exe = Path(tmp) / "tuner.exe"
         built = subprocess.run([args.cxx, "-std=c++20", "-O1", "-Wall", "-Wextra", "-Werror", "-I", str(VK),
                                 str(ROOT / "tests" / "replay_threads_tuner_test.cpp"), "-o", str(exe)], capture_output=True, text=True)
         check(built.returncode == 0, "the fixture did not build:\n" + built.stderr[-4000:])
         env = {k: v for k, v in os.environ.items() if not k.startswith("RX_VK_")}
-        for case in ("same", "prev", "rule", "backoff", "settled"):
+        for case in ("same", "prev", "rule", "backoff", "settled", "calm"):
             r = subprocess.run([str(exe), case], env=env, capture_output=True, text=True, timeout=300)
             print((r.stdout + r.stderr).strip())
             check(r.returncode == 0, "replay_threads_tuner_test %s" % case)
     print("PASS: the helper threads' tuner decides as it did inline with the rule off; with it, on without a trial where the "
           "replay is plainly the frame's limit, no trial where the GPU or the game's threads are, trials in between; the "
           "back-off makes them rarer and shorter once the way holds, early where the scene changes, off as before; both judge "
-          "settled scenes only")
+          "settled scenes only, no trial where nothing is cut, and the rule's \"on\" holds for its scene")
 
 
 if __name__ == "__main__":

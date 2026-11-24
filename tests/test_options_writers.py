@@ -78,6 +78,7 @@ struct Host { int (*binding)(int set, int i, int k); };
 const Host host_v{[](int set, int i, int k) { return binds[set][i][k]; }};
 const Host* host = &host_v;
 bool can_bind() { return true; }
+struct { unsigned w, h; } remembered_custom{};
 std::string mic_want;
 std::string the_path;
 std::string ini_path() { return the_path; }
@@ -128,6 +129,8 @@ int main(int argc, char** argv) {
         const std::string key = colon == std::string::npos ? "" : step.substr(colon + 1, eq - colon - 1);
         const std::string value = eq == std::string::npos ? "" : step.substr(eq + 1);
         if (what == "load") load();
+        else if (what == "remember") remembered_custom = {3437, 1440};
+        else if (what == "clear") remembered_custom = {};
         else if (what == "save") save();
         else if (what == "outside") outside(key, value);
         else if (what == "game") {
@@ -194,6 +197,12 @@ def main():
             return lines(path)
 
         start = "alpha=1\nbeta=1\ngamma=1\noptions_version=6\ndiscord_app_id=42\npad_a=3\nkey_a=65,0\nkey_up=87,0\n"
+        key = "output_custom_size"
+        check(key not in run("absent", start, ["load", "save", "save"]), "no empty Custom line added")
+        check(run("remember", start, ["load", "remember", "save"]).get(key) == "3437x1440", "entered Custom written")
+        check(run("clear", start, ["load", "remember", "save", "clear", "save"]).get(key) == "", "existing Custom cleared")
+        check(run("external", start, ["load", "outside:output_custom_size=800x600", "save", "save"]).get(key) == "800x600",
+              "Custom added outside survives unrelated saves")
         got = run("both", start, ["load", "outside:beta=7", "game:alpha=2", "save"])
         check(got.get("alpha") == "2" and got.get("beta") == "7",
               "a row changed outside and another in the game within a second: both survive (%s)" % got)
