@@ -16,6 +16,8 @@ enum Owner { GAME = 0, REFLEX = 1, RTSS = 2 };   // (pace_rule.h's PACE_*)
 void set_period_ns(int ns);
 /// HOS_OPT_PACE_MOVIE: 1 while a movie plays (the game's own wait holds a movie), told before each frame_start.
 void set_movie(int playing);
+/// (Triforce VR) Whether a movie plays, as last told (vk_xr.cpp: a movie on the floating screen rather than the head's view).
+bool movie_playing();
 /// (Triforce) HOS_OPT_PACE_STEADY, option_set: 1 while the period told is the Steady frame rate row's (host/pace_steady.h).
 void set_steady(int on);
 /// HOS_OPT_PACE_STEADY, option (on the game's presenting thread, once a frame): the microseconds steady_held counted since

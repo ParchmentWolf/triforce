@@ -131,7 +131,10 @@ enum MenuTab {
     TAB_COUNT = 7,
     TAB_MOTION = TAB_COUNT,   // (hookshot: not a tab of the strip, the Motion page that the Controls tab's Motion row
                               // opens: one past the strip's tabs, so a tab added before TAB_COUNT moves it along)
-    TAB_PAGE = TAB_MOTION + 1,   // (hookshot: the Controls page's rows, above its grid; no tab shows them)
+    TAB_VRPAGE = TAB_MOTION + 1,   // ((Triforce VR) the VR Controls page that the Controls tab's VR Controls row opens)
+    TAB_3DPAGE = TAB_VRPAGE + 1,   // ((Triforce VR) the 3D Settings page (Display's 3D Style)
+    TAB_VRSET = TAB_3DPAGE + 1,    // ((Triforce VR) the VR Settings page (Display's 3D Style)
+    TAB_PAGE = TAB_VRSET + 1,   // (hookshot: the Controls page's rows, above its grid; no tab shows them)
     TAB_HIDDEN = TAB_PAGE + 1    // ((Triforce, options_version 7) saved values a merged row stands for: never shown, merged_rows.h)
 };
 
@@ -176,7 +179,14 @@ const char* tx_framegen(int v) {
 const char* tx_onoff(int v) { return v ? "On" : "Off"; }
 // (Triforce VR) the VR tab's values
 const char* tx_vr_view(int v) { return v ? "Immersive" : "Theater"; }
+const char* tx_vr_mode(int v) { return v >= 2 ? "Full Dive" : v ? "Immersive" : "Theater"; }
+const char* tx_view3d(int v) {
+    static const char* const t[] = {"Flatscreen", "VR", "Red/cyan glasses", "Side by side (3D TV)", "Crossed eyes", "Above and below",
+                                    "Side by side (Cardboard)"};
+    return t[v >= 0 && v < 7 ? v : 0];
+}
 const char* tx_vr_camera(int v) { return v ? "Third person" : "First person"; }
+const char* tx_vr_cutscenes(int v) { return v ? "First person" : "Classic"; }
 const char* tx_resolution(int v);
 const char* tx_vr_resolution(int v) { return v <= 0 ? "As in Graphics" : tx_resolution(v); }
 const char* tx_flat3d(int v) {
@@ -190,8 +200,7 @@ const char* tx_flat3d_screen(int v) {
     return b;
 }
 const char* tx_vr_stereo(int v) { return v == 2 ? "Accurate" : v == 1 ? "Balanced" : "Performant"; }
-const char* tx_vr_hand(int v) { return v ? "Right-handed" : "Left-handed"; }
-const char* tx_vr_body(int v) { return v ? "Your arms" : "Hidden"; }
+const char* tx_vr_body(int v) { return v ? "Shown" : "Hidden"; }
 const char* tx_unit(int v, const char* fmt) {
     static char b[24];
     snprintf(b, sizeof b, fmt, v);
@@ -995,9 +1004,13 @@ static_assert(mod_cheat_rows::kSlots == 96, "MOD_CHEAT_ROWS8 below is used twelv
 // (merged_store). Never saved themselves (ini_row): the saved values keep their own keys, in the hidden rows below)
 struct Merged {
     int hdr = 0, framegen = 0, pacing = 0, latency = 0;
+    int vr_mode = 2, view3d = 0;   // ((Triforce VR) VR mode: vr_view with vr_camera; 3D Style's Mode: vr with flat3d)
 };
 Merged merged;
-bool is_merged(const int* v) { return v == &merged.hdr || v == &merged.framegen || v == &merged.pacing || v == &merged.latency; }
+bool is_merged(const int* v) {
+    return v == &merged.hdr || v == &merged.framegen || v == &merged.pacing || v == &merged.latency || v == &merged.vr_mode ||
+           v == &merged.view3d;
+}
 
 // ((Triforce, options_version 7, the owner: "group them correctly, such as HDR should be its own group, the upscaling should be
 // its own group, etc. Add the in-game filigree to group them, separate them") A group's heading: the game's separator with
@@ -1029,19 +1042,25 @@ Row rows[] = {
      hn_output_res, true},
     {TAB_DISPLAY, "GPU device", &opts.gpu_device, 0, 8, 1, tx_gpu,
      "Which graphics card the game runs on. Applies after a restart.", hn_gpu, true, true},
-    MENU_HEADING(TAB_DISPLAY, "Flatscreen 3D"),
-    {TAB_DISPLAY, "3D on the screen", &opts.flat3d, 0, 5, 1, tx_flat3d,
-     "The game in 3D on a flat screen, without a headset (when VR is off or no headset is connected). Red/cyan: glasses with "
-     "a red and a cyan lens. Side by side (3D TV): each eye squeezed into its half, for a 3D TV's side by side mode. Crossed "
-     "eyes: the right eye's picture on the left, for viewing with crossed eyes. Above and below: each eye in its half, one "
-     "over the other. Side by side (Cardboard): each eye's whole picture in its own half, for a phone in a viewer such as "
-     "Google Cardboard, or for showing a stream in 3D; with this one, while VR runs, the desktop shows both of the headset's "
-     "eyes side by side.", nullptr, false, true, -1, false, "flat3d"},
-    {TAB_DISPLAY, "3D depth", &opts.flat3d_depth, 0, 800, 10, tx_percent,
+    MENU_HEADING(TAB_DISPLAY, "3D Style"),
+    {TAB_DISPLAY, "Mode", &merged.view3d, 0, 6, 1, tx_view3d,
+     "How the game is shown. Flatscreen: on the screen as usual. VR: in a VR headset through OpenXR (for example WiVRn on "
+     "Linux, SteamVR or Meta's runtime on Windows), with the headset connected before the game starts; turning VR on or off "
+     "applies after a restart. The rest are 3D on a flat screen without a headset. Red/cyan: glasses with a red and a cyan "
+     "lens. Side by side (3D TV): each eye squeezed into its half, for a 3D TV's side by side mode. Crossed eyes: the right "
+     "eye's picture on the left, for viewing with crossed eyes. Above and below: each eye in its half, one over the other. "
+     "Side by side (Cardboard): each eye's whole picture in its own half, for a phone in a viewer such as Google Cardboard.",
+     nullptr, true, true},
+    {TAB_DISPLAY, "3D Settings", nullptr, 0, 0, 0, nullptr,   // ((Triforce VR) opens the 3D Settings page, the TAB_3DPAGE rows)
+     "Flat screen 3D: how strong the 3D is, and where the screen sits in it."},
+    {TAB_DISPLAY, "VR Settings", nullptr, 0, 0, 0, nullptr,   // ((Triforce VR) opens the VR Settings page, the TAB_VRSET rows)
+     "The headset: the VR mode, cutscenes, the HUD, the theater screen, the view and where your eyes sit."},
+    // ((Triforce VR) the 3D Settings page
+    {TAB_3DPAGE, "Depth", &opts.flat3d_depth, 0, 800, 10, tx_percent,
      "How strong the 3D is on the screen: the eyes' distance, 100% a person's (6.4 cm); the farther you sit from the screen, "
      "the more it takes. Not VR's Depth.", nullptr, false, true, -1,
      false, "flat3d_depth"},
-    {TAB_DISPLAY, "Screen distance", &opts.flat3d_screen, 0, 2000, 10, tx_flat3d_screen,
+    {TAB_3DPAGE, "Screen distance", &opts.flat3d_screen, 0, 2000, 10, tx_flat3d_screen,
      "How far into the world the screen sits: things nearer come out of it, farther ones stay behind it. Auto: at the nearest "
      "thing in the picture's middle, so the world sits behind the screen, as the 3DS does.", nullptr, false, true, -1, false,
      "flat3d_screen"},
@@ -1309,6 +1328,22 @@ Row rows[] = {
     MENU_HEADING(TAB_CONTROLS, "Motion & buttons"),
     {TAB_CONTROLS, "Motion", nullptr, 0, 0, 0, nullptr,   // (hookshot: opens the Motion page, the TAB_MOTION rows)
      "Aiming with the controller's gyroscope: on or off, its sensitivity and its inverts."},
+    // ((Triforce VR) the VR Controls page: Link's body, then the hand controllers' swings and pointing
+    {TAB_VRPAGE, "Body visibility", &opts.vr_body, 0, 1, 1, tx_vr_body,
+     "Full Dive: Shown: Link stays drawn, his arms follow your hands with what they hold, and his head is hidden. "
+     "Hidden: all of Link is hidden, what he holds stays in view.", nullptr, false, true, -1, false, "vr_body"},
+    {TAB_VRPAGE, "Arm reach", &opts.vr_arm_reach, 100, 160, 5, tx_percent,
+     "Body visibility Shown: how far Link's arms may stretch to meet your hands, his arms being shorter than yours. 100%: never "
+     "stretched.", nullptr, false, true, -1, false, "vr_arm_reach"},
+    MENU_HEADING(TAB_VRPAGE, "Controls"),
+    {TAB_VRPAGE, "Swing speed", &opts.vr_swing_speed, 100, 500, 10, tx_cm_s,
+     "How fast your hand must move for a swing to count as a sword slash. Lower: gentler swings slash.", nullptr, false, true, -1, false, "vr_swing_speed"},
+    {TAB_VRPAGE, "Charge reach", &opts.vr_charge_reach, 25, 70, 1, tx_cm,
+     "How far out from your body a swing must leave your hand to keep charging the sword; bringing the hand back in "
+     "releases it. Lower suits shorter arms.", nullptr, false, true, -1, false, "vr_charge_reach"},
+    {TAB_VRPAGE, "Pointing angle", &opts.vr_aim_tilt, 0, 60, 1, tx_degrees,
+     "Motion: how far below the controller's own pointing line your aim goes. Raise it if the aim sits above where you "
+     "point, lower it if below.", nullptr, false, true, -1, false, "vr_aim_tilt"},
     // (hookshot) the Controls page's own rows, above its grid (TAB_PAGE: no tab shows them)
     {TAB_PAGE, "Layout preset", &opts.pad_layout, 0, 3, 1, tx_pad_layout,
      "Which face button is which. Binding one yourself on the Controls page makes it Custom.", hn_pad_layout},
@@ -1317,76 +1352,54 @@ Row rows[] = {
      hn_prompts, true, true},
     {TAB_CONTROLS, "Controls", nullptr, 0, 0, 0, nullptr,   // (hookshot: opens its page)
      "The layout preset, the button prompts, and which button and keys press each of the Switch's buttons."},
+    {TAB_CONTROLS, "VR Controls", nullptr, 0, 0, 0, nullptr,   // ((Triforce VR) opens the VR Controls page, the TAB_VRPAGE rows)
+     "The VR hand controllers: Link's body in Full Dive, and how swings and pointing are read."},
 
     // (Triforce VR) VR through OpenXR (vk_xr.cpp; host/vr_game.c for the camera's rows)
-    {TAB_VR, "VR", &opts.vr, 0, 1, 1, tx_onoff,
-     "Shows the game in a VR headset through OpenXR (for example WiVRn on Linux, SteamVR or Meta's runtime on "
-     "Windows), with the headset connected before the game starts. Applies after a restart.", nullptr, true, true, -1, false, "vr"},
-    {TAB_VR, "View", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},
-    {TAB_VR, "VR mode", &opts.vr_view, 0, 1, 1, tx_vr_view,
-     "Immersive: the world surrounds you in play and in cutscenes, and the game's camera follows your head. Theater: "
-     "the game on a large screen floating in front of you. This menu always shows on the screen.", nullptr, false, true, -1, false, "vr_view"},
-    {TAB_VR, "Screen size", &opts.vr_screen_size, 45, 125, 5, tx_degrees,
+    // ((Triforce VR) Display's VR Settings page (TAB_VRSET; vk_xr.cpp and host/vr_game.c read them through vk_xr_cfg)
+    {TAB_VRSET, "VR mode", &merged.vr_mode, 0, 2, 1, tx_vr_mode,
+     "Theater: the game on a large screen floating in front of you, with its own camera. Immersive: the world surrounds you, "
+     "the game's own camera behind Link, turned by your head. Full Dive: the world surrounds you from Link's own eyes; he "
+     "faces where you look while he stands. This menu always shows on the screen.", nullptr, false, true},
+    {TAB_VRSET, "Cutscenes", &opts.vr_cutscenes, 0, 1, 1, tx_vr_cutscenes,
+     "Full Dive: how cutscenes are seen. Classic: the game's own cutscene camera, turned by your head. First "
+     "person: from Link's eyes. Load zones, conversations, getting an item and showing one are always from Link's eyes.",
+     nullptr, false, true, -1, false, "vr_cutscenes"},
+    {TAB_VRSET, "HUD size", &opts.vr_hud_size, 40, 200, 5, tx_cm,
+     "The width of the HUD's panel, a metre in front of you.", nullptr, false, true, -1, false, "vr_hud_size"},
+    MENU_HEADING(TAB_VRSET, "Theater"),
+    {TAB_VRSET, "Screen size", &opts.vr_screen_size, 45, 125, 5, tx_degrees,
      "How much of your view the floating screen fills, in degrees across: Theater mode, this menu and the title.", nullptr, false, true, -1, false, "vr_screen_size"},
-    {TAB_VR, "Curved screen", &opts.vr_screen_curve, 0, 1, 1, tx_onoff,
+    {TAB_VRSET, "Curved screen", &opts.vr_screen_curve, 0, 1, 1, tx_onoff,
      "Curves the floating screen around you, like a cinema's, so its edges stay as near as its middle. Off: a flat "
      "screen.", nullptr, false, true, -1, false, "vr_screen_curve"},
-    {TAB_VR, "Camera", &opts.vr_camera, 0, 1, 1, tx_vr_camera,
-     "First person: you see from Link's eyes, Link is hidden while what he holds stays in view, and he faces where you "
-     "look while he stands. Third person: the game's own camera, turned by your head.", nullptr, false, true, -1, false, "vr_camera"},
-    {TAB_VR, "Body", &opts.vr_body, 0, 1, 1, tx_vr_body,
-     "First person (Touch controllers): Your arms: Link stays drawn, his arms follow your hands with what they hold, and "
-     "his head is hidden. Hidden: all of Link is hidden, what he holds stays in view.", nullptr, false, true, -1, false, "vr_body"},
-    {TAB_VR, "Arm reach", &opts.vr_arm_reach, 100, 160, 5, tx_percent,
-     "Your arms: how far Link's arms may stretch to meet your hands, his arms being shorter than yours. 100%: never "
-     "stretched.", nullptr, false, true, -1, false, "vr_arm_reach"},
-    {TAB_VR, "Field of view", &opts.vr_view_scale, 50, 200, 5, tx_percent,
-     "How much of the world the view takes in. The default, 100%, matches the headset's lenses exactly. Higher fits "
-     "more of the world into your view, so everything looks smaller; lower zooms in. Away from 100%, the world seems "
-     "to swim as you turn your head.", nullptr, false, true, -1, false, "vr_view_scale"},
-    {TAB_VR, "Render resolution", &opts.vr_resolution, 0, ur::kValues - 1, 1, tx_vr_resolution,
+    MENU_HEADING(TAB_VRSET, "View"),
+    {TAB_VRSET, "Render resolution", &opts.vr_resolution, 0, ur::kValues - 1, 1, tx_vr_resolution,
      "The size the 3D is drawn at while VR is on, in every stereo mode. As in Graphics: the Graphics tab's Render resolution "
      "(Auto lowers it under load, which looks blocky in the headset). A fixed size costs more GPU time but stays sharp. "
      "Applies after a restart.", nullptr, true, true, -1, false, "vr_resolution"},
-    {TAB_VR, "Stereo", &opts.vr_stereo, 0, 2, 1, tx_vr_stereo,
+    {TAB_VRSET, "Stereo Vision", &opts.vr_stereo, 0, 2, 1, tx_vr_stereo,
      "Performant: the game draws one picture and each eye's is made from it and its depth at the game's full rate; "
      "edges beside near things can smear. Balanced: each eye is drawn in turn, true depth everywhere, with the game's "
      "time standing still for the second eye, so both eyes see the same moment; the world moves at half the game's "
      "rate. Accurate: the frame is drawn twice, once for each eye, true depth everywhere at the game's full rate, for about twice "
      "the GPU time. The desktop window shows the left eye in Balanced and the right eye in Accurate.", nullptr, false, true, -1, false, "vr_stereo"},
-    {TAB_VR, "Depth", &opts.vr_depth, 0, 200, 5, tx_percent,
+    {TAB_VRSET, "Field of view", &opts.vr_view_scale, 50, 200, 5, tx_percent,
+     "How much of the world the view takes in. The default, 100%, matches the headset's lenses exactly. Higher fits "
+     "more of the world into your view, so everything looks smaller; lower zooms in. Away from 100%, the world seems "
+     "to swim as you turn your head.", nullptr, false, true, -1, false, "vr_view_scale"},
+    {TAB_VRSET, "Depth", &opts.vr_depth, 0, 200, 5, tx_percent,
      "How far apart your eyes are in the game's world. 100% matches your own eyes; 0% shows both eyes the same flat "
      "picture.", nullptr, false, true, -1, false, "vr_depth"},
-    {TAB_VR, "Eye position", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},
-    {TAB_VR, "Height", &opts.vr_eye_up, -30, 30, 1, tx_cm_signed,
+    MENU_HEADING(TAB_VRSET, "Eye position"),
+    {TAB_VRSET, "Head Vertical", &opts.vr_eye_up, -30, 30, 1, tx_cm_signed,
      "Moves your eyes up or down from the height of Link's eyes.", nullptr, false, true, -1, false, "vr_eye_up"},
-    {TAB_VR, "Left and right", &opts.vr_eye_side, -30, 30, 1, tx_cm_signed,
+    {TAB_VRSET, "Head Horizontal", &opts.vr_eye_side, -30, 30, 1, tx_cm_signed,
      "Moves your eyes to Link's right (more) or left (less).", nullptr, false, true, -1, false, "vr_eye_side"},
-    {TAB_VR, "Forward", &opts.vr_eye_forward, -30, 30, 1, tx_cm_signed,
+    {TAB_VRSET, "Head Forward", &opts.vr_eye_forward, -30, 30, 1, tx_cm_signed,
      "Moves your eyes forward or back from Link's face.", nullptr, false, true, -1, false, "vr_eye_forward"},
-    {TAB_VR, "Cutscene height", &opts.vr_event_up, -50, 50, 1, tx_cm_signed,
-     "Moves your eyes up or down in cutscenes and conversations. They stand Link's height (a child's or an adult's) "
-     "above the game's camera.", nullptr, false, true, -1, false, "vr_event_up"},
-    {TAB_VR, "Controls", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},
-    // ((Triforce VR) the Control scheme and Play style rows are gone: the hand controllers and a gamepad both play at once, the
-    // hand controllers always with motion (their aim where the hand points), a gamepad as a pad: vk_xr_cfg answers so)
-    {TAB_VR, "Handedness", &opts.vr_handedness, 0, 1, 1, tx_vr_hand,
-     "Which hand holds the sword until you choose with your hands: drawing with both grips behind your head, the higher hand "
-     "takes the sword; raising the shield alone, that hand takes the shield.", nullptr, false, true, -1, false, "vr_handedness"},
-    {TAB_VR, "Pointing angle", &opts.vr_aim_tilt, 0, 60, 1, tx_degrees,
-     "Motion: how far below the controller's own pointing line your aim goes. Raise it if the aim sits above where you "
-     "point, lower it if below.", nullptr, false, true, -1, false, "vr_aim_tilt"},
-    {TAB_VR, "Swing speed", &opts.vr_swing_speed, 100, 500, 10, tx_cm_s,
-     "How fast your hand must move for a swing to count as a sword slash. Lower: gentler swings slash.", nullptr, false, true, -1, false, "vr_swing_speed"},
-    {TAB_VR, "Charge reach", &opts.vr_charge_reach, 25, 70, 1, tx_cm,
-     "How far out from your body a swing must leave your hand to keep charging the sword; bringing the hand back in "
-     "releases it. Lower suits shorter arms.", nullptr, false, true, -1, false, "vr_charge_reach"},
-    {TAB_VR, "Straight-ahead zone", &opts.vr_run_zone, 0, 20, 1, tx_degrees,
-     "Running forward in first person, Link runs dead straight while your head is within this many degrees of looking "
-     "straight ahead; turn it further and he follows your head. 0: he always follows your head.", nullptr, false, true, -1, false, "vr_run_zone"},
-    {TAB_VR, "HUD", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},
-    {TAB_VR, "HUD size", &opts.vr_hud_size, 40, 200, 5, tx_cm,
-     "The width of the HUD's panel, a metre in front of you.", nullptr, false, true, -1, false, "vr_hud_size"},
+    {TAB_VRSET, "Cutscene height", &opts.vr_event_up, -50, 50, 1, tx_cm_signed,
+     "Moves your eyes up or down from the game's own cutscene camera.", nullptr, false, true, -1, false, "vr_event_up"},
     // ---- Debug: the tools' switch, the tools themselves below it while they are on (cheat: menu_tick does what they do),
     // then the developer's rows ----
     {TAB_DEBUG, "Debug tools", &opts.debug_tools, 0, 1, 1, tx_onoff,
@@ -1476,6 +1489,23 @@ Row rows[] = {
     // host read them, some before the menu (host/nn_vi.c renodx_hdr= and steady_frame_rate=, vk_dlssg.cpp
     // dlss_frame_generation=). Their merged rows take the restarts (restart_value_of) ----
     {TAB_HIDDEN, "HDR", &opts.hdr, 0, 2, 1, tx_hdr, nullptr},
+    // ((Triforce VR) the saved values that VR mode and 3D Style's Mode stand for)
+    {TAB_HIDDEN, "VR", &opts.vr, 0, 1, 1, tx_onoff,
+     "Shows the game in a VR headset through OpenXR (for example WiVRn on Linux, SteamVR or Meta's runtime on "
+     "Windows), with the headset connected before the game starts. Applies after a restart.", nullptr, false, true, -1, false, "vr"},
+    {TAB_HIDDEN, "VR view", &opts.vr_view, 0, 1, 1, tx_vr_view,
+     "Immersive: the world surrounds you in play and in cutscenes, and the game's camera follows your head. Theater: "
+     "the game on a large screen floating in front of you. This menu always shows on the screen.", nullptr, false, true, -1, false, "vr_view"},
+    {TAB_HIDDEN, "Camera", &opts.vr_camera, 0, 1, 1, tx_vr_camera,
+     "First person: you see from Link's eyes, Link is hidden while what he holds stays in view, and he faces where you "
+     "look while he stands. Third person: the game's own camera, turned by your head.", nullptr, false, true, -1, false, "vr_camera"},
+    {TAB_HIDDEN, "3D on the screen", &opts.flat3d, 0, 5, 1, tx_flat3d,
+     "The game in 3D on a flat screen, without a headset (when VR is off or no headset is connected). Red/cyan: glasses with "
+     "a red and a cyan lens. Side by side (3D TV): each eye squeezed into its half, for a 3D TV's side by side mode. Crossed "
+     "eyes: the right eye's picture on the left, for viewing with crossed eyes. Above and below: each eye in its half, one "
+     "over the other. Side by side (Cardboard): each eye's whole picture in its own half, for a phone in a viewer such as "
+     "Google Cardboard, or for showing a stream in 3D; with this one, while VR runs, the desktop shows both of the headset's "
+     "eyes side by side.", nullptr, false, true, -1, false, "flat3d"},
     {TAB_HIDDEN, "RenoDX HDR", &opts.renodx, 0, 1, 1, tx_onoff, nullptr},
     {TAB_HIDDEN, "Frame generation", &opts.framegen, 0, framegen_rows::kRowMax, 1, tx_framegen, nullptr},
     {TAB_HIDDEN, "DLSS frame generation", &opts.dlssg, 0, 3, 1, tx_dlssg, nullptr},
@@ -1827,8 +1857,19 @@ const char* cheat_confirm(int i) {
 constexpr int kRows = sizeof rows / sizeof rows[0];
 
 int cur_tab = TAB_DISPLAY;
-int tab_selected[TAB_COUNT + 1] = {};   // (and the Motion page's)
+int tab_selected[TAB_VRSET + 1] = {};   // (and the pages the rows open: Motion, VR Controls, 3D Settings, VR Settings)
 bool is_motion_row(const Row& r) { return r.tab == TAB_CONTROLS && !r.value && !strcmp(r.name, "Motion"); }
+/// ((Triforce VR) the page a row opens (Controls: VR Controls; Display: 3D Settings, VR Settings), -1 none. Motion keeps its own
+int row_page(const Row& r) {
+    if (r.value || r.heading) return -1;
+    if (r.tab == TAB_CONTROLS && !strcmp(r.name, "VR Controls")) return TAB_VRPAGE;
+    if (r.tab == TAB_DISPLAY && !strcmp(r.name, "3D Settings")) return TAB_3DPAGE;
+    if (r.tab == TAB_DISPLAY && !strcmp(r.name, "VR Settings")) return TAB_VRSET;
+    return -1;
+}
+/// ((Triforce VR) a page a row opens: under its row's tab, Back to it
+bool sub_page(int tab) { return tab == TAB_MOTION || tab == TAB_VRPAGE || tab == TAB_3DPAGE || tab == TAB_VRSET; }
+int page_parent(int tab) { return tab == TAB_3DPAGE || tab == TAB_VRSET ? TAB_DISPLAY : sub_page(tab) ? TAB_CONTROLS : tab; }
 
 // (Triforce) The System tab's rows that act on a press, after NX2navi's: Export save, Export save for a bug report, Import a
 // save and Bug capture. The work is the host's, on a thread of its own (host/save_share.c, host/bug_capture.c): a press leaves
@@ -1893,6 +1934,7 @@ int restart_value_of(const Row& r) {
     if (r.value == &merged.hdr) return opts.hdr == 2 && opts.renodx ? 1 : 0;
     if (r.value == &merged.framegen) return opts.dlssg;
     if (r.value == &merged.pacing) return opts.steady_fps;
+    if (r.value == &merged.view3d) return opts.vr;   // ((Triforce VR) VR on or off alone: the 3D styles apply at once)
     if (r.value == &opts.resolution) return opts.resolution + (ur::full_scale(opts.dlss) ? 100 : 0);
     return *r.value;
 }
@@ -1974,6 +2016,8 @@ void merged_sync() {
     merged.framegen = mr7::framegen_row(opts.framegen, opts.dlssg);
     merged.pacing = mr7::pacing_row(opts.pace, opts.steady_fps);
     merged.latency = mr7::latency_row(latency_vendor(), opts.reflex, opts.antilag);
+    merged.vr_mode = !opts.vr_view ? 0 : opts.vr_camera ? 1 : 2;   // (Theater; Immersive: third person; Full Dive: first)
+    merged.view3d = opts.vr ? 1 : opts.flat3d > 0 ? opts.flat3d + 1 : 0;
 }
 /// ...and a merged row's new value into the saved ones it stands for
 void merged_store(const int* v) {
@@ -1981,6 +2025,8 @@ void merged_store(const int* v) {
     if (v == &merged.framegen) mr7::framegen_set(merged.framegen, opts.framegen, opts.dlssg);
     if (v == &merged.pacing) mr7::pacing_set(merged.pacing, opts.pace, opts.steady_fps);
     if (v == &merged.latency) mr7::latency_set(merged.latency, latency_vendor(), opts.reflex, opts.antilag);
+    if (v == &merged.vr_mode) opts.vr_view = merged.vr_mode > 0, opts.vr_camera = merged.vr_mode == 1;
+    if (v == &merged.view3d) opts.vr = merged.view3d == 1, opts.flat3d = merged.view3d >= 2 ? merged.view3d - 1 : 0;
 }
 /// A merged row's next value from v (dir): its choices here
 int merged_step(const int* value, int v, int dir) {
@@ -1988,8 +2034,9 @@ int merged_step(const int* value, int v, int dir) {
         if (!framegen_count) framegen_row_sync();
         return mr7::step_in(framegen_list, framegen_count, v, dir);
     }
-    int list[4], n = 0;
-    const int hi = value == &merged.hdr ? (renodx_built() ? 3 : 2) : value == &merged.pacing ? 3 : mr7::latency_hi(latency_vendor());
+    int list[8], n = 0;
+    const int hi = value == &merged.vr_mode ? 2 : value == &merged.view3d ? 6 : value == &merged.hdr ? (renodx_built() ? 3 : 2)
+                 : value == &merged.pacing ? 3 : mr7::latency_hi(latency_vendor());
     for (int k = 0; k <= hi; k++) list[n++] = k;
     return mr7::step_in(list, n, v, dir);
 }
@@ -2103,7 +2150,7 @@ constexpr int64_t kMarqueeStep = 150000000LL, kMarqueeRest = 1200000000LL;   // 
 int hover_tab = -1;
 int drag_row = -1;
 bool mouse_read = false;   // (the menu has read the mouse since it opened)
-bool is_slider(const Row& r) { return r.value == &opts.sharpness || r.value == &opts.mouse_sens || r.value == &opts.gyro_sens_x || r.value == &opts.gyro_sens_y || (r.tab == TAB_VR && r.value && r.hi - r.lo > 2); }
+bool is_slider(const Row& r) { return r.value == &opts.sharpness || r.value == &opts.mouse_sens || r.value == &opts.gyro_sens_x || r.value == &opts.gyro_sens_y || ((r.tab == TAB_VRSET || r.tab == TAB_VRPAGE) && r.value && r.hi - r.lo > 2); }
 /// (a scale: the arrows and a click stop at its ends; Rumble strength would go from Off to its strongest)
 bool stops_at_ends(const Row& r) { return r.value == &opts.mouse_sens || r.value == &opts.rumble || r.value == &opts.rumble_curve || r.value == &opts.lstick_dead_zone || r.value == &opts.rstick_dead_zone || r.value == &opts.walk_scale || r.value == &opts.gyro_sens_x || r.value == &opts.gyro_sens_y; }
 /// (the ini's Rumble strength on the menu's steps: 0 to 300, the nearest 25)
@@ -2137,13 +2184,13 @@ const VrKey vr_keys[] = {
     {"VR_EYE_SIDE", &opts.vr_eye_side, nullptr},
     {"VR_EYE_FORWARD", &opts.vr_eye_forward, nullptr},
     {"VR_EVENT_UP", &opts.vr_event_up, nullptr},
+    {"VR_CUTSCENES", &opts.vr_cutscenes, "classic|first"},
     {"VR_CONTROLS", &opts.vr_controls, "gamepad|meta"},
     {"VR_HANDEDNESS", &opts.vr_handedness, "left|right"},
     {"VR_PLAY", &opts.vr_play, "stationary|motion"},
     {"VR_AIM_TILT", &opts.vr_aim_tilt, nullptr},
     {"VR_SWING_SPEED", &opts.vr_swing_speed, nullptr},
     {"VR_CHARGE_REACH", &opts.vr_charge_reach, nullptr},
-    {"VR_RUN_ZONE", &opts.vr_run_zone, nullptr},
     {"VR_HUD", &opts.vr_hud, "panel|picture"},
     {"VR_HUD_SIZE", &opts.vr_hud_size, nullptr},
     {"VR_BODY", &opts.vr_body, "hidden|arms"},
@@ -2698,13 +2745,13 @@ struct PerfView {
     perf_stats::Base base;
 } perf_view;
 menu_hit::Map hits;      // (the menu's controls as last drawn: the mouse's, menu_tick)
-float scroll_at[TAB_MOTION + 2];   // (the first row shown, eased toward the selection: the options' tabs and the Motion page, then
+float scroll_at[TAB_VRSET + 2];   // (the first row shown, eased toward the selection: the options' tabs and the Motion page, then
                                    // the Controls page: kControlsSlot)
-constexpr int kControlsSlot = TAB_MOTION + 1;
-int wheel_rows[TAB_MOTION + 2];   // (the mouse wheel's notches since the last drawing, a slot each: scroll_rows scrolls by them)
-int scrolled_to[TAB_MOTION + 2] = {-1, -1, -1, -1, -1, -1, -1, -1, -1};   // (the selection scroll_rows last brought into view)
-static_assert(TAB_MOTION + 2 == 9, "scrolled_to: a slot for each tab, the Motion page and the Controls page");
-float scroll_want[TAB_MOTION + 2];   // (where scroll_at is going: the wheel moves it, a new selection too)
+constexpr int kControlsSlot = TAB_VRSET + 1;
+int wheel_rows[TAB_VRSET + 2];   // (the mouse wheel's notches since the last drawing, a slot each: scroll_rows scrolls by them)
+int scrolled_to[TAB_VRSET + 2] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};   // (the selection scroll_rows last brought into view)
+static_assert(TAB_VRSET + 2 == 12, "scrolled_to: a slot for each tab, each page a row opens and the Controls page");
+float scroll_want[TAB_VRSET + 2];   // (where scroll_at is going: the wheel moves it, a new selection too)
 float ease_step = 0;     // (this drawing's share of the way: the time since the last one)
 bool ease_live = false;  // ((Triforce) menu_record steps the easing: a window's frames. Without them a still is drawn settled)
 
@@ -3105,7 +3152,8 @@ void draw_tabs(ui::Ctx& c, int sel, bool game, bool hit) {
     // it is an entry of its own under the game's System list and the title's, kModsRowPage)
     int entry[TAB_COUNT + 2], tabs = 0;
     if (game) entry[tabs++] = -1;
-    for (int t = 0; t < TAB_DEBUG; t++) entry[tabs++] = t;
+    for (int t = 0; t < TAB_DEBUG; t++)
+        if (t != TAB_VR) entry[tabs++] = t;   // ((Triforce VR) its rows are Display's VR Settings page now
     if (debug_shown()) entry[tabs++] = TAB_DEBUG;
     const float ty = ui::at(c, 0, 998).y, step = ui::lu(c, tabs > 7 ? 320 : tabs > 6 ? 350 : tabs > 5 ? 400 : 460), tpx = ui::lu(c, 54 * ui::kType);
     const float tx0 = c.w * 0.5f - step * (tabs - 1) * 0.5f;
@@ -3155,7 +3203,7 @@ void draw_options(ui::Ctx& c) {
     const float s = c.s, hh = banner_h(c);
     header_layer(c, true);   // ((Triforce, 11-19) over the Full panel inside the game's Options screen: draw_menu)
     ui::banner(c, hh);
-    draw_tabs(c, cur_tab == TAB_MOTION ? TAB_CONTROLS : cur_tab, embed_open, true);   // (the Motion page: under Controls)
+    draw_tabs(c, page_parent(cur_tab), embed_open, true);   // (the Motion page: under Controls)
     header_layer(c, false);
     // the rows, in the column; the caption beside it
     float cx0, cx1, hx0, hx1;
@@ -3179,7 +3227,7 @@ void draw_options(ui::Ctx& c) {
     if (!selr.value) prompt_list[0] = {ui::kConfirm, confirms ? (pending == &selr ? "Confirm" : selr.name) : "Open"};
     if (share_row(selr)) prompt_list[0] = {ui::kConfirm, share_label(share_row(selr))};
     if (sel_cheat >= 0) prompt_list[0] = {ui::kLeftRight, "Change"};   // (Triforce: a mod's cheat, On | Off)
-    if (cur_tab == TAB_MOTION) prompt_list[1] = {ui::kBack, "Back"}, prompts_n = 2;   // (Esc: to Controls)
+    if (sub_page(cur_tab)) prompt_list[1] = {ui::kBack, "Back"}, prompts_n = 2;   // (Esc: to Controls)
     if (selr.cheat >= 0) {   // (a debug tool: Change when Left and Right do something, then what confirm does)
         prompts_n = 0;
         if (selr.cheat <= 1 || selr.cheat == 7 || cheat_chooses(selr.cheat) || age_shown(selr.cheat))
@@ -5881,9 +5929,9 @@ static menu_sound::State sound_state() {
     s.open = open_now.load();
     if (!s.open) return s;
     s.embedded = embed_open || game_options_shown();
-    const bool motion = page == 0 && cur_tab == TAB_MOTION;
+    const bool motion = page == 0 && sub_page(cur_tab);
     s.page = motion ? kSoundPageMotion : page;
-    s.tab = motion ? (int)TAB_CONTROLS : cur_tab;
+    s.tab = motion ? page_parent(cur_tab) : cur_tab;
     auto hashed = [](const std::string& t) {
         int64_t h = 1469598103934665603LL;
         for (const char ch : t) h = (h ^ (unsigned char)ch) * 1099511628211LL;
@@ -6412,9 +6460,10 @@ void mods_open_page();   // ((Triforce) below: the Mods screen opened, its searc
 /// ours to System, Mods, Debug when shown; inside the game's Options, past either end is the game's own tab again
 void tab_move(int dir) {
     int entry[TAB_COUNT + 2], n = 0;
-    for (int t = 0; t < TAB_DEBUG; t++) entry[n++] = t;
+    for (int t = 0; t < TAB_DEBUG; t++)
+        if (t != TAB_VR) entry[n++] = t;
     if (debug_shown()) entry[n++] = TAB_DEBUG;
-    const int from = page == kModsPage ? kModsTab : cur_tab == TAB_MOTION ? TAB_CONTROLS : cur_tab;
+    const int from = page == kModsPage ? kModsTab : page_parent(cur_tab);
     int at = 0;
     while (at < n - 1 && entry[at] != from) at++;
     if (embed_open && ((dir < 0 && at == 0) || (dir > 0 && at == n - 1))) {
@@ -7078,7 +7127,7 @@ void menu_tick() {
         if (go[0] || go[1] || clicked_tab >= 0) {
             const int64_t open0 = prof_now();   // ((Triforce) the open's own work, logged at the first: nothing of it should wait)
             open_now = true, embed_open = true, page = 0, listening = 0;
-            cur_tab = clicked_tab >= 0 ? clicked_tab : go[1] ? TAB_DISPLAY : tabs_shown() - 1;
+            cur_tab = clicked_tab >= 0 ? clicked_tab : go[1] ? TAB_DISPLAY : debug_shown() ? TAB_DEBUG : TAB_SYSTEM;
             auto_pad = pad_last;
             ui::want_glyphs();
             opts.pad_layout = detect_pad_layout();
@@ -7436,13 +7485,13 @@ void menu_tick() {
             // values change by a click on their arrows or halves, a slider's drag, Left and Right, A and Enter)
             if (ptr.wheel && drag_row < 0) wheel_rows[cur_tab] += ptr.wheel, changed = true;
         }
-        if (press[5] && cur_tab == TAB_MOTION) cur_tab = TAB_CONTROLS, press[5] = false, changed = true;   // (back)
+        if (press[5] && sub_page(cur_tab)) cur_tab = page_parent(cur_tab), press[5] = false, changed = true;   // (back)
         if (press[5] && pending) pending = nullptr, changed = true;   // (a Restart or Quit waiting for its second press: cancelled)
-        else if (press[5] && cur_tab == TAB_MOTION) cur_tab = TAB_CONTROLS, press[5] = false, changed = true;   // (back)
+        else if (press[5] && sub_page(cur_tab)) cur_tab = page_parent(cur_tab), press[5] = false, changed = true;   // (back)
         else if (press[5] && restart_ask()) page = 5, ask_sel = 0, changed = true;   // (the restart question first)
         else if (press[5]) open_now = false;
         // (the tabs: LB and RB, Q and E, or Tab; from the Motion page, as from Controls)
-        if ((tab_left || tab_right) && cur_tab == TAB_MOTION) cur_tab = TAB_CONTROLS;
+        if ((tab_left || tab_right) && sub_page(cur_tab)) cur_tab = page_parent(cur_tab);
         if (tab_left || tab_right) {   // (inside the game's Options: past our first or last tab is the game's own again; Mods
                                        // after System: tab_move)
             tab_move(tab_left ? -1 : 1);
@@ -7478,6 +7527,7 @@ void menu_tick() {
         else if (press[7] && share_row(r)) share_press(share_row(r)), press[7] = false, changed = true;   // (Triforce: the host does it)
         else if (press[7] && is_ach_row(r)) page = kAchPage, ach_view.reveal(ach_capacity), press[7] = false, changed = true;
         else if (press[7] && is_motion_row(r)) cur_tab = TAB_MOTION, tab_selected[TAB_MOTION] = 0, press[7] = false, changed = true;
+        else if (press[7] && row_page(r) >= 0) cur_tab = row_page(r), tab_selected[cur_tab] = 0, press[7] = false, changed = true;
         else if (press[7] && !r.value && can_bind()) page = 1, csel = 0, ccol = 0, changed = true;
         if ((press[3] || press[4] || press[7]) && r.value) {   // (Enter, or A, as Right)
             if (press[7]) press[4] = true;
@@ -7757,6 +7807,8 @@ extern "C" const char* vk_xr_cfg(const char* key) {
     // ((Triforce VR) the hand controllers always play, with motion; a gamepad alongside them as a pad (no rows for these now)
     if (!strcmp(key, "VR_CONTROLS")) return "meta";
     if (!strcmp(key, "VR_PLAY")) return "motion";
+    // ((Triforce VR) the sword hand before a draw chooses one: Controls' Right handed Link (no VR row for it now)
+    if (!strcmp(key, "VR_HANDEDNESS")) return mkwvk::opts.right_handed ? "right" : "left";
     if (!strcmp(key, "VR_MIRROR")) {   // ((Triforce VR) Link mirrored for what the hands last did, "" before: vk_xr.cpp)
         const int v = vk_xr_live_mirror();
         return v < 0 ? "" : v ? "on" : "off";

@@ -160,18 +160,18 @@ struct Options {
     int flat3d = 0;             // (Triforce) Flatscreen 3D without a headset: 0 off, 1 red/cyan, 2 side by side, 3 crossed eyes, 4 above and below, 5 Cardboard
     int flat3d_depth = 250;     // its eyes' distance, percent of 6.4 cm
     int flat3d_screen = 0;      // the screen's distance in cm, 0 the nearest thing in the picture's middle
-    int vr_resolution = 0;      // (Triforce VR) the 3D's size while VR is on: 0 the Graphics tab's Render resolution, else its values
+    int vr_resolution = 1;      // (Triforce VR) the 3D's size while VR is on: 0 the Graphics tab's Render resolution, else its values
     int vr_stereo = 1;          // 0 Performant (each eye from one picture and its depth), 1 Balanced (eyes in turn, the game's time held)
     int vr_depth = 100;         // the eyes' distance, percent of the wearer's own (0 to 200)
     int vr_eye_up = 0, vr_eye_side = 0, vr_eye_forward = 0;   // first person: the eyes moved from Link's, cm (-30 to 30)
-    int vr_event_up = 0;        // cutscenes: the eyes raised this many cm more (-50 to 50)
+    int vr_event_up = 0;        // cutscenes: the eyes raised this many cm (-50 to 50)
+    int vr_cutscenes = 1;       // Full Dive: cutscenes from 0 the game's camera (Classic), 1 Link's eyes
     int vr_controls = 0;        // 0 a gamepad, 1 the Touch controllers
     int vr_handedness = 0;      // the sword hand: 0 left, 1 right
     int vr_play = 0;            // 0 Stationary (the game's own gear and aim), 1 Motion (the gear in the hands)
     int vr_aim_tilt = 35;       // Motion's pointed aim: the controller's ray tilted down, degrees (0 to 60)
     int vr_swing_speed = 230;   // a sword swing's hand speed, cm a second (100 to 500)
-    int vr_charge_reach = 45;   // how far out from the head a swing must leave the hand to hold the charge, cm (25 to 70)
-    int vr_run_zone = 5;        // first person: running goes straight while the head is within this many degrees (0 to 20)
+    int vr_charge_reach = 35;   // how far out from the head a swing must leave the hand to hold the charge, cm (25 to 70)
     int vr_hud = 0;             // 0 a panel in front of the head, 1 left in the picture
     int vr_hud_size = 100;      // the HUD panel's width, cm a metre away (40 to 200)
     int vr_body = 1;            // first person: 0 Link hidden, 1 his arms on the controllers and his head hidden (host/vr_body.c)

@@ -98,9 +98,16 @@ static int player_rot(float m[9]) {
 
 /* an event plays (a cutscene, a conversation): the event manager's singleton (main+0x4c7e090) holds the manager, whose +104
    is the event running, 0 when none. The event camera updates every frame whether one plays or not. */
-static int oot_event_playing(void) {
+static uint64_t oot_event(void) {
     const uint64_t singleton = rd_ptr(OOT_DATA_MAIN + 0x4c7e090), events = singleton ? rd_ptr(singleton) : 0;
-    return events && rd_ptr(events + 104) != 0;
+    return events ? rd_ptr(events + 104) : 0;
+}
+static int oot_event_playing(void) { return oot_event() != 0; }
+/* ((Triforce VR) the event's name, kept in the event at +0x14: "Dm_SY_BancChangeGo", "Npc_Hylia_Talon_Child_D_T"...) */
+static void oot_event_name(uint64_t event, char out[64]) {
+    out[0] = 0;
+    if (!event || !rd(event + 0x14, out, 63)) out[0] = 0;
+    out[63] = 0;
 }
 /* Link's state's name (his component 107's name at +at: 0x244 his state, "Wait", "CrouchGuard"...; 0x34c his upper body's,
    "BowChargeUpper"...), "" when there is none */
@@ -161,7 +168,27 @@ static int first_person_eye(double eye[3]) {
        Quest 3 against his body with only his head hidden (the earlier 1.45 m and 18 cm sat 28 cm low and 12 cm ahead of
        it; hidden's 1.80 m and 8 cm was a guess with his model in the way); young Link scaled alike, 1.19 m and 4 cm) */
     const int child = oot_childhood();
-    const double up = (child ? 1.19 : 1.73) + cfg_int("VR_EYE_UP") / 100.0;
+    double up = (child ? 1.19 : 1.73) + cfg_int("VR_EYE_UP") / 100.0;
+    {   /* ((Triforce VR) crouched (a crawlspace too: Crouch, CrouchLockOnMove...): the eyes down by as much as his neck is
+           below its height standing still, eased over about a tenth of a second) */
+        static double stand = -1, drop, target;
+        static int stand_child = -1;
+        static uint64_t at;
+        char state[48];
+        oot_link_state_at(state, 0x244);
+        const int crouch = !strncmp(state, "Crouch", 6);
+        double neck;
+        const int have = vr_body_neck_height(&neck);
+        if (child != stand_child) stand = -1, stand_child = child;
+        if (have && !strcmp(state, "Wait")) stand = stand < 0 ? neck : stand + 0.05 * (neck - stand);
+        if (!crouch) target = 0;
+        else if (have && stand > 0) target = fmax(0.0, stand - neck);
+        const uint64_t t = now_ns();
+        const double dt = at ? (t - at) / 1e9 : 0;
+        at = t;
+        drop += (target - drop) * (dt > 0 && dt < 0.5 ? 1.0 - exp(-dt / 0.1) : 1.0);
+        up -= drop;
+    }
     const double ahead = (child ? 0.04 : 0.06) + cfg_int("VR_EYE_FORWARD") / 100.0, side = cfg_int("VR_EYE_SIDE") / 100.0;
     eye[0] = feet[0] + ahead * fx - side * fz;   /* his right: (-fz, 0, fx) */
     eye[1] = feet[1] + up;
@@ -318,7 +345,7 @@ static void vr_tick(Ctx *c, const MkwVkXr *x) {
 }
 
 /* First person play: the left stick runs Link the way it points (forward, back or sideways) from the head's view, with no ZL.
-   Within VR_RUN_ZONE degrees of the head's rest the way is from the game's own camera instead. turn_link faces him that way. */
+   turn_link faces him that way. */
 static double head_s, head_c = 1;   /* the head's view's level direction (sin, cos of its yaw), from the last camera update */
 static double base_s, base_c = 1;   /* the game's own camera's, before the head turned it */
 static double run_s, run_c = 1;     /* the way a run straight ahead takes */
@@ -335,17 +362,8 @@ static void vr_pad(uint64_t *buttons, int32_t *lx, int32_t *ly) {
     if (now_ns() - fp_at > 200000000ull) return;
     const int64_t m2 = (int64_t)*lx * *lx + (int64_t)*ly * *ly;
     if (m2 < (int64_t)8000 * 8000) return;
-    const double zone = cfg_int("VR_RUN_ZONE") * M_PI / 180.0;
-    const double off = atan2(head_s * base_c - head_c * base_s, head_c * base_c + head_s * base_s);
-    const int rest = fabs(off) < zone;
-    const double fs = rest ? base_s : head_s, fc = rest ? base_c : head_c;
-    /* the stick's way from the forward (fs, fc) and right (-fc, fs) */
-    const double wx = fs * *ly - fc * *lx, wz = fc * *ly + fs * *lx;
-    if (rest) {
-        const double f = wx * head_s + wz * head_c, r = -wx * head_c + wz * head_s;
-        *ly = (int32_t)fmax(-32767, fmin(32767, f));
-        *lx = (int32_t)fmax(-32767, fmin(32767, r));
-    }
+    /* the stick's way from the head's forward (head_s, head_c) and right (-head_c, head_s) */
+    const double wx = head_s * *ly - head_c * *lx, wz = head_c * *ly + head_s * *lx;
     const double n = sqrt(wx * wx + wz * wz);
     run_s = wx / n, run_c = wz / n, run_at = now_ns();
 }
@@ -563,6 +581,42 @@ int vr_holds_time(void) {
     return x && x->holds_time();
 }
 
+/* ((Triforce VR) how the event playing is seen, by its name and Link's state: from Link's eyes always (load zones, a void out,
+   the castle guards' throw-out, a conversation, getting an item, showing one), with the HUD panel hidden for a transition,
+   or as the Cutscenes row says (classic: the events' camera) */
+enum { EV_CUTSCENE, EV_EYES, EV_EYES_NO_HUD };
+static int event_view(uint64_t event) {
+    static uint64_t was;
+    static char name[64];
+    static int shot, flinched;   /* (this event: Link has been in a directed shot's state; in the guards' flinch) */
+    if (event != was) {
+        oot_event_name(event, name);
+        was = event, shot = flinched = 0;
+    }
+    char state[48];
+    oot_link_state_at(state, 0x244);
+    const size_t n = strlen(name);
+    /* the system's events (a load zone's two halves, Dm_SY_BancChangeGo and ..._Arrive_<place>; a void out, DmF_SY_FallDown) */
+    if (strstr(name, "_SY_") || strstr(name, "BancChange")) return EV_EYES_NO_HUD;
+    /* caught by the castle's guards: the talk, then the throw-out to the gate (from his flinch's end on) */
+    if (!strcmp(name, "HyruleCastle_FoundBySecurity")) {
+        if (!strcmp(state, "EvtFlinchLong")) flinched = 1;
+        else if (flinched) return EV_EYES_NO_HUD;
+        return EV_EYES;
+    }
+    /* showing an item (ShowItem with no one to show it to; EvtShowItemSuccess at the start of the one it is shown to) */
+    if (!strcmp(name, "ShowItem") || !strncmp(state, "EvtShowItem", 11)) return EV_EYES;
+    /* getting an item (an event of its own, its name ending _D_S) */
+    if (n > 4 && !strcmp(name + n - 4, "_D_S")) return EV_EYES;
+    /* a conversation (_D_T), until Link is in a directed shot's state (C and a number: C06, C08_Loop...): a lesson's
+       cutscene from there on */
+    if (n > 4 && !strcmp(name + n - 4, "_D_T")) {
+        if (state[0] == 'C' && state[1] >= '0' && state[1] <= '9') shot = 1;
+        if (!shot) return EV_EYES;
+    }
+    return strcmp(cfg_value("VR_CUTSCENES"), "first") ? EV_CUTSCENE : EV_EYES;
+}
+
 void hos_vr_camera(Ctx *c) {
     static const int up_reg[3] = {7, 16, 6};
     const MkwVkXr *x = xr();
@@ -570,7 +624,10 @@ void hos_vr_camera(Ctx *c) {
     if (scene != 1 && scene != 2) return;
     if (rx_option(HOS_OPT_CHEAT_CAMERA, 0)) return;   /* (the Debug tab's free camera has it) */
     hooks_on = 1;
-    const int event = oot_event_playing();
+    const uint64_t event_now = oot_event();
+    const int event = event_now != 0;
+    const int view = event ? event_view(event_now) : EV_CUTSCENE;
+    if (x->hud_hidden) x->hud_hidden(view == EV_EYES_NO_HUD);
     const int k = scene - 1;
     if (scene == 1) head_camera = 0;
     if (scene == 2 ? !event : event) return;   /* the camera that shows: Link's in play, the events' in an event */
@@ -612,8 +669,14 @@ void hos_vr_camera(Ctx *c) {
         for (int i = 0; i < 3; i++) at[i] += eye[i] - pos[i], pos[i] = eye[i];
         fp_eye = 1;
     }
-    if (scene == 2) {   /* an event's camera raised by Link's height for his age, and VR_EVENT_UP cm more */
-        const double lift = (oot_childhood() ? 1.27 : 1.80) + cfg_int("VR_EVENT_UP") / 100.0;
+    if (scene == 2 && view != EV_CUTSCENE && x->head_active() && first_person_eye(eye)) {
+        /* ((Triforce VR) an event seen from Link's eyes: facing as the gameplay camera last did, the head turning from there) */
+        for (int i = 0; i < 3; i++) pos[i] = eye[i];
+        at[0] = eye[0] + base_s, at[1] = eye[1], at[2] = eye[2] + base_c;
+        up[0] = 0, up[1] = 1, up[2] = 0;
+        fp_eye = 1;
+    } else if (scene == 2) {   /* an event's camera, VR_EVENT_UP cm up */
+        const double lift = cfg_int("VR_EVENT_UP") / 100.0;
         pos[1] += lift, at[1] += lift;
     }
     x->update_step(step_seconds < 0 ? -1 : update_seconds());
@@ -621,6 +684,7 @@ void hos_vr_camera(Ctx *c) {
     for (int i = 0; i < 3; i++) set_d(c, i, pos[i]), set_d(c, 3 + i, at[i]), set_s(c, up_reg[i], up[i]);
     memcpy(out_pos[k], pos, sizeof pos), memcpy(out_at[k], at, sizeof at), have_out[k] = 1;
     head_camera = c->x[19];
+    if (fp_eye) fp_eye_at = now_ns();   /* (vr_body.c: his head hidden; his arms on the controllers in play alone: the anchor) */
     if (scene != 1) return;   /* Link turns in play alone */
     {   /* (vr_body.c: where Link stood for this view, the hands' anchor; and first person's eyes on him) */
         float feet[3];
@@ -630,7 +694,6 @@ void hos_vr_camera(Ctx *c) {
             anchor_at = now_ns();
             ReleaseSRWLockExclusive(&anchor_lock);
         }
-        if (fp_eye) fp_eye_at = now_ns();
     }
     const double ahead[3] = {at[0] - pos[0], at[1] - pos[1], at[2] - pos[2]};
     turn_link(ahead);

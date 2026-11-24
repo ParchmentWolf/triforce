@@ -33,7 +33,12 @@
 #include <cctype>
 #include <string>
 #include <vector>
+#ifndef _WIN32
+#include <dirent.h>
+#include <unistd.h>
+#endif
 
+#include "vk_pace.h"
 #include "vk_paths.h"
 #include "vk_present_rect.h"
 #include "shaders/xr_aim_comp_spv.h"
@@ -267,6 +272,7 @@ struct Xr {
     std::atomic<bool> ocarina{false};   // vr_game.c: Link plays the ocarina (the controllers' Ocarina mode)
     std::atomic<bool> weapon_out{false};   // vr_game.c: Link holds his sword and shield (or another weapon) out
     std::atomic<bool> child{true};         // vr_game.c: Link is a child (his hands' model)
+    std::atomic<int> hud_hidden{0};        // ((Triforce VR) vr_game.c: no HUD panel now (a load zone's transition)
     std::atomic<int> head_worn{0};         // ((Triforce VR) vr_game.c: 0 nothing on his head, 1 a mask, 2 the Lens of Truth)
     std::atomic<bool> in_play{false};      // vr_game.c: play (not a menu, a pause, an event): the grips' and swing's play roles
     // the last picture drawn from the head whose world scene8 and eye8 still hold (the present's thread alone): a paused
@@ -330,6 +336,67 @@ extern "C" int vk_xr_row_on(void) {
     return v != 0;
 }
 
+#ifndef _WIN32
+namespace {
+/// ((Triforce VR) Linux: the VR server running now and its own runtime manifest, read through the process (/proc/<pid>/root, so
+/// a Flatpak's as a system install's): WiVRn and Monado keep it at <bin>/../share/openxr/1/, SteamVR (ALVR streams through it)
+/// at <SteamVR>/steamxr_linux64.json beside bin/linux64/vrserver. The oldest server of a kind: a second one is a leftover.
+/// False: none runs
+bool running_runtime(std::string &manifest, std::string &who) {
+    struct Kind { const char *comm, *name; int up; const char *file; };
+    static const Kind kinds[] = {{"wivrn-server", "WiVRn", 1, "share/openxr/1/"}, {"monado-service", "Monado", 1, "share/openxr/1/"},
+                                 {"vrserver", "SteamVR", 3, "steamxr_linux64.json"}};
+    DIR *proc = opendir("/proc");
+    if (!proc) return false;
+    long best_pid = 0;
+    int best_kind = -1;
+    while (dirent *e = readdir(proc)) {
+        char *end;
+        const long pid = strtol(e->d_name, &end, 10);
+        if (*end || pid <= 0) continue;
+        char path[64], comm[32] = "";
+        snprintf(path, sizeof path, "/proc/%ld/comm", pid);
+        if (FILE *f = fopen(path, "r")) {
+            if (!fgets(comm, sizeof comm, f)) comm[0] = 0;
+            fclose(f);
+        }
+        comm[strcspn(comm, "\n")] = 0;
+        for (int k = 0; k < (int)(sizeof kinds / sizeof kinds[0]); k++)
+            if (!strcmp(comm, kinds[k].comm) && (best_kind < 0 || k < best_kind || (k == best_kind && pid < best_pid)))
+                best_kind = k, best_pid = pid;
+    }
+    closedir(proc);
+    if (best_kind < 0) return false;
+    const Kind &k = kinds[best_kind];
+    who = k.name;
+    char link[64], exe[1024];
+    snprintf(link, sizeof link, "/proc/%ld/exe", best_pid);
+    const ssize_t n = readlink(link, exe, sizeof exe - 1);
+    if (n <= 0) return true;   // (running, its manifest not found: the loader's own choice)
+    exe[n] = 0;
+    std::string dir(exe);
+    for (int i = 0; i < k.up + 1 && dir.find('/') != std::string::npos; i++) dir.erase(dir.find_last_of('/'));
+    // (the path as this process sees it where it is there, a system or Steam install's; else through the server's own root, a
+    // Flatpak's /app)
+    const std::string plain = dir + "/" + k.file;
+    const std::string at = plat_file_exists(plain.c_str()) ? plain : "/proc/" + std::to_string(best_pid) + "/root" + plain;
+    if (at.back() != '/') {
+        if (plat_file_exists(at.c_str())) manifest = at;
+        return true;
+    }
+    if (DIR *d = opendir(at.c_str())) {   // (the first manifest there)
+        while (dirent *f = readdir(d))
+            if (strstr(f->d_name, ".json")) {
+                manifest = at + f->d_name;
+                break;
+            }
+        closedir(d);
+    }
+    return true;
+}
+}   // namespace
+#endif
+
 namespace {
 
 bool init() {
@@ -355,15 +422,23 @@ bool init() {
     }
     if (!lib) lib = plat_lib_open("openxr_loader.dll");
 #else
-    // WiVRn installed from Flathub registers no runtime for programs outside the sandbox: its manifest is used when no
-    // runtime is named
+    // ((Triforce VR) The VR server running decides (running_runtime), waited for up to 5 s: none, and the game starts on the
+    // flat screen rather than wait on a runtime with no server (the loader's choice can hang there). Its own manifest is used,
+    // so a Flatpak's WiVRn, which registers no runtime outside its sandbox, works as a system one. XR_RUNTIME_JSON set: as named
     char named[8];
     if (!plat_getenv("XR_RUNTIME_JSON", named, sizeof named)) {
-        static const char *wivrn = "/var/lib/flatpak/app/io.github.wivrn.wivrn/current/active/files/share/openxr/1/openxr_wivrn.json";
-        if (plat_file_exists(wivrn)) {
-            plat_setenv("XR_RUNTIME_JSON", wivrn);
-            rt_log("vr: XR_RUNTIME_JSON unset: WiVRn's Flatpak runtime, %s", wivrn);
+        std::string manifest, who;
+        bool found = false;
+        for (int i = 0; i < 50 && !(found = running_runtime(manifest, who)); i++) {
+            if (!i) rt_log("vr: no VR server running (WiVRn, Monado, SteamVR or ALVR): waiting up to 5 s");
+            usleep(100000);
         }
+        if (!found) {
+            rt_log("vr: no VR server running after 5 s: the flat screen (start WiVRn, Monado, SteamVR or ALVR before the game)");
+            return false;
+        }
+        if (!manifest.empty()) plat_setenv("XR_RUNTIME_JSON", manifest.c_str());
+        rt_log("vr: %s runs: its runtime %s", who.c_str(), manifest.empty() ? "as the system registers it" : manifest.c_str());
     }
     void *lib = plat_lib_open("libopenxr_loader.so.1");
 #endif
@@ -2094,7 +2169,7 @@ void run(void *) {
         }
         // the paused game's menus go on the HUD's panel, over the world as it was
         const bool show_menu = shown_drawn.tracked && shown_drawn.menu && hud_has && hud_swapchain;
-        const bool show_hud = shown_drawn.tracked && shown_drawn.hud && hud_has && hud_swapchain;
+        const bool show_hud = shown_drawn.tracked && shown_drawn.hud && hud_has && hud_swapchain && !x.hud_hidden.load();
         const XrCompositionLayerBaseHeader *screen = curved ? (const XrCompositionLayerBaseHeader *)&curve
                                                             : (const XrCompositionLayerBaseHeader *)&quad;
         const XrCompositionLayerBaseHeader *layers[] = {shown_drawn.tracked ? (const XrCompositionLayerBaseHeader *)&proj
@@ -2652,8 +2727,9 @@ extern "C" int vk_xr_wants_capture(int hdr) {
     Xr &x = xr();
     if (!x.ok || !x.timeline) return 0;
     const bool head = vk_xr_head_wanted();
-    // (this menu over the game's own Options screen stays in the head's view, the game's paused picture on the HUD panel)
-    x.head_view.store(head && (!menu_is_open() || menu_embedded()), std::memory_order_relaxed);
+    // (this menu over the game's own Options screen stays in the head's view, the game's paused picture on the HUD panel;
+    // (Triforce VR) a movie on the floating screen)
+    x.head_view.store(head && (!menu_is_open() || menu_embedded()) && !mkwvk::pace::movie_playing(), std::memory_order_relaxed);
     if (hdr) {
         static bool told;
         if (!told) told = true, rt_log("vr: the headset needs HDR off");
@@ -2899,13 +2975,14 @@ extern "C" int vk_xr_planes(float planes[2]) {
 
 extern "C" int vk_xr_active(void) { return xr().ok && xr().timeline; }
 extern "C" void vk_xr_head_worn(int what) { xr().head_worn.store(what); }
+extern "C" void vk_xr_hud_hidden(int hidden) { xr().hud_hidden.store(hidden != 0); }
 
 extern "C" const MkwVkXr *vk_xr_table(void) {
     static const MkwVkXr t = {
         vk_xr_cfg, vk_xr_head_active, vk_xr_camera, vk_xr_lens, vk_xr_holds_time, vk_xr_update_step, vk_xr_pad,
         vk_xr_ocarina, vk_xr_weapon_out, vk_xr_child,
         vk_xr_hand_item, vk_xr_in_play, vk_xr_aim_freeze, vk_xr_pointer, vk_xr_aim, vk_xr_untracked, vk_xr_hands,
-        vk_xr_active, vk_xr_head_worn};
+        vk_xr_active, vk_xr_head_worn, vk_xr_hud_hidden};
     return &t;
 }
 

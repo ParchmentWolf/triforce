@@ -38,5 +38,7 @@ int vr_play_anchor(double feet[3]);
 int vr_game_paused(void);
 /* vr_game.c: Link a child now */
 int vr_game_childhood(void);
+/* vr_body.c: 1 and his neck's height over his feet (metres) as the late bone pass last posed it, while that was a moment ago */
+int vr_body_neck_height(double *height);
 
 #endif

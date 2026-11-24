@@ -1509,13 +1509,24 @@ static void euro3(Euro *f, double v[3], double dt, double min_cut, double beta) 
 /* the head sunk this far into the chest (metres), in the neck's frame */
 #define HEAD_SINK 0.25
 
+static volatile double neck_height;
+static volatile int64_t neck_at;
+int vr_body_neck_height(double *height) {
+    if (!neck_at || hos_now_ns() - neck_at > 200000000LL) return 0;
+    *height = neck_height;
+    return isfinite(*height);
+}
+
 void hos_oot_after_anim(Ctx *c) {
     /* (it follows every model's late bone pass, hundreds a frame: the cheapest checks first) */
     if (!ob.valid || !vr_first_person_now()) return;
     const MkwVkXr *x = rx_xr();
-    if (!x || !x->hands || !body_arms()) return;
+    if (!x || !x->hands) return;
+    /* ((Triforce VR) Link hidden: only his neck's height, for the eyes while he crouches, a few times a frame at most) */
+    const int arms = body_arms();
+    if (!arms && hos_now_ns() - neck_at < 4000000LL) return;
     /* (quick, for every model's pass: Link's slots as this hook left them: the animation has not been back, leave) */
-    if (!arms_forced && ob_unchanged(c, OB_ARM1_L) && ob_unchanged(c, OB_ARM1_R) && ob_unchanged(c, OB_HEAD)) return;
+    if (arms && !arms_forced && ob_unchanged(c, OB_ARM1_L) && ob_unchanged(c, OB_ARM1_R) && ob_unchanged(c, OB_HEAD)) return;
     if (!TryAcquireSRWLockExclusive(&ob_lock)) return;
     /* (the cache still Link's: a level change frees his model before the movement update notices; never write a freed one) */
     if (!ob.valid || !plausible(ob.actor, 0x330) || recomp_load64(c, ob.actor) != 0x84b45e18ULL ||
@@ -1526,6 +1537,16 @@ void hos_oot_after_anim(Ctx *c) {
     }
     static int64_t runs;
     if (runs++ == 0) hos_log("vr: body: the arms' hook after the late bone pass runs");
+    if (ob.neck_world) {   /* (his neck's height over his feet, before the head is sunk: first person's eyes while he crouches) */
+        Xf nk;
+        xf_load(c, ob.neck_world, &nk);
+        neck_height = nk.m[1][3] + ld_f(c, ob.origin + 4) - ld_f(c, ob.actor + 0x31c + 4);
+        neck_at = hos_now_ns();
+    }
+    if (!arms) {
+        ReleaseSRWLockExclusive(&ob_lock);
+        return;
+    }
     /* the head to a thousandth, sunk into the chest. Not twice: a second pass in the same frame finds it shrunk already */
     Xf head_now;
     xf_load(c, ob.slot[OB_HEAD] + 0x20, &head_now);

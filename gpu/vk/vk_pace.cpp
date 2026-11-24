@@ -136,6 +136,7 @@ bool rtss_frame(int64_t period, int fg, int mult, bool movie) {
 
 void set_period_ns(int ns) { period_ns.store(ns > 0 ? ns : 0, std::memory_order_relaxed); }
 void set_movie(int playing) { movie_on.store(playing != 0, std::memory_order_relaxed); }
+bool movie_playing() { return movie_on.load(std::memory_order_relaxed) != 0; }
 void set_steady(int on) { steady_on.store(on == 1, std::memory_order_relaxed); }
 int steady_held_us() {
     presenting = true;
