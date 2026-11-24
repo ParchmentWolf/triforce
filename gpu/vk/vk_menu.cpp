@@ -190,10 +190,7 @@ const char* tx_flat3d_screen(int v) {
     return b;
 }
 const char* tx_vr_stereo(int v) { return v == 2 ? "Accurate" : v == 1 ? "Balanced" : "Performant"; }
-const char* tx_vr_controls(int v) { return v ? "Touch controllers" : "Gamepad"; }
 const char* tx_vr_hand(int v) { return v ? "Right-handed" : "Left-handed"; }
-const char* tx_vr_play(int v) { return v ? "Motion" : "Stationary"; }
-const char* tx_vr_hud(int v) { return v ? "In the picture" : "Panel in front of you"; }
 const char* tx_vr_body(int v) { return v ? "Your arms" : "Hidden"; }
 const char* tx_unit(int v, const char* fmt) {
     static char b[24];
@@ -1292,6 +1289,9 @@ Row rows[] = {
     {TAB_CONTROLS, "Sprint mode", &opts.sprint_mode, 0, 1, 1, tx_sprint_mode,
      "Toggle: a press starts the sprint, the next press or stopping ends it. Hold: Link sprints while the button is held.",
      nullptr, false, true},
+    {TAB_CONTROLS, "Right handed Link", &opts.right_handed, 0, 1, 1, tx_onoff,
+     "Link holds his sword and what he uses in his right hand, his shield on his left arm: his moves are mirrored, his body "
+     "is not.", nullptr, false, true},
     {TAB_MOTION, "Motion controls", &opts.gyro, 0, 1, 1, tx_gyro,
      "Aims and looks with the controller's gyroscope where the game uses motion, as on the Switch: Switch Pro controllers "
      "and pads in Switch mode, DualSense and DualShock 4.", hn_gyro, false, true},
@@ -1368,17 +1368,11 @@ Row rows[] = {
      "Moves your eyes up or down in cutscenes and conversations. They stand Link's height (a child's or an adult's) "
      "above the game's camera.", nullptr, false, true, -1, false, "vr_event_up"},
     {TAB_VR, "Controls", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},
-    {TAB_VR, "Control scheme", &opts.vr_controls, 0, 1, 1, tx_vr_controls,
-     "Gamepad: a normal controller (or the keyboard and mouse), as without VR. Touch controllers: A/B the game's A/B, "
-     "X/Y mirror A/B, the sticks' clicks X (jump), the triggers L/R, the grips ZL/ZR. In menus every button is its own. Swing the sword hand to slash; both hands together "
-     "behind your head draw or put away the sword and shield; the shield held before the eye on its side targets. "
-     "D-pad: both arms shaken upward boots, both hands together before your face the ocarina, both hands beside your "
-     "head Navi, a hand shaken sideways above your head the mask.", nullptr, false, true, -1, false, "vr_controls"},
+    // ((Triforce VR) the Control scheme and Play style rows are gone: the hand controllers and a gamepad both play at once, the
+    // hand controllers always with motion (their aim where the hand points), a gamepad as a pad: vk_xr_cfg answers so)
     {TAB_VR, "Handedness", &opts.vr_handedness, 0, 1, 1, tx_vr_hand,
-     "Which hand holds the sword (Touch controllers): its swing slashes and charges. The other hand holds the shield.", nullptr, false, true, -1, false, "vr_handedness"},
-    {TAB_VR, "Play style", &opts.vr_play, 0, 1, 1, tx_vr_play,
-     "Stationary: aiming as on a pad. Motion (Touch controllers): the slingshot, bow, hookshot and boomerang aim where "
-     "your sword hand points (the game's motion controls on).", nullptr, false, true, -1, false, "vr_play"},
+     "Which hand holds the sword until you choose with your hands: drawing with both grips behind your head, the higher hand "
+     "takes the sword; raising the shield alone, that hand takes the shield.", nullptr, false, true, -1, false, "vr_handedness"},
     {TAB_VR, "Pointing angle", &opts.vr_aim_tilt, 0, 60, 1, tx_degrees,
      "Motion: how far below the controller's own pointing line your aim goes. Raise it if the aim sits above where you "
      "point, lower it if below.", nullptr, false, true, -1, false, "vr_aim_tilt"},
@@ -1391,9 +1385,6 @@ Row rows[] = {
      "Running forward in first person, Link runs dead straight while your head is within this many degrees of looking "
      "straight ahead; turn it further and he follows your head. 0: he always follows your head.", nullptr, false, true, -1, false, "vr_run_zone"},
     {TAB_VR, "HUD", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},
-    {TAB_VR, "HUD placement", &opts.vr_hud, 0, 1, 1, tx_vr_hud,
-     "Panel in front of you: the hearts, buttons and map float on a panel that moves with your head, and the world is "
-     "shown without them. In the picture: the HUD stays drawn over the world.", nullptr, false, true, -1, false, "vr_hud"},
     {TAB_VR, "HUD size", &opts.vr_hud_size, 40, 200, 5, tx_cm,
      "The width of the HUD's panel, a metre in front of you.", nullptr, false, true, -1, false, "vr_hud_size"},
     // ---- Debug: the tools' switch, the tools themselves below it while they are on (cheat: menu_tick does what they do),
@@ -5844,6 +5835,7 @@ void menu_set_gpu_count(int count) {
 
 bool menu_is_open() { return open_now.load(std::memory_order_relaxed); }
 bool menu_embedded() { return open_now.load(std::memory_order_relaxed) && embed_open; }
+bool menu_game_options() { return game_options_shown(); }   // ((Triforce VR) the game's Options screen runs, our tabs over it)
 // (the tools off on the Debug tab: flight, the free camera and heart protection put away; -1, heart protection never set, is the
 // host's own HOS_OOT_PROTECT_HEARTS)
 int menu_heart_protection() {
@@ -7758,8 +7750,21 @@ void menu_record_image(VkCommandBuffer cmd, VkImage image, VkImageView view, uin
 } // namespace mkwvk
 
 // (Triforce VR) a VR row's value by its key, as text: a choice's name, else the number; "" for a key that is not a VR row
+extern "C" int vk_xr_live_sword(void);
+extern "C" int vk_xr_live_mirror(void);
 extern "C" const char* vk_xr_cfg(const char* key) {
     static thread_local char b[24];
+    // ((Triforce VR) the hand controllers always play, with motion; a gamepad alongside them as a pad (no rows for these now)
+    if (!strcmp(key, "VR_CONTROLS")) return "meta";
+    if (!strcmp(key, "VR_PLAY")) return "motion";
+    if (!strcmp(key, "VR_MIRROR")) {   // ((Triforce VR) Link mirrored for what the hands last did, "" before: vk_xr.cpp)
+        const int v = vk_xr_live_mirror();
+        return v < 0 ? "" : v ? "on" : "off";
+    }
+    if (!strcmp(key, "VR_SWORD_HAND")) {   // ((Triforce VR) the last two-grip draw's sword hand, "" before one: vk_xr.cpp)
+        const int v = vk_xr_live_sword();
+        return v < 0 ? "" : v ? "right" : "left";
+    }
     for (const mkwvk::VrKey& v : mkwvk::vr_keys) {
         if (strcmp(v.key, key)) continue;
         const int n = *v.value;

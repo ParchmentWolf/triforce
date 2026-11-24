@@ -93,6 +93,7 @@ inline char *plat_last_sep(char *path) {
 namespace mkwvk {
 bool menu_is_open();
 bool menu_embedded();   // open over the game's own Options screen
+bool menu_game_options();   // ((Triforce VR) the game's own Options screen runs (our tabs drawn over its header): vk_menu.cpp
 }
 int menu_perf_rect(int r[4]);
 inline int menu_is_open() { return mkwvk::menu_is_open(); }

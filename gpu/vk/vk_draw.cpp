@@ -6734,6 +6734,9 @@ void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, Vk
     uint32_t du[kDynU];
     uint8_t db[160];
     const int nb = dyn_pack(s, at, topo, mesh, df, du, db);
+    // ((Triforce VR) right-handed: a thing the game side mirrored (host/vr_body.c) has its faces turned; part of the packed state,
+    // so the fast path neither skips the turn nor carries it on to the next draw)
+    if (at.depth && xr_draw_mirrored(s)) du[24] |= 0x100u;
     if (!dump_on() && last_dyn_valid && dyn_fast.on && dyn_fast.nb == nb &&
         dyn_same(df, kDynF, du, kDynU, db, nb, dyn_fast.fp, dyn_fast.up, dyn_fast.raw)) {
         ps.wm_or |= dyn_fast.wm0, ps.wm_n = dyn_fast.wm_n;   // (the pass trace still sees the masks)
@@ -6813,6 +6816,8 @@ void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, Vk
     // The viewport is flipped (negative height), which reverses the screen-space winding, so NVN's front face maps
     // straight across: telling Vulkan the opposite is what culled every triangle (the frame was black).
     d.front = s.poly.front == NVN_FRONT_FACE_CCW ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
+    if (du[24] & 0x100u)   // ((Triforce VR) a mirrored thing: its faces turned (above))
+        d.front = d.front == VK_FRONT_FACE_COUNTER_CLOCKWISE ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
     if (fp) d.cull = VK_CULL_MODE_NONE;
     d.topo = mesh ? VK_PRIMITIVE_TOPOLOGY_MAX_ENUM : topo;
     d.restart = !mesh && s.restart && topo != VK_PRIMITIVE_TOPOLOGY_POINT_LIST && topo != VK_PRIMITIVE_TOPOLOGY_LINE_LIST &&
@@ -13589,6 +13594,71 @@ bool xs_cam(uint64_t a) {
 }
 }  // namespace
 XrEyeCam xr_eye;
+/// (Triforce VR) right-handed play (VR_HANDEDNESS right, first person with his arms: host/vr_body.c hos_oot_mirror mirrors Link
+/// and what he carries as their bones go to the GPU): a draw whose bones' first matrix (a vertex storage buffer's, rows of a
+/// 3x4 after 16 bytes, as the game's skinned draws have them) turns space inside out is one of theirs, its faces turned so
+/// they are not culled from the inside
+static std::mutex xr_mirror_mu;
+static float xr_mirror_set[512][12];   // (the turns of what the game side mirrored lately: host/vr_body.c, the shield)
+static int xr_mirror_at, xr_mirror_n, xr_mirror_last_n;
+}  // namespace mkwvk
+// ((Triforce VR) right-handed: the game side's mirrored shield's turns, whose draws get their faces turned; looked up by name
+// (host/rx_backend.c hos_vk_mirror_publish))
+extern "C"
+#ifdef _WIN32
+__declspec(dllexport)
+#else
+__attribute__((visibility("default")))
+#endif
+void hos_vk_mirror_publish(const float* turns, int n) {
+    using namespace mkwvk;
+    std::lock_guard<std::mutex> g(xr_mirror_mu);
+    for (int i = 0; i < n; i++) {
+        memcpy(xr_mirror_set[xr_mirror_at], turns + i * 12, sizeof xr_mirror_set[0]);
+        xr_mirror_at = (xr_mirror_at + 1) % 512;
+        if (xr_mirror_n < 512) xr_mirror_n++;
+    }
+    xr_mirror_last_n = n;
+}
+namespace mkwvk {
+bool xr_draw_mirrored(const NvnState& s) {
+    // (the game side's mirrored things are drawn with their bone's world, rows, at the start of the vertex stage's uniform buffer
+    // 3: a draw with an inside-out turn there that the game side sent lately (512 kept: the renderer runs frames behind))
+    const nvn_p_bind_buf& b = s.ubo[0][3];
+    if (!b.addr || b.size < 48) return false;
+    // (a binding stays as it was set until another replaces it: a draw whose program never reads slot 3 still has the last thing's there)
+    const Shader::Info* vi = cur_program ? vertex_info(*cur_program) : nullptr;
+    if (!vi || Shader::Info::MAX_CBUFS <= 6 || vi->constant_buffer_used_sizes[6] < 48) return false;
+    float r[12];   // (as the stream sees it at this draw: the inline updates before it over the submission's capture)
+    if (!ub_read(b.addr, r, sizeof r)) return false;
+    const float det = r[0] * (r[5] * r[10] - r[6] * r[9]) - r[1] * (r[4] * r[10] - r[6] * r[8]) + r[2] * (r[4] * r[9] - r[5] * r[8]);
+    if (!(det < -0.04f)) return false;
+    std::lock_guard<std::mutex> g(xr_mirror_mu);
+    for (int k = 0; k < xr_mirror_n; k++) {
+        const float* t = xr_mirror_set[k];
+        bool same = true;
+        for (int q = 0; q < 12 && same; q++) same = fabsf(r[q] - t[q]) < 2e-3f;   // (rows with their places: no other thing shares one)
+        if (!same) continue;
+        {   // (research: each match, to tell the things' own draws from others that happen to match)
+            static int told = 0;
+            if (told < 80) {
+                told++;
+                logf("vk: xr mirror match: program %#llx, buffer %#llx (+%u, size %u), set %d of %d, frame %llu: %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f",
+                     (unsigned long long)cur_program->key, (unsigned long long)b.addr, 0u, (unsigned)b.size, k, xr_mirror_n, (unsigned long long)texture_frame_no(), r[0], r[1], r[2], r[3], r[4],
+                     r[5], r[6], r[7], r[8], r[9], r[10], r[11]);
+            }
+        }
+        static uint64_t frame_at = 0;
+        static int flips = 0, frames = 0;
+        if (texture_frame_no() != frame_at) {
+            if (frame_at && frames++ % 300 == 0) logf("vk: xr mirror: %d draws' faces turned in frame %llu", flips, (unsigned long long)frame_at);
+            frame_at = texture_frame_no(), flips = 0;
+        }
+        flips++;
+        return true;
+    }
+    return false;
+}
 namespace {
 std::mutex xr_det_mu;
 std::unordered_set<const Texture*> xr_w1, xr_w2;

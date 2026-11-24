@@ -34,5 +34,9 @@ int vr_first_person_now(void);
 /* vr_game.c: 1 and Link's feet as they were at the gameplay camera's last update with the head's view (where the hands were
    placed from), while that was a moment ago */
 int vr_play_anchor(double feet[3]);
+/* vr_game.c: the game paused by its own menus */
+int vr_game_paused(void);
+/* vr_game.c: Link a child now */
+int vr_game_childhood(void);
 
 #endif

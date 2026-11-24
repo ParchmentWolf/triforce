@@ -124,6 +124,9 @@ static int oot_paused(void) {
     return p || pre || post;
 }
 
+int vr_game_paused(void) { return oot_paused(); }
+int vr_game_childhood(void) { return oot_childhood(); }
+
 static uint64_t head_camera;   /* x19 of the update the head's view was put on (0: none); the game's thread alone */
 
 
@@ -164,7 +167,7 @@ static int first_person_eye(double eye[3]) {
     eye[1] = feet[1] + up;
     eye[2] = feet[2] + ahead * fz + side * fx;
     /* (VR_BODY arms: he stays drawn, his arms on the controllers and his head hidden by vr_body.c; hidden: all of him) */
-    if (strcmp(cfg_value("VR_BODY"), "arms")) hide_link(actor);
+    if (strcmp(cfg_value("VR_BODY"), "arms") && !oot_paused()) hide_link(actor);   /* ((Triforce VR) whole in the menus) */
     return 1;
 }
 
@@ -195,6 +198,7 @@ static int link_aims(void) {
 
 
 static int g_aiming;           /* hand_item: Link aims or holds a ranged item ready now (the bow, slingshot, hookshot, boomerang) */
+int vr_game_aiming(void) { return g_aiming; }   /* ((Triforce VR) vr_body.c: the arms put on the controllers again before the mirror */
 static uint64_t zr_at, y_at;   /* the item button's (ZR) and the sword's (Y) last presses, vr_pad_read */
 
 /* Whether Link holds something out, and the item in his hand as VR's hands draw it (a model of the game's files), "" for
@@ -302,6 +306,11 @@ static void vr_tick(Ctx *c, const MkwVkXr *x) {
         x->child(oot_childhood());
         x->weapon_out(hand_item(item));
         x->hand_item(item);
+    }
+    if (x->head_worn) {   /* what he wears on his head: the mask's and the Lens of Truth's gestures */
+        char head[64] = "";
+        oot_data_text(gw(), "PlayerStatus.EquipHeadArmor", head);
+        x->head_worn(strstr(head, "Mask") ? 1 : strstr(head, "GlassTruth") ? 2 : 0);
     }
     const int camera = !hooks_on || now_ns() - play_at < 200000000ull;   /* (without the hooks: Link's state alone) */
     const int play = camera && !oot_event_playing() && state[0] && strncmp(state, "Demo", 4);
@@ -444,7 +453,9 @@ static void motion_feed(const double gyro[3]) {
     }
     HosMotionSample s;
     memset(&s, 0, sizeof s);
-    s.st.accel[2] = -1;
+    /* ((Triforce VR) gravity as the turned controller would feel it (its frame's view of the world's down, R's third row): with
+       it fixed flat, the game's tilt correction pulled the aim's pitch back to level, so up and down barely moved) */
+    for (int i = 0; i < 3; i++) s.st.accel[i] = (float)-motion_r[2][i];
     for (int i = 0; i < 3; i++) {
         const float turns = (float)(gyro[i] / (2 * M_PI));
         motion_angle[i] += turns * (float)dt;
@@ -474,11 +485,46 @@ static void steer_aim(const MkwVkXr *x, const double d[3]) {
     if (!pointed || !x->pointer(t)) return;
     const double yaw_err = wrap_pi(atan2(t[0], t[2]) - atan2(d[0], d[2]));
     const double pitch_err = asin(fmax(-1, fmin(1, t[1]))) - asin(fmax(-1, fmin(1, d[1])));
-    const char *spec = getenv("VR_GYRO");
+    /* ((Triforce VR) research: ~/.app/pc_port/triforce-runs/vr_gyro.txt "<spec> [flipm]", read once a second: the axes the
+       pitch and yaw go out on (as VR_GYRO, "x+z+" by default), flipm the yaw turned over while his animation is mirrored) */
+    static char file_spec[8];
+    static int flip_m, read_at_s;
+    /* (the pitch's turn rate times pitch_gain: 50, found by eye in the headset (2026-11-24): the game's aim moves up and down far
+       less than across for the same rate; a word "p<n>" in the file sets another) */
+    static double pitch_gain = 50.0;
+    static double yaw_gain = 1.1;   /* (across a little more too, by eye; a word "y<n>" sets another) */
+    {
+        const int s_now = (int)(now_ns() / 1000000000ull);
+        if (s_now != read_at_s) {
+            read_at_s = s_now;
+            char path[512], a[8] = "", b[8] = "", g[8] = "", h[8] = "";
+            snprintf(path, sizeof path, "%s/.app/pc_port/triforce-runs/vr_gyro.txt", getenv("HOME") ? getenv("HOME") : "");
+            FILE *f = fopen(path, "r");
+            if (f) {
+                if (fscanf(f, "%7s %7s %7s %7s", a, b, g, h) < 1) a[0] = 0;
+                fclose(f);
+            }
+            snprintf(file_spec, sizeof file_spec, "%s", strlen(a) == 4 ? a : "");
+            flip_m = !strcmp(b, "flipm") || !strcmp(g, "flipm");
+            pitch_gain = 50.0;
+            if (b[0] == 'p') pitch_gain = atof(b + 1);
+            if (g[0] == 'p') pitch_gain = atof(g + 1);
+            if (!(pitch_gain > 0 && pitch_gain <= 200)) pitch_gain = 50.0;
+            yaw_gain = 1.1;
+            if (b[0] == 'y') yaw_gain = atof(b + 1);
+            if (g[0] == 'y') yaw_gain = atof(g + 1);
+            if (h[0] == 'y') yaw_gain = atof(h + 1);
+            if (!(yaw_gain > 0 && yaw_gain <= 20)) yaw_gain = 1.1;
+        }
+    }
+    const char *spec = file_spec[0] ? file_spec : getenv("VR_GYRO");
     if (!spec || strlen(spec) < 4) spec = "x+z+";
     double gyro[3] = {0, 0, 0};
     const double k = 10.0, most = 8.0;
-    const double rate[2] = {fmax(-most, fmin(most, k * pitch_err)), fmax(-most, fmin(most, k * yaw_err))};
+    int vr_body_mirrored(void);
+    const double yaw_sign = flip_m && vr_body_mirrored() ? -1.0 : 1.0;
+    const double rate[2] = {fmax(-most * pitch_gain, fmin(most * pitch_gain, k * pitch_gain * pitch_err)),
+                            yaw_sign * fmax(-most * yaw_gain, fmin(most * yaw_gain, k * yaw_gain * yaw_err))};
     for (int i = 0; i < 2; i++) {
         const int axis = spec[2 * i] == 'x' ? 0 : spec[2 * i] == 'y' ? 1 : 2;
         gyro[axis] += spec[2 * i + 1] == '-' ? -rate[i] : rate[i];

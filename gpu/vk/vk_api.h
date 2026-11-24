@@ -171,6 +171,8 @@ enum { HOS_OPT_MODS_ALPHA = 162 };
    in the list was earned now, the bytes sent so far the day: the notice shows it. One at a time, the host waits between two */
 enum { HOS_OPT_ACH_TEXT = 165, HOS_OPT_ACH_ADD, HOS_OPT_ACH_COUNT, HOS_OPT_ACH_EARNED, HOS_OPT_ACH_ASK };
 enum { HOS_ACH_EARNED = 256 };
+/* (Triforce) HOS_OPT_RIGHT_HANDED, option: the Controls tab's Right handed Link row, 1 on (host/vr_body.c ma_wanted) */
+enum { HOS_OPT_RIGHT_HANDED = 175 };
 
 /* (hookshot) the mouse over the window while it is free (not captured): the Insert menu's (host/display.c,
    host/posix/display_sdl.c). x and y: the cursor in the window's pixels, of a window width x height pixels (the
@@ -357,6 +359,7 @@ typedef struct MkwVkXr {
     void (*untracked)(void);
     int (*hands)(double pos[6], double point[6], double palm[6]);   /* (Triforce VR) the controllers in the game's world */
     int (*active)(void);   /* (Triforce VR) a session runs: without one the game's side does nothing (vk_xr_active) */
+    void (*head_worn)(int what);   /* (Triforce VR) what Link wears on his head: 0 nothing, 1 a mask, 2 the Lens of Truth */
 } MkwVkXr;
 
 /* the DLL's one export: null when Vulkan is not usable (the executable then falls back to WebGPU) */

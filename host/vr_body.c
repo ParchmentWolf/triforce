@@ -34,6 +34,11 @@ static const char *body_cfg(const char *key) {
     return x && x->cfg ? x->cfg(key) : "";
 }
 static int body_arms(void) { return !strcmp(body_cfg("VR_BODY"), "arms"); }
+/* the sword's hand in VR: the last two-grip draw's (VR_SWORD_HAND), else the Handedness row's; 1 right */
+static int vr_sword_right(void) {
+    const char *live = body_cfg("VR_SWORD_HAND");
+    return live[0] ? !strcmp(live, "right") : !strcmp(body_cfg("VR_HANDEDNESS"), "right");
+}
 
 /* ---- the game's memory, and calls into its code ---- */
 static int plausible(uint64_t a, uint64_t n) {
@@ -44,6 +49,12 @@ static float ld_f(Ctx *c, uint64_t a) {
     float f;
     memcpy(&f, &b, 4);
     return f;
+}
+static void st_f(Ctx *c, uint64_t a, double v) {
+    const float f = (float)v;
+    uint32_t b;
+    memcpy(&b, &f, 4);
+    recomp_store32(c, a, b);
 }
 static uint64_t vr_call(Ctx *c, uint64_t fn, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x8) {
     const A64Fn f = a64_lookup(fn);
@@ -582,12 +593,888 @@ static void hide_back_items(Ctx *c, uint64_t link, int first_person) {
     ReleaseSRWLockExclusive(&lock);
 }
 
+/* ---- right-handed by the animation: Link's pose mirrored left for right as the animation leaves it (after the late bone
+   pass, before the world pass), his body itself not: each bone given its partner's (Wrist_L for Wrist_R; a centre bone its
+   own) pose reflected in his model's x, through the two bones' rest frames, so the mesh is never turned inside out ---- */
+#define MA_BONES 512
+#define MA_PARTS 4
+typedef struct {
+    uint64_t bones, res;   /* (the part's skeleton object, [inst+0xf8], and its BFRES skeleton, [bones]) */
+    int n;
+    int16_t par[MA_BONES], mate[MA_BONES];
+    int16_t hand_l, hand_r;   /* (Weapon_L and Weapon_R: what he holds hangs from them; their places swapped, -1 if none) */
+    Xf F[MA_BONES];   /* (B_mate^-1 S B: the rest frames' reflection, S = his model's x) */
+    Xf orig[MA_BONES];   /* (each local as the animation last made it) */
+    float last[MA_BONES][12];   /* (each local as written here, read back: the animation's next write differs) */
+    Xf Mo[MA_BONES], Mmir[MA_BONES];   /* (his model-space pose as the animation made it, and as mirrored) */
+    uint8_t raw[MA_BONES][0x60];   /* (each slot as the animation left it, before the mirror wrote it: put back after the world
+                                      pass, so the animation's own reads (its blends) never see the mirrored pose) */
+    int16_t strap;   /* (Ph_ArmStrap: a physics bone the shield's strap follows; -1 if none) */
+    char name[MA_BONES][32];   /* (research: the bones' names, for the reflected-bones file) */
+    int16_t bangle;   /* (Ph_Bangle: a physics bone on his wrist his bracelets hang from; -1 if none) */
+    Xf bangle_rest;   /* (its rest local) */
+    int written;
+} MaPart;
+static struct {
+    uint64_t actor, model;
+    MaPart part[MA_PARTS];
+    int parts;
+    int64_t told_at, runs;
+} ma;
+static SRWLOCK ma_lock = SRWLOCK_INIT;
+static __thread int arms_forced;   /* ((Triforce VR) the world pass's arms call while aiming: past the "unchanged" check */
+static int ma_wanted(void) {
+    static int64_t at;
+    static int off;
+    const int64_t now = hos_now_ns();
+    if (now - at > 1000000000LL) {   /* (research: ~/.app/pc_port/triforce-runs/mirror_anim_off.txt there: the mirror off) */
+        at = now;
+        const char *home = getenv("HOME");
+        char path[512];
+        snprintf(path, sizeof path, "%s/.app/pc_port/triforce-runs/mirror_anim_off.txt", home ? home : "");
+        FILE *f = fopen(path, "r");
+        const int was = off;
+        off = f != NULL;
+        if (f) fclose(f);
+        if (off != was) hos_log("vr: body: mirrored animation: %s", off ? "off (research switch)" : "on again");
+    }
+    if (off) return 0;
+    static int64_t paused_at;
+    static int paused;
+    if (now - paused_at > 100000000LL) {   /* (the menus show him posed as the game has him) */
+        paused_at = now;
+        const int was = paused;
+        paused = vr_game_paused();
+        if (paused != was) hos_log("vr: body: mirrored animation: %s", paused ? "held while the game is paused" : "on again after the pause");
+    }
+    if (paused) return 0;
+    const char *e = getenv("RX_MIRROR_ANIM");
+    if (e && *e) return *e == '1';
+    static int64_t opt_at;
+    static int opt, file = -1;
+    if (now - opt_at > 250000000LL) {   /* (the Controls tab's Right handed Link row, asked four times a second) */
+        int rx_option(int id, int otherwise);
+        int hos_ini_option(const char *key, int otherwise);
+        opt_at = now;
+        if (file < 0) file = hos_ini_option("right_handed_link", 0);
+        opt = rx_option(HOS_OPT_RIGHT_HANDED, file) != 0;
+    }
+    {   /* (in VR what the hands last did decides: the sword's hand, an item's, the ocarina's pointing) */
+        const char *m = body_cfg("VR_MIRROR");
+        if (m[0]) return !strcmp(m, "on");
+    }
+    return opt || vr_sword_right();
+}
+static void xf_id(Xf *x) {
+    memset(x, 0, sizeof *x);
+    x->m[0][0] = x->m[1][1] = x->m[2][2] = 1;
+}
+static void ma_rest_local(Ctx *c, uint64_t e, Xf *x) {   /* (a ResBone's rest scale, turn and place as a 3x4) */
+    const uint32_t fl = recomp_load32(c, e + 0x2c);
+    double sc[3], r[4], t[3];
+    for (int k = 0; k < 3; k++) sc[k] = ld_f(c, e + 0x30 + k * 4), t[k] = ld_f(c, e + 0x4c + k * 4);
+    for (int k = 0; k < 4; k++) r[k] = ld_f(c, e + 0x3c + k * 4);
+    M3 R;
+    if (fl & 0x1000) {   /* (Euler XYZ: X first, R = Rz Ry Rx) */
+        const double cx = cos(r[0]), sx = sin(r[0]), cy = cos(r[1]), sy = sin(r[1]), cz = cos(r[2]), sz = sin(r[2]);
+        R[0][0] = cz * cy, R[0][1] = cz * sy * sx - sz * cx, R[0][2] = cz * sy * cx + sz * sx;
+        R[1][0] = sz * cy, R[1][1] = sz * sy * sx + cz * cx, R[1][2] = sz * sy * cx - cz * sx;
+        R[2][0] = -sy, R[2][1] = cy * sx, R[2][2] = cy * cx;
+    } else {   /* (a quaternion x y z w) */
+        const double qx = r[0], qy = r[1], qz = r[2], qw = r[3];
+        R[0][0] = 1 - 2 * (qy * qy + qz * qz), R[0][1] = 2 * (qx * qy - qz * qw), R[0][2] = 2 * (qx * qz + qy * qw);
+        R[1][0] = 2 * (qx * qy + qz * qw), R[1][1] = 1 - 2 * (qx * qx + qz * qz), R[1][2] = 2 * (qy * qz - qx * qw);
+        R[2][0] = 2 * (qx * qz - qy * qw), R[2][1] = 2 * (qy * qz + qx * qw), R[2][2] = 1 - 2 * (qx * qx + qy * qy);
+    }
+    for (int i = 0; i < 3; i++) {
+        for (int k = 0; k < 3; k++) x->m[i][k] = R[i][k] * sc[k];
+        x->m[i][3] = t[i];
+    }
+}
+static int ma_name(Ctx *c, uint64_t e, char *out, int cap) {
+    const uint64_t p = recomp_load64(c, e);
+    if (!plausible(p, 2)) return 0;
+    const int n = recomp_load16(c, p);
+    if (n <= 0 || n >= cap || !plausible(p + 2, (uint64_t)n)) return 0;
+    for (int i = 0; i < n; i++) out[i] = (char)recomp_load8(c, p + 2 + i);
+    out[n] = 0;
+    return 1;
+}
+static int ma_side_swap(const char *in, char *out, int at) {   /* (_L <-> _R at a token's end: end, '_' or a digit after) */
+    const size_t n = strlen(in);
+    if (at < 0 || (size_t)at + 2 > n || in[at] != '_' || (in[at + 1] != 'L' && in[at + 1] != 'R')) return 0;
+    const char next = in[at + 2];
+    if (next && next != '_' && !(next >= '0' && next <= '9')) return 0;
+    memcpy(out, in, n + 1);
+    out[at + 1] = in[at + 1] == 'L' ? 'R' : 'L';
+    return 1;
+}
+static int ma_part_load(Ctx *c, uint64_t bones, MaPart *mp) {
+    static char names[MA_BONES][64];
+    const uint64_t res = recomp_load64(c, bones);
+    if (!plausible(res, 0x40)) return 0;
+    const int n = recomp_load16(c, res + 0x38);
+    const uint64_t arr = recomp_load64(c, res + 0x10);
+    if (n <= 0 || n > MA_BONES || !plausible(arr, (uint64_t)n * 0x58)) return 0;
+    static Xf B[MA_BONES];
+    for (int i = 0; i < n; i++) {
+        const uint64_t e = arr + (uint64_t)i * 0x58;
+        if (!ma_name(c, e, names[i], 64)) return 0;
+        mp->par[i] = (int16_t)recomp_load16(c, e + 0x22);
+        if (mp->par[i] >= i) return 0;   /* (parents first, as the world pass wants them) */
+        Xf L;
+        ma_rest_local(c, e, &L);
+        if (mp->par[i] < 0) B[i] = L;
+        else xf_mul(&B[mp->par[i]], &L, &B[i]);
+    }
+    int paired = 0;
+    for (int i = 0; i < n; i++) {
+        mp->mate[i] = (int16_t)i;
+        char other[64];
+        for (int at = 0; names[i][at] && mp->mate[i] == i; at++)
+            if (ma_side_swap(names[i], other, at))
+                for (int j = 0; j < n; j++)
+                    if (!strcmp(names[j], other)) {
+                        mp->mate[i] = (int16_t)j, paired++;
+                        break;
+                    }
+        Xf S, Bi, t;
+        xf_id(&S);
+        S.m[0][0] = -1;
+        if (!xf_inv(&B[mp->mate[i]], &Bi)) return 0;
+        xf_mul(&Bi, &S, &t);
+        xf_mul(&t, &B[i], &mp->F[i]);
+    }
+    for (int i = 0; i < n; i++) snprintf(mp->name[i], sizeof mp->name[i], "%s", names[i]);
+    mp->hand_l = mp->hand_r = mp->strap = mp->bangle = -1;
+    for (int i = 0; i < n; i++) {
+        if (!strcmp(names[i], "Ph_ArmStrap")) mp->strap = (int16_t)i;
+        if (!strcmp(names[i], "Ph_Bangle") && mp->par[i] >= 0) {
+            mp->bangle = (int16_t)i;
+            ma_rest_local(c, arr + (uint64_t)i * 0x58, &mp->bangle_rest);
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (!strcmp(names[i], "Weapon_L")) mp->hand_l = (int16_t)i;
+        if (!strcmp(names[i], "Weapon_R")) mp->hand_r = (int16_t)i;
+    }
+    mp->bones = bones, mp->res = res, mp->n = n, mp->written = 0;
+    hos_log("vr: body: mirrored animation: a skeleton of %d bones, %d of them in left/right pairs (%s, %s...); hands %d/%d", n, paired,
+            names[0], n > 1 ? names[1] : "", mp->hand_l, mp->hand_r);
+    return 1;
+}
+static void ma_snap(Ctx *c, uint64_t slots, MaPart *mp, int b) {
+    for (int k = 0; k < 12; k++) mp->last[b][k] = ld_f(c, slots + (uint64_t)b * 0x60 + 0x20 + (k / 3) * 16 + (k % 3) * 4);
+}
+static int ma_same(Ctx *c, uint64_t slots, MaPart *mp, int b) {
+    for (int k = 0; k < 12; k++)
+        if (ld_f(c, slots + (uint64_t)b * 0x60 + 0x20 + (k / 3) * 16 + (k % 3) * 4) != mp->last[b][k]) return 0;
+    return 1;
+}
+static int64_t ma_done, ma_skipped;
+/* (research: the hand's half turn read from a file once a second, so it can be changed while she watches: x, y, z or none) */
+static int ma_hand_turn(void) {
+    static int64_t at;
+    static int ax = -1;
+    const int64_t now = hos_now_ns();
+    if (now - at < 1000000000LL) return ax;
+    at = now;
+    const char *home = getenv("HOME");
+    char path[512];
+    snprintf(path, sizeof path, "%s/.app/pc_port/triforce-runs/mirror_hand_turn.txt", home ? home : "");
+    FILE *f = fopen(path, "r");
+    int v = 2;   /* (z: what he holds faced the right way, found in the headset; a file says another) */
+    if (f) {
+        const int ch = fgetc(f);
+        v = ch == 'x' ? 0 : ch == 'y' ? 1 : ch == 'z' ? 2 : -1;
+        fclose(f);
+    }
+    if (v != ax) hos_log("vr: body: mirrored animation: the hands' half turn now %c", v < 0 ? '-' : "xyz"[v]);
+    ax = v;
+    return ax;
+}
+static void ma_part_mirror(Ctx *c, int part, MaPart *mp) {
+    const uint64_t slots = recomp_load64(c, mp->bones + 0x18);
+    if (!plausible(slots, (uint64_t)mp->n * 0x60)) return;
+    static Xf M[MA_BONES], Mm[MA_BONES];
+    for (int b = 0; b < mp->n; b++) {   /* (a bone the animation wrote anew: its local as made; one it left: the last made) */
+        if (!mp->written || !ma_same(c, slots, mp, b)) xf_load(c, slots + (uint64_t)b * 0x60 + 0x20, &mp->orig[b]);
+        if (mp->par[b] < 0) M[b] = mp->orig[b];
+        else xf_mul(&M[mp->par[b]], &mp->orig[b], &M[b]);
+    }
+    Xf S;
+    xf_id(&S);
+    S.m[0][0] = -1;
+    static char truly[MA_BONES];
+    {   /* (research: ~/.app/pc_port/triforce-runs/mirror_reflect_bones.txt, a bone's name a line: that bone truly reflected,
+           its frame turned inside out with the pose, not through its rest frames; read once a second) */
+        static int64_t at;
+        static char want[16][32];
+        static int wax[16];
+        static int nw;
+        const int64_t now = hos_now_ns();
+        if (now - at > 1000000000LL) {
+            at = now;
+            const char *home = getenv("HOME");
+            char path[512], line[64];
+            snprintf(path, sizeof path, "%s/.app/pc_port/triforce-runs/mirror_reflect_bones.txt", home ? home : "");
+            FILE *f = fopen(path, "r");
+            int k = 0;
+            while (f && k < 16 && fgets(line, sizeof line, f)) {
+                char ax[8] = "";
+                const int got = sscanf(line, "%31s %7s", want[k], ax);
+                if (got < 1) continue;
+                wax[k] = 0;   /* (after the reflection, these of its own axes turned round: x 1 y 2 z 4; "r": through its rest frames) */
+                for (const char *q = ax; *q; q++) wax[k] |= *q == 'x' ? 1 : *q == 'y' ? 2 : *q == 'z' ? 4 : *q == 'r' ? 8 : 0;
+                k++;
+            }
+            if (f) fclose(f);
+            if (k != nw) hos_log("vr: body: mirrored animation: %d bone(s) truly reflected", k);
+            nw = k;
+        }
+        for (int b = 0; b < mp->n; b++) {
+            truly[b] = 0;
+            for (int k = 0; k < nw; k++)
+                if (!strcmp(mp->name[b], want[k])) truly[b] = (char)(1 | wax[k] << 1);
+        }
+    }
+    for (int b = 0; b < mp->n; b++) {
+        Xf t;
+        xf_mul(&S, &M[mp->mate[b]], &t);
+        if (truly[b] && !(truly[b] >> 1 & 8)) {
+            Mm[b] = t;
+            for (int a = 0; a < 3; a++)
+                if (truly[b] >> 1 >> a & 1)
+                    for (int r = 0; r < 3; r++) Mm[b].m[r][a] = -Mm[b].m[r][a];
+        } else {
+            xf_mul(&t, &mp->F[b], &Mm[b]);
+            for (int a = 0; truly[b] && a < 3; a++)
+                if (truly[b] >> 1 >> a & 1)
+                    for (int r = 0; r < 3; r++) Mm[b].m[r][a] = -Mm[b].m[r][a];
+        }
+    }
+    memcpy(mp->Mo, M, sizeof(Xf) * mp->n), memcpy(mp->Mmir, Mm, sizeof(Xf) * mp->n);
+    if (mp->hand_l >= 0 && mp->hand_r >= 0) {   /* (what he holds in a hand to the other: his mirrored pose's sword hand is the right) */
+        const Xf t = Mm[mp->hand_l];
+        Mm[mp->hand_l] = Mm[mp->hand_r], Mm[mp->hand_r] = t;
+        for (int h = 0; h < 2; h++) {   /* (each where its own pose is, reflected: the rest frames' reflection moves it when the two
+                                           hands' rest places are not each other's mirror, as the child's are not) */
+            const int b = h ? mp->hand_r : mp->hand_l;
+            for (int r = 0; r < 3; r++) Mm[b].m[r][3] = r ? M[b].m[r][3] : -M[b].m[r][3];
+        }
+        const int ax = ma_hand_turn();   /* (a half turn about one of the hand's axes: what he holds faced the right way) */
+        if (ax >= 0)
+            for (int h = 0; h < 2; h++) {
+                Xf *x = &Mm[h ? mp->hand_r : mp->hand_l];
+                for (int r = 0; r < 3; r++)
+                    for (int k = 0; k < 3; k++)
+                        if (k != ax) x->m[r][k] = -x->m[r][k];
+            }
+    }
+    for (int b = 0; b < mp->n; b++)   /* (a slot still holding the mirror's last write keeps the raw kept then) */
+        if (!mp->written || !ma_same(c, slots, mp, b))
+            for (int k = 0; k < 0x60; k += 4) {
+                const uint32_t v = recomp_load32(c, slots + (uint64_t)b * 0x60 + (uint64_t)k);
+                memcpy(&mp->raw[b][k], &v, 4);
+            }
+    for (int b = 0; b < mp->n; b++) {
+        Xf L, pi;
+        if (mp->par[b] < 0) L = Mm[b];
+        else {
+            if (!xf_inv(&Mm[mp->par[b]], &pi)) continue;
+            xf_mul(&pi, &Mm[b], &L);
+        }
+        bone_write(c, ma.model, (uint32_t)part | ((uint32_t)b << 16), L.m);
+    }
+    for (int b = 0; b < mp->n; b++) ma_snap(c, slots, mp, b);
+    mp->written = 1;
+    ma_done++;
+}
+static void ma_seen(Ctx *c, uint64_t actor) {   /* (his movement update: his model noted, for the late bone pass's hook;
+                                                    with the mirror off too, for the things fixed always) */
+    const uint64_t model = vr_call(c, 0x80994de0ULL, actor, 0, 0, 0);
+    if (model == ma.model && actor == ma.actor) return;
+    AcquireSRWLockExclusive(&ma_lock);
+    ma.actor = actor, ma.model = model, ma.parts = 0;
+    if (model && plausible(model, 0x30)) {
+        const int np = (int)recomp_load32(c, model + 0x20);
+        const uint64_t parts = recomp_load64(c, model + 0x28);
+        for (int k = 0; k < np && k < 16 && ma.parts < MA_PARTS && plausible(parts, 8); k++) {
+            const uint64_t pk = recomp_load64(c, parts + (uint64_t)k * 8);
+            if (!plausible(pk, 8)) continue;
+            const uint64_t inst = recomp_load64(c, pk);
+            if (!plausible(inst + 0xf8, 8)) continue;
+            const uint64_t bones = recomp_load64(c, inst + 0xf8);
+            int seen = 0;
+            for (int i = 0; i < ma.parts; i++) seen |= ma.part[i].bones == bones;
+            if (seen || !plausible(bones, 0x28)) continue;
+            if (ma_part_load(c, bones, &ma.part[ma.parts])) ma.part[ma.parts].written = 0, ma.parts++;
+            else hos_log("vr: body: mirrored animation: part %d's skeleton not read", k);
+        }
+    }
+    hos_log("vr: body: mirrored animation: Link %#llx, model %#llx: %d skeletons", (unsigned long long)actor, (unsigned long long)model, ma.parts);
+    ReleaseSRWLockExclusive(&ma_lock);
+}
+static int ma_part_index(Ctx *c, uint64_t bones) {   /* (the part of the model with these bones, for its bone ids) */
+    const int np = (int)recomp_load32(c, ma.model + 0x20);
+    const uint64_t parts = recomp_load64(c, ma.model + 0x28);
+    for (int k = 0; k < np && k < 16; k++) {
+        const uint64_t pk = recomp_load64(c, parts + (uint64_t)k * 8);
+        if (plausible(pk, 8) && plausible(recomp_load64(c, pk) + 0xf8, 8) && recomp_load64(c, recomp_load64(c, pk) + 0xf8) == bones) return k;
+    }
+    return -1;
+}
+/* the shield's placing (f_81500960: its bones from the base matrix x1, the skeleton x0): with his pose mirrored, a left arm's
+   shield is mirrored too (the handle on its other side), its base reflected in one of its own axes and the placing run with
+   that; the renderer turns its faces (gpu/vk xr_draw_mirrored). 1: done here, the game's own run skipped */
+static __thread int shield_inside;
+/* what is mirrored besides his pose: a table of actor name prefixes and the axis of each one's own base it is reflected in,
+   read once a second from a file (lines "<prefix> <x|y|z>"; without one: the shield in x), so a thing's axis can be found
+   while she watches. Their skeletons found again every half second among the actors near him (his list at +0x1b0) */
+typedef struct {
+    char prefix[40];
+    int age;   /* (prefix@child or prefix@adult: that age's only, 1 child 2 adult; 0 both) */
+    int always;   /* (a line ending in "always": put away, its K with the mirror off too: a fix of the game's own) */
+    int hand, back;   /* (axes to reflect, bits x 1 y 2 z 4: in a hand, put away; back -1: the matrix K instead) */
+    float K[12];      /* (put away: the base taken through this, rows of a 3x4 in the thing's own frame: the measured mirror) */
+} MirItem;
+static MirItem mir_items[32] = {{"Weapon_Shield_", 0, 1, 0, {0}}};
+static int mir_items_n = 1;
+/* the table as measured in the headset (2026-11-23/24): each thing's mirror in a hand and put away, by age; a file of the same
+   lines (~/.app/pc_port/triforce-runs/mirror_items.txt) in its place while tuning */
+static const char mir_items_builtin[] =
+    "Weapon_Shield_Hylian@adult x K -0.8537 0.1319 -0.5042 0.1943 0.1245 0.9911 0.0505 -0.0093 -0.5058 0.0202 0.8626 0.0520\n"
+    "Weapon_Shield_Hylian@child - -\n"
+    "Weapon_Shield_Mirror@adult x K -0.8556 0.1269 -0.5020 0.1826 0.1202 0.9918 0.0476 -0.0128 -0.5034 0.0198 0.8629 0.0460\n"
+    "Weapon_Shield_Mirror@child - K 0.8659 -0.0098 -0.5015 0.0305 0.0004 1.0001 -0.0182 0.0090 0.5006 0.0151 0.8652 -0.0416 always\n"
+    "Weapon_Shield_Deku@adult x K -0.8663 0.0531 -0.4964 0.0428 0.0497 0.9983 0.0195 -0.0072 -0.4968 0.0083 0.8680 0.0094\n"
+    "Weapon_Shield_Deku@child x K -0.4725 0.1887 -0.8605 0.1641 0.1693 0.9782 0.1214 -0.0221 -0.8654 0.0885 0.4936 0.0915\n"
+    "Weapon_Shield_ x -\n"
+    "Weapon_Sword_Kokiri@adult - K -0.8134 0.0477 0.5798 -0.2143 0.0584 0.9980 -0.0021 -0.0006 0.5782 -0.0320 0.8153 0.0690\n"
+    "Weapon_Sheath_Kokiri@adult - K -0.8134 0.0477 0.5798 -0.2143 0.0584 0.9980 -0.0021 -0.0006 0.5782 -0.0320 0.8153 0.0690\n"
+    "Weapon_Sword_Kokiri@child - K -0.4102 0.1057 0.9053 -0.2055 0.0925 0.9932 -0.0745 0.0162 0.9075 -0.0524 0.4175 0.1304\n"
+    "Weapon_Sheath_Kokiri@child - K -0.4102 0.1057 0.9053 -0.2055 0.0925 0.9932 -0.0745 0.0162 0.9075 -0.0524 0.4175 0.1304\n"
+    "Item_Ocarina_ x -\n"
+    "Item_Hammer xy -\n"
+    "Weapon_Sword_Master@adult - K -0.8716 0.0385 0.4883 -0.2508 0.0537 0.9978 0.0167 -0.0055 0.4867 -0.0405 0.8723 0.0735\n"
+    "Weapon_Sheath_070@adult - K -0.8716 0.0385 0.4883 -0.2508 0.0537 0.9978 0.0167 -0.0055 0.4867 -0.0405 0.8723 0.0735\n"
+    "Weapon_Sword_Biggoron@adult - K -0.7472 -0.1872 -0.6373 0.2956 -0.1369 0.9819 -0.1291 0.0316 -0.6508 0.0091 0.7598 0.1289\n"
+    "Weapon_Sword_Biggoron@child - K -0.3239 0.0716 -0.9434 0.3341 0.0688 0.9969 0.0516 -0.0140 -0.9437 0.0485 0.3272 0.2375\n"
+    "Weapon_Range_Hookshot xy -\n"
+    "Weapon_Range_Bow xy -\n"
+    "Item_CojiroCucco - P\n"
+    "Weapon_Sword_Master@child - K -0.4960 0.1490 0.8549 -0.3230 0.1267 0.9869 -0.0988 0.0337 0.8584 -0.0595 0.5087 0.1821\n"
+    "Weapon_Sheath_070@child - K -0.4960 0.1490 0.8549 -0.3230 0.1267 0.9869 -0.0988 0.0337 0.8584 -0.0595 0.5087 0.1821\n"
+    "Item_AlarmCucco - P\n"
+    "Item_ZeldaLetter - P\n"
+    "Item_WeirdEgg - P\n"
+    "Item_ScrubBusinessSeed - P\n"
+    "Item_MagicBean - P\n";
+static void mir_items_read(void) {
+    static int64_t at;
+    const int64_t now = hos_now_ns();
+    if (now - at < 1000000000LL) return;
+    at = now;
+    const char *home = getenv("HOME");
+    char path[512], line[256];
+    static char text[8192];
+    snprintf(path, sizeof path, "%s/.app/pc_port/triforce-runs/mirror_items.txt", home ? home : "");
+    FILE *f = fopen(path, "r");
+    size_t len = 0;
+    if (f) {
+        len = fread(text, 1, sizeof text - 1, f);
+        fclose(f);
+    } else {
+        len = strlen(mir_items_builtin);
+        if (len > sizeof text - 1) len = sizeof text - 1;
+        memcpy(text, mir_items_builtin, len);
+    }
+    text[len] = 0;
+    static MirItem t[32];
+    int n = 0;
+    for (const char *q = text; n < 32 && *q;) {
+        const char *e = strchr(q, '\n');
+        size_t l = e ? (size_t)(e - q) : strlen(q);
+        if (l >= sizeof line) l = sizeof line - 1;
+        memcpy(line, q, l), line[l] = 0;
+        q = e ? e + 1 : q + strlen(q);
+        char pre[40], a[8] = "-", b[8] = "-";
+        int used = 0;
+        if (sscanf(line, "%39s %7s %7s%n", pre, a, b, &used) >= 2) {
+            char *tag = strchr(pre, '@');
+            t[n].age = 0;
+            if (tag) {
+                t[n].age = !strcmp(tag, "@child") ? 1 : !strcmp(tag, "@adult") ? 2 : 0;
+                *tag = 0;
+            }
+            snprintf(t[n].prefix, sizeof t[n].prefix, "%s", pre);
+            t[n].always = strstr(line, " always") != NULL;
+            t[n].hand = t[n].back = 0;
+            memset(t[n].K, 0, sizeof t[n].K);
+            for (const char *p = a; *p; p++) t[n].hand |= *p == 'x' ? 1 : *p == 'y' ? 2 : *p == 'z' ? 4 : 0;
+            if (!strcmp(b, "K")) {   /* (then 12 numbers: rows of the 3x4) */
+                const char *p = line + used;
+                int got = 0;
+                for (; got < 12; got++) {
+                    char *e;
+                    t[n].K[got] = strtof(p, &e);
+                    if (e == p) break;
+                    p = e;
+                }
+                t[n].back = got == 12 ? -1 : 0;
+            } else if (!strcmp(b, "P"))   /* (its place alone reflected through his body, in a hand or not: what he holds up) */
+                t[n].back = -2;
+            else
+                for (const char *p = b; *p; p++) t[n].back |= *p == 'x' ? 1 : *p == 'y' ? 2 : *p == 'z' ? 4 : 0;
+            n++;
+        }
+    }
+    int changed = n != mir_items_n;
+    for (int k = 0; !changed && k < n; k++) changed = strcmp(t[k].prefix, mir_items[k].prefix) || t[k].hand != mir_items[k].hand || t[k].age != mir_items[k].age || t[k].always != mir_items[k].always || t[k].back != mir_items[k].back || memcmp(t[k].K, mir_items[k].K, sizeof t[k].K);
+    if (changed) {
+        memcpy(mir_items, t, sizeof t[0] * n), mir_items_n = n;
+        for (int k = 0; k < n; k++) hos_log("vr: body: mirrored animation: %s%s reflected in axes %d in a hand, %d put away (x 1, y 2, z 4)", t[k].prefix, t[k].age == 1 ? " (child)" : t[k].age == 2 ? " (adult)" : "", t[k].hand, t[k].back);
+    }
+}
+static uint64_t mi_bones[16], mi_inst[16];
+static int mi_hand[16], mi_back[16], mi_item[16], mi_always[16], mi_n;
+static int mirrored_item(Ctx *c, uint64_t bones) {   /* (this skeleton's index in the found things, -1 if none) */
+    static int64_t at;
+    static SRWLOCK lock = SRWLOCK_INIT;
+    const int64_t now = hos_now_ns();
+    if (now - at > 500000000LL && TryAcquireSRWLockExclusive(&lock)) {
+        at = now;
+        mir_items_read();
+        int n = 0;
+        const uint64_t link = ma.actor;
+        const uint64_t list = plausible(link + 0x1b0, 8) ? recomp_load64(c, link + 0x1b0) : 0;
+        char name[48];
+        for (int i = 0; plausible(list, 1024 * 0x60) && i < 1024 && n < 16; i++) {
+            const uint64_t w = recomp_load64(c, list + (uint64_t)i * 0x60 + 0x40);
+            if (!w || !plausible(w, 0x40) || recomp_load64(c, w) != 0x84b45e18ULL || !actor_name(c, w, name)) continue;
+            int it = -1;
+            const int age = vr_game_childhood() ? 1 : 2;
+            for (int k = 0; k < mir_items_n && it < 0; k++)
+                if ((!mir_items[k].age || mir_items[k].age == age) && !strncmp(name, mir_items[k].prefix, strlen(mir_items[k].prefix))) it = k;
+            if (it < 0 || !(mir_items[it].hand | mir_items[it].back)) continue;
+            const uint64_t model = vr_call(c, 0x80994de0ULL, w, 0, 0, 0);
+            if (!plausible(model, 0x30)) continue;
+            const uint64_t parts = recomp_load64(c, model + 0x28);
+            const int np = (int)recomp_load32(c, model + 0x20);
+            for (int k = 0; k < np && k < 8 && n < 16 && plausible(parts, 8); k++) {
+                const uint64_t pk = recomp_load64(c, parts + (uint64_t)k * 8);
+                if (!plausible(pk, 8) || !plausible(recomp_load64(c, pk) + 0xf8, 8)) continue;
+                mi_inst[n] = recomp_load64(c, pk), mi_bones[n] = recomp_load64(c, mi_inst[n] + 0xf8), mi_hand[n] = mir_items[it].hand, mi_item[n] = it, mi_always[n] = mir_items[it].always, mi_back[n++] = mir_items[it].back;
+            }
+        }
+        if (n != mi_n) hos_log("vr: body: mirrored animation: %d skeleton(s) of mirrored things near him", n);
+        mi_n = n;
+        ReleaseSRWLockExclusive(&lock);
+    }
+    for (int i = 0; i < mi_n; i++)
+        if (mi_bones[i] == bones) return i;
+    return -1;
+}
+/* his strap (Ph_ArmStrap, a physics bone whose simulation goes astray with the arm mirrored under it) where the mirror wants
+   it: his own pose's strap reflected in his model's x, placed through his root's world as mirrored. Into his world entry and,
+   when given, a thing's bone (the shield's ArmStrap, which follows his) relative to that thing's origin */
+static void strap_place(Ctx *c, uint64_t thing_bones, uint64_t thing_inst, int reflected) {
+    const MaPart *mp = &ma.part[0];
+    const int part = ma_part_index(c, mp->bones);
+    if (mp->strap < 0 || part < 0 || !mp->written) return;
+    const uint64_t link_inst = recomp_load64(c, recomp_load64(c, recomp_load64(c, ma.model + 0x28) + (uint64_t)part * 8));
+    const uint64_t worlds = recomp_load64(c, mp->bones + 0x20);
+    if (!plausible(link_inst + 0x2d0, 12) || !plausible(worlds, (uint64_t)mp->n * 64)) return;
+    Xf root, mi, T, S, t, want;
+    xf_load(c, worlds, &root);
+    if (!xf_inv(&mp->Mmir[0], &mi)) return;
+    xf_mul(&root, &mi, &T);   /* (model to world, relative to his origin) */
+    xf_id(&S);
+    S.m[0][0] = -1;
+    xf_mul(&T, &S, &t);
+    xf_mul(&t, &mp->Mo[mp->strap], &want);   /* (reflected: the mirrored shield's strap) */
+    Xf his;
+    xf_mul(&T, &mp->Mmir[mp->strap], &his);   /* (his own, not turned inside out: the reflection through the bone's rest frames) */
+    const uint64_t e = worlds + (uint64_t)mp->strap * 64;
+    for (int k = 0; k < 4; k++)
+        for (int r = 0; r < 3; r++) st_f(c, e + k * 16 + r * 4, his.m[r][k]);
+    if (!thing_bones || !plausible(thing_inst + 0x2d0, 12)) return;
+    int strap_his = reflected ? 0 : 2;   /* (a shield only turned, or left as it is, keeps its strap on itself) */
+    {   /* (research: ~/.app/pc_port/triforce-runs/mirror_strap.txt "his" or "want" for both ages, read once a second) */
+        static int64_t at;
+        static int mode = -1;
+        const int64_t now = hos_now_ns();
+        if (now - at > 1000000000LL) {
+            at = now;
+            const char *home = getenv("HOME");
+            char path[512], w[8] = "";
+            snprintf(path, sizeof path, "%s/.app/pc_port/triforce-runs/mirror_strap.txt", home ? home : "");
+            FILE *f = fopen(path, "r");
+            if (f) {
+                if (fscanf(f, "%7s", w) != 1) w[0] = 0;
+                fclose(f);
+            }
+            const int was = mode;
+            mode = !strcmp(w, "his") ? 1 : !strcmp(w, "want") ? 0 : !strcmp(w, "none") ? 2 : -1;
+            if (mode != was) hos_log("vr: body: mirrored animation: the shield's strap %s", mode < 0 ? "by the shield's mirror" : mode == 2 ? "as the shield has it" : mode ? "at his" : "reflected");
+        }
+        if (mode >= 0) strap_his = mode;
+    }
+    if (strap_his == 2) return;
+    const uint64_t res = recomp_load64(c, thing_bones), tw = recomp_load64(c, thing_bones + 0x20);
+    const int n = plausible(res + 0x38, 2) ? (int)recomp_load16(c, res + 0x38) : 0;
+    const uint64_t arr = plausible(res + 0x10, 8) ? recomp_load64(c, res + 0x10) : 0;
+    for (int b = 0; b < n && b < 16 && plausible(arr, (uint64_t)(b + 1) * 0x58) && plausible(tw, (uint64_t)(b + 1) * 64); b++) {
+        char nm[64];
+        if (!ma_name(c, arr + (uint64_t)b * 0x58, nm, 64) || strcmp(nm, "ArmStrap")) continue;
+        for (int k = 0; k < 4; k++)
+            for (int r = 0; r < 3; r++) {
+                double v = k == 3 && strap_his ? his.m[r][3] : want.m[r][k];   /* (the child's: where his own strap is) */
+                if (k == 3) v += ld_f(c, link_inst + 0x2d0 + r * 4) - ld_f(c, thing_inst + 0x2d0 + r * 4);
+                st_f(c, tw + (uint64_t)b * 64 + k * 16 + r * 4, v);
+            }
+    }
+}
+/* his bracelet's bone (Ph_Bangle, a physics bone whose simulation goes astray with the arm mirrored under it): at rest on the
+   wrist it hangs from, that wrist as mirrored, through his root's world as mirrored. Into his world entry */
+static void bangle_place(Ctx *c) {
+    const MaPart *mp = &ma.part[0];
+    if (mp->bangle < 0 || !mp->written || ma_part_index(c, mp->bones) < 0) return;
+    const uint64_t worlds = recomp_load64(c, mp->bones + 0x20);
+    if (!plausible(worlds, (uint64_t)mp->n * 64)) return;
+    Xf root, mi, T, t, want;
+    xf_load(c, worlds, &root);
+    if (!xf_inv(&mp->Mmir[0], &mi)) return;
+    xf_mul(&root, &mi, &T);
+    xf_mul(&T, &mp->Mmir[mp->par[mp->bangle]], &t);
+    xf_mul(&t, &mp->bangle_rest, &want);
+    const uint64_t e = worlds + (uint64_t)mp->bangle * 64;
+    for (int k = 0; k < 4; k++)
+        for (int r = 0; r < 3; r++) st_f(c, e + k * 16 + r * 4, want.m[r][k]);
+}
+/* a thing placed in one of his hands (its base within 12 cm of Weapon_L's or Weapon_R's place, in the world): mirrored only
+   there; put away (his back, his belt) it sits on his body, which is not mirrored */
+static int in_his_hand(Ctx *c, uint64_t bones, uint64_t base) {
+    uint64_t inst = 0;
+    for (int i = 0; i < mi_n; i++)
+        if (mi_bones[i] == bones) inst = mi_inst[i];
+    const MaPart *mp = &ma.part[0];
+    const int part = ma_part_index(c, mp->bones);
+    if (!plausible(inst + 0x2d0, 12) || part < 0 || mp->hand_l < 0 || mp->hand_r < 0) return 0;
+    const uint64_t link_inst = recomp_load64(c, recomp_load64(c, recomp_load64(c, ma.model + 0x28) + (uint64_t)part * 8));
+    const uint64_t worlds = recomp_load64(c, mp->bones + 0x20);
+    if (!plausible(link_inst + 0x2d0, 12) || !plausible(worlds, (uint64_t)mp->n * 64)) return 0;
+    double at[3];
+    for (int k = 0; k < 3; k++) at[k] = ld_f(c, base + 0x30 + k * 4) + ld_f(c, inst + 0x2d0 + k * 4);
+    for (int h = 0; h < 2; h++) {
+        const uint64_t e = worlds + (uint64_t)(h ? mp->hand_r : mp->hand_l) * 64;
+        double d2 = 0;
+        for (int k = 0; k < 3; k++) {
+            const double d = ld_f(c, e + 0x30 + k * 4) + ld_f(c, link_inst + 0x2d0 + k * 4) - at[k];
+            d2 += d * d;
+        }
+        if (d2 < 0.12 * 0.12) return 1;
+    }
+    return 0;
+}
+/* a thing's placing (f_81500960, f_81500720: its bones from the base matrix x1, the skeleton x0), for a thing in the table:
+   its base reflected in its axis and the placing run with that; the renderer turns its faces. 1: done here */
+static int mirror_attach(Ctx *c, uint64_t fn) {
+    if (shield_inside || !ma.parts) return 0;
+    const int wanted = ma_wanted();
+    {   /* (research: the carried things placed as the game has them, from a file read once a second) */
+        static int64_t at;
+        static int plain;
+        const int64_t now = hos_now_ns();
+        if (now - at > 1000000000LL) {
+            at = now;
+            const char *home = getenv("HOME");
+            char path[512];
+            snprintf(path, sizeof path, "%s/.app/pc_port/triforce-runs/mirror_items_off.txt", home ? home : "");
+            FILE *f = fopen(path, "r");
+            if (f) fclose(f);
+            if (!!f != plain) hos_log("vr: body: mirrored animation: carried things %s", f ? "as the game places them" : "mirrored");
+            plain = !!f;
+        }
+        if (plain) return 0;
+    }
+    if (wanted) bangle_place(c);
+    {   /* (research: a placement whose base is his bracelet's bone) */
+        const MaPart *mp = &ma.part[0];
+        static int told;
+        if (mp->bangle >= 0 && told < 4 && c->x[1] == recomp_load64(c, mp->bones + 0x20) + (uint64_t)mp->bangle * 64) {
+            told++;
+            hos_log("vr: body: mirrored animation: %#llx placed straight from his bracelet's bone (by %#llx)", (unsigned long long)c->x[0], (unsigned long long)fn);
+        }
+    }
+    const int it = mirrored_item(c, c->x[0]);
+    const uint64_t base = c->x[1];
+    if (it < 0 || !plausible(base, 64)) return 0;
+    const int hand = mi_back[it] == -2 ? 0 : in_his_hand(c, c->x[0], base);
+    if (!wanted && (hand || !mi_always[it] || mi_back[it] != -1)) return 0;   /* (the mirror off: only the always-fixed, put away) */
+    const int axes = hand ? mi_hand[it] : mi_back[it];
+    if (!axes) return 0;
+    const uint64_t m = (c->x[31] - 256) & ~15ULL;   /* (the reflected base on the guest's stack, the call's frame below it) */
+    int odd;
+    if (axes == -2) {   /* (its place reflected in his x, through his place; its turn as the game has it) */
+        const uint64_t inst = mi_inst[it];
+        if (!plausible(inst + 0x2d0, 12) || !plausible(ma.actor + 0x328, 36)) return 0;
+        double nx[3], d = 0, w[3];
+        for (int r = 0; r < 3; r++) {
+            nx[r] = ld_f(c, ma.actor + 0x328 + (uint64_t)r * 12);   /* (his x in the world: the first column of his rows) */
+            w[r] = ld_f(c, base + 0x30 + (uint64_t)r * 4) + ld_f(c, inst + 0x2d0 + (uint64_t)r * 4);
+            d += (w[r] - ld_f(c, ma.actor + 0x31c + (uint64_t)r * 4)) * nx[r];
+        }
+        for (int k = 0; k < 16; k++) {
+            uint32_t v = recomp_load32(c, base + (uint64_t)k * 4);
+            if (k >= 12 && k < 15) {
+                const float f = (float)(ld_f(c, base + (uint64_t)k * 4) - 2 * d * nx[k - 12]);
+                memcpy(&v, &f, 4);
+            }
+            recomp_store32_sp(c, m + (uint64_t)k * 4, v);
+        }
+        odd = 0;
+    } else if (axes > 0) {
+        for (int k = 0; k < 16; k++) {
+            uint32_t v = recomp_load32(c, base + (uint64_t)k * 4);
+            if (k / 4 < 3 && (axes >> (k / 4) & 1) && k % 4 < 3) v ^= 0x80000000u;   /* (those columns: their axes turned round) */
+            recomp_store32_sp(c, m + (uint64_t)k * 4, v);
+        }
+        odd = __builtin_popcount((unsigned)axes) & 1;
+    } else {   /* (the base through K: base K, columns: the base's axes mixed by K's, its place moved by K's) */
+        const float *K = mir_items[mi_item[it]].K;
+        float B[4][4];   /* (column k, row r) */
+        for (int k = 0; k < 4; k++)
+            for (int r = 0; r < 4; r++) B[k][r] = ld_f(c, base + (uint64_t)(k * 16 + r * 4));
+        for (int j = 0; j < 4; j++)
+            for (int r = 0; r < 4; r++) {
+                float v = j == 3 ? B[3][r] : 0;
+                for (int i = 0; i < 3; i++) v += B[i][r] * K[i * 4 + j];
+                if (r == 3) v = B[j][3];
+                uint32_t bits;
+                memcpy(&bits, &v, 4);
+                recomp_store32_sp(c, m + (uint64_t)(j * 16 + r * 4), bits);
+            }
+        const double det = K[0] * (K[5] * K[10] - K[6] * K[9]) - K[1] * (K[4] * K[10] - K[6] * K[8]) + K[2] * (K[4] * K[9] - K[5] * K[8]);
+        odd = det < 0;
+    }
+    Ctx call = *c;
+    call.x[31] = m;
+    shield_inside = 1;
+    vr_call(&call, fn, c->x[0], m, c->x[2], c->x[8]);
+    if (wanted) strap_place(c, c->x[0], mi_inst[it], odd);
+    shield_inside = 0;
+    if (odd) {   /* (reflected: its bones' turns, rows, to the renderer: the draws it turns the faces of) */
+        extern void hos_vk_mirror_publish(const float *turns, int n);
+        const uint64_t worlds = recomp_load64(c, c->x[0] + 0x20);
+        const uint64_t head = recomp_load64(c, c->x[0]);
+        int n = plausible(head + 56, 2) ? (int)recomp_load16(c, head + 56) : 0;
+        if (n > 8) n = 8;
+        float t[16 * 12];
+        int got = 0;
+        uint64_t inst = 0;
+        for (int i = 0; i < mi_n; i++)
+            if (mi_bones[i] == c->x[0]) inst = mi_inst[i];
+        float org[3] = {0, 0, 0};
+        if (plausible(inst + 0x2d0, 12))
+            for (int k = 0; k < 3; k++) org[k] = ld_f(c, inst + 0x2d0 + k * 4);
+        static int64_t pub_at;
+        static int pub = 1;   /* (which to send: relative 1 (found right in the headset), in the world 2, both 3; a file once a second) */
+        const int64_t now = hos_now_ns();
+        if (now - pub_at > 1000000000LL) {
+            pub_at = now;
+            const char *home = getenv("HOME");
+            char path[512], w[8] = "";
+            snprintf(path, sizeof path, "%s/.app/pc_port/triforce-runs/mirror_publish.txt", home ? home : "");
+            FILE *f = fopen(path, "r");
+            if (f) {
+                if (fscanf(f, "%7s", w) != 1) w[0] = 0;
+                fclose(f);
+            }
+            const int was = pub;
+            pub = !strcmp(w, "abs") ? 2 : !strcmp(w, "none") ? 0 : !strcmp(w, "both") ? 3 : 1;   /* (relative by default) */
+            if (pub != was) hos_log("vr: body: mirrored animation: its places sent to the renderer: %s", pub == 1 ? "relative" : pub == 2 ? "in the world" : pub ? "both" : "none");
+        }
+        for (int b = 0; b < n && plausible(worlds, (uint64_t)(b + 1) * 64); b++)   /* (rows of the 3x4, the place last in each: as kept, */
+            for (int v = 0; v < 2; v++)                                               /* relative to its origin, and in the world) */
+                if (pub >> v & 1 && got < 16)
+                for (int q = 0, g = got++; q < 12; q++)
+                    t[g * 12 + q] = ld_f(c, worlds + (uint64_t)b * 64 + (q % 4) * 16 + (q / 4) * 4) + (v && q % 4 == 3 ? org[q / 4] : 0);
+        if (got) hos_vk_mirror_publish(t, got);
+    }
+    return 1;
+}
+int hos_oot_shield_attach(Ctx *c) { return mirror_attach(c, 0x81500960ULL); }
+int hos_oot_sword_attach(Ctx *c) { return mirror_attach(c, 0x81500720ULL); }
+
+/* the bone world accessor's end (f_803a1360: instance x0, its bone x2's world as rows into x1): his hands' (Weapon_L, Weapon_R)
+   asked for, by caller (the return address); research: a caller's answer given an axis turned round, from a file read once a
+   second (lines "<caller hex> <x|y|z>"), to find what places the sword's slash */
+static struct { uint64_t at; int64_t n[2]; } jw_callers[32];
+static int jw_n;
+static int64_t jw_told;
+static struct { uint64_t at; int ax; } jw_flip[16];
+static int jw_flip_n;
+static void jw_flips_read(void) {
+    static int64_t at;
+    const int64_t now = hos_now_ns();
+    if (now - at < 1000000000LL) return;
+    at = now;
+    const char *home = getenv("HOME");
+    char path[512], line[128];
+    snprintf(path, sizeof path, "%s/.app/pc_port/triforce-runs/mirror_callers.txt", home ? home : "");
+    FILE *f = fopen(path, "r");
+    int n = 0;
+    while (f && n < 16 && fgets(line, sizeof line, f)) {
+        unsigned long long a;
+        char ax;
+        /* (x|y|z: that axis turned round; w: the answer made from his world entry as mirrored, with his origin; r: without it.
+           Caller 0: every caller) */
+        /* (m: the answer's place reflected through his body, in his x: where the animation as made has the hand) */
+        if (sscanf(line, "%llx %c", &a, &ax) == 2 && (ax == 'x' || ax == 'y' || ax == 'z' || ax == 'w' || ax == 'r' || ax == 'm'))
+            jw_flip[n].at = a, jw_flip[n].ax = ax == 'w' ? 3 : ax == 'r' ? 4 : ax == 'm' ? 5 : ax - 'x', n++;
+    }
+    if (f) fclose(f);
+    if (n != jw_flip_n) hos_log("vr: body: mirrored animation: %d caller(s) given a hand's axis turned round", n);
+    jw_flip_n = n;
+}
+void hos_oot_joint_world(Ctx *c) {
+    if (!ma.parts || !ma_wanted()) return;
+    const MaPart *mp = &ma.part[0];
+    const int bone = (int)(int32_t)c->x[2];
+    if (bone != mp->hand_l && bone != mp->hand_r) return;
+    if (!plausible(c->x[0] + 0xf8, 8) || recomp_load64(c, c->x[0] + 0xf8) != mp->bones) return;
+    const uint64_t caller = c->x[30], out = c->x[1];
+    static SRWLOCK lock = SRWLOCK_INIT;
+    AcquireSRWLockExclusive(&lock);
+    int i = 0;
+    while (i < jw_n && jw_callers[i].at != caller) i++;
+    if (i == jw_n && jw_n < 32) jw_callers[jw_n++].at = caller;
+    if (i < 32) jw_callers[i].n[bone == mp->hand_r]++;
+    jw_flips_read();
+    const uint64_t worlds = recomp_load64(c, mp->bones + 0x20), e = worlds + (uint64_t)bone * 64;
+    {   /* (research: the answer beside his world entry, once a second a caller) */
+        static struct { uint64_t at; int64_t t; } seen[32];
+        int j = 0;
+        while (j < 32 && seen[j].at && seen[j].at != caller) j++;
+        if (j < 32 && plausible(out, 48) && plausible(e, 64) && plausible(c->x[0] + 0x2d0, 12) && hos_now_ns() - seen[j].t > 1000000000LL) {
+            seen[j].at = caller, seen[j].t = hos_now_ns();
+            hos_log("vr: body: mirrored animation: %#llx asked for %s: answer at %.3f %.3f %.3f, his entry %.3f %.3f %.3f + origin %.3f %.3f %.3f",
+                    (unsigned long long)caller, bone == mp->hand_l ? "Weapon_L" : "Weapon_R", ld_f(c, out + 12), ld_f(c, out + 28),
+                    ld_f(c, out + 44), ld_f(c, e + 48), ld_f(c, e + 52), ld_f(c, e + 56), ld_f(c, c->x[0] + 0x2d0),
+                    ld_f(c, c->x[0] + 0x2d4), ld_f(c, c->x[0] + 0x2d8));
+        }
+    }
+    for (int k = 0; k < jw_flip_n; k++)
+        if ((jw_flip[k].at == caller || !jw_flip[k].at) && jw_flip[k].ax == 5 && plausible(out, 48) && plausible(ma.actor + 0x328, 36)) {
+            double nx[3], d = 0;
+            for (int r = 0; r < 3; r++) {
+                nx[r] = ld_f(c, ma.actor + 0x328 + (uint64_t)r * 12);
+                d += (ld_f(c, out + (uint64_t)r * 16 + 12) - ld_f(c, ma.actor + 0x31c + (uint64_t)r * 4)) * nx[r];
+            }
+            for (int r = 0; r < 3; r++) st_f(c, out + (uint64_t)r * 16 + 12, ld_f(c, out + (uint64_t)r * 16 + 12) - 2 * d * nx[r]);
+            break;
+        }
+    for (int k = 0; k < jw_flip_n; k++)
+        if ((jw_flip[k].at == caller || !jw_flip[k].at) && jw_flip[k].ax >= 3 && jw_flip[k].ax <= 4 && plausible(out, 48) && plausible(e, 64)) {
+            for (int r = 0; r < 3; r++)
+                for (int q = 0; q < 4; q++) {
+                    double v = ld_f(c, e + (uint64_t)q * 16 + (uint64_t)r * 4);
+                    if (q == 3 && jw_flip[k].ax == 3) v += ld_f(c, c->x[0] + 0x2d0 + (uint64_t)r * 4);
+                    st_f(c, out + (uint64_t)r * 16 + (uint64_t)q * 4, v);
+                }
+            break;
+        }
+    for (int k = 0; k < jw_flip_n; k++)
+        if (jw_flip[k].at == caller && jw_flip[k].ax < 3 && plausible(out, 48))
+            for (int r = 0; r < 3; r++) {
+                const uint64_t a = out + (uint64_t)r * 16 + (uint64_t)jw_flip[k].ax * 4;
+                recomp_store32(c, a, recomp_load32(c, a) ^ 0x80000000u);
+            }
+    const int64_t now = hos_now_ns();
+    if (now - jw_told > 5000000000LL) {
+        if (jw_told)
+            for (int k = 0; k < jw_n; k++)
+                hos_log("vr: body: mirrored animation: hands asked for by %#llx: Weapon_L %lld, Weapon_R %lld in 5 s",
+                        (unsigned long long)jw_callers[k].at, (long long)jw_callers[k].n[0], (long long)jw_callers[k].n[1]);
+        jw_told = now;
+        for (int k = 0; k < jw_n; k++) jw_callers[k].n[0] = jw_callers[k].n[1] = 0;
+    }
+    ReleaseSRWLockExclusive(&lock);
+}
+
+/* the world pass's start (f_81501400, x0 the skeleton, x1..x2 its bones: its ranges may run on several workers): his
+   locals mirrored before any of his worlds is made from them; the lock waited for, so no range reads them half done */
+static __thread uint64_t wp_bones;   /* (this thread's world pass of his: its skeleton and bones, for its end) */
+static __thread int wp_part = -1, wp_lo, wp_hi;
+void hos_oot_world_pass(Ctx *c) {
+    wp_part = -1;
+    if (!ma.parts) return;
+    const uint64_t bones = c->x[0];
+    int i = 0;
+    while (i < ma.parts && ma.part[i].bones != bones) i++;
+    if (i == ma.parts && plausible(bones, 8) && recomp_load64(c, bones) == ma.part[0].res) {   /* (research: another skeleton of his
+                                                                                                  rig posed: a look-ahead's?) */
+        static struct { uint64_t b, caller; int64_t n; } o[16];
+        static int no;
+        static int64_t told;
+        static SRWLOCK lk = SRWLOCK_INIT;
+        AcquireSRWLockExclusive(&lk);
+        int k = 0;
+        while (k < no && (o[k].b != bones || o[k].caller != c->x[30])) k++;
+        if (k == no && no < 16) o[no].b = bones, o[no].caller = c->x[30], o[no].n = 0, no++;
+        if (k < 16) o[k].n++;
+        const int64_t now = hos_now_ns();
+        if (now - told > 5000000000LL) {
+            for (int j = 0; j < no; j++)
+                hos_log("vr: body: mirrored animation: another skeleton of his rig %#llx posed by %#llx: %lld in 5 s", (unsigned long long)o[j].b,
+                        (unsigned long long)o[j].caller, (long long)o[j].n), o[j].n = 0;
+            told = now;
+        }
+        ReleaseSRWLockExclusive(&lk);
+    }
+    if (i == ma.parts || !ma_wanted()) return;
+    {   /* ((Triforce VR) aiming: the game turns his upper body to the aim after the arms' hook, which the mirror would turn the
+           other way; the arms put on the controllers again here, just before the mirror (the hook leaves at once if nothing
+           has rewritten his arms since) */
+        int vr_game_aiming(void);
+        void hos_oot_after_anim(Ctx *c);
+        if (i == 0 && vr_game_aiming()) {
+            static int told;
+            if (!told++) hos_log("vr: body: aiming: the arms put on the controllers again before the mirror");
+            arms_forced = 1, hos_oot_after_anim(c), arms_forced = 0;
+        }
+    }
+    AcquireSRWLockExclusive(&ma_lock);
+    MaPart *mp = &ma.part[i];
+    if (i < ma.parts && mp->bones == bones && recomp_load64(c, bones) == mp->res && plausible(ma.actor, 0x330) &&
+        recomp_load64(c, ma.actor) == 0x84b45e18ULL) {
+        const uint64_t slots = recomp_load64(c, bones + 0x18);
+        int fresh = !mp->written;
+        for (int b = 0; !fresh && b < mp->n; b++) fresh = !ma_same(c, slots, mp, b);
+        if (fresh) {
+            const int part = ma_part_index(c, bones);
+            if (part >= 0) ma_part_mirror(c, part, mp);
+        } else ma_skipped++;
+        if (mp->written) wp_bones = bones, wp_part = i, wp_lo = (int)(int32_t)c->x[1], wp_hi = (int)(int32_t)c->x[2];
+    }
+    const int64_t now = hos_now_ns();
+    if (now - ma.told_at > 5000000000LL) {
+        if (ma.told_at) hos_log("vr: body: mirrored animation: %lld poses mirrored in 5 s, %lld world passes with nothing new", (long long)ma_done, (long long)ma_skipped);
+        ma.told_at = now, ma_done = ma_skipped = 0;
+    }
+    ReleaseSRWLockExclusive(&ma_lock);
+}
+
+static void dir_shadows(Ctx *c);
 void vr_body_lift(Ctx *c, uint64_t actor) {
+    ma_seen(c, actor);
+    dir_shadows(c);
     const MkwVkXr *x = rx_xr();
     if (!x || !x->hands || !x->active) return;
     const int on = x->active();   /* (no session: no bones looked for; what was hidden is shown again) */
     if (on) pose_cache(c, actor);
-    const int fp = on && vr_first_person_now();
+    const int fp = on && vr_first_person_now() && !vr_game_paused();   /* ((Triforce VR) the menus show him whole) */
     head_materials_set(c, fp && body_arms());
     hide_back_items(c, actor, fp);
 }
@@ -628,7 +1515,7 @@ void hos_oot_after_anim(Ctx *c) {
     const MkwVkXr *x = rx_xr();
     if (!x || !x->hands || !body_arms()) return;
     /* (quick, for every model's pass: Link's slots as this hook left them: the animation has not been back, leave) */
-    if (ob_unchanged(c, OB_ARM1_L) && ob_unchanged(c, OB_ARM1_R) && ob_unchanged(c, OB_HEAD)) return;
+    if (!arms_forced && ob_unchanged(c, OB_ARM1_L) && ob_unchanged(c, OB_ARM1_R) && ob_unchanged(c, OB_HEAD)) return;
     if (!TryAcquireSRWLockExclusive(&ob_lock)) return;
     /* (the cache still Link's: a level change frees his model before the movement update notices; never write a freed one) */
     if (!ob.valid || !plausible(ob.actor, 0x330) || recomp_load64(c, ob.actor) != 0x84b45e18ULL ||
@@ -694,11 +1581,14 @@ void hos_oot_after_anim(Ctx *c) {
         root_now = root;
         const double origin[3] = {ld_f(c, ob.origin), ld_f(c, ob.origin + 4), ld_f(c, ob.origin + 8)};
         for (int r = 0; r < 3; r++) root_now.m[r][3] = link_now[r] - origin[r];
-        /* his left arm holds the sword: the sword hand's controller (VR_HANDEDNESS), his right the other */
-        const int sword = !strcmp(body_cfg("VR_HANDEDNESS"), "right");
+        /* each arm its own side's controller; with his animation mirrored (ma_wanted) each arm as posed here becomes the
+           other side's once mirrored, so it takes the other controller reflected through his body, and ends on its own */
+        const int mirrored = ma.parts && ma_wanted();
+        Xf root_now_inv;
+        const int have_inv = xf_inv(&root_now, &root_now_inv);
         if (xf_inv(&root, &root_inv))
-            for (int s = 0; s < 2; s++) {   /* (s 0: Link's left arm, the sword's; 1: his right, the shield's) */
-                const int h = s == 0 ? sword : 1 - sword;   /* (the controller: 0 left, 1 right) */
+            for (int s = 0; s < 2; s++) {   /* (s 0: Link's left arm; 1: his right) */
+                const int h = mirrored ? 1 - s : s;   /* (the controller: 0 left, 1 right) */
                 if (hand[h * 3] == 0 && hand[h * 3 + 1] == 0 && hand[h * 3 + 2] == 0) continue;   /* (not tracked: his own) */
                 const int clav = s ? OB_CLAV_R : OB_CLAV_L, b1 = s ? OB_ARM1_R : OB_ARM1_L;
                 const double side = s ? -1 : 1;
@@ -707,15 +1597,36 @@ void hos_oot_after_anim(Ctx *c) {
                 xf_load(c, ob.world[clav], &cw);
                 xf_mul(&root_inv, &cw, &cm);
                 xf_mul(&root_now, &cm, &cn);
+                {   /* ((Triforce VR) mirrored: the worlds are the mirrored pose's, the other side's clavicle reflected, off by any
+                       turn of his upper body (the aim's) the other way; the clavicle as the animation has it instead (MaPart Mo),
+                       through his root as the animation has it (the mirrored root's world taken back through Mmir, on through Mo) */
+                    const MaPart *mp = &ma.part[0];
+                    const int bc = (int16_t)(ob.id[clav] >> 16), br = (int16_t)(ob.id[OB_ROOT] >> 16);
+                    Xf mri, base, rpre, moi;
+                    if (mirrored && mp->written && bc >= 0 && bc < mp->n && br >= 0 && br < mp->n && xf_inv(&mp->Mmir[br], &mri) &&
+                        xf_inv(&mp->Mo[br], &moi)) {
+                        xf_mul(&root, &mri, &base);   /* (model to world, relative to the origin) */
+                        xf_mul(&base, &mp->Mo[br], &rpre);
+                        for (int r = 0; r < 3; r++) rpre.m[r][3] = root_now.m[r][3];
+                        xf_mul(&moi, &mp->Mo[bc], &cm);
+                        xf_mul(&rpre, &cm, &cn);
+                    }
+                }
                 if (!xf_inv(&cn, &cinv)) continue;
                 /* the wrist's target: the controller, a little back from it along where it points */
                 double pt[3] = {point[h * 3], point[h * 3 + 1], point[h * 3 + 2]};
                 const int have_pt = v3_norm(pt);
                 double T[3];
                 for (int k = 0; k < 3; k++) T[k] = hand[h * 3 + k] - origin[k] - (have_pt ? pt[k] * 0.03 : 0);
+                double Nm[3] = {palm[h * 3], palm[h * 3 + 1], palm[h * 3 + 2]};
+                if (mirrored && have_inv) {   /* (the target, its pointing and its palm reflected in his x) */
+                    xf_pt(&root_now_inv, T, T), T[0] = -T[0], xf_pt(&root_now, T, T);
+                    xf_dir(&root_now_inv, pt, pt), pt[0] = -pt[0], xf_dir(&root_now, pt, pt);
+                    xf_dir(&root_now_inv, Nm, Nm), Nm[0] = -Nm[0], xf_dir(&root_now, Nm, Nm);
+                }
                 xf_pt(&cinv, T, T);
                 /* the elbow's pole in Link's frame: down, out to his side and a little back; then in the clavicle's */
-                double P[3] = {side * 0.35, -1, -0.3}, D[3], N[3] = {palm[h * 3], palm[h * 3 + 1], palm[h * 3 + 2]};
+                double P[3] = {side * 0.35, -1, -0.3}, D[3], N[3] = {Nm[0], Nm[1], Nm[2]};
                 xf_dir(&root_now, P, P), xf_dir(&cinv, P, P);
                 if (have_pt) xf_dir(&cinv, pt, D);
                 const int have_palm = v3_norm(N);
@@ -737,3 +1648,198 @@ void hos_oot_after_anim(Ctx *c) {
     ob_snap(c, OB_ARM1_L), ob_snap(c, OB_ARM1_R), ob_snap(c, OB_HEAD);
     ReleaseSRWLockExclusive(&ob_lock);
 }
+
+/* the world pass's end (f_81501400 returning): its bones' slots put back as the animation left them (MaPart raw), the worlds
+   made from the mirrored ones kept; research: ~/.app/pc_port/triforce-runs/mirror_restore_off.txt there: left mirrored */
+void hos_oot_world_pass_end(Ctx *c) {
+    const int i = wp_part;
+    wp_part = -1;
+    if (i < 0 || i >= ma.parts || ma.part[i].bones != wp_bones || !ma.part[i].written) return;
+    static int64_t at;
+    static int off = 1;
+    const int64_t now = hos_now_ns();
+    if (now - at > 1000000000LL) {
+        at = now;
+        const char *home = getenv("HOME");
+        char path[512];
+        snprintf(path, sizeof path, "%s/.app/pc_port/triforce-runs/mirror_restore_on.txt", home ? home : "");
+        FILE *f = fopen(path, "r");   /* (research only, off by default: putting them back loses what reads them after, the masks) */
+        const int was = off;
+        off = f == NULL;
+        if (f) fclose(f);
+        if (off != was) hos_log("vr: body: mirrored animation: his slots %s after the world pass", off ? "left mirrored" : "put back");
+    }
+    if (off) return;
+    MaPart *mp = &ma.part[i];
+    const uint64_t slots = recomp_load64(c, mp->bones + 0x18);
+    const int lo = wp_lo < 0 ? 0 : wp_lo, hi = wp_hi > mp->n ? mp->n : wp_hi;
+    if (!plausible(slots, (uint64_t)mp->n * 0x60)) return;
+    for (int b = lo; b < hi; b++)
+        for (int k = 0; k < 0x60; k += 4) {
+            uint32_t v;
+            memcpy(&v, &mp->raw[b][k], 4);
+            recomp_store32(c, slots + (uint64_t)b * 0x60 + (uint64_t)k, v);
+        }
+}
+
+/* the root's placing (f_81500ff0: the skeleton x0's root from the model's base matrix x1, then its world pass): with his pose
+   mirrored, the model's own turn about his up axis apart from where he faces (his spin attack's) turned the other way: the
+   base's yaw relative to his facing negated, the rest of it kept. Research: ~/.app/pc_port/triforce-runs/mirror_root_yaw.txt
+   "on" to do it (off until it is known not to fight his ordinary turning); the offset logged either way. 1: done here */
+static __thread int root_inside;
+int hos_oot_root_place(Ctx *c) {
+    if (root_inside || !ma.parts || ma.part[0].bones != c->x[0] || !ma_wanted() || !plausible(ma.actor + 0x328, 36)) return 0;
+    const uint64_t base = c->x[1];
+    if (!plausible(base, 64)) return 0;
+    static int64_t at, told_at;
+    static int on;
+    static double most;
+    const int64_t now = hos_now_ns();
+    if (now - at > 1000000000LL) {
+        at = now;
+        const char *home = getenv("HOME");
+        char path[512], w[8] = "";
+        snprintf(path, sizeof path, "%s/.app/pc_port/triforce-runs/mirror_root_yaw.txt", home ? home : "");
+        FILE *f = fopen(path, "r");
+        if (f) {
+            if (fscanf(f, "%7s", w) != 1) w[0] = 0;
+            fclose(f);
+        }
+        const int was = on;
+        on = !strcmp(w, "on");
+        if (on != was) hos_log("vr: body: mirrored animation: the model's own turn %s", on ? "mirrored" : "as the game has it");
+    }
+    double R[3][3], B[3][3];   /* (his facing, columns his axes; the base's turn, columns its axes) */
+    for (int r = 0; r < 3; r++)
+        for (int k = 0; k < 3; k++) R[r][k] = ld_f(c, ma.actor + 0x328 + (uint64_t)r * 12 + (uint64_t)k * 4), B[r][k] = ld_f(c, base + (uint64_t)k * 16 + (uint64_t)r * 4);
+    double rel[3][3];   /* (R^T B: the base in his frame) */
+    for (int r = 0; r < 3; r++)
+        for (int k = 0; k < 3; k++) {
+            double s = 0;
+            for (int j = 0; j < 3; j++) s += R[j][r] * B[j][k];
+            rel[r][k] = s;
+        }
+    const double yaw = atan2(rel[0][2], rel[2][2]);   /* (its forward, its z, about his up) */
+    if (fabs(yaw) > most) most = fabs(yaw);
+    if (now - told_at > 5000000000LL) {
+        if (told_at) hos_log("vr: body: mirrored animation: the model's own turn from his facing: up to %.1f degrees in 5 s", most * 57.29578);
+        told_at = now, most = 0;
+    }
+    if (!on || fabs(yaw) < 1e-4) return 0;
+    const double cy = cos(-2 * yaw), sy = sin(-2 * yaw);   /* (turned by -2 yaw about his up: the offset negated) */
+    double T[3][3] = {{cy, 0, sy}, {0, 1, 0}, {-sy, 0, cy}}, rel2[3][3], B2[3][3];
+    for (int r = 0; r < 3; r++)
+        for (int k = 0; k < 3; k++) {
+            double s = 0;
+            for (int j = 0; j < 3; j++) s += T[r][j] * rel[j][k];
+            rel2[r][k] = s;
+        }
+    for (int r = 0; r < 3; r++)
+        for (int k = 0; k < 3; k++) {
+            double s = 0;
+            for (int j = 0; j < 3; j++) s += R[r][j] * rel2[j][k];
+            B2[r][k] = s;
+        }
+    const uint64_t m = (c->x[31] - 256) & ~15ULL;
+    for (int k = 0; k < 16; k++) {
+        uint32_t v = recomp_load32(c, base + (uint64_t)k * 4);
+        if (k / 4 < 3 && k % 4 < 3) {
+            const float f = (float)B2[k % 4][k / 4];
+            memcpy(&v, &f, 4);
+        }
+        recomp_store32_sp(c, m + (uint64_t)k * 4, v);
+    }
+    Ctx call = *c;
+    call.x[31] = m;
+    root_inside = 1;
+    vr_call(&call, 0x81500ff0ULL, c->x[0], m, c->x[2], c->x[8]);
+    root_inside = 0;
+    return 1;
+}
+
+/* left/right animation queries (f_803f5b40: object x0's field x2 bound under the name at [x1] for its animation's choices):
+   the ones naming a side get a shadow of their own, the real field's value turned over while his pose is mirrored, so the
+   animation chosen is the other side's, which the mirror turns into this side's. The real field stays the game's. Research:
+   ~/.app/pc_port/triforce-runs/mirror_dir_flags.txt, the names to turn (one a line; none: none turned) */
+enum { DIR_MAX = 256 };
+static struct { uint64_t obj, real, shadow; char name[32]; } dir_bind[DIR_MAX];
+static int dir_side_name(const char *nm) {   /* (an "Is...Left", "Is...Right" or "Is...Clockwise" name: a side's query) */
+    const size_t n = strlen(nm);
+    if (strstr(nm, "Mirror") || strstr(nm, "Flip")) return 1;   /* (the animation system's own left/right mirroring) */
+    if (n < 6 || strncmp(nm, "Is", 2)) return 0;
+    return (n > 6 && !strcmp(nm + n - 4, "Left")) || (n > 7 && !strcmp(nm + n - 5, "Right")) || (n > 11 && !strcmp(nm + n - 9, "Clockwise"));
+}
+static volatile LONG dir_n;
+void hos_oot_bind_param(Ctx *c) {
+    {   /* (research only, RX_MIRROR_BIND=1: shadows stop updating where his update does not run, the menus' inputs among them) */
+        static int on = -1;
+        if (on < 0) on = getenv("RX_MIRROR_BIND") && *getenv("RX_MIRROR_BIND") == '1';
+        if (!on) return;
+    }
+    const uint64_t at = plausible(c->x[1], 8) ? recomp_load64(c, c->x[1]) : 0;
+    if (!plausible(at, 4)) return;
+    char nm[32];
+    int k = 0;
+    for (; k < 31; k++) {
+        nm[k] = (char)recomp_load8(c, at + (uint64_t)k);
+        if (!nm[k]) break;
+    }
+    nm[k] = 0;
+    if (!dir_side_name(nm)) return;
+    if (c->x[3] != 1) {   /* (research: a side's or mirror's name bound as something else than a flag) */
+        hos_log("vr: body: bound %s as kind %llu (object %#llx, field %#llx): not shadowed", nm, (unsigned long long)c->x[3],
+                (unsigned long long)c->x[0], (unsigned long long)c->x[2]);
+        return;
+    }
+    static uint64_t pool, used;
+    static SRWLOCK lk = SRWLOCK_INIT;
+    AcquireSRWLockExclusive(&lk);
+    if (!pool) {
+        uint64_t hos_region_alloc(uint64_t size, uint64_t align);
+        pool = hos_region_alloc(0x10000, 0x10000);
+        for (uint64_t o = 0; pool && o < 0x10000; o += 8) recomp_store64(c, pool + o, 0);
+    }
+    if (pool && dir_n < DIR_MAX && used + 16 <= 0x10000) {
+        const int i = (int)dir_n;
+        dir_bind[i].obj = c->x[0], dir_bind[i].real = c->x[2], dir_bind[i].shadow = pool + used;
+        snprintf(dir_bind[i].name, sizeof dir_bind[i].name, "%s", nm);
+        used += 16;
+        recomp_store8(c, dir_bind[i].shadow, recomp_load8(c, c->x[2]));
+        __atomic_store_n(&dir_n, i + 1, __ATOMIC_RELEASE);
+        hos_log("vr: body: mirrored animation: %s bound (object %#llx, field %#llx, by %#llx): given a shadow", nm, (unsigned long long)c->x[0],
+                (unsigned long long)c->x[2], (unsigned long long)c->x[30]);
+        c->x[2] = dir_bind[i].shadow;
+    }
+    ReleaseSRWLockExclusive(&lk);
+}
+/* the shadows set from their fields: turned over for the names the file lists while his pose is mirrored */
+static void dir_shadows(Ctx *c) {
+    static int64_t at;
+    static char turn[32][32];
+    static int nturn;
+    const int64_t now = hos_now_ns();
+    if (now - at > 1000000000LL) {
+        at = now;
+        const char *home = getenv("HOME");
+        char path[512], line[64];
+        snprintf(path, sizeof path, "%s/.app/pc_port/triforce-runs/mirror_dir_flags.txt", home ? home : "");
+        FILE *f = fopen(path, "r");
+        int k = 0;
+        while (f && k < 32 && fgets(line, sizeof line, f))
+            if (sscanf(line, "%31s", turn[k]) == 1) k++;
+        if (f) fclose(f);
+        if (k != nturn) hos_log("vr: body: mirrored animation: %d side quer(ies) turned over while mirrored", k);
+        nturn = k;
+    }
+    const int wanted = ma.parts && ma_wanted();
+    const int n = (int)__atomic_load_n(&dir_n, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++) {
+        const uint8_t v = recomp_load8(c, dir_bind[i].real);
+        int t = 0;
+        for (int k = 0; k < nturn && !t; k++) t = !strcmp(turn[k], dir_bind[i].name);
+        recomp_store8(c, dir_bind[i].shadow, wanted && t && v <= 1 ? (uint8_t)(v ^ 1) : v);
+    }
+}
+
+/* ((Triforce VR) his animation mirrored now: vr_game.c's aim steering asks) */
+int vr_body_mirrored(void) { return ma.parts && ma_wanted(); }

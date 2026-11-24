@@ -482,6 +482,15 @@ void rx_close_asked(void) {
     void (*close_asked)(void) = (void (*)(void))(void *)GetProcAddress(vk_module, "mkwvk_close_asked");
     if (close_asked) close_asked();
 }
+/* ((Triforce VR) right-handed: the mirrored shield's turns (host/vr_body.c) to the back end, which turns the faces of its draws
+   (gpu/vk/vk_draw.cpp xr_draw_mirrored); an older back end without the export: nothing */
+void hos_vk_mirror_publish(const float *turns, int n) {
+    static void (*publish)(const float *, int);
+    static HMODULE looked;
+    if (!vk_module) return;
+    if (looked != vk_module) looked = vk_module, publish = (void (*)(const float *, int))(void *)GetProcAddress(vk_module, "hos_vk_mirror_publish");
+    if (publish) publish(turns, n);
+}
 void rx_resize(int width, int height) { vk ? vk->resize(width, height) : wgr_resize(width, height); }
 const char *rx_describe(void) { return vk ? vk->describe() : wgr_describe(); }
 void rx_stats(int64_t *draws, int64_t *skipped, int64_t *pipelines) {

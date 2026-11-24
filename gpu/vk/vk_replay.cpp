@@ -9372,6 +9372,7 @@ void fill_replay_table(MkwVkRenderer& t) {
         if (id == HOS_OPT_MENU_SOUND_VOLUME) return std::clamp(opts.menu_sounds, 0, 100);   // (and the Menu sounds row)
         if (id == HOS_OPT_SPRINT) return opts.sprint_button;
         if (id == HOS_OPT_SPRINT_HOLD) return opts.sprint_mode;
+        if (id == HOS_OPT_RIGHT_HANDED) return opts.right_handed != 0;
         if (id == HOS_OPT_DISPLAY_CAP) return fps_cap::of_display(display_refresh_mhz());   // (Monitor's rate: host/nn_vi.c fps_max)
         if (id == HOS_OPT_PACE_START) return pace::frame_start();   // (Triforce: the game's frame starts, host/nn_vi.c hos_vi_native_acquire)
         if (id == HOS_OPT_PACE_STEADY) return pace::steady_held_us();   // (Triforce: the present's hold for the Steady frame rate row)

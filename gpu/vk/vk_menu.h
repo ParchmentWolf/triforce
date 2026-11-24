@@ -143,6 +143,7 @@ struct Options {
     int dlssg = 0;           // (Triforce) NVIDIA DLSS frame generation: 0 off, 1 2x, 2 3x, 3 4x; read at the start (vk_dlssg.cpp, dlss_frame_generation=)
     int wide_hud = 0;        // (Triforce) with Ultrawide: 0 the HUD in the middle 16:9, 1 its corner pieces at the screen's edges (host/oot_wide_hud.c)
     int sprint_button = 0;   // (Triforce) the sprint button: 0 off, 1 the left stick's click, 2 B (host/oot_sprint.h)
+    int right_handed = 0;    // (Triforce) Link right-handed: his animation mirrored, what he holds in the other hand (host/vr_body.c)
     int sprint_mode = 0;     // 0 toggle (a press starts it, the next ends it), 1 hold
     int discord = 1;   // (hookshot) the Discord status (host/discord_rpc.c): 1 on, shown while a Discord client runs on this PC
     int language = 0;  // (Triforce) Game language: the row's entry among the languages language.txt names (game_language.h). Not kept in
@@ -160,7 +161,7 @@ struct Options {
     int flat3d_depth = 250;     // its eyes' distance, percent of 6.4 cm
     int flat3d_screen = 0;      // the screen's distance in cm, 0 the nearest thing in the picture's middle
     int vr_resolution = 0;      // (Triforce VR) the 3D's size while VR is on: 0 the Graphics tab's Render resolution, else its values
-    int vr_stereo = 0;          // 0 Performant (each eye from one picture and its depth), 1 Balanced (eyes in turn, the game's time held)
+    int vr_stereo = 1;          // 0 Performant (each eye from one picture and its depth), 1 Balanced (eyes in turn, the game's time held)
     int vr_depth = 100;         // the eyes' distance, percent of the wearer's own (0 to 200)
     int vr_eye_up = 0, vr_eye_side = 0, vr_eye_forward = 0;   // first person: the eyes moved from Link's, cm (-30 to 30)
     int vr_event_up = 0;        // cutscenes: the eyes raised this many cm more (-50 to 50)

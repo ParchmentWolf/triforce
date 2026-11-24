@@ -123,6 +123,7 @@ void xr_swaps_reset();
 extern int xr_n_swaps;
 int xr_swap_copies(float* p, uint64_t n);
 extern XrEyeCam xr_eye;
+bool xr_draw_mirrored(const NvnState& s);
 bool xr_is_camera(uint64_t addr);
 struct Texture;
 /// (Triforce VR, a probe for Accurate's right eye) textures the first walk of a submission wrote, and the second; a read in the
