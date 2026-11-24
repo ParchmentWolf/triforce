@@ -2,6 +2,8 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <array>
 #include <atomic>
 #include <mutex>
@@ -514,6 +516,19 @@ inline int64_t prof_now() {
         const int64_t dns = perf_ticks_to_ns(b.QuadPart - a.QuadPart, f.QuadPart);
         Scale s;
         s.ok = c1 > c0 && dns > 0 && sink > 0;
+#ifndef _WIN32
+        // ((Triforce) not where the kernel has given the counter up: a laptop's firmware can start the cores' counters seconds
+        // apart ("TSC warp between CPUs, turning off TSC clock"), and a time read on one core was then seconds off one read on
+        // another: the game's Options tabs, timed across threads, faded in again and again. The kernel's own clock then)
+        if (s.ok) {
+            char src[16] = "";
+            if (FILE* f = fopen("/sys/devices/system/clocksource/clocksource0/current_clocksource", "r")) {
+                if (!fgets(src, sizeof src, f)) src[0] = 0;
+                fclose(f);
+            }
+            s.ok = !strncmp(src, "tsc", 3);
+        }
+#endif
         s.ns_per = s.ok ? (double)dns / (double)(c1 - c0) : 0.0;
         return s;
     }();
