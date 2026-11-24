@@ -186,6 +186,7 @@ struct Options {
     int vr_charge_reach = 35;   // how far out from the head a swing must leave the hand to hold the charge, cm (25 to 70)
     int vr_hud = 0;             // 0 a panel in front of the head, 1 left in the picture
     int vr_hud_size = 100;      // the HUD panel's width, cm a metre away (40 to 200)
+    int vr_scheme = 0;          // the VR hand controllers' control scheme: 0 Full Gesture, 1 [PlaceHolder] (vk_xr.cpp)
     int vr_body = 1;            // first person: 0 Link hidden, 1 his arms on the controllers and his head hidden (host/vr_body.c)
     int vr_arm_reach = 135;     // the arms' stretch to reach the controllers, percent of their length (100 to 160)
 };

@@ -206,6 +206,7 @@ const char* tx_flat3d_screen(int v) {
 }
 const char* tx_vr_stereo(int v) { return v == 2 ? "Accurate" : v == 1 ? "Balanced" : "Performant"; }
 const char* tx_vr_body(int v) { return v ? "Shown" : "Hidden"; }
+const char* tx_vr_scheme(int v) { return v ? "[PlaceHolder]" : "Full Gesture"; }
 const char* tx_unit(int v, const char* fmt) {
     static char b[24];
     snprintf(b, sizeof b, fmt, v);
@@ -1794,11 +1795,16 @@ Row rows[] = {
     {TAB_CONTROLS, "Motion", nullptr, 0, 0, 0, nullptr,   // (hookshot: opens the Motion page, the TAB_MOTION rows)
      "Aiming with the controller's gyroscope: on or off, its sensitivity and its inverts."},
     // ((Triforce VR) the VR Controls page: Link's body, then the hand controllers' swings and pointing
-    {TAB_VRPAGE, "Body visibility", &opts.vr_body, 0, 1, 1, tx_vr_body,
+    {TAB_VRPAGE, "Control Scheme", &opts.vr_scheme, 0, 1, 1, tx_vr_scheme,
+     "How the hand controllers play. Full Gesture: Link's moves from your own: draw from behind your head, swing to slash, "
+     "raise the shield, pull back the bow, point to aim. [PlaceHolder]: a scheme still to come.", nullptr, false, true, -1,
+     false, "vr_scheme"},
+    MENU_HEADING(TAB_VRPAGE, "Body"),
+    {TAB_VRPAGE, "Visibility", &opts.vr_body, 0, 1, 1, tx_vr_body,
      "Full Dive: Shown: Link stays drawn, his arms follow your hands with what they hold, and his head is hidden. "
      "Hidden: all of Link is hidden, what he holds stays in view.", nullptr, false, true, -1, false, "vr_body"},
     {TAB_VRPAGE, "Arm reach", &opts.vr_arm_reach, 100, 160, 5, tx_percent,
-     "Body visibility Shown: how far Link's arms may stretch to meet your hands, his arms being shorter than yours. 100%: never "
+     "Visibility Shown: how far Link's arms may stretch to meet your hands, his arms being shorter than yours. 100%: never "
      "stretched.", nullptr, false, true, -1, false, "vr_arm_reach"},
     MENU_HEADING(TAB_VRPAGE, "Controls"),
     {TAB_VRPAGE, "Swing speed", &opts.vr_swing_speed, 100, 500, 10, tx_cm_s,
@@ -2682,6 +2688,7 @@ const VrKey vr_keys[] = {
     {"VR_HUD", &opts.vr_hud, "panel|picture"},
     {"VR_HUD_SIZE", &opts.vr_hud_size, nullptr},
     {"VR_BODY", &opts.vr_body, "hidden|arms"},
+    {"VR_SCHEME", &opts.vr_scheme, "gesture|placeholder"},
     {"VR_ARM_REACH", &opts.vr_arm_reach, nullptr},
 };
 const char* ini_key(const Row& r) {
@@ -8768,7 +8775,8 @@ extern "C" const char* vk_xr_cfg(const char* key) {
     static thread_local char b[24];
     // ((Triforce VR) the hand controllers always play, with motion; a gamepad alongside them as a pad (no rows for these now)
     if (!strcmp(key, "VR_CONTROLS")) return "meta";
-    if (!strcmp(key, "VR_PLAY")) return "motion";
+    // ((Triforce VR) motion play (the pointed aim, vr_game.c) is Full Gesture's; another scheme starts from none
+    if (!strcmp(key, "VR_PLAY")) return mkwvk::opts.vr_scheme == 0 ? "motion" : "stationary";
     // ((Triforce VR) the sword hand before a draw chooses one: Controls' Right handed Link (no VR row for it now)
     if (!strcmp(key, "VR_HANDEDNESS")) return mkwvk::opts.right_handed ? "right" : "left";
     if (!strcmp(key, "VR_MIRROR")) {   // ((Triforce VR) Link mirrored for what the hands last did, "" before: vk_xr.cpp)

@@ -732,6 +732,8 @@ bool hud_wanted() { return true; }   // ((Triforce VR) the HUD always on its pan
 // VR_STEREO=balanced: each game frame drawn from one eye in turn (true geometry), the game's time held for the right
 // eye's update so both eyes show one moment, rather than performant's depth stereo from the head
 bool stereo_balanced() { return strcmp(cfg_value("VR_STEREO"), "balanced") == 0; }
+// ((Triforce VR) the hand controllers' control scheme (VR Controls' Control Scheme): Full Gesture, or another (placeholder_play)
+bool scheme_full_gesture() { return strcmp(cfg_value("VR_SCHEME"), "placeholder") != 0; }
 bool stereo_turns() { return stereo_balanced(); }
 // VR_STEREO=accurate: the game draws the left eye's picture and the renderer the same frame again for the right (true depth,
 // both eyes the same moment, the game's full rate)
@@ -1354,6 +1356,15 @@ struct Controls {
         return XR_SUCCEEDED(xr().xrGetActionStateFloat(session, &gi, &st)) && st.isActive ? st.currentState : 0.0f;
     }
     // this headset frame's buttons, sticks and grips (time: the frame's predicted display time) into the Xr's
+    // ((Triforce VR) [PlaceHolder]: the play of a control scheme other than Full Gesture, while Link is in play (menus, pauses and
+    // events keep the common buttons above). In: the pad's bits as the common buttons set them (A, B, X from the face buttons and
+    // the stick clicks, L and R from the triggers, Plus and Minus from the Menu button) and the sticks (-1..1, x right, y up);
+    // each grip's pose and whether it is tracked, its velocity in m/s, and the head's pose, all in the play space (OpenXR's x
+    // right, y up, z back). Out: bits and sticks as the game is to read them (bits |= 1ull << ZR...). Nothing yet
+    void placeholder_play(uint64_t &bits, float (&sticks)[2][2], const Pose (&poses)[2], const bool (&pose_ok)[2],
+                          const float (&velocity)[2][3], const Pose &head_pose) {
+        (void)bits, (void)sticks, (void)poses, (void)pose_ok, (void)velocity, (void)head_pose;
+    }
     void read(XrSession session, XrSpace space, XrTime time, const Pose &head_pose) {
         const float *head = head_pose.p;
         if (!ok) return;
@@ -1466,6 +1477,26 @@ struct Controls {
             const float dt = (float)(hand_t[h][i] - hand_t[h][o]) * 1e-9f;
             for (int c = 0; c < 3 && dt > 0; c++) hv[h][c] = (hand_p[h][i][c] - hand_p[h][o][c]) / dt;
             hspeed[h] = std::sqrt(hv[h][0] * hv[h][0] + hv[h][1] * hv[h][1] + hv[h][2] * hv[h][2]);
+        }
+        // ((Triforce VR) what every scheme hands on: the buttons and sticks, the grips' poses (for Link's arms), the aim's turns
+        const auto publish = [&]() {
+            std::lock_guard<std::mutex> lk(x.hands_mu);
+            x.hand_buttons = bits, x.hand_menu = !in_play;
+            std::memcpy(x.hand_sticks, sticks, sizeof sticks);
+            for (int h = 0; h < 2; h++) {
+                x.grip[h] = poses[h], x.grip_ok[h] = pose_ok[h];
+                XrSpaceLocation loc{XR_TYPE_SPACE_LOCATION};
+                const XrSpaceLocationFlags need = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+                x.aim_ok[h] = aim_space[h] && XR_SUCCEEDED(x.xrLocateSpace(aim_space[h], space, time, &loc)) &&
+                              (loc.locationFlags & need) == need;
+                if (x.aim_ok[h]) std::memcpy(x.aim_pose[h].q, &loc.pose.orientation, sizeof x.aim_pose[h].q);
+            }
+            x.hands_at = now;
+        };
+        if (!scheme_full_gesture()) {   // ((Triforce VR) another scheme's play: none of Full Gesture's below
+            if (in_play) placeholder_play(bits, sticks, poses, pose_ok, hv, head_pose);
+            publish();
+            return;
         }
         if (in_play) {   // ((Triforce VR) the head's nods for the Lens of Truth (the equip itself: still to come; logged)
             const int i = head_n++ & 3;
@@ -1806,18 +1837,7 @@ struct Controls {
             if (sx * sx + sy * sy > 0.25f)
                 set_bit(std::fabs(sx) > std::fabs(sy) ? (sx < 0 ? Y : A) : (sy > 0 ? X : R), true);
         }
-        std::lock_guard<std::mutex> lk(x.hands_mu);
-        x.hand_buttons = bits, x.hand_menu = !in_play;
-        std::memcpy(x.hand_sticks, sticks, sizeof sticks);
-        for (int h = 0; h < 2; h++) {
-            x.grip[h] = poses[h], x.grip_ok[h] = pose_ok[h];
-            XrSpaceLocation loc{XR_TYPE_SPACE_LOCATION};
-            const XrSpaceLocationFlags need = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
-            x.aim_ok[h] = aim_space[h] && XR_SUCCEEDED(x.xrLocateSpace(aim_space[h], space, time, &loc)) &&
-                          (loc.locationFlags & need) == need;
-            if (x.aim_ok[h]) std::memcpy(x.aim_pose[h].q, &loc.pose.orientation, sizeof x.aim_pose[h].q);
-        }
-        x.hands_at = now;
+        publish();
     }
     void log_profile(XrSession session) {
         if (!ok) return;
