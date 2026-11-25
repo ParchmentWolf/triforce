@@ -412,17 +412,12 @@ void hos_display_loop(void) {
                are in the log ("vk: no Vulkan 1.3 GPU", "rx: ... did not load"). A test's run (HOS_WINDOW_NOACTIVATE)
                has nobody to read a message: it only ends */
             static const char text[] =
-                "Triforce could not start its renderer, so the game cannot show a picture and ends here.
-
-"
+                "Triforce could not start its renderer, so the game cannot show a picture and ends here.\n\n"
                 "It needs a graphics card with Vulkan 1.3 and a current driver (Mesa or the vendor's): update your "
                 "graphics driver and start the game again. If triforce_vk.so is missing from the game folder, run "
-                "Triforce Setup again.
-
-triforce_log.txt in the game folder says what was found.";
+                "Triforce Setup again.\n\ntriforce_log.txt in the game folder says what was found.";
             hos_log("display: the renderer did not start: the game ends");
-            fprintf(stderr, "display: the renderer did not start: the game ends
-");
+            fprintf(stderr, "display: the renderer did not start: the game ends\n");
             hos_log_flush();
             { void hos_fs_save_finish(void); hos_fs_save_finish(); }   /* (host/nn_fs.c: as every other end of the game) */
             mouse_capture(0);

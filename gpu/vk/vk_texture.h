@@ -131,9 +131,10 @@ struct Texture {
     uint64_t view_failed_frame = 0;   // ((Triforce) a view refused for want of memory in this present: the views it has not are asked for again in the next, vk_texture.cpp cached_image_view)
     // (Triforce) a flat texture a program samples as a 3D one: its one-slice 3D copy (vk_texture.cpp twin3d_view), the layer it
     // was copied from and the texture's contents it was copied at
-    // ((Triforce, 11-24) Evil HD's texture pack, vk_texture.cpp pack_view: 0 not looked up, 1 none, 2 its file being decoded,
-    // 3 decoded; its key, and the image twice its size made from the file, its levels and views)
+    // ((Triforce, 11-24) Evil HD's texture pack, vk_texture.cpp pack_view: 0 not looked up, 1 none, 2 its file being decoded
+    // (or its image put off to a later present), 3 decoded, 4 no room in the pack's budget (11-25); its key, and the image twice its size made from the file, its levels and views)
     uint8_t pack_state = 0;
+    uint64_t pack_retry_at = 0;   // (state 4: the present (texpack::frame_no) from which it is asked again if there is room)
     uint64_t pack_key = 0;
     VkImage hd = VK_NULL_HANDLE;
     VmaAllocation hd_alloc = nullptr;
