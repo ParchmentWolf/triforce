@@ -18,6 +18,7 @@ void predict_run(void(*)(size_t,size_t)){calls.push_back(5);}
 void precompile_run(void(*)(size_t,size_t)){calls.push_back(2);}
 void pipeline_cache_save(bool force){if(!force)std::exit(2);calls.push_back(3);}
 std::string skipped_path(){return "sentinel";}
+void fsr4_prepare_shaders(){}
 int fake_remove(const char*){calls.push_back(4);return 0;}
 #define remove fake_remove
 bool run(){

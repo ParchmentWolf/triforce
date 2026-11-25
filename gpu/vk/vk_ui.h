@@ -19,6 +19,7 @@
 
 #include "imgui.h"
 #include "vk_imgui.h"
+#include "vk_menu_i18n.h"   // ((Triforce) every text below is looked up in the menu's language first: i18n::tr)
 
 namespace mkwvk::ui {
 
@@ -38,16 +39,30 @@ inline ImU32 alpha(ImU32 c, float k) {
 // P_Noise_00. kValue and kValueOn are the plain plates' colours where the game's textures are missing: with them the plates
 // are vk_game_tex.h's value_plate and value_plate_on, the texture as the game colours it)
 constexpr float kType = 1.2f;
-constexpr ImU32 kInk = rgba(255, 254, 228), kInkBright = rgba(255, 254, 228), kSoft = rgba(226, 218, 190), kDim = rgba(104, 100, 86),
-                kGold = rgba(222, 152, 40), kGoldHi = rgba(238, 168, 52), kGoldInk = rgba(36, 24, 8), kAccent = rgba(214, 170, 96),
-                kEdge = rgba(150, 122, 74, 200), kCellDark = rgba(44, 32, 17, 240), kCellName = rgba(107, 80, 42, 255),
-                kCellNameSel = rgba(124, 93, 49, 255), kBronze = rgba(84, 64, 38), kColumn = rgba(44, 36, 26, 244),
-                kBannerTop = rgba(150, 122, 78, 255), kBanner = rgba(118, 94, 58, 255), kBannerInk = rgba(255, 251, 238),
-                kBannerEdge = rgba(40, 28, 14), kTabInset = rgba(60, 42, 22, 235), kBox = rgba(52, 38, 22, 250),
-                kBoxEdge = rgba(122, 98, 64, 220), kBar = rgba(10, 8, 5, 200), kListen = rgba(150, 120, 40),
-                kValue = rgba(24, 21, 14, 255), kValueOn = rgba(211, 144, 37, 255), kValueOnInk = rgba(255, 254, 228),
-                kCursor = rgba(255, 255, 255), kCursorGlow = rgba(150, 185, 255), kSeparator = rgba(75, 57, 34),
-                kBgNoise = rgba(28, 13, 13);
+// (Triforce) the menu's palette: the game's look (the Menu theme row and its Modern dark were taken out, 11-24)
+struct Palette {
+    ImU32 ink, ink_bright, soft, dim, gold, gold_hi, gold_ink, accent, edge, cell_dark, cell_name, cell_name_sel, bronze, column,
+        banner_top, banner, banner_ink, banner_edge, tab_inset, box, box_edge, bar, listen, value, value_on, value_on_ink, cursor,
+        cursor_glow, separator, bg_noise;
+    float round;
+};
+constexpr Palette kGamePalette = {
+    rgba(255, 254, 228), rgba(255, 254, 228), rgba(226, 218, 190), rgba(104, 100, 86), rgba(222, 152, 40), rgba(238, 168, 52),
+    rgba(36, 24, 8), rgba(214, 170, 96), rgba(150, 122, 74, 200), rgba(44, 32, 17, 240), rgba(107, 80, 42, 255),
+    rgba(124, 93, 49, 255), rgba(84, 64, 38), rgba(44, 36, 26, 244), rgba(150, 122, 78, 255), rgba(118, 94, 58, 255),
+    rgba(255, 251, 238), rgba(40, 28, 14), rgba(60, 42, 22, 235), rgba(52, 38, 22, 250), rgba(122, 98, 64, 220),
+    rgba(10, 8, 5, 200), rgba(150, 120, 40), rgba(24, 21, 14, 255), rgba(211, 144, 37, 255), rgba(255, 254, 228),
+    rgba(255, 255, 255), rgba(150, 185, 255), rgba(75, 57, 34), rgba(28, 13, 13), 0};
+inline ImU32 kInk = kGamePalette.ink, kInkBright = kGamePalette.ink_bright, kSoft = kGamePalette.soft, kDim = kGamePalette.dim,
+             kGold = kGamePalette.gold, kGoldHi = kGamePalette.gold_hi, kGoldInk = kGamePalette.gold_ink, kAccent = kGamePalette.accent,
+             kEdge = kGamePalette.edge, kCellDark = kGamePalette.cell_dark, kCellName = kGamePalette.cell_name,
+             kCellNameSel = kGamePalette.cell_name_sel, kBronze = kGamePalette.bronze, kColumn = kGamePalette.column,
+             kBannerTop = kGamePalette.banner_top, kBanner = kGamePalette.banner, kBannerInk = kGamePalette.banner_ink,
+             kBannerEdge = kGamePalette.banner_edge, kTabInset = kGamePalette.tab_inset, kBox = kGamePalette.box,
+             kBoxEdge = kGamePalette.box_edge, kBar = kGamePalette.bar, kListen = kGamePalette.listen, kValue = kGamePalette.value,
+             kValueOn = kGamePalette.value_on, kValueOnInk = kGamePalette.value_on_ink, kCursor = kGamePalette.cursor,
+             kCursorGlow = kGamePalette.cursor_glow, kSeparator = kGamePalette.separator, kBgNoise = kGamePalette.bg_noise;
+inline float kRound = 0;   // (plain plates' and boxes' corners, points: square in the game's look)
 constexpr int kDimAlpha = 178;   // (the game behind the menu: the System screens darken it so)
 // (Triforce) SystemBG_00's shade (P_Bg_00: black, SystemBgSh_00's alpha, a rounded dark middle that leaves the scene at the
 // screen's edges) over its noise (P_Noise_00: kBgNoise, DecoNoise_00's alpha, 8 x 8 times across the screen as its texture's
@@ -70,6 +85,10 @@ struct Ctx {
     float safe;   // (the margin kept clear at each edge, pixels)
     bool pad;     // (a controller was the last input: its buttons in the prompts)
     int confirm_dot = 3, back_dot = 1;   // (the face buttons that confirm and go back: vk_menu_keys.h dot, 3 the bottom, 1 the right)
+    // ((Triforce) the Controls page's Clear on a controller, kClear: the icon of the Switch button bound to its face button (the
+    // game's icon font), or its name without one)
+    const char* clear_icon = nullptr;
+    const char* clear_name = "X";
     float pulse = 1;   // (the cursor's glow now, 0 to 1: the game's breathes)
     bool over_game = false;   // (Triforce: drawn over the game's own Options screen: the guides' band hides the game's guides)
     // ((Triforce, 11-20) over_game: where the game's guides band ends at the right, in these pixels (game_grid.h
@@ -86,19 +105,26 @@ struct Ctx {
 inline ImVec2 at(const Ctx& c, float x, float y) { return ImVec2(c.w * 0.5f + x * c.s / 3, c.h * 0.5f - y * c.s / 3); }
 inline float lu(const Ctx& c, float units) { return units * c.s / 3; }
 
-inline ImVec2 size_of(ImFont* font, float px, const char* t, float wrap = 0) { return font->CalcTextSizeA(px, FLT_MAX, wrap, t); }
+inline ImVec2 size_of(ImFont* font, float px, const char* t, float wrap = 0) {
+    return font->CalcTextSizeA(px, FLT_MAX, wrap, i18n::tr(t));
+}
 inline float text(Ctx& c, ImFont* font, float px, ImVec2 p, ImU32 col, const char* t, float wrap = 0) {
+    t = i18n::tr(t);
     c.d->AddText(font, px, p, col, t, nullptr, wrap);
-    return size_of(font, px, t, wrap).x;
+    return font->CalcTextSizeA(px, FLT_MAX, wrap, t).x;
 }
 /// Text wrapped at wrap pixels, its lines 1.3 em apart (ImGui's own wrap sets them 1 em apart: too tight for reading); its
 /// height. draw false: measured only
 inline float para(Ctx& c, ImFont* font, float px, ImVec2 p, ImU32 col, const char* t, float wrap, bool draw = true) {
+    t = i18n::tr(t);
     const char* end = t + strlen(t);
     float y = 0;
     while (t < end) {
         const char* cut = font->CalcWordWrapPosition(px, t, end, wrap);
-        if (cut == t) cut = t + 1;   // (a word wider than the line: a letter at least)
+        if (cut == t) {   // (a word wider than the line: a letter at least, a whole UTF-8 one)
+            cut = t + 1;
+            while (cut < end && ((unsigned char)*cut & 0xC0) == 0x80) cut++;
+        }
         if (draw) c.d->AddText(font, px, ImVec2(p.x, p.y + y), col, t, cut);
         y += px * 1.3f;
         t = cut;
@@ -119,9 +145,12 @@ inline void text_mid_right(Ctx& c, ImFont* font, float px, float x, float y, ImU
 }
 /// A line cut to w: as it is, or its longest whole characters with "..." that fit (a utf-8 sequence is never
 /// split). out is what to draw; the width drawn (0: nothing fits)
+/// ((Triforce) t in the menu's language: out is the translated text, drawn as it is, not looked up again)
 inline float fit_text(const char* t, ImFont* font, float px, float w, std::string* out) {
     out->clear();
     if (!t || !*t || w <= 0) return 0;
+    t = i18n::tr(t);
+    const auto size_of = [](ImFont* f, float size, const char* s) { return f->CalcTextSizeA(size, FLT_MAX, 0, s); };
     const float full = size_of(font, px, t).x;
     if (full <= w) { *out = t; return full; }
     const size_t n = strlen(t);
@@ -143,30 +172,37 @@ inline float fit_text(const char* t, ImFont* font, float px, float w, std::strin
 /// text, its one line fitted to w (an ellipsis when it does not fit)
 inline float text_fit(Ctx& c, ImFont* font, float px, ImVec2 p, ImU32 col, const char* t, float w) {
     std::string s;
-    fit_text(t, font, px, w, &s);
+    const float drawn = fit_text(t, font, px, w, &s);
     if (s.empty()) return 0;
-    return text(c, font, px, p, col, s.c_str());
+    c.d->AddText(font, px, p, col, s.c_str());   // ((Triforce) translated by fit_text already)
+    return drawn;
 }
 /// text_mid, its one line fitted to w
 inline float text_mid_fit(Ctx& c, ImFont* font, float px, float x, float y, ImU32 col, const char* t, float w) {
     std::string s;
-    fit_text(t, font, px, w, &s);
+    const float drawn = fit_text(t, font, px, w, &s);
     if (s.empty()) return 0;
-    return text_mid(c, font, px, x, y, col, s.c_str());
+    c.d->AddText(font, px, ImVec2(x, mid_top(font, px, y)), col, s.c_str());   // ((Triforce) translated by fit_text already)
+    return drawn;
 }
 inline void text_centre(Ctx& c, ImFont* font, float px, ImVec2 p, ImU32 col, const char* t) {
     text(c, font, px, ImVec2(p.x - size_of(font, px, t).x * 0.5f, p.y), col, t);
 }
 /// Capitals with extra space between the letters (gap in pixels), centred on x
 inline void spaced(Ctx& c, ImFont* font, float px, ImVec2 p, ImU32 col, const char* t, float gap) {
-    char one[2] = {0, 0};
+    // ((Triforce) a letter at a time, each a whole UTF-8 character: a translated title has accents and other scripts)
+    t = i18n::tr(t);
+    const auto next = [](const char* q) {
+        const char* e = q + 1;
+        while (*e && ((unsigned char)*e & 0xC0) == 0x80) e++;
+        return e;
+    };
     float total = 0;
-    for (const char* q = t; *q; q++) one[0] = *q, total += size_of(font, px, one).x + gap;
+    for (const char* q = t; *q; q = next(q)) total += font->CalcTextSizeA(px, FLT_MAX, 0, q, next(q)).x + gap;
     float x = p.x - (total - gap) * 0.5f;
-    for (const char* q = t; *q; q++) {
-        one[0] = *q;
-        c.d->AddText(font, px, ImVec2(x, p.y), col, one);
-        x += size_of(font, px, one).x + gap;
+    for (const char* q = t; *q; q = next(q)) {
+        c.d->AddText(font, px, ImVec2(x, p.y), col, q, next(q));
+        x += font->CalcTextSizeA(px, FLT_MAX, 0, q, next(q)).x + gap;
     }
 }
 /// A soft shadow under a rectangle: layers growing outwards, fading
@@ -228,17 +264,20 @@ inline void nine(Ctx& c, const Art* t, ImVec2 a, ImVec2 b, float bx, float by, I
         }
 }
 
+/// A texture of the game's menu skin for the menu's own drawing (art's; none loaded: the flat fallbacks below)
+inline const Art* skin(const char* name) { return art(name); }
+
 /// A row's plate over a..b (what shows of it: the texture's soft rim goes 28 units further out, as the layout's 1880 x 180
 /// pane shows 1824 x 124): the game's BtnThinBase plate with its fine edge line; btn: the buttons' frame, with the curls
 inline void plate(Ctx& c, ImVec2 a, ImVec2 b, bool sel = false, bool btn = false) {
-    const Art* t = art(btn ? "plate_btn" : sel ? "plate_row_sel" : "plate_row");
+    const Art* t = skin(btn ? "plate_btn" : sel ? "plate_row_sel" : "plate_row");
     const float m = lu(c, 28);
     if (t) {
         nine(c, t, a - ImVec2(m, m), b + ImVec2(m, m), 180, 56);
         return;
     }
-    c.d->AddRectFilled(a, b, kCellName);
-    c.d->AddRect(a, b, kEdge, 0, std::max(1.0f, lu(c, 3)));
+    c.d->AddRectFilled(a, b, kCellName, kRound * c.s);
+    c.d->AddRect(a, b, kEdge, kRound * c.s, 0, std::max(1.0f, lu(c, 3)));
 }
 /// A value's plate over a..b (what shows of it): the game's OptionBtnThinElement, near black under a row's value; on: the
 /// orange plate of the value chosen. Its texture's rim is 16 x 14 units outside what shows. (Triforce) The texture as
@@ -246,8 +285,8 @@ inline void plate(Ctx& c, ImVec2 a, ImVec2 b, bool sel = false, bool btn = false
 /// alpha. Before, the grey texture was tinted with the measured colour, so the orange's middle came out darker than the game's
 inline void value_plate(Ctx& c, ImVec2 a, ImVec2 b, bool on = false, float k = 1) {
     const ImVec2 m(lu(c, 16.5f), lu(c, 14));
-    if (const Art* t = art(on ? "value_plate_on" : "value_plate")) nine(c, t, a - m, b + m, 200, 28, alpha(IM_COL32_WHITE, k));
-    else if (const Art* g = art("OptionBtnThinElement_00")) nine(c, g, a - m, b + m, 200, 28, alpha(on ? kValueOn : kValue, k));
+    if (const Art* t = skin(on ? "value_plate_on" : "value_plate")) nine(c, t, a - m, b + m, 200, 28, alpha(IM_COL32_WHITE, k));
+    else if (const Art* g = skin("OptionBtnThinElement_00")) nine(c, g, a - m, b + m, 200, 28, alpha(on ? kValueOn : kValue, k));
     else c.d->AddRectFilled(a, b, alpha(on ? kValueOn : kValue, k), lu(c, 4));
 }
 /// The cursor: the game's white hand-drawn frame, its inner edge on a..b, and its blue-white glow outside, which breathes
@@ -256,7 +295,7 @@ inline void value_plate(Ctx& c, ImVec2 a, ImVec2 b, bool on = false, float k = 1
 /// game's buttons fade their cursor in and out (focus_anim.h: N_Cursor_00's alpha, the line's and the glow's)
 inline void cursor(Ctx& c, ImVec2 a, ImVec2 b, float k = 1) {
     if (k <= 0) return;
-    const Art *line = art("cursor_line"), *glow = art("cursor_glow");
+    const Art *line = skin("cursor_line"), *glow = skin("cursor_glow");
     const ImVec2 m(lu(c, 75.5f), lu(c, 73));
     if (line && glow) {
         nine(c, glow, a - m, b + m, 150, 80, alpha(kCursorGlow, (0.50f + 0.35f * c.pulse) * k));
@@ -283,9 +322,9 @@ inline void arrow(Ctx& c, ImVec2 m, bool right, ImU32 col = kInk) { triangle(c, 
 inline void separator(Ctx& c, float x0, float x1, float y, ImU32 col = kSeparator, ImU32 line_col = 0) {
     const float m = (x0 + x1) * 0.5f, mw = lu(c, 171), mh = lu(c, 60);
     if (!line_col) line_col = col;
-    if (const Art* t = art("OptionSeparateMark_00")) image(c, t, ImVec2(m - mw, y - mh), ImVec2(m + mw, y + mh), col);
+    if (const Art* t = skin("OptionSeparateMark_00")) image(c, t, ImVec2(m - mw, y - mh), ImVec2(m + mw, y + mh), col);
     else diamond(c, ImVec2(m, y), lu(c, 14), col);
-    const Art* line = art("SystemLine_03");
+    const Art* line = skin("SystemLine_03");
     const float gap = lu(c, 145);   // (the mark's ink, 28 to 200 of its 228 texels, and a little room)
     if (line && line->w > 232 && line->h > 32) {
         const float tx = lu(c, 1.5f), top = y - 9 * tx, bot = y + 9 * tx, dot = 15 * tx;   // (a texel: 1.5 units)
@@ -316,7 +355,7 @@ inline void heading(Ctx& c, ImVec2 a, ImVec2 b, float name_x, const char* title)
 }
 
 // ---- the button prompts: the game's own icons (its External font), or the keys' caps ----
-enum Glyph { kUpDown, kLeftRight, kTabs, kConfirm, kBack, kKey };
+enum Glyph { kUpDown, kLeftRight, kTabs, kConfirm, kBack, kKey, kClear };   // ((Triforce) kClear: Del, or Ctx's clear_* on a pad)
 struct Prompt {
     Glyph g;
     const char* what;
@@ -324,7 +363,7 @@ struct Prompt {
 };
 // (the game's icon font: the Switch's buttons' code points, StaticMsg/GuideKeyIcon.msbt; the host's font points each at the
 // icon of the pad input bound to it, host/prompts.c)
-constexpr const char *kIconA = "\xEE\x81\x80", *kIconB = "\xEE\x81\x81", *kIconL = "\xEE\x81\x84", *kIconR = "\xEE\x81\x85",
+constexpr const char *kIconA = "\xEE\x81\x80", *kIconB = "\xEE\x81\x81", *kIconX = "\xEE\x81\x82", *kIconY = "\xEE\x81\x83", *kIconL = "\xEE\x81\x84", *kIconR = "\xEE\x81\x85",
                      *kIconUpDown = "\xEE\x81\xA4", *kIconLeftRight = "\xEE\x81\xA5";
 /// One prompt's icon at p (its left; the line's middle my); its width. draw false: measured only
 inline float glyph(Ctx& c, float my, float x, const Prompt& pr, bool draw) {
@@ -338,6 +377,8 @@ inline float glyph(Ctx& c, float my, float x, const Prompt& pr, bool draw) {
         return w;
     };
     if (pr.g == kKey) return key(x, pr.key);
+    if (pr.g == kClear && !c.pad) return key(x, "Del");
+    if (pr.g == kClear && (!c.f.glyph || !c.clear_icon)) return key(x, c.clear_name);
     if (!c.pad || !c.f.glyph) {
         if (c.pad) {   // (a controller, and no icon font: the buttons by name)
             switch (pr.g) {
@@ -392,6 +433,7 @@ inline float glyph(Ctx& c, float my, float x, const Prompt& pr, bool draw) {
         return w + lu(c, 4) + icon(x + w + lu(c, 4), kIconR);
     }
     case kConfirm: return icon(x, kIconA);
+    case kClear: return icon(x, c.clear_icon);
     default: return icon(x, kIconB);
     }
 }
@@ -425,7 +467,7 @@ inline float prompt_bar(Ctx& c, const Prompt* list, int n) {
     const float x1 = c.over_game ? std::max(c.w, c.guides_x1) : c.w, past = c.w + lu(c, 4);
     if (c.over_game)   // (the game's own guides are under it: its band's dark, whole, from where they begin)
         c.d->AddRectFilled(ImVec2(std::min(band0 + lu(c, 260), at(c, 1000, 0).x), top + lu(c, 26)), ImVec2(x1, c.h), rgba(24, 22, 12));
-    if (const Art* t = art("SystemGuideBase_00")) {
+    if (const Art* t = skin("SystemGuideBase_00")) {
         image(c, t, ImVec2(band0, top), ImVec2(past, c.h), rgba(0, 0, 0, 215), true);
         const float u = 0.5f / std::max(1.0f, (float)t->w);   // (flipped: the texture's left edge is the band's right end)
         if (x1 > past) c.d->AddImage(t->tex->GetTexRef(), ImVec2(past, top), ImVec2(x1, c.h), ImVec2(u, 0), ImVec2(u, 1), rgba(0, 0, 0, 215));
@@ -442,7 +484,7 @@ inline void banner(Ctx& c, float /*hh*/, const char* title = nullptr) {
     const ImVec2 a = at(c, -1920, 1080), b = at(c, 1920, 880);
     c.d->AddRectFilledMultiColor(ImVec2(a.x, b.y - lu(c, 10)), ImVec2(b.x, b.y + lu(c, 46)), rgba(0, 0, 0, 150), rgba(0, 0, 0, 150), rgba(0, 0, 0, 0),
                                  rgba(0, 0, 0, 0));   // (P_UpSh: the shadow it casts)
-    if (const Art* t = art("SystemHeader_00")) image(c, t, a, b);
+    if (const Art* t = skin("SystemHeader_00")) image(c, t, a, b);
     else {
         c.d->AddRectFilledMultiColor(a, ImVec2(b.x, b.y - lu(c, 14)), kBannerTop, kBannerTop, kBanner, kBanner);
         c.d->AddRectFilled(ImVec2(a.x, b.y - lu(c, 14)), ImVec2(b.x, b.y - lu(c, 8)), kBannerEdge);
@@ -458,7 +500,7 @@ inline float banner_height(const Ctx& c) { return lu(c, 200); }
 /// only the texture's opaque middle, texels 60 to 1380 of its 1440 each way, which covers the game's own list under our rows
 /// and leaves its column's soft edges single, the game's own: drawn whole, those edges would be darkened twice
 inline void column_bg(Ctx& c, float x0, float x1, bool inner = false) {
-    const Art* t = art("SystemBg_05");
+    const Art* t = skin("SystemBg_05");
     if (!t) {
         c.d->AddRectFilled(ImVec2(x0 + lu(c, 30), 0), ImVec2(x1 - lu(c, 30), c.h), kColumn);
         return;
@@ -487,7 +529,7 @@ inline void column_bg(Ctx& c, float x0, float x1, bool inner = false) {
 /// tiles as square as on a 16:9 screen). Its capture of the scene, blurred by the game's filter, is the game's own picture
 /// here, as it is. False without the two textures (an older romfs): the caller dims the window flat, as before
 inline bool system_bg(Ctx& c) {
-    const Art *shade = art("SystemBgSh_00"), *noise = art("DecoNoise_00");
+    const Art *shade = skin("SystemBgSh_00"), *noise = skin("DecoNoise_00");
     if (!shade || !noise || c.w <= 0 || c.h <= 0) return false;
     const float th = c.h / 8, tw = std::floor(c.h * 16.0f / 9.0f + 0.5f) / 8;
     for (float y = 0; y < c.h; y += th)
@@ -499,11 +541,11 @@ inline bool system_bg(Ctx& c) {
 /// the rest of what is behind it through (the performance overlay's); the plain plate's edge line stays whole
 inline void box(Ctx& c, ImVec2 a, ImVec2 b, float opacity = 1) {
     const float m = lu(c, 82);   // (the plate's own soft rim: the layout's 1800 x 640 pane shows 476 units of height)
-    if (const Art* t = art("SystemCaptionBg_00")) nine(c, t, a - ImVec2(m, m), b + ImVec2(m, m), 133, 133, alpha(IM_COL32_WHITE, opacity));
+    if (const Art* t = skin("SystemCaptionBg_00")) nine(c, t, a - ImVec2(m, m), b + ImVec2(m, m), 133, 133, alpha(IM_COL32_WHITE, opacity));
     else {
         shadow(c, a, b, 18 * c.s, 0.8f * opacity, 4 * c.s);
-        c.d->AddRectFilled(a, b, alpha(kBox, opacity));
-        c.d->AddRect(a, b, kBoxEdge, 0, 1.5f * c.s);
+        c.d->AddRectFilled(a, b, alpha(kBox, opacity), kRound * 1.5f * c.s);
+        c.d->AddRect(a, b, kBoxEdge, kRound * 1.5f * c.s, 0, 1.5f * c.s);
     }
 }
 /// A button as the game's own (PaCommonBtnThin: the plate with the curls at its corners, 672 x 144 units of it showing, its

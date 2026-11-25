@@ -1,6 +1,9 @@
 """scripts/oot_saves.py, game-free: finding every emulator's folders, importing and exporting, the backups, the guards.
 Temp folders only: HOME, XDG_DATA_HOME, APPDATA and LOCALAPPDATA all point into one.
 
+A copy that fails part way leaves the target's save as it was (StagedCopy: copy_saves itself, so on Windows too, where
+the rest of this file's folder discovery does not run: python -I -B tests/test_oot_saves.py StagedCopy).
+
 python -I -B tests/test_oot_saves.py
 """
 import contextlib
@@ -8,6 +11,8 @@ import importlib.util
 import io
 import os
 from pathlib import Path
+import shutil
+import stat
 import tempfile
 import unittest
 from unittest import mock
@@ -329,6 +334,174 @@ class Copy(Case):
         code, out, err = self.run_main("export", "lichii")
         self.assertEqual(code, 1)
         self.assertEqual(tree(self.li), before)
+
+
+class StagedCopy(unittest.TestCase):
+    """copy_saves copies the new save whole beside the old one and swaps it in by renames: the target has all of its old
+    save or all of the new one. Before, the target's slots were deleted first, and a copy that failed part way left half
+    of the new save where the old one had been."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        self.src, self.dst, self.backups = self.tmp / "from" / "save", self.tmp / "to" / "save", self.tmp / "backups"
+        self.copies = 0
+        self.fresh()
+
+    def fresh(self):
+        for folder in (self.src, self.dst, self.backups):
+            shutil.rmtree(folder, ignore_errors=True)
+        make_save(self.src, b"NEW", slots=("slot_00",))
+        make_save(self.dst, b"OLD")
+
+    def copy(self, keep_settings=False):
+        self.copies += 1
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            oot.copy_saves(str(self.src), str(self.dst), str(self.backups / ("b%d" % self.copies)), keep_settings, False)
+        return out.getvalue()
+
+    def left_as_it_was(self, before):
+        self.assertEqual(tree(self.dst), before)
+        self.assertEqual(sorted(p.name for p in self.dst.parent.iterdir()), [self.dst.name])   # (nothing left beside it)
+        self.assertEqual(sorted(p.name for p in self.dst.iterdir()), sorted({Path(n).parts[0] for n in before}))   # (or in it)
+
+    def test_a_copy_that_works(self):
+        before = tree(self.dst)
+        out = self.copy()
+        self.assertIn("Done.", out)
+        self.assertNotIn("could not delete", out)
+        self.assertEqual(tree(self.dst), tree(self.src))   # (the old slot_01 gone with the old save, as before)
+        self.assertEqual(sorted(p.name for p in self.dst.iterdir()), ["account.sav", "option.sav", "slot_00"])
+        (backup,) = self.backups.iterdir()
+        self.assertEqual(tree(backup), before)
+
+    def test_keep_settings(self):
+        self.copy(keep_settings=True)
+        self.assertEqual((self.dst / "option.sav").read_bytes(), b"option-OLD")
+        self.assertEqual((self.dst / "account.sav").read_bytes(), b"account-NEW")
+        self.assertEqual(sorted(p.name for p in self.dst.iterdir()), ["account.sav", "option.sav", "slot_00"])
+
+    def test_failed_copy_leaves_the_target(self):
+        # (a disk that fills up while the new save is written: before, the old slots were already gone and half a save was left)
+        real_copytree, real_replace = shutil.copytree, os.replace
+
+        def full_disk(src, dst, *args, **kw):
+            if Path(src).parent == self.src and "-incoming-" in Path(dst).parent.name:
+                real_copytree(src, dst, *args, **kw)
+                raise OSError(28, "No space left on device")
+            return real_copytree(src, dst, *args, **kw)
+
+        def account_fails(src, dst, **kw):
+            raise OSError(28, "No space left on device")
+
+        def last_rename_fails(src, dst):   # (the last move into the target, after its old entries were moved aside)
+            if Path(src).name == "option.sav" and "-incoming-" in Path(src).parent.name:
+                raise OSError(13, "Permission denied")
+            return real_replace(src, dst)
+
+        for name, module, patch in (("slot", oot.shutil, dict(attribute="copytree", side_effect=full_disk)),
+                                    ("account.sav", oot.shutil, dict(attribute="copy2", side_effect=account_fails)),
+                                    ("rename", oot.os, dict(attribute="replace", side_effect=last_rename_fails))):
+            with self.subTest(failing=name):
+                self.fresh()
+                before = tree(self.dst)
+                with mock.patch.object(module, **patch), self.assertRaises(OSError):
+                    self.copy()
+                self.left_as_it_was(before)
+                self.copy()   # (and the same copy works once the disk has room)
+                self.assertEqual(tree(self.dst), tree(self.src))
+
+    def rollback_that_fails_too(self, place_option, take_back):
+        # (the forward failure: placing option.sav, the last new entry; then the new slot_00 can't be moved out again)
+        real_replace = os.replace
+
+        def replace(src, dst):
+            if "-incoming-" in Path(src).parent.name and Path(src).name == "option.sav":
+                place_option(Path(dst).parent)
+            if Path(src).parent == self.dst and Path(src).name == "slot_00" and "-incoming-" in Path(dst).parent.name:
+                take_back()
+            return real_replace(src, dst)
+
+        before = tree(self.dst)
+        with mock.patch.object(oot.os, "replace", side_effect=replace), self.assertRaises(oot.Fail) as failed:
+            self.copy()
+        err = str(failed.exception)
+        (aside,) = [p for p in self.dst.iterdir() if p.name.startswith(".")]
+        (backup,) = self.backups.iterdir()
+        self.assertIn("old ones left in %s: slot_00" % aside, err)
+        self.assertIn("put the old save back from the backup, %s" % backup, err)
+        # (every other old entry is back, the old slot_00 waits in aside, the new one stayed)
+        self.assertEqual(sorted(p.name for p in self.dst.iterdir()), sorted([aside.name, "account.sav", "option.sav", "slot_00", "slot_01"]))
+        for name, data in before.items():
+            self.assertEqual((aside if Path(name).parts[0] == "slot_00" else self.dst).joinpath(name).read_bytes(), data, name)
+        self.assertEqual(tree(self.dst / "slot_00"),
+                         {str(Path(k).relative_to("slot_00")): v for k, v in tree(self.src).items() if Path(k).parts[0] == "slot_00"})
+        self.assertEqual(tree(backup), before)
+
+    def test_rollback_that_fails_too(self):
+        def failing(_):
+            raise OSError(28, "No space left on device")
+
+        def held():
+            raise PermissionError(13, "Access is denied")
+
+        self.rollback_that_fails_too(failing, held)
+
+    @unittest.skipUnless(os.name == "nt", "Windows: a file held open without delete sharing")
+    def test_rollback_that_fails_too_with_a_file_held_open(self):
+        handles = []
+        self.addCleanup(lambda: [h.close() for h in handles])
+
+        def hold_and_fail(target):
+            handles.append(open(target / "slot_00" / "progress.sav", "rb"))   # (Python's open shares read and write, not delete)
+            raise OSError(28, "No space left on device")
+
+        self.rollback_that_fails_too(hold_and_fail, lambda: None)
+
+    def test_read_only_file_in_the_old_save(self):
+        # (on Windows a read-only file can't be deleted as it is: the old entries' folder was left in the target)
+        (self.dst / "slot_01" / "progress.sav").chmod(stat.S_IREAD)
+        out = self.copy()
+        self.assertNotIn("could not delete", out)
+        self.assertEqual(tree(self.dst), tree(self.src))
+        self.assertEqual(sorted(p.name for p in self.dst.iterdir()), ["account.sav", "option.sav", "slot_00"])
+
+    def test_old_save_that_cannot_be_deleted(self):
+        # (the same on any system: a delete refused once is tried again after the read-only bit is cleared; one refused for
+        # good is named, and the copy itself still counts)
+        real_unlink = os.unlink
+        refusals = []
+
+        def unlink(path, *args, **kw):
+            if os.path.basename(path) == "progress.sav" and len(refusals) < limit:
+                refusals.append(path)
+                raise PermissionError(13, "Access is denied")
+            return real_unlink(path, *args, **kw)
+
+        for limit, left in ((1, False), (10 ** 6, True)):
+            with self.subTest(left=left):
+                self.fresh()
+                refusals.clear()
+                with mock.patch.object(oot.os, "unlink", side_effect=unlink):
+                    out = self.copy()
+                self.assertEqual({k: v for k, v in tree(self.dst).items() if not k.startswith(".")}, tree(self.src))
+                leftovers = [p for p in self.dst.iterdir() if p.name.startswith(".")]
+                if left:
+                    (aside,) = leftovers
+                    self.assertIn("Copied, but could not delete %s: delete it by hand." % aside, out)
+                else:
+                    self.assertEqual(leftovers, [])
+                    self.assertNotIn("could not delete", out)
+                self.assertIn("Done.", out)
+
+    def test_import_keeps_the_transaction_folder_when_the_copy_fails(self):
+        # (an import that worked removes the game's own transaction folder, so the game loads the import; one that failed
+        # leaves the save as it was, and the transaction with it: scripts/oot_saves.py run)
+        source = (ROOT / "scripts" / "oot_saves.py").read_text(encoding="utf-8")
+        run = source[source.index("def run(args):"):source.index("def main(")]
+        self.assertLess(run.index("copy_saves(src, dst, backup"), run.index("shutil.rmtree(own_tx(dst), ignore_errors=True)"))
 
 
 class NX2navi(Case):

@@ -154,8 +154,8 @@ void SetLastError(DWORD e);
    word, so they wait with either an SRW lock or a critical section ---- */
 typedef pthread_rwlock_t SRWLOCK, *PSRWLOCK;
 #define SRWLOCK_INIT PTHREAD_RWLOCK_INITIALIZER
-typedef struct { volatile uint32_t seq; } CONDITION_VARIABLE, *PCONDITION_VARIABLE;
-#define CONDITION_VARIABLE_INIT {0}
+typedef struct { volatile uint32_t seq, waiters; } CONDITION_VARIABLE, *PCONDITION_VARIABLE;   /* (waiters: win32_posix.c cv_wake) */
+#define CONDITION_VARIABLE_INIT {0, 0}
 #define CONDITION_VARIABLE_LOCKMODE_SHARED 0x1
 typedef pthread_mutex_t CRITICAL_SECTION, *LPCRITICAL_SECTION;
 static inline void InitializeSRWLock(SRWLOCK *l) { pthread_rwlock_init(l, NULL); }
@@ -171,7 +171,7 @@ static inline void EnterCriticalSection(CRITICAL_SECTION *cs) { pthread_mutex_lo
 static inline void LeaveCriticalSection(CRITICAL_SECTION *cs) { pthread_mutex_unlock(cs); }
 static inline BOOL TryEnterCriticalSection(CRITICAL_SECTION *cs) { return pthread_mutex_trylock(cs) == 0; }
 static inline void DeleteCriticalSection(CRITICAL_SECTION *cs) { pthread_mutex_destroy(cs); }
-static inline void InitializeConditionVariable(CONDITION_VARIABLE *cv) { cv->seq = 0; }
+static inline void InitializeConditionVariable(CONDITION_VARIABLE *cv) { cv->waiters = 0, cv->seq = 0; }
 void WakeConditionVariable(CONDITION_VARIABLE *cv);
 void WakeAllConditionVariable(CONDITION_VARIABLE *cv);
 BOOL SleepConditionVariableSRW(CONDITION_VARIABLE *cv, SRWLOCK *l, DWORD ms, ULONG flags);
@@ -337,6 +337,9 @@ static inline SIZE_T GetLargePageMinimum(void) { return 0; }
 #define GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT 0x2
 #define GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS 0x4
 HMODULE LoadLibraryA(LPCSTR name);
+/* ((Triforce) why this thread's last LoadLibraryA failed, as dlerror() said (a missing file, or a symbol the library needs
+   and nothing loaded has); "" when it did not. GetLastError() is ERROR_FILE_NOT_FOUND for every failure) */
+const char *hos_load_error(void);
 #define LoadLibrary LoadLibraryA
 BOOL FreeLibrary(HMODULE m);
 FARPROC GetProcAddress(HMODULE m, LPCSTR name);

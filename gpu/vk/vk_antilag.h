@@ -18,6 +18,12 @@ void antilag_device_created();
 bool antilag_available();
 /// Before the present: the frame's present stage
 void antilag_present();
+/// ((Triforce) 11-24) Frame generation: the game frame a set is made at (framegen_record; 0 none), and, on the display thread
+/// before each present, the frame that present shows: its set's frame for the set's game frame, 0 for a made frame (no present
+/// stage). kAntiLagThisFrame, the default on every other thread: the frame being made, as before
+constexpr uint64_t kAntiLagThisFrame = ~0ull;
+uint64_t antilag_frame();
+extern thread_local uint64_t antilag_present_frame;
 /// After the present: the next frame's input stage, where the driver waits until that frame should start
 void antilag_input();
 /// (Triforce) Its stages are given now (the row on and the device able): the present thread (vk_replay.cpp,

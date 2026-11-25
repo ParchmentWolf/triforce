@@ -87,8 +87,9 @@ def main():
           "vk_menu.h: Options's n64_rem is not n64_rules.h kSpec's defaults, one for each Row")
 
     # ---- the rows ----
-    check("TAB_N64 = TAB_PAGE + 1," in menu and "TAB_HIDDEN = TAB_N64 + 1" in menu,
-          "TAB_N64 is not a page of its own after the Controls page and before the hidden rows")
+    # ((Triforce, 11-24) the Simulated turf page after it, then the hidden rows)
+    check("TAB_N64 = TAB_PAGE + 1," in menu and "TAB_SIM_TURF = TAB_N64 + 1," in menu and "TAB_HIDDEN = TAB_SIM_TURF + 1" in menu,
+          "TAB_N64 is not a page of its own after the Controls page and before the Simulated turf page and the hidden rows")
     in_order(menu, ['MENU_HEADING(TAB_GRAPHICS, "Anti-aliasing"),', 'MENU_HEADING(TAB_GRAPHICS, "N64 Classic"),',
                     '{TAB_GRAPHICS, "N64 Classic", &opts.n64_classic, 0, n64_rules::kPresets - 1, 1, tx_n64,',
                     '{TAB_GRAPHICS, "Remembered settings", nullptr, 0, 0, 0, nullptr,',
@@ -178,17 +179,18 @@ def main():
              "F7: the last preset kept, a press turns the row (not with RX_VK_N64), saves it and says so")
 
     # ---- the page drawn, its slots ----
-    check("draw_tabs(c, cur_tab == TAB_MOTION ? TAB_CONTROLS : cur_tab == TAB_N64 ? TAB_GRAPHICS : cur_tab, embed_open, true);" in menu,
+    check("draw_tabs(c, cur_tab == TAB_MOTION ? TAB_CONTROLS : cur_tab == TAB_N64 || cur_tab == TAB_SIM_TURF ? TAB_GRAPHICS : cur_tab, embed_open, true);" in menu,
           "the Remembered page is not drawn under Graphics")
     check('if (n64_action(selr)) prompt_list[0] = {ui::kConfirm, "Apply"};' in menu and
           'if (cur_tab == TAB_N64) prompt_list[1] = {ui::kBack, "Back"}, prompts_n = 2;' in menu,
           "the Remembered page's guides do not say Apply and Back")
-    check("s.tab = motion ? (int)TAB_CONTROLS : cur_tab == TAB_N64 ? (int)TAB_GRAPHICS : cur_tab;" in menu and
-          "cur_tab == TAB_MOTION ? TAB_CONTROLS : cur_tab == TAB_N64 ? TAB_GRAPHICS : cur_tab;" in block(menu, "void tab_move(int dir) {"),
+    check("s.tab = motion ? (int)TAB_CONTROLS : cur_tab == TAB_N64 || cur_tab == TAB_SIM_TURF ? (int)TAB_GRAPHICS : cur_tab;" in menu and
+          "cur_tab == TAB_MOTION ? TAB_CONTROLS : cur_tab == TAB_N64 || cur_tab == TAB_SIM_TURF ? TAB_GRAPHICS : cur_tab;" in block(menu, "void tab_move(int dir) {"),
           "the sounds or the tab step do not take the Remembered page as Graphics")
-    for arr in ("int tab_selected[TAB_N64 + 1]", "float scroll_at[TAB_N64 + 1];", "int wheel_rows[TAB_N64 + 1];",
-                "int scrolled_to[TAB_N64 + 1] = {-1, -1, -1, -1, -1, -1, -1, -1, -1};", "float scroll_want[TAB_N64 + 1];",
-                'static_assert(TAB_N64 + 1 == 9,'):
+    # ((Triforce, 11-24) the Simulated turf page's slot after it)
+    for arr in ("int tab_selected[TAB_SIM_TURF + 1]", "float scroll_at[TAB_SIM_TURF + 1];", "int wheel_rows[TAB_SIM_TURF + 1];",
+                "int scrolled_to[TAB_SIM_TURF + 1] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1};", "float scroll_want[TAB_SIM_TURF + 1];",
+                'static_assert(TAB_SIM_TURF + 1 == 10,'):
         check(arr in menu, "a slot array has no slot for the Remembered page: %s" % arr)
 
     # ---- vk_n64.cpp, the readme, the guide ----

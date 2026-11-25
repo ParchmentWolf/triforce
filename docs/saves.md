@@ -90,7 +90,9 @@ python -I scripts\oot_saves.py export nx2navi --hookshot "C:\Games\Hookshot"
 
 The script refuses to run while it sees Hookshot or any of the programs above running. The side being overwritten is
 copied to `oot-save-backups/<import or export>-<name>-<date>-<time>/` first: in `~/.local/share` on Linux, in
-`%LOCALAPPDATA%\Hookshot` on Windows. To undo a copy, put the backup's contents back.
+`%LOCALAPPDATA%\Hookshot` on Windows. To undo a copy, put the backup's contents back. The new save is then copied whole
+into a hidden folder inside the target and swapped for the old one only once that copy worked, so a copy that fails part
+way (a full disk, a file that cannot be written) leaves the target's save as it was.
 
 ## Copy by hand
 

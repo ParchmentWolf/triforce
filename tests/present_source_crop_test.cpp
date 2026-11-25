@@ -41,10 +41,25 @@ namespace fsr3fi { bool wanted = false; bool frames_wanted() { return wanted; } 
 // (Triforce) whether RivaTuner Statistics Server holds the display thread's presents (vk_pace.h): not here
 namespace pace { bool display_yields() { return false; } }
 int fsr_calls = 0, fsr_result = 1;
-int fsr3fi_frame(VkCommandBuffer, OutSet&, int, uint32_t w, uint32_t h, uint64_t sequence) {
+// ((Triforce) 11-24) AMD FSR 3.1's frame interpolation at any multiplier (the Frame generation by row): a set's frames at k/m,
+// each into its own slot; made (fsr_result) or none. Its HUD source is recorded first (hud_source: nothing here)
+int fsr3fi_frames(VkCommandBuffer, OutSet&, int, uint32_t w, uint32_t h, uint64_t sequence, const float* t, const int* slot,
+                  int count) {
     CHECK(w == allocated_w && h == allocated_h && sequence > 0);
-    ++fsr_calls; return fsr_result;
+    for (int i = 0; i < count; i++) CHECK(t[i] > 0.0f && t[i] < 1.0f && slot[i] == i);
+    ++fsr_calls; return fsr_result ? count : 0;
 }
+bool hud_source(VkCommandBuffer, int, uint32_t, uint32_t, int, int, uint32_t w, uint32_t h) {
+    CHECK(w == allocated_w && h == allocated_h);
+    return false;
+}
+enum { kMakerNone = 0, kMakerOwn = 1, kMakerFsr3 = 2, kMakerAmd = 3 };
+std::atomic<int> last_maker{0};
+// ((Triforce) 11-24) AMD Anti-Lag 2's frame of a set, and the game's timeline (RX_VK_FG_GAME_TIMELINE, off here)
+uint64_t antilag_frame() { return 0; }
+bool game_timeline() { return false; }
+void fixed_dues(int64_t, int64_t, int, int64_t, int64_t*) { std::abort(); }
+int64_t pace_lead(int64_t, int) { std::abort(); }
 // (Triforce) AMD FSR 4's frame generation (vk_framegen.cpp fsr4_frame, vk_fsr4.h): a stand-in that answers as told
 int fsr4_calls = 0;
 bool fsr4_blend = false;

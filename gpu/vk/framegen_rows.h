@@ -16,6 +16,15 @@ namespace mkwvk::framegen_rows {
 /// name FSR4 stays: it is the value's, saved in options files as 9)
 enum { OFF = 0, AUTO = 1, kMaxMult = 8, FSR4 = 9, kRowMax = FSR4 };
 
+/// ((Triforce) 11-24) opts.fg_by (saved as frame_generation_by), the Frame generation by row: who makes the renderer's own
+/// frames, at Auto and 2x to 8x. BY_OWN the renderer's own interpolation from the picture alone (the default, as before);
+/// BY_FSR3 AMD FSR 3.1's frame interpolation recorded as the renderer's own passes (vk_fsr3fi.h: the scene's depth and motion,
+/// what moves by itself in it, the HUD kept still), on any GPU that has what its passes need. Not AMD's library (the Frame
+/// generation row's AMD FSR, FSR4) nor NVIDIA DLSS (its own values on that row): those make their frames themselves
+enum { BY_OWN = 0, BY_FSR3 = 1, kByMax = BY_FSR3 };
+/// Whether the Frame generation by row applies to a Frame generation value: Auto and the multipliers, the renderer's own
+constexpr bool by_applies(int framegen) { return framegen >= AUTO && framegen <= kMaxMult; }
+
 /// ((Triforce, FG-9) RX_VK_FRAMEGEN_MULT=<0..9>, over the options file for a lab run: the row's whole range, 9 AMD's frame
 /// generation among it (it ran 2 to 8 alone before, and a 9 became the renderer's own 8x). Not a number: 2, as before
 inline int env_row(const char* e) {

@@ -248,6 +248,7 @@ int main() {
 '''
 
 MENU = r'''#include "@ROOT@/gpu/vk/aa_rows.h"
+#include "@ROOT@/gpu/vk/evil_hd.h"   /* ((Triforce, 11-23) the Anti-aliasing note while Evil HD is on) */
 #include "@ROOT@/gpu/vk/n64_rules.h"
 #include <algorithm>
 #include <cctype>
@@ -275,6 +276,7 @@ bool antilag_available() { return true; }
 unsigned upscalers_available() { return ~0u; }
 bool filter_needed() { return true; }
 const char* dlss_preset_env() { return nullptr; }
+int fsr4_model_env() { return -1; }   /* ((Triforce) RX_VK_FSR4_MODEL unset: row_fixed asks it for the FSR 4 model row */
 int output_choice(int v) { return v; }
 /* ((Triforce, 11-22, N64 Classic) its 3D pass drawing in the upscaler's place (vk_n64.cpp n64_in_front), RX_VK_N64, and the
    Remembered page's rows (none here) */
@@ -331,7 +333,7 @@ int main() {
            Classic's */
         int n = 0;
         while (hn_aa(v, n)) n++;
-        CHECK(n == 6 && !hn_aa(v, 6) && !hn_aa(v, 7));
+        CHECK(n == 8 && hn_aa(v, 6) && hn_aa(v, 7) && !hn_aa(v, 8));   /* ((Triforce) 6 Intel XeSS's, 7 Evil HD on */
         for (int w = 0; w < v; w++) CHECK(std::strcmp(hn_aa(v, 0), hn_aa(w, 0)));
         /* replaced: nothing more to say */
         state_now = aa_rows::REPLACED;
@@ -350,9 +352,10 @@ int main() {
         for (int v = 0; v < aa_rows::kValues; v++) {
             opts.aa = v, up_now = up, env_now = -1, state_now = aa_rows::MISSING;
             const bool nvidia = up == ur::DLSS || up == ur::DLAA;
-            CHECK(!std::strcmp(tx_aa(v), nvidia ? "DLSS's own" : "FSR's own") && row_fixed(&opts.aa));
-            CHECK(hn_aa(v, -1) == hn_aa(v, nvidia ? 1 : 2) && std::strstr(hn_aa(v, -1), "nothing to set here"));
-            CHECK(std::strstr(hn_aa(v, -1), nvidia ? "NVIDIA DLSS and DLAA" : "AMD FSR") && std::strstr(hn_aa(v, -1), "kept"));
+            const bool intel = up == ur::XESS || up == ur::XESS_AA;   /* ((Triforce) Intel XeSS) */
+            CHECK(!std::strcmp(tx_aa(v), nvidia ? "DLSS's own" : intel ? "XeSS's own" : "FSR's own") && row_fixed(&opts.aa));
+            CHECK(hn_aa(v, -1) == hn_aa(v, nvidia ? 1 : intel ? 6 : 2) && std::strstr(hn_aa(v, -1), "nothing to set here"));
+            CHECK(std::strstr(hn_aa(v, -1), nvidia ? "NVIDIA DLSS and DLAA" : intel ? "Intel XeSS" : "AMD FSR") && std::strstr(hn_aa(v, -1), "kept"));
             CHECK(opts.aa == v);
         }
     /* RX_VK_AA: the run's choice shown whatever the row holds, nothing to choose, and the line says why */
@@ -398,7 +401,7 @@ def main():
     at = [menu.find(row) for row in order]
     check(-1 not in at and at == sorted(at), "vk_menu.cpp: the Anti-aliasing row is not in its group after the Upscaling group")
     check(menu.count('"Anti-aliasing", &opts.aa') == 1, "vk_menu.cpp: more than one Anti-aliasing row")
-    check("(rows[i].value != &opts.aa || up == ur::GAME)" in definition(menu, "bool row_shown"),
+    check("(rows[i].value != &opts.aa || up == ur::GAME || up == ur::OFF)" in definition(menu, "bool row_shown"),
           "vk_menu.cpp: the Anti-aliasing row shows while DLSS or FSR smooths the edges itself")
     entry = block(menu, menu.rindex("{TAB_GRAPHICS,", 0, at[4]))
     check(re.search(r"\bint aa = 0;", header), "vk_menu.h: Anti-aliasing is not the game's own by default")
@@ -415,7 +418,8 @@ def main():
     # the renderer's side: what is in effect is the row's rule, asked with what upscales as the menu's Upscaler row shows it
     mode = definition(aa, "int aa_mode")
     choice = definition(aa, "int choice_now")
-    check("const int choice = choice_now();" in mode and "ar::chosen(opts.aa, env_choice())" in choice and
+    # ((Triforce, 11-23) the row as Evil HD has it: SMAA Ultra while on, evil_hd.h; tests/test_evil_hd.py)
+    check("const int choice = choice_now();" in mode and "ar::chosen(evil_hd::aa(evil_hd_now(), opts.aa), env_choice())" in choice and
           "ar::effective(choice, upscaler_now(), temporal_before_bloom(), env_choice() >= 0)" in mode,
           "aa_mode does not take the row's choice (RX_VK_AA over it) through aa_rows.h's effective")
     # ((Triforce, 11-22, N64 Classic) Off while its 3D pass draws the gameplay upscale; RX_VK_AA still over it)
@@ -426,7 +430,9 @@ def main():
     check(re.sub(r"\s+", " ", definition(aa, "int upscaler_now")).endswith(
         "{ if (fsr3_wanted()) return fsr3_native() ? upscaler_rows::FSR3_AA : upscaler_rows::FSR3; return temporal_mode(); }"),
         "vk_aa.cpp's upscaler_now is not what the menu's Upscaler row shows")
-    check(re.search(r"int upscaler\(\) \{ return fsr3_wanted\(\) \? \(int\)\(fsr3_native\(\) \? ur::FSR3_AA : ur::FSR3\) : temporal_mode\(\); \}", menu),
+    # ((Triforce) 11-24: and the Upscaler's Off, which is the game's own here: its SMAA runs, upscaler_now's GAME)
+    check("if (fsr3_wanted()) return fsr3_native() ? ur::FSR3_AA : ur::FSR3;\n    const int t = temporal_mode();\n"
+          "    return t == ur::GAME && opts.dlss == ur::OFF ? (int)ur::OFF : t;" in menu,
           "vk_menu.cpp's upscaler() changed: vk_aa.cpp's upscaler_now follows it")
     check('getenv("RX_VK_AA")' in aa and 'getenv("RX_VK_AA_KEEP")' in aa, "vk_aa.cpp no longer reads its two switches")
     # the game's own chosen and nothing left to free: a dispatch asks a comparison and nothing else
@@ -454,8 +460,8 @@ def main():
     places = [dispatch.find(s) for s in ("if (!cp || !cp->ready.load(std::memory_order_acquire) || cp->failed) SKIP_HERE();",
                                          "if (aa_leave_out(cp->key)) return;", "build_descriptors(s, p);",
                                          'full_barrier(cmd, "barrier (dispatch)");', "if (taau_stand_in(cmd, s, p)) return void(st_dispatches++);",
-                                         "if (aa_stand_in(cmd, s, p)) return void(st_dispatches++);", "if (!p.compute_pipeline) SKIP_HERE();",
-                                         "vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.compute_pipeline);")]
+                                         "if (aa_stand_in(cmd, s, p)) return void(st_dispatches++);", "if (!pipe) SKIP_HERE();",
+                                         "vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);")]
     check(-1 not in places and places == sorted(places), "dispatch no longer asks aa_leave_out and aa_stand_in where it did")
     stand = definition(draw, "bool aa_stand_in")
     check(stand.split("{", 1)[1].lstrip().startswith("if (aa_rows::role(p.key) != aa_rows::COMPOSE || !aa_asked()) return false;"),
@@ -491,7 +497,8 @@ def main():
                            ("@HINT@", definition(menu, "const char* hn_aa")),
                            ("@FIXED@", definition(menu, "bool row_fixed")),
                            ("@KEY@", definition(menu, "const char* ini_key")),
-                           ("@INI_ROW@", "bool is_merged(const int*) { return false; }   /* ((Triforce, options_version 7) no merged row here */\n" + definition(menu, "bool ini_row")),
+                           ("@INI_ROW@", "bool is_merged(const int*) { return false; }   /* ((Triforce, options_version 7) no merged row here */\n"
+                            "int output_pick;   /* ((Triforce) the Output device row: saved by its device's id */\n" + definition(menu, "bool ini_row")),
                            ("@ENTRY@", entry + ","),
                            ("@READ@", read)):
             fixture = fixture.replace(mark, text)

@@ -39,6 +39,9 @@ int hos_mouse_take(int32_t *dx, int32_t *dy) {
     return mouse_captured;
 }
 
+/* (nn_hid.c) the game's menus do not take the mouse here: its capture, and with it its buttons, stay the game's */
+int hos_mouse_in_game_menu(void) { return 0; }
+
 /* (mouse_native.c) motion taken and not used, put back for the next taker (the player camera's) */
 void hos_mouse_give_back(int32_t dx, int32_t dy) {
     InterlockedExchangeAdd(&mouse_dx, dx);
@@ -112,11 +115,17 @@ static volatile int refresh_now;
 static int refresh_mhz(void *w) { (void)w; return __atomic_load_n(&refresh_now, __ATOMIC_RELAXED); }
 static MkwVkWindow vk_window = {MKWVK_WINDOW_VERSION, create_surface, drawable_size, NULL, refresh_mhz};
 
+/* Esc let the captured mouse go just before it opened the Insert menu (Menu shortcut "Insert, F1 or Esc"): the capture
+   that comes back when the menu closes. Spent by the next capture or menu */
+static int esc_had_capture;
 static void mouse_capture(int on) {
+    int rx_option(int id, int otherwise);
+    if (on && rx_option(6, 0) == 2) return;   /* ((Triforce) Mouse camera Off: the mouse plays no part, a click does not capture it) */
     if (on == (int)mouse_captured) return;
     mouse_captured = on;
     InterlockedExchange(&mouse_dx, 0);
     InterlockedExchange(&mouse_dy, 0);
+    if (on) esc_had_capture = 0;
     hos_sdl_relative_mouse(window, on);
 }
 static void set_fullscreen(int on) {
@@ -127,10 +136,18 @@ static void set_fullscreen(int on) {
     hos_log("display: %s", on ? "fullscreen" : "windowed");
 }
 
+static volatile int renderer_failed;   /* ((Triforce, 11-24) rx_start answered 0: the window's thread says so and ends the game) */
 static DWORD WINAPI renderer_main(void *p) {
     (void)p;
     const int ok = rx_start(&vk_window);
-    if (!ok) hos_log("display: the renderer did not start: the window stays black");
+    if (!ok) {
+        /* ((Triforce, 11-24) as host/display.c on Windows: the game ends at once and says why. Behind a black window it
+           played on, sound and all, until the player closed it. The message is the window's thread's to show (SDL's
+           window calls belong there: hos_display_loop); the game's first work for the GPU goes on waiting meanwhile
+           (hos_renderer_wait: renderer_up is never set) */
+        __atomic_store_n(&renderer_failed, 1, __ATOMIC_RELEASE);
+        return 0;
+    }
     renderer = ok;
     if (ok) {   /* (a size change while it started) */
         int w = 0, h = 0;
@@ -167,11 +184,14 @@ __attribute__((visibility("default"))) void hos_posix_post_message(uint32_t msg,
 void hos_window_close(void) { __atomic_store_n(&close_asked, 1, __ATOMIC_RELEASE); }
 /* the menu opened: the mouse let go (its capture kept for later); closed: the capture back, if the window still has the focus */
 static int captured_before_menu;
+void hos_input_clear_toggles(void);   /* ((Triforce) 11-24: host/nn_hid.c, hold-to-toggle's latches) */
 static void menu_mouse(int open) {
     if (open == menu_open) return;
     menu_open = open;
     if (open) {
-        captured_before_menu = (int)mouse_captured;
+        hos_input_clear_toggles();
+        captured_before_menu = (int)mouse_captured || esc_had_capture;   /* (opened by Esc, which let it go) */
+        esc_had_capture = 0;
         mouse_capture(0);
         InterlockedExchange(&ptr_pressed, 0), InterlockedExchange(&ptr_wheel, 0);
     } else {
@@ -229,6 +249,12 @@ int hos_display_init(void) {
     const int gamescope = desktop && strstr(desktop, "gamescope");
     if (!getenv("SDL_VIDEODRIVER") && !getenv("SDL_VIDEO_DRIVER") && !gamescope)
         hos_sdl_hint(hos_sdl_load() == 3 ? "SDL_VIDEO_DRIVER" : "SDL_VIDEODRIVER", "wayland,x11");
+    /* (SDL2 on Wayland: libdecor from the start. SDL2 2.32 asks for the compositor's decorations before the window's first
+       configure, and a compositor that answers "the client draws them" (COSMIC) has it unmap and map the window again
+       with libdecor inside that wait, which then waits forever on a field the switch cleared: no window, no renderer.
+       libdecor takes the compositor's decorations itself where they are offered; with no libdecor SDL keeps
+       its own. SDL3 waits on the window's state and is left alone; SDL_VIDEO_WAYLAND_PREFER_LIBDECOR still wins) */
+    if (hos_sdl_load() == 2) hos_sdl_hint("SDL_VIDEO_WAYLAND_PREFER_LIBDECOR", "1");
     if (!hos_sdl_init(HOS_SDL_VIDEO | HOS_SDL_EVENTS)) {
         hos_log("display: SDL_Init: %s: no window", hos_sdl_error());
         fprintf(stderr, "display: SDL_Init: %s: no window\n", hos_sdl_error());
@@ -275,6 +301,7 @@ void hos_display_loop(void) {
         hos_log("display: SDL_CreateWindow: %s: no window", hos_sdl_error());
         fprintf(stderr, "display: SDL_CreateWindow: %s: no window\n", hos_sdl_error());
         hos_log_flush();
+        { void hos_crash_clean_end(void); hos_crash_clean_end(); }   /* ((Triforce) no unclean-end record: host/hos_crash_record.c */
         ExitProcess(1);
     }
     vk_window.window = window;
@@ -317,6 +344,7 @@ void hos_display_loop(void) {
                 case HOS_SDL_EV_FOCUS_LOST:
                     hos_posix_window[0] = 0;
                     mouse_capture(0);
+                    hos_input_clear_toggles();
                     ptr_in = 0, ptr_held = 0;
                     break;
                 case HOS_SDL_EV_MOUSE_LEAVE:
@@ -331,7 +359,10 @@ void hos_display_loop(void) {
                     break;
                 case HOS_SDL_EV_KEY_DOWN: {
                     const int scancode = e.scancode, mod = e.mod;
-                    if (e.scancode == 41) mouse_capture(0);   /* Esc */
+                    if (e.scancode == 41) {   /* Esc (it may open the Insert menu too: the capture comes back) */
+                        if (!menu_open && mouse_captured) esc_had_capture = 1;
+                        mouse_capture(0);
+                    }
                     if (!e.repeat && ((scancode == 67 && !(mod & 0x0FC3)) || (scancode == 40 && (mod & 0x300)))) set_fullscreen(!fullscreen);   /* F10, Alt+Enter (Triforce: F11 is off) */
                     break;
                 }
@@ -374,6 +405,33 @@ void hos_display_loop(void) {
         if (__atomic_load_n(&close_asked, __ATOMIC_ACQUIRE)) {
             rx_close_asked();
             hos_window_closed_exit();
+        }
+        if (__atomic_load_n(&renderer_failed, __ATOMIC_ACQUIRE)) {
+            /* ((Triforce, 11-24) no renderer started (Vulkan lists no graphics card it can use, or triforce_vk.so is not
+               there): said in the log, on stderr and in a message window, and the game ends. The renderer's own lines
+               are in the log ("vk: no Vulkan 1.3 GPU", "rx: ... did not load"). A test's run (HOS_WINDOW_NOACTIVATE)
+               has nobody to read a message: it only ends */
+            static const char text[] =
+                "Triforce could not start its renderer, so the game cannot show a picture and ends here.
+
+"
+                "It needs a graphics card with Vulkan 1.3 and a current driver (Mesa or the vendor's): update your "
+                "graphics driver and start the game again. If triforce_vk.so is missing from the game folder, run "
+                "Triforce Setup again.
+
+triforce_log.txt in the game folder says what was found.";
+            hos_log("display: the renderer did not start: the game ends");
+            fprintf(stderr, "display: the renderer did not start: the game ends
+");
+            hos_log_flush();
+            { void hos_fs_save_finish(void); hos_fs_save_finish(); }   /* (host/nn_fs.c: as every other end of the game) */
+            mouse_capture(0);
+            if (!getenv("HOS_WINDOW_NOACTIVATE") && !hos_sdl_message_box(window, "Triforce", text))
+                hos_log("display: the message could not be shown (%s)", hos_sdl_error());
+            hos_log_flush();
+            /* ((Triforce) said already: no unclean-end record, and no second window after it (host/hos_crash_dialog.h) */
+            { void hos_crash_clean_end(void); hos_crash_clean_end(); }
+            ExitProcess(1);
         }
         keys_update();
     }

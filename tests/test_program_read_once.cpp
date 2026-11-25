@@ -66,6 +66,13 @@ bool disk_on = true;
 FILE* disk_in = nullptr;
 std::mutex disk_mu;
 std::unordered_map<uint64_t, std::vector<DiskRecord>> disk_records;
+// ((Triforce) the records read in already, as vk_shader.cpp keeps them for the prediction)
+std::unordered_map<uint64_t, std::vector<DiskRecord>> disk_taken;
+void disk_note_taken(uint64_t key, const std::vector<DiskRecord>& recs) {
+    if (recs.empty()) return;
+    auto& taken = disk_taken[key];
+    taken.insert(taken.end(), recs.begin(), recs.end());
+}
 void disk_init() {}
 bool probe_names(uint64_t) { return false; }
 void logf(const char*, ...) {}
@@ -103,6 +110,13 @@ bool read_unlocked() {
 program_order::Ahead ra_ahead;
 std::atomic<int64_t> st_order_taken{0}, st_order_read{0}, st_order_let_go{0};
 bool order_on() { return false; }
+void programs_load_wait(uint64_t) {}   // (vk_programs.cpp: no load at create here)
+bool light_computes() { return false; }
+struct { uint64_t loads = 0, load_ns = 0; } thread_local use_counters;   // (vk_programs.h's census: counted, not read here)
+struct { uint64_t play_loads = 0, play_load_ns = 0; } census;
+std::atomic<bool> programs_in_play{false};
+std::atomic<int64_t> st_cache_hits{0};   // (vk_shader.cpp's count of programs found)
+std::unique_ptr<Program> read_light(FILE*, std::mutex*, uint64_t, const DiskRecord&) { return nullptr; }
 void order_note(uint64_t) {}
 void ahead_met_locked(uint64_t) {}
 void readahead_why(uint64_t) {}

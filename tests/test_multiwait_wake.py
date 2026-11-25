@@ -52,13 +52,17 @@ static void ReleaseSRWLockExclusive(SRWLOCK *l) { lock_depth--; if ((void *)l ==
 static void WakeAllConditionVariable(CONDITION_VARIABLE *cv) { (void)cv; wakes++; }
 typedef struct Obj {
     uint64_t key, event; int sem_max, kind; struct Obj **links; int nlinks, caplinks; struct Obj *mw;
-    int64_t due_ns, sig_ns; int sem, qlen, qcap, signaled, autoclear; SRWLOCK lk; CONDITION_VARIABLE cv;
+    int64_t due_ns, sig_ns; int sem, qlen, qcap, signaled, autoclear, mwait; SRWLOCK lk; CONDITION_VARIABLE cv;
 } Obj;
 typedef unsigned long DWORD;
 #define INFINITE 0xFFFFFFFFu
 static LONG InterlockedIncrement(volatile LONG *p) { return ++*p; }
 static LONG InterlockedDecrement(volatile LONG *p) { return --*p; }
 static int64_t hos_now_ns(void) { static int64_t t = 1000; return t += 100000; }   /* (0.1 ms a call: timed waits end) */
+enum { HOS_CHAIN_WAIT = 1, HOS_CHAIN_WOKE, HOS_CHAIN_SIGNAL, HOS_CHAIN_SLEEP, HOS_CHAIN_AWAKE, HOS_CHAIN_PRESENT };   /* ((Triforce) HOS_CHAIN off) */
+#define HOS_CHAIN(kind, key) ((void)(kind), (void)(key))
+static volatile int hos_chain_on;
+static void hos_chain_note(int kind, uint64_t key, uint64_t lr) { (void)kind, (void)key, (void)lr; }
 /* (scheduling points and blocking waits: counted when a lock is held; a sleep there never ends in this fixture) */
 static int sched_locked;
 static void (*on_sleep)(void);
@@ -199,13 +203,18 @@ int main(int argc, char **argv) {
 
 def fixture(source):
     table = source[source.index("typedef struct { uint64_t key; int n; } MwWatched;"):source.index("/* o: the object that changed")]
-    parts = [table, block(source, "static void poke_multiwait("), block(source, "static uint64_t holder_watch(")]
+    # ((Triforce) HOS_EVENT_ATOMIC: its switch is read in the table's part (event_atomic), its log line a no-op here)
+    parts = ["#define hos_log(...) ((void)0)", table, block(source, "static void poke_multiwait("),
+             block(source, "static uint64_t holder_watch(")]
     defines = []
     for alias, name in (("LINK", "LinkMultiWaitHolder"), ("UNLINK", "UnlinkMultiWaitHolder"),
                         ("UNLINKALL", "UnlinkAllMultiWaitHolder"), ("MOVEALL", "MoveAllMultiWaitHolder")):
         marker = re.search(r"HLE\((_ZN2nn2os\d+%sE\w*)\)" % name, source)
         parts.append(block(source, marker.group(0)))
         defines.append("#define %s %s" % (alias, marker.group(1)))
+    for other in ("static int event_take_atomic(Obj *e) {", "static int event_wait_atomic(Obj *e, int64_t timeout_ns, int try_only) {"):
+        if other in source:   # ((Triforce) HOS_EVENT_ATOMIC's way, which event_wait and event_peek take with the switch on)
+            parts.append(block(source, other))
     parts.append(block(source, "static int event_wait(Obj *e, int64_t timeout_ns, int try_only) {"))   # (the real one)
     if "static int event_peek(Obj *e) {" in source:
         parts.append(block(source, "static int event_peek(Obj *e) {"))

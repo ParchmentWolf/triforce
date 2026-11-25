@@ -3,12 +3,14 @@
 #pragma once
 
 #include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
+#include "shader_recompiler/frontend/ampere/program_address_map.h"
 
 namespace Shader::Ampere {
 class ProgramCaptureState {
 public:
     enum class Result { Continue, Complete, InvalidTarget };
-    static constexpr u32 MaximumInstructions = 65536;
+    // ((Triforce) a target past the largest program, program_address_map.h; it was 65,536 instructions, 1 MiB)
+    static constexpr u32 MaximumInstructions = MaximumNativeInstructions;
 
     Result Observe(const Instruction& instruction, u32 index) {
         const u32 opcode = instruction.Bits(0, 12);

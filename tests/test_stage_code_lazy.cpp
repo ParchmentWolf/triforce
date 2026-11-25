@@ -161,7 +161,7 @@ void translate_mesh_into(Program& p, const NvnState&, const Code* task, const Co
     p.made = made_of({task, &mesh, prim, fsc});
     p.ready.store(true);
 }
-void jobs_push(std::function<void()> fn, bool, std::atomic<bool>* ready) {
+void jobs_push(std::function<void()> fn, bool, std::atomic<bool>* ready, std::function<void()> = {}) {   // (the last: what a job that throws runs)
     fn();
     if (ready) ready->store(true);
 }

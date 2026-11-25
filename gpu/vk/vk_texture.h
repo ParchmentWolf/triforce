@@ -42,6 +42,8 @@ struct Texture {
     std::vector<uint8_t> tail_bound;            // (per layer, or [0] with SINGLE_MIPTAIL: its mip tail has memory)
     std::vector<VkDeviceMemory> sparse_chunks;  // (the device memory blocks are taken from, 64 MB at a time)
     VkDeviceSize chunk_used = 0;
+    struct SparseFree { VkDeviceMemory memory; VkDeviceSize offset, size; };
+    std::vector<SparseFree> sparse_free;        // (taken for binds that failed: given out again before the chunks)
     VkSparseImageMemoryRequirements sparse_req{};
     uint32_t sparse_type = 0;
     VkDeviceSize sparse_align = 0;
@@ -88,6 +90,8 @@ struct Texture {
     mutable bool obsolete = false;
     mutable uint64_t obsolete_checked = 0;
     uint64_t gpu_wrote_seen = 0;   // (the newest finished GPU write into its storage it was uploaded after)
+    // ((Triforce, RX_VK_GPU_WRITE_HISTORY=1) the recording and segment that last drew it, as gpu_write_history.h last heard)
+    uint64_t gpu_draw_value = 0, gpu_draw_segment = 0;
     uint64_t last_written = 0;     // (the frame the GPU last wrote it: a render target, each frame it is used)
     uint64_t prev_written = 0;     // ((Triforce) the frame it was written in before last_written's, 0: none: redrawn.h)
     uint64_t first_written = 0;    // (the frame its GPU contents began: written in that frame alone, a table the game baked)
@@ -115,8 +119,27 @@ struct Texture {
     uint64_t wb_value = 0;        // (the submission whose own commands write its texels into its memory; 0: none)
     uint64_t pool_key = 0;    // (a render target's image: its create info's key in the pool it goes to when the texture does)
     std::unordered_map<uint64_t, VkImageView> views;
+    // ((Triforce) a 3D image of the game's BC blocks drawn into where its own raw views cannot be (vk_texture.cpp bc3d_way,
+    // texture_attachment): an uncompressed 3D image of its own for each level and view format so drawn, a texel a block)
+    struct BlockAttachment {
+        VkImage image;
+        VmaAllocation allocation;
+        VkFormat format;
+        uint32_t level;
+    };
+    std::vector<BlockAttachment> block_attachments;
+    uint64_t view_failed_frame = 0;   // ((Triforce) a view refused for want of memory in this present: the views it has not are asked for again in the next, vk_texture.cpp cached_image_view)
     // (Triforce) a flat texture a program samples as a 3D one: its one-slice 3D copy (vk_texture.cpp twin3d_view), the layer it
     // was copied from and the texture's contents it was copied at
+    // ((Triforce, 11-24) Evil HD's texture pack, vk_texture.cpp pack_view: 0 not looked up, 1 none, 2 its file being decoded,
+    // 3 decoded; its key, and the image twice its size made from the file, its levels and views)
+    uint8_t pack_state = 0;
+    uint64_t pack_key = 0;
+    VkImage hd = VK_NULL_HANDLE;
+    VmaAllocation hd_alloc = nullptr;
+    uint32_t hd_levels = 0;
+    uint64_t hd_bytes = 0;
+    std::unordered_map<uint64_t, VkImageView> hd_views;
     VkImage twin3d = VK_NULL_HANDLE;
     VmaAllocation twin3d_alloc = nullptr;
     uint32_t twin3d_layer = 0;
@@ -144,6 +167,23 @@ void texture_end_recording(VkCommandBuffer cmd);
 bool texture_uploads_recorded();
 /// The recording's upload command buffer, to record into (its first use orders it after the work before)
 VkCommandBuffer upload_command_buffer();
+/// (Triforce) An upload command buffer that went on in pieces (vk_texture.cpp upload_piece_next: a GPU ASTC upload's decoded
+/// texels past RX_VK_ASTC_CHUNK_MPX). A piece is a command buffer of its own, with a pool of its own, recorded after `base` and
+/// the pieces before it, and each goes to the queue as a submission of its own, in that order, before whatever followed `base`
+/// in its submit: a driver is not interrupted inside one submission, and Windows resets a GPU that does not answer for 2 s
+struct UploadPiece {
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    bool ended = false;   // (false: it could not be ended, and is not submitted)
+};
+/// The pieces `base` (a recording's upload command buffer, or a parallel replay's segment init one) went on in, ended, appended
+/// to `out` in their order; `base` itself is the caller's to end. Returns how many. Called once nothing records into them any
+/// more (the recording's or the segment's end), by the thread that submits `base`
+size_t texture_upload_pieces(VkCommandBuffer base, std::vector<UploadPiece>& out);
+/// The pieces' submission is done on the GPU, or they were never submitted: reused from here on (`pieces` is emptied)
+void texture_upload_pieces_free(std::vector<UploadPiece>& pieces);
+/// The command buffer `base` goes on in now: its last piece, or itself
+VkCommandBuffer texture_upload_last(VkCommandBuffer base);
 /// A copy of an RGBA8 region (decoded ASTC kept as RGBA8) into a texture kept as BC3: through the encoder
 bool texture_copy_into_bc(VkCommandBuffer cmd, Texture* src, uint32_t src_level, uint32_t src_layer, int sx, int sy,
                           Texture* dst, uint32_t dst_level, uint32_t dst_layer, int dx, int dy, uint32_t w, uint32_t h,
@@ -206,8 +246,28 @@ Texture* texture_get(const nvn_tex* t, bool for_sampling);
 /// A view of it: the view's levels and layers (all when v is null), as view_type, in the view's format
 /// (attachment: one level, one layer; storage: one level, every layer, in a storage-capable format)
 enum class ViewUse { Sample, Attachment, Storage };
+/// ((Triforce) vk_texture.cpp bc3d_way) A colour or depth target's view of one level and layer (texture_view's, as an
+/// attachment), and for a slice of a 3D BC image where its own raw views cannot be drawn into: a view of the level's block
+/// attachment, an uncompressed image a texel a block, which the caller loads from the BC image before its pass and stores
+/// back after (copy_block_attachment, a full barrier around each). The replay's lock held (it may make the image)
+struct TextureAttachment {
+    VkImageView view = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    VkImage blocks = VK_NULL_HANDLE;   // (the block attachment the view is of; null: the view is the texture's own)
+};
+TextureAttachment texture_attachment(Texture* tex, const nvn_tex* t, const nvn_view* v);
+/// Slice `slice` of `level`: from the BC image into its block attachment (to_attachment), or back
+void copy_block_attachment(VkCommandBuffer cmd, const Texture& tex, VkImage blocks, uint32_t level, uint32_t slice,
+                           bool to_attachment);
 VkImageView texture_view(Texture* tex, const nvn_tex* t, const nvn_view* v, VkImageViewType view_type, ViewUse use,
                          VkFormat* format_out = nullptr, VkFormat force_format = VK_FORMAT_UNDEFINED);
+/// (hookshot) The format rules texture_get and texture_view follow (vk_texture.cpp), shared with the pipeline state list: the image's
+/// format, a view's before its use (a BC-kept image's own pair is texture_view's alone), and for a use (UNDEFINED: no such view)
+VkFormat image_format_of(VkFormat vf, bool astc_decoded);
+VkFormat view_format_of(VkFormat image, bool astc_decoded, int view_nvn);
+VkFormat view_format_for(VkFormat f, ViewUse use, VkFormat force_format);
+/// The format a draw renders in on this device, into a texture of NVN format tex_nvn through a view of NVN format view_nvn
+VkFormat attachment_format(int tex_nvn, int view_nvn);
 /// The view format an NVN texture and view sample / render in
 int view_nvn_format(const nvn_tex* t, const nvn_view* v);
 /// The level and layer a view starts at (the texture's levels)
@@ -228,9 +288,14 @@ void texture_rendered(Texture* tex);
 uint64_t texture_frame_no();
 /// A texel buffer view over guest memory (texture targets of NVN_TEXTURE_TARGET_BUFFER, and image buffers)
 VkBufferView texel_buffer_view(const nvn_tex* t, const nvn_view* v, bool storage);
+/// ((Triforce) The texel buffer views over an imported buffer go, right before the buffer itself does (vk_memory.cpp
+/// destroy_import_buffer)
+void release_texel_buffer_views(VkBuffer buffer);
 /// The texture whose image was rendered for the window (present): t's own, or one rendered at its storage
 Texture* texture_for_present(const nvn_tex* t);
 /// Ages the cache by one present; images nothing used for a while go, after the work that last read them
+/// ((Triforce, RX_VK_GPU_WRITE_HISTORY) the GPU's buffer writes of the recordings done by `completed` count from now on
+void texture_complete_writes(uint64_t completed);
 void texture_frame(uint64_t completed_value);
 /// ((Triforce) tex_warm.h, RX_VK_TEX_WARM: a slot registered, noted; at a submission's start after a light frame, the noted
 /// textures made and uploaded ahead)

@@ -113,7 +113,7 @@ def main():
     # the background: inside the game's Options screen, its own; over play, the System screens' shade and noise
     # (v0.5.1: draw_menu takes perf_under, and over the Mods entry (row) dims nothing)
     draw = function(menu, "void draw_menu(ui::Ctx& c, bool perf_under) {")
-    check("if (!embed_open && !row && !ui::system_bg(c)) c.d->AddRectFilled(" in draw,
+    check("if (!embed_open && !row && !tuning && !ui::system_bg(c)) c.d->AddRectFilled(" in draw,   # ((Triforce) not the tuning bar
           "draw_menu dims the game's own Options screen, or not the System screens' way over play")
     check(draw.count("AddRectFilled(ImVec2(0, 0), ImVec2(c.w, c.h)") == 1, "draw_menu dims the window more than once")
     check("ui::column_bg(k, cx0, cx1, k.over_game);" in draw and "k.over_game = embed_open;" in draw,
@@ -124,10 +124,12 @@ def main():
     check("at(c, 0, 1240 + 2500)" in column and "at(c, 0, 1240 - 2500)" in column and "lu(c, 20)" in column,
           "column_bg is not P_OptionBg_00's place (2240 x 5000 units, 1240 up, seen through S_Scissor_00)")
     bg = function(ui, "inline bool system_bg(")
-    check('art("SystemBgSh_00")' in bg and 'art("DecoNoise_00")' in bg and "return false;" in bg, "system_bg does not fall back")
+    check('skin("SystemBgSh_00")' in bg and 'skin("DecoNoise_00")' in bg and "return false;" in bg, "system_bg does not fall back")
     check("kNoiseAlpha = 102, kShadeAlpha = 179;" in ui, "the shade and the noise are not the layout's 0.7 and 0.4")
-    check("kBgNoise = rgba(28, 13, 13)" in ui and "kSeparator = rgba(75, 57, 34)" in ui and "kInk = rgba(255, 254, 228)" in ui,
-          "vk_ui.h's colours are not the layouts' own")
+    game = ui[ui.index("constexpr Palette kGamePalette = {"):]
+    game = game[:game.index("};")]
+    check(game.split("{", 1)[1].strip().startswith("rgba(255, 254, 228)") and "rgba(75, 57, 34), rgba(28, 13, 13), 0" in game and
+          "inline ImU32 kInk = kGamePalette.ink," in ui, "vk_ui.h's colours (the game's look, the Menu theme's default) are not the layouts' own")
     # (v0.5.1: the colour is a parameter, the performance overlay asks for its own; kSeparator is its default)
     check("ImU32 col = kSeparator, ImU32 line_col = 0) {" in ui, "the separator is not the layout's colour")
 
@@ -146,9 +148,9 @@ def main():
                  '"plate_row", make_plate(*shape, *grain, skin.get("BtnThinBase_04"), kPlateBlack, kPlateWhite, kPlateLine)'):
         check(made in skin, "make_skin does not make " + made.split(",")[0])
     plate = function(ui, "inline void value_plate(")
-    check('art(on ? "value_plate_on" : "value_plate")' in plate and "alpha(IM_COL32_WHITE, k)" in plate,
+    check('skin(on ? "value_plate_on" : "value_plate")' in plate and "alpha(IM_COL32_WHITE, k)" in plate,
           "value_plate does not draw the baked plates untinted")
-    check('ui::art("tab_select")) ui::image(c, t, a, b);' in function(menu, "void draw_tabs("), "the chosen tab is not the baked plate")
+    check('ui::skin("tab_select")) ui::image(c, t, a, b);' in function(menu, "void draw_tabs("), "the chosen tab is not the baked plate")
 
     with tempfile.TemporaryDirectory(prefix="vanilla-look-") as tmp:
         src, exe = Path(tmp) / "look.cpp", Path(tmp) / "look.exe"

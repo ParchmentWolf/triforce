@@ -61,6 +61,8 @@ static int vcore_yields, os_yields, vcores, aways, backs, slept;
 static void hos_vcore_yield(void) { vcore_yields++; }
 static int hos_vcores_on(void) { return vcores; }
 static int hos_vcore_away(void) { aways++; return 1; }
+enum { HOS_CHAIN_WAIT = 1, HOS_CHAIN_WOKE, HOS_CHAIN_SIGNAL, HOS_CHAIN_SLEEP, HOS_CHAIN_AWAKE, HOS_CHAIN_PRESENT };   /* ((Triforce) HOS_CHAIN off) */
+#define HOS_CHAIN(kind, key) ((void)(kind), (void)(key))
 static void hos_vcore_back(void) { backs++; }
 static int SwitchToThread(void) { os_yields++; return 1; }
 static void sleep_for(int64_t ns, int guest) { (void)ns, (void)guest; slept++; }

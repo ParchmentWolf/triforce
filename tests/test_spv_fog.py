@@ -83,7 +83,7 @@ def check_source():
         if needle not in body:
             raise SystemExit("make_module no longer has: " + needle)
     # (the module made from what was patched; the record's SPIR-V, written from the translation, is not)
-    if body.find("spv_fog::") > body.find("vkCreateShaderModule"):
+    if body.find("spv_fog::") > body.find("extern_guarded_shader_module("):
         raise SystemExit("make_module patches after the module is made")
     docs = (ROOT / "docs/development.md").read_text(encoding="utf-8")
     if "`RX_VK_FOG_CULL=1`" not in docs:

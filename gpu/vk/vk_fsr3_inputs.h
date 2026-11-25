@@ -118,6 +118,8 @@ void missed();
 /// jitter sequence's length (fsr3_math.h jitter_phases, AMD's rule). vk_replay.cpp's rx_option gives the host this or
 /// vk_temporal.cpp's temporal_jitter_size, whichever upscaler draws
 uint32_t jitter_size(int axis);
+/// ((Triforce) the same, one whole sample (temporal_jitter.h): all zero while there is to be none
+MkwVkJitter jitter_sample();
 
 /// Once a frame (vk_fsr3.cpp fsr3_idle): the colour, depth and motion images and the depth views let go once nothing has
 /// asked for these inputs (wanted) for 120 frames, and what was let go earlier destroyed when no frame in flight can use it

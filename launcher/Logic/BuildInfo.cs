@@ -28,6 +28,9 @@ public static partial class BuildInfo
     /// <summary>The Linux parts list (builder/linux/linux_update.py LIST_NAME).</summary>
     public const string LinuxListAsset = "triforce-linux.txt";
     public const string AppName = "Triforce";
+    /// <summary>((Triforce, 11-25) Evil HD's texture pack: its manifest.json and parts, in an R2 bucket of their own, apart from the
+    /// release's files (TexturePack; TRIFORCE_TEXPACK_URL goes over it for a test).</summary>
+    public const string TexturePackBase = "https://hd.triforceproject.com";
 
     /// <summary>The User-Agent every request to the release server carries (old Shell.cs Http).</summary>
     public static string UserAgent => "TriforceSetup/" + Version;

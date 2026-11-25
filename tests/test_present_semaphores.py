@@ -21,7 +21,7 @@ present = replay[start:replay.index('\n}', start) + 2]
 # ((Triforce) the present call is present_out's, on the presenting thread or the present thread: RX_VK_PRESENT_THREAD)
 out_start = replay.index('static void present_out(const PresentOut& o,', start)
 out = replay[out_start:replay.index('\n}', out_start) + 2]
-assert 'uint32_t index = o.index;' in out and 'const PresentOut out{index, smooth_mine};' in present
+assert 'uint32_t index = o.index;' in out and 'const PresentOut out{index, smooth_mine, check_ticket, present_check_frame, dev.swap_generation, f.done};' in present
 signal = re.search(r'    signal\.semaphore = [^;]+;', present)[0]
 wait = re.search(r'    pi\.pWaitSemaphores = [^;]+;', out)[0]
 acquire_wait = re.search(r'    waits\[0\]\.semaphore = [^;]+;', present)[0]

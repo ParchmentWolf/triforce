@@ -327,6 +327,8 @@ const ACTIONS = {
   mod: (id) => openModSheet(id),
   sc: (i) => openSaveSheet(+i),
   file: (i) => { S.cur = +i; drawHome(); },
+  texpack: () => cmd(S.texpack && S.texpack.busy ? 'texpackstop' : 'texpack'),
+  evilhd: () => { const r = evilRow(); if (!r) return; r.v = +r.v === 1 ? 0 : 1; drawEvilHd(); cmd('gopt.value', { key: 'evil_hd', value: r.v }); },
   bringin: () => openSaveFlow('import'),
   copyout: () => openSaveFlow('export'),
   opt: (a, el) => { $$('.opt', el.parentElement).forEach(o => o.classList.toggle('sel', o === el)); },
@@ -426,6 +428,36 @@ function addLog(lines) {
 }
 
 /* ---------------- home ---------------- */
+/// ((Triforce, 11-25) Evil HD on the home screen, the owner's ask: the game's own row (evil_hd, the Graphics tab), on or off
+/// with one click; the same setting as the game's menu and F2. Hidden where the game's settings are not known (no game yet))
+function evilRow() {
+  const g = S.gameopts; if (!g || !g.data) return null;
+  for (const t in g.data) for (const s of g.data[t]) for (const r of s.rows) if (r.key === 'evil_hd') return r;
+  return null;
+}
+function drawEvilHd() {
+  const r = evilRow(), box = $('#evilHd'); if (!box) return;
+  box.style.display = r ? '' : 'none'; if (!r) return;
+  const on = +r.v === 1, locked = !!(S.gameopts && S.gameopts.locked);
+  box.classList.toggle('on', on); box.classList.toggle('off', locked);
+  box.title = r.help || '';
+  $('#evilHdSub').textContent = locked ? 'Close the game to change it · F2 works while you play'
+    : 'Remastered textures, edges and shadows · F2 in game';
+  drawTexPack();
+}
+// ((Triforce, 11-25) the Remastered textures row under the switch: Evil HD's texture pack, downloaded into the game folder
+function drawTexPack() {
+  const p = S.texpack, box = $('#ehPack'), r = evilRow(); if (!box) return;
+  const show = !!(p && r && p.have !== 'nogame'); box.style.display = show ? '' : 'none'; if (!show) return;
+  box.classList.toggle('busy', !!p.busy); box.classList.toggle('have', p.have === 'installed');
+  const pct = Math.round((p.frac || 0) * 100);
+  $('#ehPackSub').textContent = p.busy ? (p.line || 'Downloading') + ' · ' + pct + '%'
+    : p.have === 'installed' ? 'Installed · shown while Evil HD is on'
+    : p.have === 'partial' ? 'Stopped part way · goes on where it stopped'
+    : '4,505 textures at twice the detail · ' + (p.size || '18 GB');
+  $('#ehPackBtn').textContent = p.busy ? 'Stop' : p.have === 'installed' ? 'Manage' : p.have === 'partial' ? 'Continue' : 'Download';
+  $('#ehPackBar').style.width = (p.busy ? pct : 0) + '%';
+}
 function picUrl(f) { return f && f.pic ? `url("${f.pic}")` : 'none'; }
 function drawHome() {
   const h = S.home; if (!h) return;
@@ -446,6 +478,7 @@ function drawHome() {
   $('#hCap').textContent = f ? `${f.label} · ${f.last ? 'your last save · ' : ''}picture from the game` : '';
   $('#strip').innerHTML = files.map((x, i) => `<div class="f${i === S.cur ? ' on' : ''}" data-f data-act="file:${i}" id="f${i}"><img src="${esc(x.pic)}" alt=""><small>${esc(x.label)}</small></div>`).join('');
   $('.files').style.display = files.length ? '' : 'none';
+  drawEvilHd();
   const n = h.news;
   $('#whatsnew').innerHTML = n ? `<h4>${esc(n.title)}${n.more && h.mode !== 'update' ? ' · <span class="lnk" data-f data-act="open:changes">All changes</span>' : ''}</h4>` + n.items.map(i => `<p><b>${esc(i.b)}</b> ${esc(i.p)}</p>`).join('') : '';
 }

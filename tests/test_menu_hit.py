@@ -55,7 +55,7 @@ def sources():
     # them since 11-17: one loop draws every tab); a half picks)
     if "float halves_meet(ImVec2 a, ImVec2 b)" not in menu or "const float xm = halves_meet(a, b);" not in menu:
         raise SystemExit("the menu's toggles are not split for the mouse where they are drawn to meet")
-    if len(re.findall(r"hits\.add\([^;]*menu_hit::kRow[^;]*, vm\);", menu)) != 1:
+    if len(re.findall(r"hits\.add\([^;]*menu_hit::kRow[^;]*, vm\);", menu)) != 2:   # ((Triforce) and the tuning bar's row, draw_tune_bar
         raise SystemExit("a page of rows records its toggles without where their halves meet")
     if "if (*d.value != (hit.side < 0 ? d.hi : d.lo)) press[4] = true;" not in menu:
         raise SystemExit("a click on a toggle's half does not pick that value")

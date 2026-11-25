@@ -32,7 +32,7 @@ C = r'''
 int main(void) {
     const uint32_t menus = KMENUS;
     /* (the table's order is what the bits mean: nx2/oot_wide.py KEEP_VTABLES, main at 0x80020000) */
-    CHECK(OOT_HUD_KEEP_N == 4);
+    CHECK(OOT_HUD_KEEP_N == 5);
     const uint64_t wheel = oot_hud_keep_classes[0], pause = oot_hud_keep_classes[1], event_fade = oot_hud_keep_classes[2],
                    loading_fade = oot_hud_keep_classes[3];
     CHECK(wheel == 0x80020000ULL + 0x4bed098 && pause == 0x80020000ULL + 0x4be4fb0);
@@ -47,6 +47,9 @@ int main(void) {
     CHECK(oot_hud_keep_bit(loading_fade) & centred);
     CHECK(oot_hud_keep_bit(wheel) & centred);   /* (the wheel's background is the last frame of play: whole, as before) */
     CHECK(!oot_hud_keep_bit(0x84c00000ULL));    /* (any other screen: the HUD and the menus, in the middle) */
+    /* ((Triforce) the system overlay: bit 4, never in the row's masks (set by wide_sides only while the wheel shows) */
+    CHECK(oot_hud_keep_classes[4] == 0x80020000ULL + 0x4bef4a0 && oot_hud_keep_bit(oot_hud_keep_classes[4]) == 0x10u);
+    CHECK(!(oot_hud_keep_bit(oot_hud_keep_classes[4]) & full) && !(oot_hud_keep_bit(oot_hud_keep_classes[4]) & centred));
     printf("ultrawide: the menus' background alone leaves the keep list with the row on Centred; both fades stay whole\n");
     return 0;
 }
@@ -67,7 +70,7 @@ def main():
     lift = (ROOT / "nx2/oot_wide.py").read_text(encoding="utf-8")
     m = re.search(r"constexpr uint32_t kMenus = (0x[0-9a-fA-F]+);", framegen)
     check(m is not None, "vk_framegen.cpp wide_sides has no kMenus")
-    check("host->wide_menus(opts.wide_menus ? 0xfu & ~kMenus : 0xfu)" in framegen,
+    check("host->wide_menus(overlay_bit | (opts.wide_menus ? 0xfu & ~kMenus : 0xfu))" in framegen,
           "wide_sides no longer gives the host the keep mask by the Ultrawide menus row")
     # (the header's table and the lift's list are the same four, in the same order)
     table = re.findall(r"0x84c0([0-9a-f]{4})ULL,", header)
@@ -75,7 +78,7 @@ def main():
     check(listed is not None and re.findall(r"MAIN \+ 0x4be([0-9a-f]{4})", listed.group(1)) ==
           [t for t in (x[0:4] for x in ("d098", "4fb0", "61c8", "7b30"))],
           "nx2/oot_wide.py KEEP_VTABLES is not the four screens in the order host/oot_wide_hud.h has them")
-    check(table == ["d098", "4fb0", "61c8", "7b30"], "host/oot_wide_hud.h's table is not the four screens in that order")
+    check(table == ["d098", "4fb0", "61c8", "7b30", "f4a0"], "host/oot_wide_hud.h's table is not the five screens in that order")
     with tempfile.TemporaryDirectory(prefix="wide-fades-") as tmp:
         src = Path(tmp) / "fades.c"
         src.write_text(C, encoding="utf-8")

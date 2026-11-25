@@ -6,7 +6,8 @@ translator in a64emit's place (no compiler is needed), and the lifter's own disc
 page marks over them.
 
   - the planner: every function in exactly one run, the runs in order, none past its limits but by its last function;
-  - the texts a run is sent are exactly the ones the lifter's emit reads for it;
+  - the texts a process makes for its run (emit_pool.run_texts) hold every one the lifter's emit reads for it, each the text
+    the lifter's own write() makes for every function, and their FPX shapes together are its shapes;
   - the answers come back in the order asked, whichever process ends first, and no more is asked ahead than the processes
     and AHEAD;
   - a lift by 3 and by 5 processes, in runs that neither count divides, twice into the same folder (the chunk boundaries from
@@ -174,7 +175,12 @@ def late(i, delay):
 
 
 # ---- a lift ------------------------------------------------------------------------------------------------------------------
-def lift(folder, jobs, cls=a64_lift.Lifter, setup=(poll.install,), **fail):
+def authored_translator():
+    """(a spawned process's setup, as the lift's process has it: authored()) the authored translator in a64emit's place"""
+    a64emit.translate = translate
+
+
+def lift(folder, jobs, cls=a64_lift.Lifter, setup=(poll.install, authored_translator), **fail):
     """One lift of the authored code into folder, as nx2/lift.py does it (write, edit_c without waiting for the page marks,
     then marks_done): the files it leaves, the lines it printed and its counters, or the SystemExit that ended it"""
     L = cls(Image())
@@ -247,7 +253,8 @@ def test_plan():
 
 
 def test_texts_sent():
-    """What a run is sent of the texts is what the lifter's emit reads for it: more is only weight, less is a KeyError there"""
+    """What a process translates for its run holds what the lifter's emit reads for it (less is a KeyError there), each the text
+    the lifter's write() makes, and the runs' FPX shapes together are the lifter's"""
     L = a64_lift.Lifter(Image())
     L.discover()
     keys = {}
@@ -256,7 +263,12 @@ def test_texts_sent():
             if k[0] == "op":
                 keys.setdefault((w, pc) if a64_lift.pc_relative(w) else w, (pc, w))
     tx, fl = translate(list(keys.values()))
-    texts = dict(zip(keys, zip((a64_lift.op_text(t, set()) for t in tx), fl)))
+    shapes = set()
+    texts = dict(zip(keys, zip((a64_lift.op_text(t, shapes) for t in tx), fl)))
+    theirs = set()
+    for es in emit_pool.plan(sorted(L.funcs), lambda e: len(L.funcs[e][0]), 7, 150):
+        emit_pool.run_texts({e: L.funcs[e] for e in es}, theirs)
+    check("the runs' FPX shapes (%d) are the lifter's (%d)" % (len(theirs), len(shapes)), theirs == shapes)
 
     class Seen(dict):
         def __getitem__(self, k):
@@ -268,9 +280,9 @@ def test_texts_sent():
         seen.read = set()
         for e in es:
             L.emit_function(e, seen)
-        sent = emit_pool.texts_of(L.funcs, es, texts)
-        check("the texts sent for a run (%d) are the ones its emit read (%d)" % (len(sent), len(seen.read)), set(sent) == seen.read)
-        check("a text sent is the text", all(sent[k] is texts[k] for k in sent))
+        made = emit_pool.run_texts({e: L.funcs[e] for e in es}, set())
+        check("the texts made for a run (%d) hold the ones its emit read (%d)" % (len(made), len(seen.read)), seen.read <= set(made))
+        check("a text made for a run is the lifter's", all(made[k] == texts[k] for k in made))
 
 
 def test_order_of_answers():
@@ -339,8 +351,13 @@ def test_failures(tmp, one):
     # (the lift's process has the polls on its lifter class and does not name what put them there: the workers' class would emit
     # without them)
     folder = os.path.join(tmp, "setup")
-    got = lift(folder, 3, setup=())
+    got = lift(folder, 3, setup=(authored_translator,))
     failed("a lifter class set up otherwise", got, "poll.install.<locals>.emit_function", "setup")
+    check("a lifter class set up otherwise: lifted files are left", lifted(folder) == [])
+    # ((Triforce) and a translator set up otherwise: the processes translate their runs themselves)
+    folder = os.path.join(tmp, "translator")
+    got = lift(folder, 3, setup=(poll.install,))
+    failed("a translator set up otherwise", got, "a64emit.translate", "setup")
     check("a lifter class set up otherwise: lifted files are left", lifted(folder) == [])
     # (the page marks: a file the worker cannot read, a folder with a chunk's name; the patches before them are not this test's)
     folder = os.path.join(tmp, "marks")
@@ -349,7 +366,7 @@ def test_failures(tmp, one):
     gen, image = os.path.join(folder, "gen"), os.path.join(folder, "image")
     os.makedirs(image)
     with contextlib.redirect_stdout(io.StringIO()):
-        chunks.write(L, gen, image, counters=[poll.stats], jobs=3, setup=[poll.install])
+        chunks.write(L, gen, image, counters=[poll.stats], jobs=3, setup=[poll.install, authored_translator])
     check("the processes stay between write() and edit_c()", chunks._workers is not None)
     os.mkdir(os.path.join(gen, "code_001_7.c"))
     stand_in = mock.Mock()
@@ -367,7 +384,7 @@ def test_failures(tmp, one):
     os.rmdir(os.path.join(gen, "code_001_7.c"))
     # (the patches' own failure is said as it was, and the processes go)
     with contextlib.redirect_stdout(io.StringIO()):
-        chunks.write(L, gen, image, counters=[poll.stats], jobs=3, setup=[poll.install])
+        chunks.write(L, gen, image, counters=[poll.stats], jobs=3, setup=[poll.install, authored_translator])
     stand_in.apply.side_effect = SystemExit("oot_patches: authored")
     with mock.patch.dict(sys.modules, {"oot_patches": stand_in}):
         try:
@@ -448,7 +465,7 @@ def abandon(folder):
     L.discover()
     gen, image = os.path.join(folder, "gen"), os.path.join(folder, "image")
     os.makedirs(image)
-    chunks.write(L, gen, image, counters=[poll.stats], jobs=3, setup=[poll.install])
+    chunks.write(L, gen, image, counters=[poll.stats], jobs=3, setup=[poll.install, authored_translator])
     chunks.edit_c(gen, L.stats, False, whole=False, wait=False)
     raise SystemExit("authored: the lift's last files could not be written")
 
@@ -527,8 +544,8 @@ def test_key():
 
 
 def authored():
-    """What a lift of the authored code needs, in the lift's process only: the workers are sent what it made, and translate
-    nothing"""
+    """What a lift of the authored code needs, in the lift's process (the workers' translator is set up by
+    authored_translator, in their setup)"""
     a64emit.translate = translate
     a64_lift.Lifter.jump_table = lambda self, br_pc, reg, window=32: None   # (no tables in the authored code: its br is an indirect jump)
     a64_lift.CHUNK_BYTES = 60000

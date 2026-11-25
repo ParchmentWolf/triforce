@@ -93,6 +93,7 @@ volatile uint32_t hos_wide_keep_mask;
 static int mods_mode;
 enum { HOS_OPT_MODS_MUSIC = 161 };
 int rx_option(int id, int otherwise) { return id == HOS_OPT_MODS_MUSIC ? mods_mode : otherwise; }
+void hos_wide_ui_tick(void) {}   // ((Triforce) host/hos_wide_ui.c's plan, each present: not this test's)
 BACKEND_SITES
 static float margin_now() { return host_wide_menus(0xd); }
 void menus() {

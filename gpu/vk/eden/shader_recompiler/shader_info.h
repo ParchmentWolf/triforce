@@ -179,6 +179,22 @@ struct StorageBufferDescriptor {
     auto operator<=>(const StorageBufferDescriptor&) const = default;
 };
 
+/// ((Triforce) simulated turf, ir_opt/sim_turf_pool_pass.h) A storage descriptor the pass adds: the back end binds the turf list
+/// at the guest address c0+(cbuf_offset & 0xffff) names, a buffer of the renderer's own (vk_draw.cpp sim_turf_private_binding)
+/// or the game's own list. Bit 31 marks one (c0 holds 64 KiB: no real offset has it); bit 30: a pool of 48-byte records (else
+/// the blade list of 8-byte ones); bit 29: the program that writes the records (else one that reads them)
+inline constexpr u32 kSimTurfStorageBit = 0x80000000u, kSimTurfStoragePool = 0x40000000u, kSimTurfStorageCreator = 0x20000000u;
+[[nodiscard]] constexpr u32 SimTurfStorageOffset(u32 orig, bool pool, bool creator) noexcept {
+    return kSimTurfStorageBit | (pool ? kSimTurfStoragePool : 0u) | (creator ? kSimTurfStorageCreator : 0u) | (orig & 0xffffu);
+}
+[[nodiscard]] constexpr bool IsSimTurfStorage(const StorageBufferDescriptor& d) noexcept {
+    return d.cbuf_index == 0 && d.count == 1 && (d.cbuf_offset & kSimTurfStorageBit) != 0;
+}
+/// The constant bank offset of the address (and size) words a storage descriptor's binding is read from
+[[nodiscard]] constexpr u32 SimTurfStorageOrig(const StorageBufferDescriptor& d) noexcept {
+    return IsSimTurfStorage(d) ? d.cbuf_offset & 0xffffu : d.cbuf_offset;
+}
+
 struct TextureBufferDescriptor {
     bool has_secondary;
     u32 cbuf_index;

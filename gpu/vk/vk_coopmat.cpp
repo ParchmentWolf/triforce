@@ -17,6 +17,7 @@
 
 #include "vk_internal.h"
 #include "shader_recompiler/backend/spirv/mma_layout.h"
+#include "shader_recompiler/backend/spirv/mma_software.h"
 #include <sirit/sirit.h>
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
@@ -43,6 +44,10 @@ float from_half(uint16_t h) {
     return f;
 }
 
+bool wmma16_result_matches(float got, float want) {
+    return std::isfinite(got) && std::fabs(got - want) <= 1e-4f;
+}
+
 // the console's fragment positions: lane t (g = t/4, i = t%4), element e (two a register, low half first)
 void console_a(int t, int e, int& r, int& k) { const int g = t / 4, i = t % 4; r = g + ((e >> 1) & 1) * 8; k = 2 * i + (e & 1) + (e >> 2) * 8; }
 void console_b(int t, int e, int& k, int& n) { const int g = t / 4, i = t % 4; k = 2 * i + (e & 1) + (e >> 1) * 8; n = g; }
@@ -52,6 +57,7 @@ void console_c(int t, int e, int& r, int& n) { const int g = t / 4, i = t % 4; r
 struct TestShader {
     Sirit::Module m{0x00010600};
     Sirit::Id u32, f16, f16x2, buf, u32_ptr, lane, ta, tb, tc, zero;
+    std::vector<Sirit::Id> extra_interfaces;   // (variables the body adds: test_multiply_wmma16's workgroup tiles)
     Sirit::Id c32(uint32_t v) { return m.Constant(u32, v); }
     Sirit::Id word_ptr(Sirit::Id index) { return m.OpAccessChain(u32_ptr, buf, c32(0), index); }
     Sirit::Id word(Sirit::Id index) { return m.OpLoad(u32, word_ptr(index)); }
@@ -102,13 +108,16 @@ std::vector<uint32_t> build_shader(const std::function<void(TestShader&)>& body)
     body(s);
     m.OpReturn();
     m.OpFunctionEnd();
-    m.AddEntryPoint(spv::ExecutionModel::GLCompute, main, "main", s.buf, lid);
+    std::vector<Id> interfaces{s.buf, lid};
+    interfaces.insert(interfaces.end(), s.extra_interfaces.begin(), s.extra_interfaces.end());
+    m.AddEntryPoint(spv::ExecutionModel::GLCompute, main, "main", interfaces);
     m.AddExecutionMode(main, spv::ExecutionMode::LocalSize, 32U, 1U, 1U);
     return m.Assemble();
 }
 
-// one dispatch of a 32-lane shader over words (in and out)
-bool run_shader(const std::vector<uint32_t>& code, std::vector<uint32_t>& data) {
+// one dispatch of a 32-lane shader over words (in and out), groups of 32 lanes
+bool run_shader(const std::vector<uint32_t>& code, std::vector<uint32_t>& data, uint32_t groups = 1,
+                const char* what = "cooperative matrix test") {
     const VkDeviceSize size = data.size() * 4;
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = size;
@@ -133,7 +142,12 @@ bool run_shader(const std::vector<uint32_t>& code, std::vector<uint32_t>& data) 
     }
     vkBindBufferMemory(dev.device, buffer, memory, 0);
     uint32_t* words = nullptr;
-    vkMapMemory(dev.device, memory, 0, size, 0, (void**)&words);
+    if (vkMapMemory(dev.device, memory, 0, size, 0, (void**)&words) != VK_SUCCESS || !words) {
+        logf("vk: cooperative matrix test: the buffer could not be mapped");
+        vkDestroyBuffer(dev.device, buffer, nullptr);
+        vkFreeMemory(dev.device, memory, nullptr);
+        return false;
+    }
     std::memcpy(words, data.data(), size);
 
     VkDescriptorSetLayoutBinding b{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
@@ -186,7 +200,7 @@ bool run_shader(const std::vector<uint32_t>& code, std::vector<uint32_t>& data) 
         vkBeginCommandBuffer(cmd, &cbb);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
-        vkCmdDispatch(cmd, 1, 1, 1);
+        vkCmdDispatch(cmd, groups, 1, 1);
         VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
         mb.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, mb.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
         mb.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT, mb.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
@@ -196,21 +210,27 @@ bool run_shader(const std::vector<uint32_t>& code, std::vector<uint32_t>& data) 
         vkEndCommandBuffer(cmd);
         VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         VkFence fence{};
-        vkCreateFence(dev.device, &fci, nullptr, &fence);
+        if (vkCreateFence(dev.device, &fci, nullptr, &fence) != VK_SUCCESS) fence = VK_NULL_HANDLE;   // (no fence: not submitted, so all is freed below)
         VkCommandBufferSubmitInfo csi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
         csi.commandBuffer = cmd;
         VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
         si.commandBufferInfoCount = 1, si.pCommandBufferInfos = &csi;
-        ok = vkQueueSubmit2(dev.queue, 1, &si, fence) == VK_SUCCESS &&
-             vkWaitForFences(dev.device, 1, &fence, VK_TRUE, 5000000000ull) == VK_SUCCESS;
+        const bool submitted = fence && vkQueueSubmit2(dev.queue, 1, &si, fence) == VK_SUCCESS;
+        ok = submitted && vkWaitForFences(dev.device, 1, &fence, VK_TRUE, 5000000000ull) == VK_SUCCESS;
         if (ok) std::memcpy(data.data(), words, size);
-        else logf("vk: cooperative matrix test: the dispatch did not complete");
+        else logf("vk: %s: the dispatch did not complete", what);
+        // (submitted and not done in 5 s: what it uses is still the GPU's, the fence, the pool, the pipeline and the buffer are
+        // left as they are; only the module, which a made pipeline no longer needs, goes)
+        if (submitted && !ok) {
+            if (module) vkDestroyShaderModule(dev.device, module, nullptr);
+            return false;
+        }
         vkDestroyFence(dev.device, fence, nullptr);
         vkDestroyCommandPool(dev.device, cmd_pool, nullptr);
         vkDestroyDescriptorPool(dev.device, pool, nullptr);
         vkDestroyPipeline(dev.device, pipeline, nullptr);
     } else {
-        logf("vk: cooperative matrix test: pipeline creation failed (%d)", (int)pr);
+        logf("vk: %s: pipeline creation failed (%d)", what, (int)pr);
     }
     if (module) vkDestroyShaderModule(dev.device, module, nullptr);
     vkDestroyPipelineLayout(dev.device, layout, nullptr);
@@ -329,10 +349,266 @@ bool test_multiply() {
     return bad == 0;
 }
 
+// (AMD RDNA 3/3.5/4) full 16x16 N-paired multiply as DefineWmma16PairFunction (emit_spirv_warp.cpp) emits it, for one
+// subgroup: lane t's fragment words at 12t (A 4, B0 2, B1 2, C0 2, C1 2), D0/D1 (4 words) out at 384 + 4t, verifying all 256 elements
+bool test_multiply_wmma16() {
+    using namespace Shader::Backend::SPIRV;
+    std::vector<uint32_t> data(512, 0xffffffffu);
+    const auto pack = [](float lo, float hi) { return (uint32_t)to_half(lo) | ((uint32_t)to_half(hi) << 16); };
+    for (int t = 0; t < 32; t++) {
+        int r0, c0, r1, c1;
+        for (int e = 0; e < 8; e += 2) console_a(t, e, r0, c0), console_a(t, e + 1, r1, c1), data[t * 12 + e / 2] = pack(a_val(r0, c0), a_val(r1, c1));
+        for (int e = 0; e < 4; e += 2) console_b(t, e, r0, c0), console_b(t, e + 1, r1, c1), data[t * 12 + 4 + e / 2] = pack(b_val(r0, c0), b_val(r1, c1));
+        for (int e = 0; e < 4; e += 2) console_b(t, e, r0, c0), console_b(t, e + 1, r1, c1), data[t * 12 + 6 + e / 2] = pack(b_val(r0, c0 + 8), b_val(r1, c1 + 8));
+        for (int e = 0; e < 4; e += 2) console_c(t, e, r0, c0), console_c(t, e + 1, r1, c1), data[t * 12 + 8 + e / 2] = pack(c_val(r0, c0), c_val(r1, c1));
+        for (int e = 0; e < 4; e += 2) console_c(t, e, r0, c0), console_c(t, e + 1, r1, c1), data[t * 12 + 10 + e / 2] = pack(c_val(r0, c0 + 8), c_val(r1, c1 + 8));
+    }
+    const auto code = build_shader([](TestShader& s) {
+        auto& m = s.m;
+        const auto c = [&](uint32_t v) { return s.c32(v); };
+        const Sirit::Id scope = c((uint32_t)spv::Scope::Subgroup);
+        const auto mat = [&](spv::CooperativeMatrixUse use) {
+            return m.TypeCooperativeMatrixKHR(s.f16, scope, c(16), c(16), c((uint32_t)use));
+        };
+        const Sirit::Id ta = mat(spv::CooperativeMatrixUse::MatrixAKHR), tb = mat(spv::CooperativeMatrixUse::MatrixBKHR),
+                        tc = mat(spv::CooperativeMatrixUse::MatrixAccumulatorKHR);
+        const Sirit::Id wptr = m.TypePointer(spv::StorageClass::Workgroup, s.u32);
+        const Sirit::Id tiles = m.AddGlobalVariable(
+            m.TypePointer(spv::StorageClass::Workgroup, m.TypeArray(s.u32, c(mma_wmma16_tile_words))),
+            spv::StorageClass::Workgroup);
+        s.extra_interfaces.push_back(tiles);
+        const auto at = [&](Sirit::Id index) { return m.OpAccessChain(wptr, tiles, index); };
+        const auto put = [&](Sirit::Id index, Sirit::Id value) { m.OpStore(at(index), value, spv::MemoryAccessMask::NonPrivatePointer); };
+        const auto get = [&](Sirit::Id index) { return m.OpLoad(s.u32, at(index), spv::MemoryAccessMask::NonPrivatePointer); };
+        const auto barrier = [&] {
+            m.OpControlBarrier(scope, scope, c((uint32_t)(spv::MemorySemanticsMask::AcquireRelease | spv::MemorySemanticsMask::WorkgroupMemory |
+                                                          spv::MemorySemanticsMask::MakeAvailable | spv::MemorySemanticsMask::MakeVisible)));
+        };
+        const Sirit::Id in = m.OpIMul(s.u32, s.lane, c(12));
+        const Sirit::Id g = m.OpShiftRightLogical(s.u32, s.lane, c(2)), i = m.OpBitwiseAnd(s.u32, s.lane, c(3));
+        const Sirit::Id gi = m.OpIAdd(s.u32, m.OpShiftLeftLogical(s.u32, g, c(3)), i);
+        const auto word = [&](uint32_t region, uint32_t rows, uint32_t words) { return s.at(gi, region * 128 + rows * 8 + words); };
+        const Sirit::Id zero = c(0);
+        const bool fast = mma_wmma16_fast;
+        put(word(0, 0, 0), s.word(s.at(in, 0))), put(word(0, 8, 0), s.word(s.at(in, 1)));
+        put(word(0, 0, 4), s.word(s.at(in, 2))), put(word(0, 8, 4), s.word(s.at(in, 3)));
+        put(word(1, 0, 0), s.word(s.at(in, 4))), put(word(1, 0, 4), fast ? s.word(s.at(in, 5)) : zero);
+        put(word(1, 8, 0), s.word(s.at(in, 6))), put(word(1, 8, 4), fast ? s.word(s.at(in, 7)) : zero);
+        if (!fast) {
+            put(word(2, 0, 0), zero), put(word(2, 0, 4), s.word(s.at(in, 5)));
+            put(word(2, 8, 0), zero), put(word(2, 8, 4), s.word(s.at(in, 7)));
+        }
+        put(word(3, 0, 0), s.word(s.at(in, 8))), put(word(3, 8, 0), s.word(s.at(in, 9)));
+        put(word(3, 0, 4), s.word(s.at(in, 10))), put(word(3, 8, 4), s.word(s.at(in, 11)));
+        barrier();
+        const auto tile = [&](Sirit::Id type, uint32_t region, uint32_t layout) {
+            return m.OpCooperativeMatrixLoadKHR(type, at(c(region * 128)), c(layout), c(8), spv::MemoryAccessMask::NonPrivatePointer);
+        };
+        const Sirit::Id a = tile(ta, 0, 0);
+        Sirit::Id d = m.OpCooperativeMatrixMulAddKHR(tc, a, tile(tb, 1, 1), tile(tc, 3, 0));
+        if (!fast) d = m.OpCooperativeMatrixMulAddKHR(tc, a, tile(tb, 2, 1), d);
+        barrier();
+        m.OpCooperativeMatrixStoreKHR(at(c(3 * 128)), d, c(0), c(8), spv::MemoryAccessMask::NonPrivatePointer);
+        barrier();
+        const Sirit::Id out = m.OpIAdd(s.u32, c(384), m.OpIMul(s.u32, s.lane, c(4)));
+        s.store(s.at(out, 0), get(word(3, 0, 0)));
+        s.store(s.at(out, 1), get(word(3, 8, 0)));
+        s.store(s.at(out, 2), get(word(3, 0, 4)));
+        s.store(s.at(out, 3), get(word(3, 8, 4)));
+    });
+    if (!run_shader(code, data)) return false;
+    int bad = 0;
+    for (int t = 0; t < 32; t++)
+        for (int half_idx = 0; half_idx < 2; half_idx++)
+            for (int e = 0; e < 4; e++) {
+                int r, n;
+                console_c(t, e, r, n);
+                n += half_idx * 8;
+                float want_d = c_val(r, n);
+                for (int k = 0; k < 16; k++) want_d += a_val(r, k) * b_val(k, n);
+                const uint32_t w = data[384 + t * 4 + half_idx * 2 + e / 2];
+                const float got = from_half((uint16_t)(e & 1 ? w >> 16 : w & 0xffff));
+                // (RDNA 3/3.5 gfx11 v_wmma_f16 can leave a <=2^-22 f16 subnormal residual on exact cancellation to 0;
+                // any layout or tile bug is off by >= 1.0 on these integer inputs, so 1e-4 catches every wrong lane)
+                if (!wmma16_result_matches(got, want_d) && bad++ < 4)
+                    logf("vk: WMMA 16x16x16 test: lane %d element %d (D[%d][%d]) %g, the CPU %g", t, e, r, n, got, want_d);
+            }
+    if (bad) logf("vk: WMMA 16x16x16 test: %d of 256 elements differ", bad);
+    return bad == 0;
+}
+
 } // namespace
 
 // (vk_main.cpp, once the device is made: dev.coop_matrix says the extension and its feature are on)
 namespace {
+// ---- (Triforce) The software multiplies' form (mma_software.h). The unrolled form is used only where, on this device, it gives every
+// word the loop gives: a 32-lane shader multiplies kSoftwareTestLanes lanes' fragments once in each form and the words are compared.
+// The fragments are f16 values of every kind (normal at several scales, subnormal, zero, sums that overflow), and every eighth warp
+// is built so that a K group's exact sum lies just off an f16 tie that its f32 rounding lands on, the remainder coming in the
+// group's last FMA (K 7 and 15: the one a conversion would be folded into): 3 * 683 + 2^-8 * (+-2^-8) = 2049 +- 2^-16 (f32: 2049,
+// a tie between 2048 and 2050), 48 * 1365 + 2^-8 * (+-2^-8) = 65520 +- 2^-16 (a tie between 65504 and infinity). A driver that
+// rounds such a sum to f16 once, folding the conversion into the FMA, gives the other neighbour for 2049 + 2^-16 and 65520 -
+// 2^-16, and the loop is kept. (The test module has none of the game programs' float-control execution modes: it stands for
+// them while those leave f16 denormals alone, profile support_fp16_denorm_* unset, as now.)
+constexpr uint32_t kSoftwareTestLanes = 32 * 256;
+
+/// lane gid (workgroup * 32 + lane): D of words [8 gid, 8 gid + 8) (A 4, B 2, C 2) through the form's function, to words
+/// 8 * kSoftwareTestLanes + 2 gid
+std::vector<uint32_t> software_test_shader(Shader::Backend::SPIRV::SoftwareMmaForm form, bool quad) {
+    using namespace Sirit;
+    using Shader::Backend::SPIRV::DefineSoftwareMma;
+    Module m{0x00010600};
+    // (f16 only in the form that converts to it: the others run where the device has no f16 shaders)
+    const bool f16 = form == Shader::Backend::SPIRV::SoftwareMmaForm::UnrolledF16;
+    m.AddCapability(spv::Capability::Shader);
+    if (f16) m.AddCapability(spv::Capability::Float16);
+    m.AddCapability(spv::Capability::GroupNonUniform);
+    m.AddCapability(spv::Capability::GroupNonUniformShuffle);
+    if (quad) m.AddCapability(spv::Capability::GroupNonUniformQuad);
+    m.SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
+    const Id void_t = m.TypeVoid(), u32 = m.TypeUInt(32), f32 = m.TypeFloat(32);
+    const Id uvec3 = m.TypeVector(u32, 3);
+    const Shader::Backend::SPIRV::SoftwareMmaTypes types{u32, m.TypeVector(u32, 2), m.TypeVector(u32, 4), f32, m.TypeVector(f32, 2),
+                                                         f16 ? m.TypeFloat(16) : Id{}, m.TypeBool()};
+    const Id runtime = m.TypeRuntimeArray(u32);
+    m.Decorate(runtime, spv::Decoration::ArrayStride, 4U);
+    const Id block = m.TypeStruct(runtime);
+    m.Decorate(block, spv::Decoration::Block);
+    m.MemberDecorate(block, 0U, spv::Decoration::Offset, 0U);
+    const Id buf = m.AddGlobalVariable(m.TypePointer(spv::StorageClass::StorageBuffer, block), spv::StorageClass::StorageBuffer);
+    m.Decorate(buf, spv::Decoration::DescriptorSet, 0U);
+    m.Decorate(buf, spv::Decoration::Binding, 0U);
+    const Id gid_var = m.AddGlobalVariable(m.TypePointer(spv::StorageClass::Input, uvec3), spv::StorageClass::Input);
+    m.Decorate(gid_var, spv::Decoration::BuiltIn, spv::BuiltIn::GlobalInvocationId);
+    const Id lane_var = m.AddGlobalVariable(m.TypePointer(spv::StorageClass::Input, u32), spv::StorageClass::Input);
+    m.Decorate(lane_var, spv::Decoration::BuiltIn, spv::BuiltIn::SubgroupLocalInvocationId);
+    const Id u32_ptr = m.TypePointer(spv::StorageClass::StorageBuffer, u32);
+    const Id fn = DefineSoftwareMma(m, types, lane_var, form, quad);
+    const Id main = m.OpFunction(void_t, spv::FunctionControlMask::MaskNone, m.TypeFunction(void_t));
+    m.AddLabel();
+    const auto c32 = [&](uint32_t v) { return m.Constant(u32, v); };
+    const Id gid = m.OpCompositeExtract(u32, m.OpLoad(uvec3, gid_var), 0U);
+    const auto word = [&](Id base, uint32_t n) { return m.OpAccessChain(u32_ptr, buf, c32(0), m.OpIAdd(u32, base, c32(n))); };
+    const Id in = m.OpIMul(u32, gid, c32(8));
+    std::array<Id, 8> w;
+    for (uint32_t k = 0; k < 8; k++) w[k] = m.OpLoad(u32, word(in, k));
+    const Id d = m.OpFunctionCall(types.u32x2, fn, m.OpCompositeConstruct(types.u32x4, w[0], w[1], w[2], w[3]),
+                                  m.OpCompositeConstruct(types.u32x2, w[4], w[5]), m.OpCompositeConstruct(types.u32x2, w[6], w[7]));
+    const Id out = m.OpIAdd(u32, c32(8 * kSoftwareTestLanes), m.OpIMul(u32, gid, c32(2)));
+    for (uint32_t k = 0; k < 2; k++) m.OpStore(word(out, k), m.OpCompositeExtract(u32, d, k));
+    m.OpReturn();
+    m.OpFunctionEnd();
+    m.AddEntryPoint(spv::ExecutionModel::GLCompute, main, "main", buf, gid_var, lane_var);
+    m.AddExecutionMode(main, spv::ExecutionMode::LocalSize, 32U, 1U, 1U);
+    return m.Assemble();
+}
+
+/// The fragments the forms are compared on (fixed: the same every start)
+std::vector<uint32_t> software_test_input() {
+    std::vector<uint32_t> data(10 * kSoftwareTestLanes, 0);
+    uint32_t x = 0x9e3779b9u;
+    const auto next = [&x] { x ^= x << 13, x ^= x >> 17, x ^= x << 5; return x; };
+    const auto half = [&]() -> uint32_t {
+        const uint32_t k = next() % 16, sign = next() & 0x8000, man = next() & 0x3ff;
+        if (k < 9) return sign | ((10 + next() % 10) << 10) | man;   // (normal, 2^-5 to 2^4: activations and weights)
+        if (k < 11) return sign | man;                                // (subnormal or zero)
+        if (k < 13) return sign | ((25 + next() % 6) << 10) | man;    // (large: sums overflow)
+        if (k < 14) return sign | ((1 + next() % 4) << 10) | man;     // (tiny normal)
+        return sign | ((next() % 31) << 10) | man;                    // (any finite)
+    };
+    for (uint32_t i = 0; i < 8 * kSoftwareTestLanes; i++) data[i] = half() | half() << 16;
+    for (uint32_t warp = 0; warp < kSoftwareTestLanes / 32; warp += 8) {
+        // (A[r][6] = a, A[r][7] = 2^-8; B[6][n] = b, B[7][n] = +-2^-8; all else 0: lanes 4g + 3 hold k 6 and 7 of rows g, g + 8 and
+        // of column g)
+        const uint32_t kind = warp / 8 % 4, a = kind < 2 ? 0x4200 /* 3 */ : 0x5200 /* 48 */,
+                       b = kind < 2 ? 0x6156 /* 683 */ : 0x6555 /* 1365 */, small = kind % 2 ? 0x9c00 : 0x1c00;   // (+-2^-8)
+        for (uint32_t t = 0; t < 32; t++) {
+            uint32_t* lane = &data[(warp * 32 + t) * 8];
+            for (uint32_t k = 0; k < 8; k++) lane[k] = 0;
+            if (t % 4 != 3) continue;
+            lane[0] = lane[1] = a | 0x1c00u << 16;   // (rows g and g + 8: k 6 and 7)
+            lane[4] = b | small << 16;               // (column g: k 6 and 7)
+        }
+    }
+    return data;
+}
+
+constexpr size_t kSoftwareFormDidNotRun = ~size_t(0);
+
+/// The two forms' words the same (any NaN is a NaN). *differ: the words that are not, or kSoftwareFormDidNotRun when the device
+/// could not run the form (false then too)
+bool software_forms_agree(Shader::Backend::SPIRV::SoftwareMmaForm form, bool quad, const std::vector<uint32_t>& loop, size_t* differ) {
+    std::vector<uint32_t> data = software_test_input();
+    *differ = kSoftwareFormDidNotRun;
+    if (!run_shader(software_test_shader(form, quad), data, kSoftwareTestLanes / 32, "software matrix test")) return false;
+    const auto nan_as_one = [](uint32_t h) { return (h & 0x7c00) == 0x7c00 && (h & 0x3ff) ? 0x7e00u : h; };
+    *differ = 0;
+    for (uint32_t i = 0; i < 2 * kSoftwareTestLanes; i++) {
+        const uint32_t got = data[8 * kSoftwareTestLanes + i], want = loop[8 * kSoftwareTestLanes + i];
+        *differ += nan_as_one(got & 0xffff) != nan_as_one(want & 0xffff) || nan_as_one(got >> 16) != nan_as_one(want >> 16);
+    }
+    return *differ == 0;
+}
+
+/// RX_VK_MMA_UNROLL=0: the loop; 1: the unrolled forms tried on any GPU; unset: on RADV and on AMD RDNA 4 (RX 9 / GFX12) with
+/// AMD's Windows driver, where they were measured (the Steam Deck and an RX 9060 XT). Tried only: the device's own test then says
+/// whether a form gives the loop's words (choose_software_form)
+bool software_unroll_wanted(VkDriverId driver, bool rdna4, const char* env) {
+    const bool def = driver == VK_DRIVER_ID_MESA_RADV || (rdna4 && driver == VK_DRIVER_ID_AMD_PROPRIETARY);
+    return env ? !(env[0] == '0' && !env[1]) : def;
+}
+/// (AMD RDNA 4: an RX 9 card, or GFX12 in the name)
+bool rdna4_named() {
+    return dev.props.vendorID == 0x1002 && (std::strstr(dev.props.deviceName, "RX 9") || std::strstr(dev.props.deviceName, "GFX12"));
+}
+
+void choose_software_form() {
+    using Shader::Backend::SPIRV::SoftwareMmaForm;
+    namespace spirv = Shader::Backend::SPIRV;
+    spirv::mma_software_form = (uint32_t)SoftwareMmaForm::Loop;
+    const char* env = std::getenv("RX_VK_MMA_UNROLL");
+    if (!software_unroll_wanted(dev.driver_id, rdna4_named(), env)) {
+        logf("vk: software matrix multiplies looped (%s)",
+             env ? "RX_VK_MMA_UNROLL=0" : "not RADV or RDNA 4 on AMD's Windows driver, RX_VK_MMA_UNROLL=1 tries the unrolled form");
+        return;
+    }
+    // (A through quad broadcasts where every stage has quad operations, as the translator may emit the function in any stage that
+    // has subgroup operations; shuffles to the same lanes otherwise)
+    VkPhysicalDeviceSubgroupProperties sg{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    p2.pNext = &sg;
+    vkGetPhysicalDeviceProperties2(dev.physical, &p2);
+    const bool quad = (sg.supportedOperations & VK_SUBGROUP_FEATURE_QUAD_BIT) && (sg.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+                      sg.quadOperationsInAllStages;
+    std::vector<uint32_t> loop = software_test_input();
+    if (!run_shader(software_test_shader(SoftwareMmaForm::Loop, false), loop, kSoftwareTestLanes / 32, "software matrix test")) {
+        logf("vk: software matrix multiplies looped (the loop's test did not run)");
+        return;
+    }
+    size_t differ = 0;
+    for (const SoftwareMmaForm form : {SoftwareMmaForm::UnrolledF16, SoftwareMmaForm::Unrolled}) {
+        const char* name = form == SoftwareMmaForm::UnrolledF16 ? "unrolled, f16 rounding by conversion" : "unrolled, f16 rounding in integers";
+        // (the f16 form's conversions need f16 shaders: RADV gives Polaris, RX 400/500, none)
+        if (form == SoftwareMmaForm::UnrolledF16 && !dev.vk12.shaderFloat16) {
+            logf("vk: software matrix multiplies: %s not tried (the GPU has no f16 shaders)", name);
+            continue;
+        }
+        if (software_forms_agree(form, quad, loop, &differ)) {
+            spirv::mma_software_form = (uint32_t)form;
+            spirv::mma_software_quad = quad;
+            logf("vk: software matrix multiplies %s%s: the loop's words for %u lanes (RX_VK_MMA_UNROLL=0: looped)", name,
+                 quad ? ", A through quad broadcasts" : "", kSoftwareTestLanes);
+            return;
+        }
+        if (differ == kSoftwareFormDidNotRun)
+            logf("vk: software matrix multiplies: %s: its test did not run: not used", name);
+        else
+            logf("vk: software matrix multiplies: %s gave %zu of %u words other than the loop's: not used", name, differ,
+                 2 * kSoftwareTestLanes);
+    }
+    logf("vk: software matrix multiplies looped");
+}
+
 /// Without cooperative matrices (a GTX 1650, an RTX 2060 on some drivers, AMD and Intel cards): the same multiplies in a shader function on
 /// subgroup shuffles. The lowering refuses a matrix multiply it has no way to run, and the game's upscaling networks were then left out:
 /// the 3D scene came out black or as coloured noise, with the HUD over it (Hookshot issues 10 and 14)
@@ -340,6 +616,91 @@ void software_multiplies(const char* why) {
     Shader::Backend::SPIRV::mma_software = true;
     dev.native_mma = true;
     logf("vk: matrix multiplies in software (%s)", why);
+    choose_software_form();
+}
+/// (hookshot, mma_layout.h global_table_loop) Intel's Mesa driver only for now (Mesa inlines DontInline; Windows not tried); env is
+/// RX_VK_GM_LOOP, 0 (off) or any other value (on) over the default. A table indexed by the loop's counter needs dynamic indexing of storage buffer arrays
+/// (tests/test_global_table_loop.py)
+bool table_loop_wanted(VkDriverId driver, bool dynamic_indexing, const char* env) {
+    return (env ? !(env[0] == '0' && !env[1]) : driver == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA) && dynamic_indexing;
+}
+/// ((Triforce) mma_layout.h graphics_table_loads) off by default, RX_VK_GP_TABLE's 1 or 2 on (anything else 0); 0 where the table
+/// cannot hold the pools: the guest's memory not imported with device addresses
+int table_loads_wanted(const char* env, bool device_addresses) {
+    const int v = env ? std::atoi(env) : 0;
+    return (v == 1 || v == 2) && device_addresses ? v : 0;
+}
+/// ((Triforce) mma_layout.h mesh_fallback_global_attributes and mesh_fallback_shared_warp) Intel's Mesa driver only, where they were
+/// measured (an Iris Xe: 8.3 to 18.2 fps at Hyrule Castle with these and the pages below); env is RX_VK_MESH_GLOBAL_ATTRS or
+/// RX_VK_MESH_SHARED_WARP, 0 (off) or any other value (on) over the default
+bool mesh_intel_wanted(VkDriverId driver, const char* env) {
+    return env ? !(env[0] == '0' && !env[1]) : driver == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
+}
+/// (Triforce) AMD RDNA 3 (GFX11.0) and RDNA 3.5 (GFX11.5), by device ID, else by name; RDNA 4 (RX 9, GFX12) apart (rdna4_named)
+bool rdna3_named() {
+    if (dev.props.vendorID != 0x1002 || rdna4_named()) return false;
+    switch (dev.props.deviceID) {
+    case 0x7448: case 0x7449: case 0x744A: case 0x744B: case 0x744C: case 0x745E:
+    case 0x7460: case 0x7461: case 0x7470: case 0x747E:
+    case 0x7480: case 0x7481: case 0x7483: case 0x7487: case 0x7489: case 0x748B: case 0x7499: case 0x749F:
+    case 0x15BF: case 0x15C8: case 0x1900: case 0x1901:
+    case 0x150E: case 0x1586: case 0x1114: case 0x1902:
+        return true;
+    case 0x164E: case 0x13C0: case 0x1681: case 0x1506: case 0x1638: case 0x163F: case 0x15E7: case 0x1435:
+        return false;
+    default:
+        break;
+    }
+    const char* n = dev.props.deviceName;
+    for (const char* k : {"GFX11", "RX 7", "PRO W7", "Pro W7", "PRO V710", "Pro V710", "740M", "760M", "780M", "820M", "840M", "860M",
+                          "880M", "890M", "8040S", "8050S", "8060S", "8065S"})
+        if (std::strstr(n, k)) return true;
+    return false;
+}
+/// (Triforce, AMD RDNA 3/4) cooperative matrices of 16x16x16 only: HMMA_nx2 through workgroup tiles (emit_spirv_warp.cpp
+/// DefineWmma16MatrixFunction). Off by default in Triforce: RX_VK_MMA_WMMA16=1 tries it (a test multiply on the device first,
+/// as below). Measured elsewhere at +9-12% native fps on those cards, with the game's movie networks run (not left out) and
+/// its upscaling sharper; not run here yet. Unset or 0: the software multiplies, as before
+void wmma16_init() {
+    using namespace Shader::Backend::SPIRV;
+    const char* asked = std::getenv("RX_VK_MMA_WMMA16");
+    if (!asked || !*asked || (asked[0] == '0' && !asked[1])) {
+        software_multiplies(asked ? "RX_VK_MMA_WMMA16=0" : "cooperative matrices of 16x16x16 only (RX_VK_MMA_WMMA16=1 tries them)");
+        return;
+    }
+    if (dev.props.vendorID != 0x1002 || Shader::Backend::SPIRV::nan_bits || !(rdna3_named() || rdna4_named())) {
+        software_multiplies("WMMA 16x16x16 requires an AMD RDNA 3/4 GPU");
+        return;
+    }
+    if (!dev.vk12.shaderFloat16) {
+        software_multiplies("no f16 shaders");
+        return;
+    }
+    if (!(dev.sg32_stages & VK_SHADER_STAGE_COMPUTE_BIT)) {   // (the tiles are per 32-lane subgroup)
+        software_multiplies("cooperative matrices of 16x16x16 only, and no 32-lane compute subgroups");
+        return;
+    }
+    if (!dev.vk13.computeFullSubgroups) {   // (a subgroup with lanes missing would run the tiles: vk_draw.cpp pin_subgroup)
+        software_multiplies("cooperative matrices of 16x16x16 only, and no full compute subgroups");
+        return;
+    }
+    mma_wmma16_full_subgroups = true;
+    mma_wmma16_max_subgroups = dev.max_workgroup_subgroups;
+    const char* fast_env = std::getenv("RX_VK_MMA_WMMA16_FAST");
+    mma_wmma16_fast = fast_env && *fast_env && !(fast_env[0] == '0' && !fast_env[1]);
+    const char* fuse_env = std::getenv("RX_VK_MMA_WMMA16_FUSE");
+    mma_wmma16_fused = !fuse_env || !(fuse_env[0] == '0' && !fuse_env[1]);
+    mma_wmma16_shared_limit = dev.props.limits.maxComputeSharedMemorySize;
+    if (!test_multiply_wmma16()) {
+        mma_wmma16_fast = false;
+        mma_wmma16_fused = false;
+        software_multiplies("the 16x16x16 cooperative matrix test failed");
+        return;
+    }
+    mma_wmma16 = true;
+    dev.native_mma = true;
+    logf("vk: native matrix multiplies on (WMMA 16x16x16 through workgroup tiles, %s, %s)",
+         mma_wmma16_fused ? "fused" : "unfused", mma_wmma16_fast ? "fast K=16" : "exact K=8");
 }
 } // namespace
 
@@ -355,12 +716,68 @@ void coopmat_init() {
     // (dev.features.robustBufferAccess: on exactly when robustBufferAccess2 is, vk_main.cpp create_device)
     Shader::Backend::SPIRV::fetch_bounds_buffers = dev.fixes.fetch_bounds && !dev.features.robustBufferAccess;
     Shader::Backend::SPIRV::nan_bits = dev.fixes.nan_bits;
+    // ((Triforce) mma_layout.h f32_add_subgroup: Intel's GPUs, where the float adds' loop lost the device; a GPU whose adds
+    // are the native atomic has no loop to admit to. RX_VK_FADD_SUBGROUP=0 off, any other value on, on any GPU)
+    {
+        const char* const e = std::getenv("RX_VK_FADD_SUBGROUP");
+        Shader::Backend::SPIRV::f32_add_subgroup = e && *e ? !(e[0] == '0' && !e[1]) : dev.props.vendorID == 0x8086;
+        if (Shader::Backend::SPIRV::f32_add_subgroup && !dev.float_atomic_add)
+            logf("vk: float adds to storage buffers enter their compare-exchange loop one at a time a subgroup "
+                 "(RX_VK_FADD_SUBGROUP=0: every invocation at once, as before)");
+    }
+    // ((Triforce) mma_layout.h mesh_fallback_strict_fmul: the same driver as nan_bits before its switch, AMD's older Windows
+    // shader compiler; RX_VK_MESH_STRICT_FMUL=0 off, any other value on, on any GPU)
+    {
+        const char* const e = std::getenv("RX_VK_MESH_STRICT_FMUL");
+        Shader::Backend::SPIRV::mesh_fallback_strict_fmul = e && *e ? !(e[0] == '0' && !e[1]) : dev.amd_older_compiler;
+        if (Shader::Backend::SPIRV::mesh_fallback_strict_fmul)
+            logf("vk: the mesh fallback's f32 multiplies are strict (fma(a, b, -0.0); RX_VK_MESH_STRICT_FMUL=0: plain)");
+    }
+    Shader::Backend::SPIRV::global_table_loop = table_loop_wanted(dev.driver_id, dev.features.shaderStorageBufferArrayDynamicIndexing,
+                                                                  std::getenv("RX_VK_GM_LOOP"));
+    if (Shader::Backend::SPIRV::global_table_loop) logf("vk: storage buffer tables searched in loops (RX_VK_GM_LOOP=0: written out)");
+    {   // ((Triforce) mma_layout.h graphics_table_loads: off by default; RX_VK_GP_TABLE=1 the table alone, 2 the search checked
+        // against it. The table needs buffer device addresses; without the table itself (vk_replay.cpp replay_start) it is undone)
+        const char* e = std::getenv("RX_VK_GP_TABLE");
+        const int v = table_loads_wanted(e, dev.vk12.bufferDeviceAddress != VK_FALSE);
+        if (!v && table_loads_wanted(e, true))
+            logf("vk: global loads search the storage buffers: the guest page table needs buffer device addresses (RX_VK_GP_TABLE not taken)");
+        Shader::Backend::SPIRV::graphics_table_loads = v;
+        if (v) memory_table_cover_on();
+        if (v == 1)
+            logf("vk: vertex, fragment, compute, task and mesh stages' global loads read the guest page table alone (RX_VK_GP_TABLE=1; unset: they "
+                 "search the storage buffers)");
+        else if (v == 2)
+            logf("vk: vertex, fragment, compute, task and mesh stages' global loads checked against the guest page table (RX_VK_GP_TABLE=2)");
+    }
+    // ((Triforce) mma_layout.h mesh_fallback_pages: off by default on every GPU, RX_VK_MESH_PAGES=1 on. Its loads read the guest page
+    // table alone, which must give every bound storage buffer's pages the memory the binding reads: Triforce's memory code (the lazy
+    // write-back, the mirrors' inheritance) was not checked for that. RX_VK_GP_TABLE=2's check (vk_draw.cpp gp_table_check_log)
+    // tells where it does not)
+    {
+        const char* e = std::getenv("RX_VK_MESH_PAGES");
+        Shader::Backend::SPIRV::mesh_fallback_pages = e && *e && !(e[0] == '0' && !e[1]);
+    }
+    if (Shader::Backend::SPIRV::mesh_fallback_pages) {
+        memory_table_cover_on();
+        logf("vk: the mesh fallback's global loads read the guest page table (RX_VK_MESH_PAGES)");
+    }
+    Shader::Backend::SPIRV::mesh_fallback_global_attributes = mesh_intel_wanted(dev.driver_id, std::getenv("RX_VK_MESH_GLOBAL_ATTRS"));
+    if (Shader::Backend::SPIRV::mesh_fallback_global_attributes)
+        logf("vk: the mesh fallback's attribute regions in a pool of the records buffer (RX_VK_MESH_GLOBAL_ATTRS=0: in workgroup memory)");
+    Shader::Backend::SPIRV::mesh_fallback_shared_warp = mesh_intel_wanted(dev.driver_id, std::getenv("RX_VK_MESH_SHARED_WARP"));
+    {
+        const char* e = std::getenv("RX_VK_MESH_SHARED_WARP_CHECK");
+        Shader::Backend::SPIRV::mesh_fallback_shared_warp_check =
+            Shader::Backend::SPIRV::mesh_fallback_shared_warp && e && *e && !(e[0] == '0' && !e[1]);
+    }
+    if (Shader::Backend::SPIRV::mesh_fallback_shared_warp)
+        logf("vk: the mesh fallback's warps in workgroup memory, its stages at any lane count (RX_VK_MESH_SHARED_WARP=0: the subgroup's)%s",
+             Shader::Backend::SPIRV::mesh_fallback_shared_warp_check ? "; checked against the subgroup's (RX_VK_MESH_SHARED_WARP_CHECK)" : "");
     // (hookshot) RX_VK_MMA_SOFTWARE=1: HMMA_nx2 in a shader function on subgroup shuffles, no cooperative matrices
     // (emit_spirv_warp.cpp, from Lichii): the lowering still gives HMMA_nx2 (dev.native_mma)
     if (const char* sw = std::getenv("RX_VK_MMA_SOFTWARE"); sw && std::atoi(sw)) {
-        Shader::Backend::SPIRV::mma_software = true;
-        dev.native_mma = true;
-        logf("vk: matrix multiplies in software (subgroup shuffles, RX_VK_MMA_SOFTWARE)");
+        software_multiplies("subgroup shuffles, RX_VK_MMA_SOFTWARE");
         return;
     }
     const char* env = std::getenv("RX_VK_NATIVE_MMA");
@@ -376,11 +793,18 @@ void coopmat_init() {
     vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(dev.physical, &n, nullptr);
     std::vector<VkCooperativeMatrixPropertiesKHR> props(n, VkCooperativeMatrixPropertiesKHR{VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
     vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(dev.physical, &n, props.data());
-    bool shape = false;
-    for (const auto& p : props)
-        shape |= p.MSize == 16 && p.NSize == 8 && p.KSize == 16 && p.AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
-                 p.BType == VK_COMPONENT_TYPE_FLOAT16_KHR && p.CType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
-                 p.ResultType == VK_COMPONENT_TYPE_FLOAT16_KHR && p.scope == VK_SCOPE_SUBGROUP_KHR;
+    bool shape = false, shape16 = false;
+    for (const auto& p : props) {
+        const bool f16 = p.AType == VK_COMPONENT_TYPE_FLOAT16_KHR && p.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                         p.CType == VK_COMPONENT_TYPE_FLOAT16_KHR && p.ResultType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                         p.scope == VK_SCOPE_SUBGROUP_KHR;
+        shape |= f16 && p.MSize == 16 && p.NSize == 8 && p.KSize == 16;
+        shape16 |= f16 && p.MSize == 16 && p.NSize == 16 && p.KSize == 16;
+    }
+    if (!shape && shape16) {   // (AMD RDNA 3/4: WMMA 16x16x16 only)
+        wmma16_init();
+        return;
+    }
     if (!shape) {
         software_multiplies("the cooperative matrices lack 16x8x16 f16");
         return;

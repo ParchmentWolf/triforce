@@ -107,7 +107,9 @@ def check_source():
     check("barrier_rules::part_draws_default(dev.props.vendorID, radv);" in part, "the default is not asked of the rule with the driver")
     check(part.rstrip().endswith('return barrier_rules::part_draws(env != nullptr, env_value, lab_ab::value_of("chunk", by_driver));'),
           "part_draws does not ask the knob at each call, behind the variable")
-    check(replay.count('getenv("RX_VK_CHUNK")') == 1, "RX_VK_CHUNK is read somewhere else")
+    # ((Triforce) and once by Threaded rendering's parts, only to step aside when it is set: pass_end_parts)
+    ends = function(replay, "PassEndParts& pass_end_parts() {")
+    check(replay.count('getenv("RX_VK_CHUNK")') == 2 and ends.count('getenv("RX_VK_CHUNK")') == 1, "RX_VK_CHUNK is read somewhere else")
     dev = (ROOT / "docs/development.md").read_text(encoding="utf-8")
     row = [line for line in dev.splitlines() if line.startswith("| `RX_VK_CHUNK=<n>` |")]
     check(len(row) == 1 and "**120 on every driver**" in row[0] and "`chunk:<n>`" in row[0], "docs/development.md: no row for RX_VK_CHUNK with its default")

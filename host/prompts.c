@@ -6,7 +6,8 @@
 
    The face: triforce_options.ini's button_prompts (the menu's Button prompts row): 0 Auto, from the first controller's name
    (SDL), else 1 Switch, 2 Xbox, 3 PlayStation 4, 4 PlayStation 5, 5 Steam Deck, 6 Keyboard & mouse. The game reads the font
-   once, at its start: a new face or new controls show at the next start.
+   once, at its start; ((Triforce) among the controllers' faces) a new face or new controls are written where it keeps it, and
+   its texts drawn again (the live part, below). The keyboard and mouse face, or a change to or from it, still at the next start.
 
    (Triforce, 11-19) Auto follows the device used last over runs: with no controller there at the start it takes the face of
    the device the player used last in the run before (<user>/prompts_auto.txt, follow_main). And while the game has the keys'
@@ -32,6 +33,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include "../gpu/vk/vk_api.h"   /* (HOS_SW_*, HOS_PAD_*, HOS_BIND_PAD) */
+#include "hd_rumble.h"   /* ((Triforce) hd_rumble_kind: SDL's types of the Switch's controllers, face_of_type) */
 
 int hos_binding(int set, int button, int slot);   /* nn_hid.c */
 int hos_sdl_pads(uint64_t *buttons, int32_t stick[4]);   /* pad_sdl.c */
@@ -41,9 +43,12 @@ int hos_input_last(void);   /* nn_hid.c: 0 none yet, 1 the keys or the mouse, 2 
 unsigned hos_input_uses(int device);   /* nn_hid.c: that device's uses so far */
 extern const char *hos_user_dir;   /* nn_fs.c: the saves' folder */
 void hos_sdl_pad_last_name(char *out, size_t cap);   /* pad_sdl.c */
+int hos_sdl_pad_type_of(int last, int *sdl);   /* pad_sdl.c */
 int hos_sdl_pad_scans(void);
 void hos_host_thread_register_self(const char *name);   /* hos_prof.c */
 int hos_mods_has(const char *prefix, const char *suffix);   /* mods.c */
+int rx_option(int id, int otherwise);   /* rx_backend.c: the Insert menu's rows */
+float hos_wide_hud_out(void);   /* oot_wide_hud.c */
 
 #define FONT_PATH "font2/scalable/external.nin_ounce_nvn2.bfotf.zs"   /* (as hos_mods_romfs's keys: lower case) */
 #define TEXTURES_PATH "ui/layout2archive/common.product.100.nin_ounce_nvn2.bntx.zs"
@@ -56,6 +61,22 @@ static const char *const faces[HOS_PROMPT_N] = {"switch", "xbox", "ps4", "ps5", 
 /* the Switch buttons' code points in the font, in HOS_SW_* order (nx2/prompt_assets.py SWITCH) */
 static const uint16_t switch_code[HOS_SW_N] = {0xE040, 0xE041, 0xE042, 0xE043, 0xE056, 0xE057, 0xE044, 0xE045,
                                                0xE046, 0xE047, 0xE04B, 0xE04C, 0xE062, 0xE060, 0xE063, 0xE061};
+/* ((Triforce) the live part's codes, nx2/prompt_assets.py faces_font: each controller face's (HOS_PROMPT_* below
+   LIVE_FACES) icon of pad input i at FACE_BASE + FACE_CODES x face + i and its d-pad icons at + STATIC_AT..; a text's code for
+   Switch button b on pad input i of a face at BIND_BASE + (face x HOS_SW_N + b) x HOS_PAD_N + i. A font built before has none
+   of them: then nothing follows while the game runs) */
+#define LIVE_FACES HOS_PROMPT_KEYBOARD
+#define FACE_BASE 0xF800
+#define FACE_CODES 32
+#define STATIC_AT 24
+#define BIND_BASE 0xF000
+/* the pad input whose icon an unbound Switch button shows (nx2/prompt_assets.py DEFAULT: host/nn_hid.c's default controls) */
+static const unsigned char switch_pad[HOS_SW_N] = {
+    HOS_PAD_EAST, HOS_PAD_SOUTH, HOS_PAD_NORTH, HOS_PAD_WEST, HOS_PAD_LSTICK, HOS_PAD_RSTICK, HOS_PAD_LSHOULDER,
+    HOS_PAD_RSHOULDER, HOS_PAD_LTRIGGER, HOS_PAD_RTRIGGER, HOS_PAD_START, HOS_PAD_BACK, HOS_PAD_LEFT, HOS_PAD_UP,
+    HOS_PAD_RIGHT, HOS_PAD_DOWN};
+/* the d-pad icons that follow the face, not the controls (nx2/prompt_assets.py STATIC) */
+static const uint16_t static_code[3] = {0xE049, 0xE064, 0xE065};
 
 static int game_dir(char *out, size_t cap) {   /* the game folder, with its separator */
     char path[MAX_PATH];
@@ -89,9 +110,37 @@ static int auto_face(const char *name, int xinput, int remembered) {
     if (!name[0]) return xinput ? HOS_PROMPT_XBOX : remembered >= 0 && remembered < HOS_PROMPT_N ? remembered : HOS_PROMPT_KEYBOARD;
     if (contains(name, "dualsense") || contains(name, "ps5")) return HOS_PROMPT_PS5;
     if (contains(name, "dualshock") || contains(name, "ps4") || contains(name, "playstation")) return HOS_PROMPT_PS4;
-    if (contains(name, "steam deck")) return HOS_PROMPT_STEAMDECK;
+    /* (a Steam Controller names its buttons as the Deck does: L1/R1, View, Menu, Steam. SDL3 calls it "Steam Controller") */
+    if (contains(name, "steam deck") || contains(name, "steam controller")) return HOS_PROMPT_STEAMDECK;
     if (contains(name, "nintendo") || contains(name, "switch") || contains(name, "joy-con")) return HOS_PROMPT_SWITCH;
     return HOS_PROMPT_XBOX;   /* (Xbox pads, and the many that copy their layout) */
+}
+
+/* (Triforce) The face of a controller by the type SDL gives it (sdl: the SDL it came from, 3 or 2; type: SDL_GetGamepadType's
+   or SDL_GameControllerGetType's number), HOS_PROMPT_*; -1 for a type that names no face (unknown, standard, virtual, the
+   others). SDL knows the type from the pad's USB ids, where names vary ("Wireless Controller" is a DualShock 4 or a
+   DualSense on some systems) */
+static int face_of_type(int sdl, int type) {
+    if (hd_rumble_kind(sdl, type) != HD_RUMBLE_NONE) return HOS_PROMPT_SWITCH;   /* (a Pro Controller, Joy-Cons) */
+    if (sdl == 3) {   /* (SDL_GAMEPAD_TYPE_XBOX360 2, XBOXONE 3, PS3 4, PS4 5, PS5 6) */
+        if (type == 2 || type == 3) return HOS_PROMPT_XBOX;
+        if (type == 4 || type == 5) return HOS_PROMPT_PS4;
+        if (type == 6) return HOS_PROMPT_PS5;
+    } else if (sdl == 2) {   /* (SDL_CONTROLLER_TYPE_XBOX360 1, XBOXONE 2, PS3 3, PS4 4, PS5 7) */
+        if (type == 1 || type == 2) return HOS_PROMPT_XBOX;
+        if (type == 3 || type == 4) return HOS_PROMPT_PS4;
+        if (type == 7) return HOS_PROMPT_PS5;
+    }
+    return -1;
+}
+
+/* (Triforce) A named controller's face with its SDL type: a name that says its maker's buttons wins (auto_face: any face
+   but the Xbox's, which is also what a name that says nothing comes to); such a name asks the type (a HORIPAD for the
+   Switch, "Wireless Controller"), and keeps the Xbox's when the type names no face either */
+static int typed_face(int named, const char *name, int sdl, int type) {
+    if (!name[0] || named != HOS_PROMPT_XBOX || contains(name, "xbox")) return named;
+    const int by_type = face_of_type(sdl, type);
+    return by_type >= 0 ? by_type : named;
 }
 
 /* ((Triforce, 11-19) where Auto keeps the device used last: <user>/prompts_auto.txt, beside the saves and mouse_sens.txt.
@@ -151,9 +200,11 @@ static int choose_face(const char *dir) {
     }
     const int xinput = !name[0] && hos_xinput_connected();
     const int remembered = name[0] || xinput ? -1 : remembered_face(dir);
-    const int face = auto_face(name, xinput, remembered);
-    hos_log("prompts: auto: controller \"%s\": %s", name[0] ? name : xinput ? "(XInput's, no name)" :
-            remembered >= 0 ? "(none: the device used last in the run before, prompts_auto.txt)" : "(none)", faces[face]);
+    int sdl = 0;
+    const int type = name[0] ? hos_sdl_pad_type_of(0, &sdl) : 0;
+    const int face = typed_face(auto_face(name, xinput, remembered), name, sdl, type);   /* ((Triforce) by SDL's type where the name says no maker) */
+    hos_log("prompts: auto: controller \"%s\" (SDL%d type %d): %s", name[0] ? name : xinput ? "(XInput's, no name)" :
+            remembered >= 0 ? "(none: the device used last in the run before, prompts_auto.txt)" : "(none)", sdl, type, faces[face]);
     return face;
 }
 
@@ -190,30 +241,50 @@ static int bound_input(int face, int control) {
     return first > 0 ? first : hos_binding(HOS_BIND_KEY, control, 1);
 }
 
+/* a code point's own segment (one code, by idDelta alone) pointed at glyph gid; 0 when it has none */
+static int cmap4_point(uint8_t *st, unsigned segs, unsigned code, unsigned gid) {
+    uint8_t *ends = st + 14, *starts = ends + 2 * segs + 2, *deltas = starts + 2 * segs, *ranges = deltas + 2 * segs;
+    for (unsigned i = 0; i < segs; i++)
+        if (rd16(starts + 2 * i) == code && rd16(ends + 2 * i) == code && !rd16(ranges + 2 * i)) {
+            wr16(deltas + 2 * i, (gid - code) & 0xFFFF);
+            return 1;
+        }
+    return 0;
+}
+
 /* each Switch button's segment pointed at its input's icon (bound_input); how many. (Triforce) On the keyboard and mouse
    face the left stick's four directions too, at their movement keys' icons (nx2/prompt_keys.py MOVES), and a key that has
-   no icon (one a hand put into the options file) shows the blank cap */
+   no icon (one a hand put into the options file) shows the blank cap. ((Triforce) the live part) A controller's face in a
+   font with every face's icons (FACE_BASE): each Switch button at that face's icon of its input, an unbound one (or one on a
+   paddle) at its default's, and the d-pad's at the face's, so the font served for one face is pointed at another's while the
+   game runs (live_font); for the face the font was built for, the same as it has */
 static int cmap4_bind(uint8_t *st, size_t n, int face) {
     const unsigned segs = rd16(st + 6) / 2;
     if (14 + 8 * (size_t)segs + 2 > n) return 0;   /* (as cmap4_glyph: the ranges' last entry too) */
-    uint8_t *ends = st + 14, *starts = ends + 2 * segs + 2, *deltas = starts + 2 * segs, *ranges = deltas + 2 * segs;
     static const struct { uint16_t code; uint8_t control; } moves[4] = {
         {0xE052, HOS_KEY_MOVE_UP}, {0xE050, HOS_KEY_MOVE_DOWN}, {0xE05A, HOS_KEY_MOVE_LEFT}, {0xE058, HOS_KEY_MOVE_RIGHT}};
     const int keys = face == HOS_PROMPT_KEYBOARD, inputs = keys ? 256 : HOS_PAD_N;
+    const unsigned base = FACE_BASE + FACE_CODES * (unsigned)face;
+    const int faces = !keys && face < LIVE_FACES && cmap4_glyph(st, n, base + HOS_PAD_SOUTH) != 0;
     int done = 0;
     for (int b = 0; b < HOS_SW_N + (keys ? 4 : 0); b++) {
         const unsigned code = b < HOS_SW_N ? switch_code[b] : moves[b - HOS_SW_N].code;
         const int pad = bound_input(face, b < HOS_SW_N ? b : moves[b - HOS_SW_N].control);
+        if (faces) {
+            const int bound = pad >= 0 && pad < HOS_PAD_N;
+            const unsigned gid = cmap4_glyph(st, n, base + (unsigned)(bound ? pad : switch_pad[b]));
+            if (gid && cmap4_point(st, segs, code, gid)) done += bound;
+            continue;
+        }
         if (pad < 0 || pad >= inputs) continue;   /* (unbound: the default icon stays) */
         unsigned gid = cmap4_glyph(st, n, PAD_BASE + (unsigned)pad);
         if (!gid && keys) gid = cmap4_glyph(st, n, PAD_BASE);
         if (!gid) continue;
-        for (unsigned i = 0; i < segs; i++)
-            if (rd16(starts + 2 * i) == code && rd16(ends + 2 * i) == code && !rd16(ranges + 2 * i)) {
-                wr16(deltas + 2 * i, (gid - code) & 0xFFFF);
-                done++;
-                break;
-            }
+        done += cmap4_point(st, segs, code, gid);
+    }
+    for (int k = 0; faces && k < 3; k++) {
+        const unsigned gid = cmap4_glyph(st, n, base + STATIC_AT + (unsigned)k);
+        if (gid) cmap4_point(st, segs, static_code[k], gid);
     }
     return done;
 }
@@ -269,6 +340,27 @@ static int bind_font(uint8_t *otf, size_t n, int face) {
             done = cmap4_bind(cmap + so, sl <= len - so ? sl : len - so, face);
         }
         return done;
+    }
+    return 0;
+}
+
+/* ((Triforce) the live part) the glyph of a code in the decrypted font's first format 4 subtable, 0 none */
+static unsigned font_glyph(const uint8_t *otf, size_t n, unsigned code) {
+    if (n < 12) return 0;
+    const unsigned tables = rd16(otf + 4);
+    for (unsigned t = 0; t < tables && 12 + 16 * (size_t)(t + 1) <= n; t++) {
+        const uint8_t *rec = otf + 12 + 16 * t;
+        if (memcmp(rec, "cmap", 4)) continue;
+        const uint32_t off = rd32(rec + 8), len = rd32(rec + 12);
+        if (off > n || len > n - off || len < 4) return 0;
+        const uint8_t *cmap = otf + off;
+        for (unsigned s = 0; s < rd16(cmap + 2) && 4 + 8 * (size_t)(s + 1) <= len; s++) {
+            const uint32_t so = rd32(cmap + 4 + 8 * s + 4);
+            if (so > len || len - so < 14 || rd16(cmap + so) != 4) continue;
+            const unsigned sl = rd16(cmap + so + 2);
+            return cmap4_glyph(cmap + so, sl <= len - so ? sl : len - so, code);
+        }
+        return 0;
     }
     return 0;
 }
@@ -380,7 +472,9 @@ static void add_run(Run **runs, size_t *nruns, size_t *cap, uint32_t off, uint32
    u32 runs; each run: u32 offset, u32 length, the bytes; a later entry over an earlier). Written again only when the face, the
    controls or the blocks changed (prompts/Common.key) */
 /* out: the game's file (game) with the runs written over it (a later one over an earlier where they meet), as raw zstd blocks;
-   written again only when its key (keypath: the hash h of what chose the runs) changed */
+   written again only when its key (keypath: the hash h of what chose the runs) changed. Written beside it first (out.tmp), and
+   moved over it with the key removed until then: a failed write leaves the last good file and its key, a stop between the
+   steps leaves no key (written again at the next start) */
 static int write_patched(const char *game, const char *out, const char *keypath, uint64_t h, Run *runs, size_t nruns) {
     qsort(runs, nruns, sizeof *runs, run_cmp);
     char keyline[32] = "", want[32];
@@ -392,7 +486,9 @@ static int write_patched(const char *game, const char *out, const char *keypath,
     snprintf(want, sizeof want, "%016llx", (unsigned long long)h);
     int ok = !strcmp(keyline, want) && GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES;
     if (!ok) {   /* the game's file through, the chosen runs written over it, out as raw zstd blocks */
-        FILE *in = fopen(game, "rb"), *o = fopen(out, "wb");
+        char tmp[MAX_PATH + 8];
+        snprintf(tmp, sizeof tmp, "%s.tmp", out);
+        FILE *in = fopen(game, "rb"), *o = fopen(tmp, "wb");
         uint8_t *chunk = (uint8_t *)malloc(131072);
         ok = in && o && chunk;
         if (ok) {
@@ -427,12 +523,63 @@ static int write_patched(const char *game, const char *out, const char *keypath,
         if (in) fclose(in);
         if (o) ok &= fclose(o) == 0;
         free(chunk);
+        ok = ok && (GetFileAttributesA(keypath) == INVALID_FILE_ATTRIBUTES || DeleteFileA(keypath)) &&
+             MoveFileExA(tmp, out, MOVEFILE_REPLACE_EXISTING);
+        if (!ok) DeleteFileA(tmp);
         if (ok && (f = fopen(keypath, "w"))) {
             fputs(want, f);
             fclose(f);
         }
     }
     return ok;
+}
+
+/* ((Triforce) the live part's state, its code below build()) what the game is to show now (the start's, then each change's):
+   the face and the controls; and what each part it loaded shows (PART_*: the start's until written over, so a part found
+   after a change catches up) */
+enum { PART_TEXTURES, PART_LAYOUTS, PART_FONT, PARTS };
+static int live_face_now = -1, live_bind_now[HOS_SW_N];
+static int part_face[PARTS], part_bind[PARTS][HOS_SW_N];
+static int served_face[PARTS], served_bind[PARTS][HOS_SW_N];   /* (each part's file as served: what the game loads again) */
+static void live_start(int face, const int *bind) {   /* (the first file served: the start's) */
+    if (live_face_now >= 0) return;
+    memcpy(live_bind_now, bind, sizeof live_bind_now);
+    live_face_now = face;
+}
+static void part_served(int p, int face, const int *bind) {   /* (its file written for this face and these controls) */
+    served_face[p] = part_face[p] = face;
+    memcpy(served_bind[p], bind, sizeof served_bind[p]);
+    memcpy(part_bind[p], bind, sizeof part_bind[p]);
+    live_start(face, bind);
+}
+static struct {
+    volatile uint64_t at;   /* where the game keeps the served font, decrypted (behind its header or not), 0 not seen */
+    uint32_t n;             /* the file's length, 0 not served */
+    uint8_t head[64];       /* its first bytes, decrypted: the tables' directory */
+    int live;               /* it has every controller face's icons (nx2/prompt_assets.py faces_font): a change can show */
+} font;
+static void live_textures_start(const char *bntx, const Run *runs, size_t nruns);
+
+/* the runs of a face's textures.bin (t, tn bytes) that the controls (bind: each Switch button's input) choose, in the file's
+   order; *nruns of them */
+static Run *texture_runs(const uint8_t *t, long tn, const int *bind, size_t *nruns) {
+    const uint32_t count = rd32le(t + 4);
+    size_t at = 8, cap_runs = 256;
+    Run *runs = (Run *)malloc(cap_runs * sizeof *runs);
+    *nruns = 0;
+    for (uint32_t e = 0; e < count && at + 8 <= (size_t)tn; e++) {
+        const int sw = t[at], pad = t[at + 1];
+        const uint32_t nr = rd32le(t + at + 4);
+        const int on = sw == 0xff || (sw < HOS_SW_N && bind[sw] == pad);
+        at += 8;
+        for (uint32_t r = 0; r < nr && at + 8 <= (size_t)tn; r++) {
+            const uint32_t off = rd32le(t + at), len = rd32le(t + at + 4);
+            if (len > (size_t)tn - at - 8) break;
+            if (on) add_run(&runs, nruns, &cap_runs, off, len, t + at + 8);
+            at += 8 + len;
+        }
+    }
+    return runs;
 }
 
 static int build_textures(char *out, size_t cap) {
@@ -446,22 +593,8 @@ static int build_textures(char *out, size_t cap) {
     int bind[HOS_SW_N];   /* ((Triforce) on the keyboard and mouse face the entries' inputs are key codes: bound_input) */
     for (int b = 0; b < HOS_SW_N; b++) bind[b] = bound_input(face, b);
     uint64_t h = fnv(fnv(fnv(0xcbf29ce484222325ull, &face, sizeof face), bind, sizeof bind), t, (size_t)tn);
-    /* the runs these controls choose */
-    const uint32_t count = rd32le(t + 4);
-    size_t at = 8, nruns = 0, cap_runs = 256;
-    Run *runs = (Run *)malloc(cap_runs * sizeof *runs);
-    for (uint32_t e = 0; e < count && at + 8 <= (size_t)tn; e++) {
-        const int sw = t[at], pad = t[at + 1];
-        const uint32_t nr = rd32le(t + at + 4);
-        const int on = sw == 0xff || (sw < HOS_SW_N && bind[sw] == pad);
-        at += 8;
-        for (uint32_t r = 0; r < nr && at + 8 <= (size_t)tn; r++) {
-            const uint32_t off = rd32le(t + at), len = rd32le(t + at + 4);
-            if (len > (size_t)tn - at - 8) break;
-            if (on) add_run(&runs, &nruns, &cap_runs, off, len, t + at + 8);
-            at += 8 + len;
-        }
-    }
+    size_t nruns;   /* the runs these controls choose */
+    Run *runs = texture_runs(t, tn, bind, &nruns);
     snprintf(out, cap, "%sprompts/Common.bntx.zs", dir);
     snprintf(path, sizeof path, "%sprompts/Common.bntx", dir);
     char keypath[MAX_PATH];
@@ -469,16 +602,21 @@ static int build_textures(char *out, size_t cap) {
     const int ok = write_patched(path, out, keypath, h, runs, nruns);
     hos_log("prompts: %s textures, %zu runs for these controls%s", faces[face], nruns,
             ok ? "" : ": could not be written");
+    if (ok && face < LIVE_FACES) {   /* ((Triforce) the live part: what the game loads is this file, these runs over it) */
+        live_textures_start(path, runs, nruns);
+        part_served(PART_TEXTURES, face, bind);
+    }
     free(runs);
     free(t);
     return ok;
 }
 
-/* the face the game was given (faces[]), -1 none: the Insert menu names the pad inputs as that controller does. -1 too
+/* the face the game was given (faces[]; (Triforce) or shown since, the live part), -1 none: the Insert menu names the pad inputs as that controller does. -1 too
    until the game has asked for a prompt file: the menu asks from the present thread, and choose_face can wait for SDL */
 int hos_prompts_face(void) {
     char dir[MAX_PATH];
     int face;
+    if (live_face_now >= 0) return live_face_now;   /* ((Triforce) the live part: the face shown now) */
     return setup_state >= 2 && setup(dir, sizeof dir, &face) ? face : -1;
 }
 
@@ -512,44 +650,60 @@ static void ring_places(const int *bind, int place[4]) {
      count; each: u32 offset, i8 side, 3 bytes, f32 x), with the Insert menu's Ultrawide HUD row on Screen edges
      (host/oot_wide_hud.h);
    none when all are as the game has them (the game's own file) */
-static int build_layouts(char *out, size_t cap) {
-    char dir[MAX_PATH], path[MAX_PATH];
-    int face;
-    if (!setup(dir, sizeof dir, &face)) return 0;
-    int bind[HOS_SW_N], place[4] = {0, 1, 2, 3};
-    for (int b = 0; b < HOS_SW_N; b++) bind[b] = bound_input(face, b);
+/* ((Triforce) the live part) the runs over the game's Common.blarc for a face and its controls (bind: each Switch button's
+   input, bound_input's), and what they point into (freed with layout_free) */
+typedef struct {
+    Run *runs;
+    size_t n;
+    uint64_t h;   /* (what chose them: the file's key) */
+    uint8_t *ring, *hint, *wide;
+    float *xs, *wxs;
+    int place[4];
+} Layout;
+static void layout_free(Layout *o) {
+    free(o->wxs);
+    free(o->wide);
+    free(o->xs);
+    free(o->hint);
+    free(o->runs);
+    free(o->ring);
+    memset(o, 0, sizeof *o);
+}
+
+static int layout_runs(const char *dir, int face, const int *bind, Layout *o) {
+    char path[MAX_PATH];
+    memset(o, 0, sizeof *o);
+    for (int i = 0; i < 4; i++) o->place[i] = i;
     /* ((Triforce) keys have no places among four face buttons: the keyboard and mouse face keeps the Switch's) */
-    if (face != HOS_PROMPT_KEYBOARD) ring_places(bind, place);
-    const int ring_moved = !(place[0] == 0 && place[1] == 1 && place[2] == 2 && place[3] == 3);
-    size_t nruns = 0, cap_runs = 64;
-    Run *runs = (Run *)malloc(cap_runs * sizeof *runs);
-    uint64_t h = fnv(0xcbf29ce484222325ull, place, sizeof place);
+    if (face != HOS_PROMPT_KEYBOARD) ring_places(bind, o->place);
+    const int ring_moved = !(o->place[0] == 0 && o->place[1] == 1 && o->place[2] == 2 && o->place[3] == 3);
+    size_t cap_runs = 64;
+    o->runs = (Run *)malloc(cap_runs * sizeof *o->runs);
+    o->h = fnv(0xcbf29ce484222325ull, o->place, sizeof o->place);
     long tn = 0, hn = 0;
     snprintf(path, sizeof path, "%sprompts/ring.bin", dir);
-    uint8_t *t = ring_moved ? read_all(path, "HPRG", &tn) : NULL;
+    uint8_t *t = o->ring = ring_moved ? read_all(path, "HPRG", &tn) : NULL;
     if (t) {
         const uint32_t count = rd32le(t + 4);
         size_t at = 8;
         for (uint32_t e = 0; e < count && at + 8 <= (size_t)tn; e++) {
             const int placed = t[at + 1], where = t[at + 2];
             const uint32_t nr = rd32le(t + at + 4);
-            const int on = placed < 4 && place[placed] == where;
+            const int on = placed < 4 && o->place[placed] == where;
             at += 8;
             for (uint32_t r = 0; r < nr && at + 8 <= (size_t)tn; r++) {
                 const uint32_t off = rd32le(t + at), len = rd32le(t + at + 4);
                 if (len > (size_t)tn - at - 8) break;
-                if (on) add_run(&runs, &nruns, &cap_runs, off, len, t + at + 8);
+                if (on) add_run(&o->runs, &o->n, &cap_runs, off, len, t + at + 8);
                 at += 8 + len;
             }
         }
-        h = fnv(h, t, (size_t)tn);
+        o->h = fnv(o->h, t, (size_t)tn);
     }
     /* the hint's notes, in its order (Switch L R Y X A: up, down, left, right, A) */
     static const int notes[5] = {HOS_SW_L, HOS_SW_R, HOS_SW_Y, HOS_SW_X, HOS_SW_A};
     snprintf(path, sizeof path, "%sprompts/%s/hint.bin", dir, faces[face]);
-    uint8_t *hint = read_all(path, "HPHN", &hn);
-    float *xs = NULL;
-    int spread = 0;
+    uint8_t *hint = o->hint = read_all(path, "HPHN", &hn);
     if (hint) {
         const uint32_t npads = rd32le(hint + 4);
         const size_t panes_at = 8 + 4 * (size_t)npads;
@@ -561,57 +715,72 @@ static int build_layouts(char *out, size_t cap) {
         }
         for (int i = 3; i >= 0; i--) shift[i] = shift[i + 1] - extra[i];   /* (an icon is drawn from its pane's left) */
         shift[5] = shift[0];   /* (the text with the first icon) */
-        spread = shift[0] != 0;
+        const int spread = shift[0] != 0;
         const uint32_t count = panes_at + 4 <= (size_t)hn ? rd32le(hint + panes_at) : 0;
         if (spread && count <= ((size_t)hn - panes_at - 4) / 12) {
-            xs = (float *)malloc(count * sizeof *xs);
+            o->xs = (float *)malloc((count ? count : 1) * sizeof *o->xs);
             for (uint32_t k = 0; k < count; k++) {
                 const uint8_t *e = hint + panes_at + 4 + 12 * k;
-                memcpy(&xs[k], e + 8, 4);
-                xs[k] += shift[e[4] < 6 ? e[4] : 5];
-                add_run(&runs, &nruns, &cap_runs, rd32le(e), 4, (const uint8_t *)&xs[k]);
+                memcpy(&o->xs[k], e + 8, 4);
+                o->xs[k] += shift[e[4] < 6 ? e[4] : 5];
+                add_run(&o->runs, &o->n, &cap_runs, rd32le(e), 4, (const uint8_t *)&o->xs[k]);
             }
-            h = fnv(fnv(h, shift, sizeof shift), hint, (size_t)hn);
+            o->h = fnv(fnv(o->h, shift, sizeof shift), hint, (size_t)hn);
         }
     }
-    float hos_wide_hud_out(void);
     const float wide_out = hos_wide_hud_out();
     long wn = 0;
     snprintf(path, sizeof path, "%sprompts/wide.bin", dir);
-    uint8_t *wide = wide_out > 0.0f ? read_all(path, "HPWD", &wn) : NULL;
-    float *wxs = NULL;
+    uint8_t *wide = o->wide = wide_out > 0.0f ? read_all(path, "HPWD", &wn) : NULL;
     if (wide) {
         const uint32_t count = rd32le(wide + 4);
         if (count && count <= ((size_t)wn - 8) / 12) {
-            wxs = (float *)malloc(count * sizeof *wxs);
+            o->wxs = (float *)malloc(count * sizeof *o->wxs);
             for (uint32_t k = 0; k < count; k++) {
                 const uint8_t *e = wide + 8 + 12 * k;
-                memcpy(&wxs[k], e + 8, 4);
-                wxs[k] += (float)(int8_t)e[4] * wide_out;
-                add_run(&runs, &nruns, &cap_runs, rd32le(e), 4, (const uint8_t *)&wxs[k]);
+                memcpy(&o->wxs[k], e + 8, 4);
+                o->wxs[k] += (float)(int8_t)e[4] * wide_out;
+                add_run(&o->runs, &o->n, &cap_runs, rd32le(e), 4, (const uint8_t *)&o->wxs[k]);
             }
-            h = fnv(fnv(h, &wide_out, sizeof wide_out), wide, (size_t)wn);
+            o->h = fnv(fnv(o->h, &wide_out, sizeof wide_out), wide, (size_t)wn);
         }
-    } else if (wide_out > 0.0f) {
-        hos_log("prompts: no prompts/wide.bin: the Ultrawide HUD stays in the middle (Setup's Update makes it)");
     }
+    return 1;
+}
+
+static void live_layouts_start(const char *blarc, const Layout *o);
+
+static int build_layouts(char *out, size_t cap) {
+    char dir[MAX_PATH], path[MAX_PATH];
+    int face;
+    if (!setup(dir, sizeof dir, &face)) return 0;
+    int bind[HOS_SW_N];
+    for (int b = 0; b < HOS_SW_N; b++) bind[b] = bound_input(face, b);
+    Layout o;
+    layout_runs(dir, face, bind, &o);
+    if (!o.wide && hos_wide_hud_out() > 0.0f)
+        hos_log("prompts: no prompts/wide.bin: the Ultrawide HUD stays in the middle (Setup's Update makes it)");
     int ok = 0;
-    if (nruns) {
+    snprintf(path, sizeof path, "%sprompts/Common.blarc", dir);
+    if (o.n) {
         char keypath[MAX_PATH];
         snprintf(out, cap, "%sprompts/Common.blarc.zs", dir);
-        snprintf(path, sizeof path, "%sprompts/Common.blarc", dir);
         snprintf(keypath, sizeof keypath, "%sprompts/Common.blarc.key", dir);
-        ok = write_patched(path, out, keypath, h, runs, nruns);
+        ok = write_patched(path, out, keypath, o.h, o.runs, o.n);
         hos_log("prompts: the Talk ring's A B X Y at places %d %d %d %d, the ocarina hint %s, edge-anchored HUD %s%s",
-                place[0], place[1], place[2], place[3], xs ? "spread" : "as is", wxs ? "at the picture's sides" : "as is",
+                o.place[0], o.place[1], o.place[2], o.place[3], o.xs ? "spread" : "as is", o.wxs ? "at the picture's sides" : "as is",
                 ok ? "" : ": could not be written");
     }
-    free(wxs);
-    free(wide);
-    free(xs);
-    free(hint);
-    free(runs);
-    free(t);
+    /* ((Triforce) the live part: the file the game loads, ours or its own as the game has it (none to write over it), and the
+       runs in it; not when ours could not be written: what the game has is not known then */
+    if (face < LIVE_FACES && (ok || !o.n)) {
+        Layout served = o;
+        if (!ok) served.n = 0;
+        live_layouts_start(path, &served);
+        part_served(PART_LAYOUTS, face, bind);
+    } else {
+        layout_free(&o);
+    }
     return ok;
 }
 
@@ -640,12 +809,25 @@ static int build_font(const char *dir, int face, const char *name, int pad, char
         if (k) several = bind_keys(b + 8, (size_t)n - 8, k, (size_t)kn);
         free(k);
     }
+    uint8_t head[64];   /* ((Triforce) the live part: the served font's first bytes, decrypted) */
+    memcpy(head, b + 8, n - 8 < 64 ? (size_t)(n - 8) : 64);
+    const int live = !pad && face < LIVE_FACES && n - 8 >= 64 &&
+                     font_glyph(b + 8, (size_t)n - 8, FACE_BASE + FACE_CODES * (unsigned)face + HOS_PAD_SOUTH) != 0;
     for (long i = 8; i < n; i += 4) wr32le(b + i, rd32le(b + i) ^ key);
     snprintf(out, cap, "%sprompts/%s", dir, name);
     snprintf(path, sizeof path, "%s.new", out);
     const int ok = pad ? write_zstd_raw(path, b, (size_t)n) && MoveFileExA(path, out, MOVEFILE_REPLACE_EXISTING)
                        : write_zstd_raw(out, b, (size_t)n);
     free(b);
+    if (ok && !pad && face < LIVE_FACES) {   /* ((Triforce) the live part: the font the game loads; found by hos_prompts_glyph) */
+        font.n = (uint32_t)n;
+        memcpy(font.head, head, sizeof font.head);
+        font.live = live;
+        int bind[HOS_SW_N];
+        for (int i = 0; i < HOS_SW_N; i++) bind[i] = bound_input(face, i);
+        part_served(PART_FONT, face, bind);
+        if (!live) hos_log("prompts: this font has not every controller's icons (built before): a new face or new controls show at the next start");
+    }
     if (pad)
         hos_log("prompts: the overlay's icons of the controller used last: %s, %d buttons on this pad's controls%s", faces[face],
                 bound, ok ? "" : ": could not be written");
@@ -674,6 +856,529 @@ static int build(char *out, size_t cap) {
         hos_log("prompts: a mod has the resource size table: the font's room comes from the size hook (host/mods.c)");
     }
     return build_font(dir, face, "External.bfotf.zs", 0, out, cap) > 0;
+}
+
+/* ---- ((Triforce) the live part) the prompts changed while the game runs: among the controllers' faces, a new face (the
+   Button prompts row, or Auto's controller) or new controls (the Controls page, a layout preset) reach what the game has
+   loaded, at once, by the rules the start follows (each icon the pad input bound to its button; a mod's file never touched:
+   only the files served here are looked for).
+   - The textures (Common.bntx): their data lies in a memory pool the game makes over the file (hos_prompts_pool, found by
+     bytes no run writes). The renderer uploads what is written again (HOS_WRITTEN).
+   - The layouts (Common.blarc): where the game keeps them, found by their first bytes near the start of an address region
+     (find_layouts); written only where the game's bytes are still the file's.
+   - The font (prompts/<face>/External.bfotf, every controller face's icons: nx2/prompt_assets.py faces_font): where FreeType
+     reads it (hos_prompts_glyph, from nx2/oot_patches.py's hook in its glyph render); only its cmap changes (for the texts
+     set after), and the texts' button codes are rewritten to the face's own (hos_prompts_text_layout).
+   A change puts the game's own bytes back where the runs written before fall, then writes the runs the new face and controls
+   choose (as the start: texture_runs, layout_runs). Only when every part the game loaded from here is found (a change never
+   shows in one part and not in another), and never to or from the keyboard and mouse face (its font is another one): then at
+   the next start, as before. */
+typedef struct {
+    char path[MAX_PATH];        /* the game's file the runs go over (prompts/Common.bntx, prompts/Common.blarc) */
+    volatile uint64_t base;     /* the guest address of the file's offset 0 once seen, 0 before */
+    uint64_t lo, hi;            /* the guest range runs may be written in */
+    uint32_t (*ranges)[2];      /* the runs written: (offset, length), the game's own bytes back first */
+    size_t nranges;
+    int guarded;                /* a run written only where the game's bytes are still the file's */
+} Live;
+
+static void keep_ranges(Live *l, const Run *runs, size_t nruns) {
+    free(l->ranges);
+    l->ranges = (uint32_t (*)[2])malloc((nruns ? nruns : 1) * sizeof *l->ranges);
+    for (size_t r = 0; l->ranges && r < nruns; r++) l->ranges[r][0] = runs[r].off, l->ranges[r][1] = runs[r].len;
+    l->nranges = l->ranges ? nruns : 0;
+}
+
+/* the game's own bytes back where l's runs were, then these runs (in their order: a later one over an earlier), each marked
+   written; how many were outside l's range, or (guarded) over bytes the game changed: not written. Guarded, every run is
+   looked at before any is written (a later one over an earlier finds the file's bytes), and only those written are kept */
+static size_t put_runs(Live *l, const Run *runs, size_t nruns, size_t *written, size_t *put_back) {
+    FILE *f = fopen(l->path, "rb");
+    uint8_t *chunk = (uint8_t *)malloc(131072);
+    uint8_t *ok = (uint8_t *)calloc(nruns ? nruns : 1, 1);
+    size_t outside = 0;
+    *written = *put_back = 0;
+    const uint64_t base = l->base;   /* (once: 0 when the game let the memory go, nothing written then) */
+    if (!base) nruns = 0;
+    for (size_t r = 0; base && f && chunk && r < l->nranges; r++) {
+        const uint64_t off = l->ranges[r][0], len = l->ranges[r][1], a = base + off;
+        uint8_t *q = a >= l->lo && a + len <= l->hi ? (uint8_t *)hos_guest_range(a, len) : NULL;
+        if (!q) continue;
+        for (uint64_t k = 0; k < len;) {
+            const size_t n = len - k < 131072 ? (size_t)(len - k) : 131072;
+            if (fseek(f, (long)(off + k), SEEK_SET) || fread(chunk, 1, n, f) != n) break;
+            memcpy(q + k, chunk, n);
+            k += n;
+        }
+        HOS_WRITTEN(q, (size_t)len);
+        (*put_back)++;
+    }
+    for (size_t r = 0; r < nruns && ok; r++) {
+        const uint64_t a = base + runs[r].off, len = runs[r].len;
+        const uint8_t *q = a >= l->lo && a + len <= l->hi ? (const uint8_t *)hos_guest_range(a, len) : NULL;
+        ok[r] = q != NULL;
+        for (uint64_t k = 0; ok[r] && l->guarded && k < len;) {
+            const size_t n = len - k < 131072 ? (size_t)(len - k) : 131072;
+            ok[r] = f && chunk && !fseek(f, (long)(runs[r].off + k), SEEK_SET) && fread(chunk, 1, n, f) == n &&
+                    !memcmp(q + k, chunk, n);
+            k += n;
+        }
+    }
+    for (size_t r = 0; r < nruns; r++) {
+        if (!ok || !ok[r]) {
+            outside++;
+            continue;
+        }
+        const uint64_t a = base + runs[r].off;
+        uint8_t *q = a >= l->lo && a + runs[r].len <= l->hi ? (uint8_t *)hos_guest_range(a, runs[r].len) : NULL;
+        if (!q) {
+            outside++;
+            continue;
+        }
+        memcpy(q, runs[r].data, runs[r].len);
+        HOS_WRITTEN(q, runs[r].len);
+        (*written)++;
+    }
+    if (f) fclose(f);
+    free(chunk);
+    keep_ranges(l, runs, nruns);
+    size_t kept = 0;   /* (the ones written: the next change puts the game's bytes back there) */
+    for (size_t r = 0; r < l->nranges; r++)
+        if (ok && ok[r]) memmove(l->ranges[kept++], l->ranges[r], sizeof *l->ranges);
+    l->nranges = kept;
+    free(ok);
+    return outside;
+}
+
+static int in_runs(uint64_t a, uint64_t n, const Run *runs, size_t nruns) {
+    for (size_t r = 0; r < nruns; r++)
+        if (a < (uint64_t)runs[r].off + runs[r].len && runs[r].off < a + n) return 1;
+    return 0;
+}
+
+enum { SAMPLES = 3, SAMPLE_LEN = 64 };
+static struct {
+    Live l;                               /* over the game's Common.bntx */
+    uint64_t data_off, data_len;          /* its texture data: offset (the BRTD block's + 16) and length */
+    uint64_t sample[SAMPLES];             /* file offsets of bytes no run of the start's writes */
+    uint8_t want[SAMPLES][SAMPLE_LEN];
+    uint8_t *bins[LIVE_FACES];            /* each face's textures.bin, read when first chosen (the runs point into it) */
+    long nbins[LIVE_FACES];
+    uint32_t (*served)[2];                /* the runs of the file as served (offset, length): a pool made again holds them */
+    size_t nserved;
+} tex;
+
+/* (build_textures) the file's texture data, with bytes to know its pool by, and the ranges of the start's runs */
+static void live_textures_start(const char *bntx, const Run *runs, size_t nruns) {
+    FILE *f = fopen(bntx, "rb");
+    uint8_t h[0x38], blk[16];
+    if (!f) return;
+    int ok = fread(h, 1, sizeof h, f) == sizeof h && !memcmp(h, "BNTX", 4);
+    uint64_t brtd = 0;
+    if (ok) memcpy(&brtd, h + 0x30, 8);   /* (the NX block's pointer to the BRTD block, as the file has it: an offset) */
+    ok = ok && brtd < 0x7fffffff && !fseek(f, (long)brtd, SEEK_SET) && fread(blk, 1, 16, f) == 16 && !memcmp(blk, "BRTD", 4);
+    if (ok) {
+        uint64_t size;
+        memcpy(&size, blk + 8, 8);
+        tex.data_off = brtd + 16;
+        tex.data_len = size > 16 ? size - 16 : 0;
+        for (int s = 0; s < SAMPLES && ok; s++) {   /* (a quarter, a half, three quarters in; past any run there) */
+            uint64_t at = tex.data_off + tex.data_len / 4 * (s + 1);
+            while (in_runs(at, SAMPLE_LEN, runs, nruns) && at + 2 * SAMPLE_LEN < tex.data_off + tex.data_len) at += 4096;
+            tex.sample[s] = at;
+            ok = !fseek(f, (long)at, SEEK_SET) && fread(tex.want[s], 1, SAMPLE_LEN, f) == SAMPLE_LEN;
+        }
+    }
+    fclose(f);
+    if (!ok || !tex.data_len) {
+        tex.data_len = 0;
+        hos_log("prompts: %s is not a texture file known: the textures change at the next start", bntx);
+        return;
+    }
+    snprintf(tex.l.path, sizeof tex.l.path, "%s", bntx);
+    keep_ranges(&tex.l, runs, nruns);
+    free(tex.served);
+    tex.served = (uint32_t (*)[2])malloc((nruns ? nruns : 1) * sizeof *tex.served);
+    if (tex.served) memcpy(tex.served, tex.l.ranges, tex.l.nranges * sizeof *tex.served);
+    tex.nserved = tex.served ? tex.l.nranges : 0;
+}
+
+/* nvn_native.c: a memory pool the game made (its storage, size bytes): the one Common.bntx's texture data is in? (Its
+   texture data there, or the whole file) */
+static SRWLOCK tex_lock = SRWLOCK_INIT;   /* (the textures' pool: found, let go, written; the game's threads and the input's) */
+void hos_prompts_pool(uint64_t mem, uint64_t size) {
+    if (!tex.data_len || tex.l.base || size < SAMPLE_LEN) return;
+    const uint8_t *p = (const uint8_t *)hos_guest_range(mem, 4);
+    if (!p) return;
+    const uint64_t base = !memcmp(p, "BNTX", 4) ? mem : mem - tex.data_off;
+    for (int s = 0; s < SAMPLES; s++) {
+        const uint64_t a = base + tex.sample[s];
+        const uint8_t *q = a >= mem && a + SAMPLE_LEN <= mem + size ? (const uint8_t *)hos_guest_range(a, SAMPLE_LEN) : NULL;
+        if (!q || memcmp(q, tex.want[s], SAMPLE_LEN)) return;
+    }
+    AcquireSRWLockExclusive(&tex_lock);
+    const int first = !tex.l.base;
+    if (first) {
+        tex.l.lo = mem, tex.l.hi = mem + size;
+        part_face[PART_TEXTURES] = served_face[PART_TEXTURES];   /* (the file as served: a change since is written at the next look) */
+        memcpy(part_bind[PART_TEXTURES], served_bind[PART_TEXTURES], sizeof part_bind[PART_TEXTURES]);
+        if (tex.served) {   /* (the served runs: the bytes put back at that look) */
+            free(tex.l.ranges);
+            tex.l.ranges = (uint32_t (*)[2])malloc((tex.nserved ? tex.nserved : 1) * sizeof *tex.l.ranges);
+            if (tex.l.ranges) memcpy(tex.l.ranges, tex.served, tex.nserved * sizeof *tex.served);
+            tex.l.nranges = tex.l.ranges ? tex.nserved : 0;
+        }
+        __atomic_store_n(&tex.l.base, base, __ATOMIC_RELEASE);   /* (lo and hi first: the input thread reads them once base is set) */
+    }
+    ReleaseSRWLockExclusive(&tex_lock);
+    if (first)
+        hos_log("prompts: the textures' pool at %#llx (+%#llx): a new face or new controls show at once", (unsigned long long)mem,
+                (unsigned long long)size);
+}
+
+/* nvn_native.c: the game finalized a memory pool (its storage): the textures' one? Then nothing is written there any more
+   (the memory may hold something else), until the game makes it again (hos_prompts_pool). A change being written waits
+   (tex_lock): the game frees the memory once this returns */
+void hos_prompts_pool_gone(uint64_t mem) {
+    if (!__atomic_load_n(&tex.l.base, __ATOMIC_ACQUIRE) || mem != tex.l.lo) return;
+    AcquireSRWLockExclusive(&tex_lock);
+    const int ours = tex.l.base && mem == tex.l.lo;
+    if (ours) __atomic_store_n(&tex.l.base, 0, __ATOMIC_RELEASE);
+    ReleaseSRWLockExclusive(&tex_lock);
+    if (ours)
+        hos_log("prompts: the textures' pool at %#llx was finalized: not written until the game makes it again",
+                (unsigned long long)mem);
+}
+
+/* the face's textures.bin, read once (before tex_lock: a finalize waits for the writes alone); 0 none */
+static int texture_bin(const char *dir, int face) {
+    if (!tex.bins[face]) {
+        char path[MAX_PATH];
+        snprintf(path, sizeof path, "%sprompts/%s/textures.bin", dir, faces[face]);
+        tex.bins[face] = read_all(path, "HPTX", &tex.nbins[face]);
+    }
+    return tex.bins[face] != NULL;
+}
+
+/* the pool's textures as this face and these controls choose them (tex_lock held); 0 when they could not be */
+static int live_textures(const char *dir, int face, const int *bind) {
+    if (!texture_bin(dir, face)) return 0;
+    size_t nruns, written, put_back;
+    if (!__atomic_load_n(&tex.l.base, __ATOMIC_ACQUIRE)) return 0;   /* (finalized since: hos_prompts_pool_gone) */
+    Run *runs = texture_runs(tex.bins[face], tex.nbins[face], bind, &nruns);
+    const size_t outside = put_runs(&tex.l, runs, nruns, &written, &put_back);
+    free(runs);
+    hos_log("prompts: now %s textures: %zu runs written, %zu put back%s", faces[face], written, put_back,
+            outside ? " (some outside the pool: at the next start)" : "");
+    return 1;
+}
+
+static Live lay;               /* over the game's Common.blarc */
+static Layout lay_start;       /* the runs served (until find_layouts) */
+static uint8_t lay_head[32];   /* the file's first bytes (no run writes them) */
+static uint64_t lay_n;         /* its length, 0 not followed */
+
+/* (build_layouts) the file the game loads and the runs served over it (o: kept until find_layouts) */
+static void live_layouts_start(const char *blarc, const Layout *o) {
+    FILE *f = fopen(blarc, "rb");
+    long n = 0;
+    const int headed = f && fread(lay_head, 1, sizeof lay_head, f) == sizeof lay_head &&
+                       !in_runs(0, sizeof lay_head, o->runs, o->n) && !fseek(f, 0, SEEK_END) && (n = ftell(f)) > 0;
+    if (f) fclose(f);
+    if (!headed) {
+        Layout drop = *o;
+        layout_free(&drop);
+        hos_log("prompts: %s is not a layout file known: the layouts change at the next start", blarc);
+        return;
+    }
+    snprintf(lay.path, sizeof lay.path, "%s", blarc);
+    lay.guarded = 1;
+    lay_n = (uint64_t)n;
+    lay_start = *o;
+}
+
+/* run r's bytes at q as write_patched left them: each one the run's, or a later run's (idx) over it */
+static int run_as_served(const Run *runs, size_t n, size_t r, const uint8_t *q) {
+    for (uint32_t k = 0; k < runs[r].len; k++) {
+        if (q[k] == runs[r].data[k]) continue;
+        const uint64_t at = (uint64_t)runs[r].off + k;
+        int over = 0;
+        for (size_t s = 0; s < n && !over; s++) over = runs[s].idx > runs[r].idx && at >= runs[s].off && at < (uint64_t)runs[s].off + runs[s].len;
+        if (!over) return 0;
+    }
+    return 1;
+}
+
+/* where the game keeps the layouts: the whole Common.blarc, unpacked near the start of an address region of its own (the
+   game's resources each take one: the textures' pool and the font too), its offsets made pointers where they lie. Looked
+   for by the file's first bytes at the pages of each region's first 1 MB, every 2 s from when the textures' pool is known
+   (the game unpacks its resources then; without the textures, at once), 30 times at most; then the runs served that are still
+   there are the ones a change puts the game's bytes back over (put_runs, guarded: never over a pointer the game made) */
+static void find_layouts(void) {
+    static int tries;
+    static int64_t last;
+    static uint64_t regions[4096][2];
+    const int64_t now = hos_now_ns();
+    if (lay.base || tries >= 30 || !lay_n || (tex.data_len && !tex.l.lo) || now - last < 2000000000) return;
+    last = now, tries++;
+    int n = hos_regions(regions, 4096);
+    if (n > 4096) n = 4096;
+    for (int i = 0; i < n && !lay.base; i++) {
+        const uint64_t lo = regions[i][0], hi = regions[i][1];
+        for (uint64_t a = lo; a < lo + (1u << 20) && a < hi && hi - a >= lay_n && !lay.base; a += 4096) {
+            const uint8_t *q = (const uint8_t *)hos_guest_range(a, sizeof lay_head);
+            if (q && !memcmp(q, lay_head, sizeof lay_head) && hos_guest_range(a, lay_n)) lay.lo = a, lay.hi = a + lay_n, lay.base = a;
+        }
+    }
+    size_t kept = 0;
+    if (lay.base) {
+        keep_ranges(&lay, lay_start.runs, lay_start.n);
+        for (size_t r = 0; r < lay_start.n && r < lay.nranges; r++) {
+            const Run *run = &lay_start.runs[r];
+            const uint8_t *q = (const uint8_t *)hos_guest_range(lay.base + run->off, run->len);
+            if (q && run_as_served(lay_start.runs, lay_start.n, r, q)) memmove(lay.ranges[kept++], lay.ranges[r], sizeof *lay.ranges);
+        }
+        lay.nranges = kept;
+    }
+    if (!lay.base && tries < 30) return;
+    if (lay.base)
+        hos_log("prompts: the layouts at %#llx: the Talk ring and the ocarina hint follow at once", (unsigned long long)lay.base);
+    else
+        hos_log("prompts: the layouts not found among the game's %d address regions: they change at the next start", n);
+    if (lay.base && kept < lay_start.n)
+        hos_log("prompts: %zu of the layouts' %zu runs served are no longer as served: left as the game has them", lay_start.n - kept,
+                lay_start.n);
+    layout_free(&lay_start);
+}
+
+static int live_layouts(const char *dir, int face, const int *bind) {
+    const uint8_t *q = (const uint8_t *)hos_guest_range(lay.base, sizeof lay_head);
+    /* (the game let the memory go: nothing written there. Unlike the textures' pool (tex_lock), nothing holds the region
+       from here to the writes: the game frees its resources' regions on its own thread, with no hook here, so a region let
+       go in that moment is not seen. A new run is still written only where the bytes are the file's (put_runs, guarded); the
+       last change's bytes put back are not checked so) */
+    if (!q || memcmp(q, lay_head, sizeof lay_head)) {
+        hos_log("prompts: the layouts at %#llx are no longer there: they change at the next start", (unsigned long long)lay.base);
+        lay.base = 0;
+        return 0;
+    }
+    Layout o;
+    layout_runs(dir, face, bind, &o);
+    size_t written, put_back;
+    const size_t outside = put_runs(&lay, o.runs, o.n, &written, &put_back);
+    hos_log("prompts: now the Talk ring's A B X Y at places %d %d %d %d, the ocarina hint %s: %zu runs written, %zu put back%s",
+            o.place[0], o.place[1], o.place[2], o.place[3], o.xs ? "spread" : "as is", written, put_back,
+            outside ? " (some outside: at the next start)" : "");
+    layout_free(&o);
+    return 1;
+}
+
+/* the texts' icons after a change while the game runs. The game keeps each code's glyph drawn (by the code, whatever the font
+   says now), so a text's Switch button codes are rewritten to codes of their own for the face and the pad input
+   (BIND_BASE: never drawn before with another icon; in UTF-8 three bytes, as the game's), as the game lays the box out or
+   updates it to draw it (nx2/oot_patches.py; box: the text box pane, its text at +0xf0 in UTF-8, often the layout's own,
+   its length in bytes at +0x124), and the box laid out and drawn anew (its status, at +8: 0x20000 laid out, 0x100000 drawn,
+   as the word after it allows). Until a change, the texts as the game has them: the font served for this start's face and
+   controls */
+static volatile LONG font_changes;
+
+static int text_code(unsigned c, int face, const int *bind) {   /* the code that shows c's button now, else -1 */
+    int b = -1, k = -1;
+    for (int i = 0; i < HOS_SW_N && b < 0; i++)
+        if (c == switch_code[i]) b = i;
+    for (int i = 0; i < 3 && k < 0; i++)
+        if (c == static_code[i]) k = i;
+    if (c >= BIND_BASE && c < BIND_BASE + LIVE_FACES * HOS_SW_N * HOS_PAD_N) b = (int)((c - BIND_BASE) / HOS_PAD_N % HOS_SW_N);
+    if (c >= FACE_BASE + STATIC_AT && c < FACE_BASE + FACE_CODES * LIVE_FACES && (c - FACE_BASE) % FACE_CODES >= STATIC_AT &&
+        (c - FACE_BASE) % FACE_CODES < STATIC_AT + 3)
+        k = (int)((c - FACE_BASE) % FACE_CODES - STATIC_AT);
+    if (k >= 0) return FACE_BASE + FACE_CODES * face + STATIC_AT + k;
+    if (b < 0) return -1;
+    const int pad = bind[b] >= 0 && bind[b] < HOS_PAD_N ? bind[b] : switch_pad[b];   /* (a paddle: the default's icon) */
+    return BIND_BASE + (face * HOS_SW_N + b) * HOS_PAD_N + pad;
+}
+
+/* the box's codes for the buttons as they are now; 1 when it changed them */
+static int text_rewrite(uint64_t box) {
+    if (!font_changes) return 0;
+    const int face = live_face_now;
+    if (face < 0 || face >= LIVE_FACES) return 0;
+    int bind[HOS_SW_N];
+    memcpy(bind, live_bind_now, sizeof bind);
+    const uint64_t *text = (const uint64_t *)hos_guest_range(box + 0xf0, 8);
+    const uint32_t *len = (const uint32_t *)hos_guest_range(box + 0x124, 4);
+    if (!text || !len || !*text || *len < 3 || *len > 65536) return 0;
+    uint8_t *s = (uint8_t *)hos_guest_range(*text, *len);
+    if (!s) return 0;
+    int changed = 0;
+    for (uint32_t i = 0; i + 2 < *len; i++) {   /* (UTF-8: the codes here are 3 bytes, 1110xxxx 10xxxxxx 10xxxxxx) */
+        if ((s[i] != 0xEE && s[i] != 0xEF) || (s[i + 1] & 0xC0) != 0x80 || (s[i + 2] & 0xC0) != 0x80) continue;
+        const unsigned code = (unsigned)(s[i] & 0x0F) << 12 | (unsigned)(s[i + 1] & 0x3F) << 6 | (s[i + 2] & 0x3F);
+        const int c = text_code(code, face, bind);
+        if (c >= 0 && (unsigned)c != code) {
+            s[i] = (uint8_t)(0xE0 | c >> 12), s[i + 1] = (uint8_t)(0x80 | (c >> 6 & 0x3F)), s[i + 2] = (uint8_t)(0x80 | (c & 0x3F));
+            changed = 1;
+        }
+        i += 2;
+    }
+    return changed;
+}
+
+/* the box's status bits set (as the word after them allows) */
+static void mark_box(uint64_t box, uint32_t bits) {
+    const uint64_t *status = (const uint64_t *)hos_guest_range(box + 8, 8);
+    uint32_t *word = status && *status ? (uint32_t *)hos_guest_range(*status, 8) : NULL;
+    if (word) *word |= bits & word[1];
+}
+
+/* nx2/oot_patches.py, as the game lays a text box out (f_8152aec0, before it looks at the box's status: laid out now) */
+void hos_prompts_text_layout(uint64_t box) {
+    if (text_rewrite(box)) mark_box(box, 0x20000);
+}
+
+/* nx2/oot_patches.py, as the game draws a text box (f_8152b670, each time it shows it): a box rewritten is laid out again at
+   the next update (its status) */
+void hos_prompts_text_draw(uint64_t box) {
+    if (text_rewrite(box)) mark_box(box, 0x20000 | 0x100000);
+}
+
+/* nx2/oot_patches.py, as FreeType draws a glyph (ft_smooth_render, f_81680c60; slot: its FT_GlyphSlot): the font the glyph
+   is of (slot->face at +8, the face's stream at +192: its base and size), the one served? Then where the game keeps it,
+   decrypted (FreeType and the text shaping read it there) */
+void hos_prompts_glyph(uint64_t slot) {
+    static volatile uint64_t last;   /* (the last face found to be another font: its glyphs not looked at again) */
+    if (font.at || !font.n || !font.live) return;
+    const uint64_t *s = (const uint64_t *)hos_guest_range(slot + 8, 8);
+    const uint64_t face = s ? *s : 0;
+    if (!face || face == last) return;
+    const uint64_t *st = (const uint64_t *)hos_guest_range(face + 192, 8);
+    const uint64_t *base = st ? (const uint64_t *)hos_guest_range(*st, 16) : NULL;
+    if (!base) return;   /* (not readable yet: looked at again) */
+    if (base[1] != font.n && base[1] != font.n - 8) {
+        last = face;   /* (another font: not looked at again while its glyphs follow each other) */
+        return;
+    }
+    /* (a stream of the file's size may hold the font behind its 8-byte header, or from its start, as on native Windows: the
+       font's own head says which) */
+    uint64_t at = 0;
+    int unread = 0;
+    for (uint64_t a = base[0] + (base[1] == font.n ? 8 : 0);; a = base[0]) {
+        const uint8_t *q = (const uint8_t *)hos_guest_range(a, font.n - 8);
+        if (!q) unread = 1;
+        else if (!memcmp(q, font.head, sizeof font.head)) {
+            at = a;
+            break;
+        }
+        if (a == base[0]) break;
+    }
+    if (!at) {
+        if (!unread) last = face;   /* (another font of that size) */
+        return;   /* (else not readable yet: looked at again) */
+    }
+    font.at = at;
+    hos_log("prompts: the font at %#llx: the icons in texts follow at once", (unsigned long long)font.at);
+}
+
+/* the served font (the start's face's file) pointed at this face and these controls (cmap4_bind), written where the game
+   keeps it: its tables' directory and size the same, only the cmap changes */
+static int live_font(const char *dir, int start, int face) {
+    char path[MAX_PATH];
+    snprintf(path, sizeof path, "%sprompts/%s/External.bfotf", dir, faces[start]);
+    long n;
+    uint8_t *b = read_all(path, NULL, &n);
+    if (!b || n < 16 || n % 4 || (uint32_t)n != font.n) {
+        free(b);
+        hos_log("prompts: %s is not the font served: the icons in texts at the next start", path);
+        return 0;
+    }
+    const uint32_t key = rd32le(b) ^ MAGIC;
+    for (long i = 8; i < n; i += 4) wr32le(b + i, rd32le(b + i) ^ key);
+    const int bound = bind_font(b + 8, (size_t)n - 8, face);
+    uint8_t *q = (uint8_t *)hos_guest_range(font.at, (uint64_t)n - 8);
+    const int ok = q && !memcmp(q, b + 8, 64);   /* (still the font: its tables' directory, which a binding leaves as is) */
+    if (ok) {
+        memcpy(q, b + 8, (size_t)n - 8);
+        InterlockedIncrement(&font_changes);
+        hos_log("prompts: now the %s icons in texts, %d buttons on these controls", faces[face], bound);
+    } else {
+        hos_log("prompts: the font is no longer where FreeType read it: the icons in texts at the next start");
+    }
+    free(b);
+    return ok;
+}
+
+volatile int hos_prompts_row = -1;   /* nn_hid.c's live input ("!prompts <row>"): over the menu's row, -1 none */
+
+/* the face the Button prompts row chooses now: Auto, the first controller's (by its type where its name says no maker; none:
+   the face shown, as the keys' face cannot be followed); -1 none known */
+static int live_face(void) {
+    const int choice = hos_prompts_row >= 0 ? hos_prompts_row : rx_option(HOS_OPT_PROMPTS, -1);
+    if (choice >= 1 && choice <= HOS_PROMPT_N) return choice - 1;
+    if (choice < 0) return live_face_now;   /* (no menu: the start's) */
+    char name[128] = "";
+    hos_sdl_pad_first_name(name, sizeof name);
+    if (!name[0]) return live_face_now;
+    int sdl = 0;
+    const int type = hos_sdl_pad_type_of(0, &sdl);
+    return typed_face(auto_face(name, 0, -1), name, sdl, type);
+}
+
+/* nn_hid.c, as the game reads its controller (every frame; looked at every 100 ms): the face or the controls changed, or a
+   part found since that still shows what was before? */
+int hos_prompts_live_parts(void);
+void hos_prompts_live(void) {
+    static volatile LONG busy;
+    static int64_t last;
+    const int pool = __atomic_load_n(&tex.l.base, __ATOMIC_ACQUIRE) != 0;   /* (hos_prompts_pool: lo and hi set before) */
+    if (live_face_now < 0 || live_face_now >= LIVE_FACES || (!pool && !lay_n && !font.at) ||
+        InterlockedCompareExchange(&busy, 1, 0))
+        return;
+    const int64_t now = hos_now_ns();
+    if (now - last >= 100000000) {
+        last = now;
+        find_layouts();
+        int bind[HOS_SW_N];
+        for (int b = 0; b < HOS_SW_N; b++) bind[b] = hos_binding(HOS_BIND_PAD, b, 0);
+        const int face = live_face();
+        /* (the menu asks for a restart then: nothing changes before, no part on another face than the rest) */
+        if (face < 0 || face >= LIVE_FACES || (hos_prompts_live_parts() & HOS_PROMPTS_LIVE_ALL) != HOS_PROMPTS_LIVE_ALL) {
+            InterlockedExchange(&busy, 0);
+            return;
+        }
+        live_face_now = face;
+        memcpy(live_bind_now, bind, sizeof live_bind_now);
+        const int found[PARTS] = {0, lay.base != 0, font.at != 0};   /* (the textures: looked at under tex_lock) */
+        char dir[MAX_PATH];
+        int ignored, ready = -1;
+        if (tex.l.base && (part_face[PART_TEXTURES] != face || memcmp(part_bind[PART_TEXTURES], bind, sizeof bind)) &&
+            (ready = setup(dir, sizeof dir, &ignored)))
+            texture_bin(dir, face);   /* (read before tex_lock) */
+        for (int p = 0; p < PARTS; p++) {
+            if (p == PART_TEXTURES) AcquireSRWLockExclusive(&tex_lock);   /* (the pool kept, or let go, till its writes end) */
+            const int here = p == PART_TEXTURES ? tex.l.base != 0 : found[p];
+            if (here && (part_face[p] != face || memcmp(part_bind[p], bind, sizeof bind))) {
+                if (ready < 0) ready = setup(dir, sizeof dir, &ignored);
+                if (ready && p == PART_TEXTURES) live_textures(dir, face, bind);
+                if (ready && p == PART_LAYOUTS) live_layouts(dir, face, bind);
+                if (ready && p == PART_FONT) live_font(dir, served_face[PART_FONT], face);
+                part_face[p] = face;   /* (also when it failed: not tried again until the next change) */
+                memcpy(part_bind[p], bind, sizeof part_bind[p]);
+            }
+            if (p == PART_TEXTURES) ReleaseSRWLockExclusive(&tex_lock);
+        }
+    }
+    InterlockedExchange(&busy, 0);
+}
+
+/* what the Insert menu's Button prompts row can change at once (vk_api.h HOS_PROMPTS_LIVE_*): each part the game has loaded
+   from a file served here and found, or that none was served for (the game's own then, whatever the face); 0 with none found,
+   with the keys' face shown, or with a font built before (not every controller's icons: font.live) */
+int hos_prompts_live_parts(void) {
+    if (live_face_now < 0 || live_face_now >= LIVE_FACES) return 0;
+    const int t = tex.l.base != 0, l = lay.base != 0, f = font.at != 0 && font.live;
+    if (!t && !l && !f) return 0;
+    return (t || !tex.data_len ? HOS_PROMPTS_LIVE_TEXTURES : 0) | (l || !lay_n ? HOS_PROMPTS_LIVE_LAYOUTS : 0) |
+           (f || !font.n ? HOS_PROMPTS_LIVE_TEXTS : 0);
 }
 
 /* the face of the device used last (device: hos_input_last's; name: the controller used last's, SDL's, "" none: XInput's,
@@ -738,7 +1443,9 @@ static DWORD WINAPI follow_main(void *arg) {
         char name[128] = "";
         const int device = hos_input_last();
         if (device == 2) hos_sdl_pad_last_name(name, sizeof name);
-        const int face = device_face(device, name);
+        int sdl = 0;
+        const int type = device == 2 && name[0] ? hos_sdl_pad_type_of(1, &sdl) : 0;
+        const int face = typed_face(device_face(device, name), name, sdl, type);   /* ((Triforce) by SDL's type where the name says no maker) */
         const int64_t now = hos_now_ns();
         const unsigned used = hos_input_uses(device);
         const int active = device >= 1 && device <= 2 && used != uses[device];

@@ -60,6 +60,7 @@ FIXTURE = r'''
 #include <memory>
 #include <mutex>
 #include <set>
+#include <string>
 #include <thread>
 #include <vector>
 #include "page_marks.h"
@@ -71,6 +72,8 @@ constexpr uint64_t kPageShift = 12, kChunkPages = 65536, kPages = 2048 * kChunkP
 static std::mutex wb_pages_mu;
 /* WBPAGES */ wb_pages;
 PageMarks wb_marks;
+/* WBENV */
+/* WBSPANS */
 struct WbRun { uint64_t lo, hi, value; };
 static std::vector<WbRun> wb_runs_recent;
 static uint64_t wb_runs_lost = 0;
@@ -353,6 +356,9 @@ def main():
                                    ("/* VWIN */", texture, "bool texture_gpu_written_in(uint64_t lo, uint64_t size) {"),
                                    ("/* VWMARKED */", texture, "bool texture_gpu_written_marked(uint64_t lo, uint64_t size) {")):
             source = source.replace(mark, block(text, marker))
+        # (the extents wb_pages_note keeps beside the table and memory_writeback_value reads, RX_VK_WB_SPANS, with their switch's rule)
+        source = source.replace("/* WBENV */", block(memory, "bool env_value_off(const char* v) {"))
+        source = source.replace("/* WBSPANS */", memory[memory.index("bool wb_spans_on() {"):memory.index("struct WbRun {")])
     except (ValueError, OSError) as e:
         fail("a text this test reads is not there (%s)" % e)
     with tempfile.TemporaryDirectory(prefix="invalidate-quick-") as tmp:

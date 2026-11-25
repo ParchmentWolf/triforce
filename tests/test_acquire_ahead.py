@@ -53,7 +53,17 @@ def main():
     check("#ifdef _WIN32" in wanted and 'getenv("RX_VK_ACQUIRE_AHEAD")' in wanted, "the switch is not read, or not on Windows alone")
     check("if (asked == 0 || !acquire_fence_on() || dlssg::active()) return false;" in wanted,
           "it runs without the acquire's fence, with DLSS frame generation, or with the switch at 0")
-    check("return asked > 0 || dev.props.vendorID == 0x1002;" in wanted, "it is not AMD's by default, or =1 does not turn it on")
+    check("if (asked > 0 || dev.props.vendorID == 0x1002) return true;" in wanted, "it is not AMD's by default, or =1 does not turn it on")
+    # ((Triforce) elsewhere only with Threaded rendering, never under FIFO or frame generation, its acquire with a zero timeout)
+    check("return acquire_ahead_threaded();" in wanted,
+          "it is on elsewhere without Threaded rendering")
+    threaded = block(replay, "bool acquire_ahead_threaded() {")
+    check("static const bool v = threaded_on();" in threaded and "framegen_on()" in threaded and "present_mode::kFifo" not in threaded
+          and "mode == present_mode::kMailbox || mode == present_mode::kImmediate" in threaded,
+          "Threaded rendering's acquire ahead runs under FIFO or frame generation")
+    timeout = block(replay, "uint64_t acquire_ahead_timeout() {")
+    check("return UINT64_MAX;" in timeout and "    return 0;" in timeout,
+          "the acquire's timeout is not as before on AMD and =1, and 0 for Threaded rendering alone")
 
     ahead = block(replay, "void acquire_ahead() {")
     check("present_image_mu" not in ahead.split("//")[0] and "std::lock_guard lk(present_image_mu)" not in ahead,
@@ -61,7 +71,7 @@ def main():
     check(before(ahead, "if (held_image.on || !dev.swapchain || dev.swap_resize.load(std::memory_order_acquire) ||",
                  "surface_lost_noted.load(std::memory_order_acquire)", "return;", "vkAcquireNextImageKHR("),
           "it acquires while an image is held, with no swapchain, or before present_image made the swapchain again")
-    check("vkAcquireNextImageKHR(dev.device, dev.swapchain, UINT64_MAX, VK_NULL_HANDLE, fence, &index);" in ahead,
+    check("vkAcquireNextImageKHR(dev.device, dev.swapchain, acquire_ahead_timeout(), VK_NULL_HANDLE, fence, &index);" in ahead,
           "the acquire does not signal the fence alone")
     check(before(ahead, "if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR) {", "return;", "image_free(250000000ull)",
                  "held_image = {true, index, dev.swap_generation, 0, false, ready == VK_SUCCESS};"),

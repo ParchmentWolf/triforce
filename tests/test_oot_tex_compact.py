@@ -149,7 +149,7 @@ int main(void) {
 def check_ask(host):
     due = block(host, "int hos_oot_tex_compact_due(void) {")
     in_order(due, ['getenv("HOS_OOT_TEX_ASK_MS")', "hos_oot_tex_ask_ms(e)", "const int64_t now = hos_now_ns();",
-                   "const int due = hos_oot_tex_ask_due(ms, now, &last);", "return due;"], "oot_tex_compact.c hos_oot_tex_compact_due")
+                   "const int due = hos_oot_tex_ask_due(ms, hos_input_movie_time(&ask_time, now), &last);", "return due;"], "oot_tex_compact.c hos_oot_tex_compact_due")
     if '#include "oot_tex_compact.h"' not in host:
         raise SystemExit("oot_tex_compact.c: the rule's header is not included")
     import oot_patches

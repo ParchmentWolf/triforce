@@ -770,6 +770,8 @@ static void frames_and_events(void) {
 #define FRAME 240
 static float master = 1.0f;
 static float master_volume(void) { return master; }
+static float speaker_frame[FRAME];   /* ((Triforce) the controller speaker's frame, off here: host/pad_speaker.c) */
+static int speaker_on;
 static void render_tail(float out[6][FRAME], int16_t *pcm, const int nch) {
 #include "render_tail.inc"
 }

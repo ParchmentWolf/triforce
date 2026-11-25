@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -26,6 +27,7 @@ struct Face {
     uint64_t vs = 0, fs = 0;             // the vertex (or mesh) and fragment modules, by their SPIR-V (0: no fragment stage)
     uint32_t vs_locs = 0, fs_locs = 0;   // generic inputs read, colour outputs written
     predict_types::Locations vs_in;      // ((Triforce, 11-22, PIPE-44) the vertex inputs' base types, RX_VK_PREDICT_TYPES=1)
+    int64_t at = 0;                      // ((Triforce, 11-24) its record's place in the programs' file: the later one is kept)
 };
 /// The locations of a module's Input (storage 1) or Output (3) variables
 uint32_t spirv_locations(const std::vector<uint32_t>& w, uint32_t storage) {
@@ -162,6 +164,7 @@ std::vector<std::unique_ptr<PipeNote>> predict_pipelines(const std::vector<std::
     static const bool typed = predict_types::typed(predict_types::mode(getenv("RX_VK_PREDICT_TYPES")));
     PredictCounts tally;
     std::unordered_map<std::pair<uint64_t, uint64_t>, Face, PairHash> faces;
+    std::mutex faces_mu;
     program_cache_each([&](const KeptProgram& k) {
         Face f;
         for (const auto& [stage, spirv] : k.stages) {
@@ -172,7 +175,12 @@ std::vector<std::unique_ptr<PipeNote>> predict_pipelines(const std::vector<std::
             } else if (stage == VK_SHADER_STAGE_TASK_BIT_EXT || stage == VK_SHADER_STAGE_MESH_BIT_EXT) f.vs = h, f.vs_locs = 0;
             else if (stage == VK_SHADER_STAGE_FRAGMENT_BIT) f.fs = h, f.fs_locs = spirv_locations(spirv, 3);
         }
-        faces[{k.key, k.variant}] = f;
+        f.at = k.at;
+        // ((Triforce, 11-24) program_cache_each calls on several threads, in no order: a variant's later record wins, as it did
+        // in the file's order)
+        std::lock_guard lk(faces_mu);
+        auto [it, fresh] = faces.try_emplace({k.key, k.variant}, f);
+        if (!fresh && it->second.at < f.at) it->second = f;
     });
     std::unordered_map<uint64_t, Seen> vh, vsig, fh, fsig;
     std::unordered_map<Class, const PipeNote*, ClassHash> vdonor, odonor;

@@ -21,6 +21,11 @@
    cannot be run on the PC this was written on: it is built, and is not the default. HOS_SHORT_SLEEP_TIMER=game asks
    for it on any system; SHORT_SLEEP_ELSEWHERE below is what a build that is not Windows' does with the switch not
    set: SHORT_SLEEP_YIELD, as before, until a Steam Deck A/B says SHORT_SLEEP_GUEST_TIMER (Source A's default).
+   (Triforce, 11-24) Now SHORT_SLEEP_GUEST_TIMER, Source A's default, measured there on Linux by itself: Hyrule Field on a
+   24-thread 7900X with an RTX 3090, the frame's CPU 44.8 -> 35.4 ms at the same median frame (11.30 / 11.32 ms), the
+   five idle job workers and sead::MainThread no longer yielding 3.3-3.6 ms a frame each; the workers are off the frame's
+   critical path there. On 4-8 thread PCs (the Steam Deck: 8) those yields held processors the frame needs. Windows is
+   unchanged (it counts the processors). HOS_SHORT_SLEEP_TIMER=0: all yield, as before
 
    The rule alone, no threads and no clock: tests/test_short_sleep_timer.py compiles it. */
 #pragma once
@@ -43,7 +48,7 @@ static inline int short_sleep_timer(const char *asked, int threads) {
 }
 
 /* ((Triforce, 11-22, the performance audit's OS-32) what a build that is not Windows' does with the switch not set */
-#define SHORT_SLEEP_ELSEWHERE SHORT_SLEEP_YIELD
+#define SHORT_SLEEP_ELSEWHERE SHORT_SLEEP_GUEST_TIMER
 
 /* The same with the system: windows, a Windows build (the processors count there); elsewhere, what any other build does
    with the switch not set (SHORT_SLEEP_ELSEWHERE). "game": the game's own short sleeps on the timer, the host's

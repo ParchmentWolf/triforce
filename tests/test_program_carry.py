@@ -2,12 +2,13 @@
 
 A kept program is used by another build of the translator only when the two have the same translation stamp (nx2/build.py
 translation_stamp, HOOKSHOT_TRANSLATION_STAMP): the translator's files without vk_api.h, without the parts of vk_shader.cpp and
-vk_bank.cpp marked as outside it, and without comments, blank lines and the spaces at lines' ends. These checks hold that rule:
+vk_bank.cpp marked as outside it, and without comments, blank lines, the spaces at lines' ends and (11-24) the indentation, each run of blanks between tokens one
+space. These checks hold that rule:
 
 - the stamp, by nx2/build.py's own functions run on authored files: every edit that can change a translation changes it (code
   anywhere else, a literal that looks like a comment, a number with digit separators, an #include's name, a raw string, the
   line after a backslash, a mark that does not pair), and the edits that cannot do not (vk_api.h, the marked parts, comments,
-  blank lines, spaces at a line's end, CRLF), while the whole translator's stamp still changes with all of them but CRLF;
+  blank lines, spaces at a line's end, indentation and wider spacing, CRLF), while the whole translator's stamp still changes with all of them but CRLF;
 - every C and C++ file of the translator in this repository, as the stamp takes it, is the same to clang's lexer as the file
   itself, comments aside: the same tokens, starting the same lines (skipped without clang);
 - vk_shader.cpp's marked parts: the five reviewed ones, each between definitions, none touching anything of a translation (Eden,
@@ -231,7 +232,10 @@ class StampTests(unittest.TestCase):
                 ("vk_shader.cpp", "   // (a note)", ""), ("vk_shader.cpp", "a block", "a longer block"),
                 ("vk_shader.cpp", "int translation", "// A new line of notes.\n/* and a block\n   of them */\n\nint translation"),
                 ("vk_shader.cpp", "int translation = 4;", "int translation = 4;   \n\n"),
-                ("eden/raw.cpp", "// (a note)", "// (another)"), ("eden/a.cpp", "a = 1;", "a = 1;   // (a note)")):
+                ("eden/raw.cpp", "// (a note)", "// (another)"), ("eden/a.cpp", "a = 1;", "a = 1;   // (a note)"),
+                # ((Triforce, 11-24) indentation, and more or fewer blanks where there were some: nx2/build.py strip_comments collapse)
+                ("vk_shader.cpp", "int translation = 4;", "    int  translation\t=   4;"), ("eden/a.cpp", "int a", "\tint    a"),
+                ("vk_shader.cpp", "#define TWO 1 + \\\n    1", "#define  TWO 1 +   \\\n        1")):
             with self.subTest(file=name, edit=new):
                 w, t = self.edited(name, old, new)
                 self.assertEqual(t, translation, "an edit that cannot change a translation changed the translation stamp")
@@ -241,6 +245,16 @@ class StampTests(unittest.TestCase):
         self.write(self.files)
         self.write({"vk_draw.cpp": "int draw_changed;\n"})
         self.assertEqual(self.stamps(), (whole, translation))
+
+    def test_blanks_after_a_backslash_line_end_keep_tokens_apart(self):
+        """((Triforce, 11-24) strip_comments collapse) The line after one a backslash ends is joined to it: blanks at its start
+        are one space there, never none, or "1\\<newline>    1" (the tokens 1 and 1) and "1\\<newline>1" (the token 11) would
+        be one text; and a backslash with blanks after it is such a line end too"""
+        _, apart = self.edited("vk_shader.cpp", "#define TWO 1 + \\\n    1", "#define TWO 1 + 1\\\n    1")
+        _, joined = self.edited("vk_shader.cpp", "#define TWO 1 + \\\n    1", "#define TWO 1 + 1\\\n1")
+        self.assertNotEqual(apart, joined, "blanks that keep two tokens apart across a line splice were dropped")
+        _, apart_blank = self.edited("vk_shader.cpp", "#define TWO 1 + \\\n    1", "#define TWO 1 + 1\\   \n    1")
+        self.assertNotEqual(apart_blank, joined, "a backslash with blanks after it was not taken for a splice")
 
     def test_marks_that_do_not_pair_take_the_file_whole(self):
         lone = self.files["vk_shader.cpp"].replace("// ---- (Triforce) Inside the translation stamp again ----\n", "")
@@ -335,9 +349,34 @@ class StampTests(unittest.TestCase):
                 self.assertEqual(note()[0], (None, None))
 
     def test_the_repository_keeps_the_last_release_stamp(self):
-        """The translation stamp of this source is the last release's (nx2/released_translation_stamp.json, made from that
-        release's source): moving it starts every player's program and pipeline caches again at the update. A change that has
-        to move it changes this test with it, saying why; the record itself changes only when a release goes out"""
+        """The translation stamp of this source against the last release's (nx2/released_translation_stamp.json, made from
+        that release's source): moving it starts every player's program and pipeline caches again at the update. A change
+        that has to move it changes this test with it, saying why; the record itself changes only when a release goes out.
+
+        Moved on purpose, once, on 11-24 (the owner's decision: one shader re-prepare for every player, for all of these
+        together): the translator fixes gathered since the release. Float adds to storage buffers as the GPU's own atomic,
+        or one at a time a subgroup in the loop (Intel's Windows driver lost the device at the sky's light sums); the
+        storage buffer tables searched in a loop on Mesa's Intel driver; a handle table's elements up to the game's own
+        count; mesh-only draws through the compute fallback and strict f32 multiplies in it on AMD's older Windows compiler;
+        the lowering's fixes (a global load across the reserved register boundary, programs over 1 MiB, ISBERD.O, a loop
+        left by predicated EXITs, the fallback lowering's shared-memory barrier and LDSM copy); image, image-buffer and
+        texture-buffer arrays as arrays, indexed nonuniformly where the GPU can; the 32-lane pin within
+        maxComputeWorkgroupSubgroups; float modes, 64-bit atomics and subgroup stages from the device; NumWorkgroups kept
+        live for RADV before Mesa 26.2.5; f16 lowered where the GPU has none. Then, the same release, the translator's second
+        batch (the stamp already moved, so players prepare once all the same): the mesh fallback's records line after line
+        (RX_VK_MESH_FB_LAYOUT) and written in a loop, its records area at 128 MB (the floor grass at the Grass distance's 4x),
+        Mesa's Intel driver's ways for it (the attribute pool, the warp in workgroup memory: emit_spirv.cpp, emit_spirv_warp.cpp,
+        runtime_info.h), global loads through the guest page table behind RX_VK_GP_TABLE (translate_program.cpp,
+        collect_shader_info_pass.cpp), a shader module made inside the driver fault guard, the software matrix multiplies'
+        unrolled form (mma_software.h) and the WMMA 16x16x16 tiles behind RX_VK_MMA_WMMA16 (sirit's arithmetic.cpp). And the
+        simulated turf's lists read through descriptors of their own, their caps from the descriptor's length (the IR pass
+        ir_opt/sim_turf_pool_pass.h, the StorageBufferLength opcode in opcodes.inc and emit_spirv_memory.cpp, the descriptors'
+        encoding in shader_info.h; RX_VK_SIM_TURF_POOLS=0 leaves them as the game has them). The files below are exactly the
+        ones those changed: another file in the list, or one gone from it, is a change that moves the stamp again and must say
+        so here. The next release's record makes the list empty again. ((Triforce, 11-24) The stamp's rule took the blanks
+        between tokens as one space from then on (strip_comments collapse): the record's file hashes were made again from
+        v0.5.1's own source (3f81f905) by that rule, which gives the same files as above; its stamp is still the one the
+        players' caches have)"""
         record = NS["translation_record_read"](NS["RELEASED_STAMP"])
         self.assertIsNotNone(record, "no record of the last release's translation stamp in nx2")
         rel_stamp, rel_files, release = record
@@ -346,9 +385,25 @@ class StampTests(unittest.TestCase):
         eden, _ = translator_files(str(VK))
         files = NS["translation_files"](str(VK), eden)
         changed, named = NS["translation_changed"](rel_files, files)
-        self.assertEqual(changed, [], "the translation's text differs from %s's in: %s" % (release, named))
-        self.assertEqual(NS["translation_stamp"](str(VK), eden), rel_stamp,
-                         "this source's translation stamp is not %s's: every player's shader caches start again" % release)
+        spirv, front = "eden/shader_recompiler/backend/spirv/", "eden/shader_recompiler/frontend/"
+        moved_by = sorted(
+            [spirv + n for n in ("emit_spirv.cpp", "emit_spirv.h", "emit_spirv_atomic.cpp", "emit_spirv_floating_point.cpp",
+                                 "emit_spirv_image.cpp", "emit_spirv_image_atomic.cpp", "emit_spirv_instructions.h",
+                                 "emit_spirv_memory.cpp", "emit_spirv_mesh.cpp", "emit_spirv_warp.cpp", "mma_layout.h", "mma_software.h",
+                                 "spirv_emit_context.cpp",
+                                 "spirv_emit_context.h")] +
+            [front + "ampere/" + n for n in ("lower_to_maxwell.h", "lower_to_maxwell_regmap.h", "program_address_map.h",
+                                             "program_capture.h")] +
+            [front + "ir/" + n for n in ("ir_emitter.cpp", "ir_emitter.h", "opcodes.cpp", "opcodes.h", "opcodes.inc")] +
+            [front + "maxwell/translate/impl/internal_stage_buffer_entry_read.cpp", front + "maxwell/translate_program.cpp",
+             "eden/shader_recompiler/ir_opt/collect_shader_info_pass.cpp", "eden/shader_recompiler/ir_opt/sim_turf_pool_pass.h",
+             "eden/shader_recompiler/runtime_info.h", "eden/shader_recompiler/profile.h", "eden/shader_recompiler/shader_info.h",
+             "sirit/include/sirit/sirit.h", "sirit/src/instructions/arithmetic.cpp", "sirit/src/instructions/atomic.cpp", "sirit/src/instructions/group.cpp",
+             "vk_shader.cpp"])
+        self.assertEqual(sorted(changed), moved_by,
+                         "the translation's text differs from %s's in other files than the 11-24 batch's: %s" % (release, named))
+        # (and so the stamp is not the release's: every player's shader caches start again at this update, once)
+        self.assertNotEqual(NS["translation_stamp"](str(VK), eden), rel_stamp)
 
     def test_the_build_keeps_the_record_once_compiled(self):
         src = BUILD.read_text(encoding="utf-8")
@@ -426,6 +481,8 @@ ALLOWED = {
     "stage_module_destroy": "a stage's module let go (vkDestroyShaderModule, its counts and packed store with it), after its "
                             "pipelines are made: the record and the translation are done by then",
     "DiskRecord": "where a record is in the file", "disk_mu": "the file's lock", "disk_in": "the file read",
+    "disk_path": "(Triforce, 11-24) the file's path, which program_cache_each opens a handle of its own on: where the records "
+                 "are read from, never what they hold (get_head and get_info, in the stamp, read each)",
     "disk_out": "the file written", "disk_idx": "the index written", "disk_records": "the list of records",
     "disk_listing": "whether records written are listed (the precompile)", "disk_on": "whether the cache is there",
     "idx_put": "an index entry, written after its record", "st_cache_hits": "a count for the log",
@@ -433,6 +490,10 @@ ALLOWED = {
     "program_cache_load": "the records of a key read for its list (program_cache_read, in the stamp, reads each and checks its key)",
     "st_draw_reads": "a count for the stall line", "st_draw_read_ns": "a time for the stall line",
     "st_ra_taken": "a count for the stall line",
+    "disk_taken": "(Triforce) the records read in already, a list as disk_records is, which the prediction lists and borrows",
+    "disk_note_taken": "(Triforce) a key's records put in that list as they leave disk_records",
+    "ModuleProgram": "(Triforce) which program translate_into's modules are of, for make_module's driver fault guard: a module is "
+                     "made or not (a fault there fails the translation, as a refused module does), never made otherwise",
     "draw_once": "(Triforce) where a pick lets shader_mu go to read a program object's stages (codes_read): when they are read, "
                  "never what: the same guest memory read and made into the same codes, the lock held or not",
 }

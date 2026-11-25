@@ -52,6 +52,7 @@
 #include <exception>
 #include <mutex>
 #include <new>
+#include <condition_variable>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -109,7 +110,8 @@ enum Op : uint16_t {
 #define RX_REC_OP(f) OP_##f,
     RX_REC_CALLS(RX_REC_OP, RX_REC_OP)
 #undef RX_REC_OP
-    OP_COUNT
+    OP_COUNT,
+    OP_PART = OP_COUNT   // ((Triforce) RX_VK_RECORDER_PARTS: a part's end and submit, post_part; no vkCmd* call)
 };
 inline const char* op_name(uint32_t op) {
     static const char* const names[] = {
@@ -117,7 +119,7 @@ inline const char* op_name(uint32_t op) {
         RX_REC_CALLS(RX_REC_NAME, RX_REC_NAME)
 #undef RX_REC_NAME
     };
-    return op < OP_COUNT ? names[op] : "?";
+    return op < OP_COUNT ? names[op] : op == OP_PART ? "a part's end and submit" : "?";
 }
 
 /// (THREAD) where the producer waited for the recorder: each boundary call, then the recorder's own reasons
@@ -132,6 +134,8 @@ enum Bound : uint16_t {
     B_RING_FULL,       // backpressure: the ring had no room
     B_FOREIGN,         // a thread without replay_mu made a call while the recorder was busy
     B_DIRECT,          // code about to record into a command buffer directly, outside vk_work.h (Dear ImGui: vk_menu.cpp)
+    B_PART,            // ((Triforce) parts) a part's submit: its slot's reuse, a wait for its recording (vk_replay.cpp)
+    B_QUEUE_LOCK,      // ((Triforce) parts) the queue's lock about to be taken: the parts handed over submitted first (QueueMutex)
     B_COUNT
 };
 inline const char* bound_name(uint32_t b) {
@@ -139,7 +143,8 @@ inline const char* bound_name(uint32_t b) {
 #define RX_REC_BNAME(f) #f,
         RX_REC_BOUNDARIES(RX_REC_BNAME, RX_REC_BNAME)
 #undef RX_REC_BNAME
-        "replay_mu unlock", "fallback", "no ring room", "par_active", "ring full", "off the replay lock", "direct recording"};
+        "replay_mu unlock", "fallback", "no ring room", "par_active", "ring full", "off the replay lock", "direct recording",
+        "a part's submit", "the queue's lock"};
     static_assert(sizeof names / sizeof *names == B_COUNT);
     return b < B_COUNT ? names[b] : "?";
 }
@@ -164,6 +169,29 @@ inline size_t g_publish_bytes = 1024;
 inline uint64_t g_spin_ns = 0;
 constexpr uint64_t kSpinLo = 20000, kSpinHi = 200000;
 inline bool g_stats_log = true;   // (RX_VK_RECORDER_STATS=0: no stats line every 10 s)
+/// ((Triforce) RX_VK_RECORDER_IDLE=wait, opt-in) with nothing to run the recorder spins 20 us, then waits on W itself
+/// (WaitOnAddress; the futex under host/posix's on Linux), and a publish wakes it; unset: the spin and a condition variable, as
+/// before. Read when the mode is; off again at the recorder's start without the two functions below: tests change it
+inline bool g_idle_wait = false;
+/// (set by vk_replay.cpp: WaitOnAddress and WakeByAddressSingle, which need windows.h; tests set fakes)
+inline bool (*g_wait_on_address)(volatile void* addr, void* compare, size_t size, uint32_t ms) = nullptr;
+inline void (*g_wake_by_address)(void* addr) = nullptr;
+// ((Triforce) RX_VK_RECORDER_PARTS: the hand-off by part, Threaded rendering's recorder (threaded_rendering.h). The producer
+// publishes a part's packets when the part ends (a long part in g_chunk_bytes chunks), not packet by packet, and the part's two
+// vkEndCommandBuffer and its queue submit go into the ring as one more packet (post_part), which the recorder runs in order: the
+// producer goes on into the next part at once. What needs a part submitted waits for that (parts_done, wait_part, settle_parts),
+// not for the ring to empty; replay_mu's unlock publishes and does not wait; the recorder waits on W between batches. A thread
+// about to take the queue's lock (QueueMutex, vk_internal.h) waits for the parts handed over first; one that holds a queue lock
+// never waits for a recorder that waits for that lock (queue_escaped). Unset: on with Threaded rendering (g_parts_default), so
+// off by default; =1 on with any recorder thread, =0 off.
+/// Set by mode_init from the switch; false until then, so the checks that set a mode themselves keep a boundary's drain
+inline std::atomic<bool> g_parts{false};
+/// (vk_replay.cpp: Threaded rendering's say with RX_VK_RECORDER_PARTS unset; null: off)
+inline bool (*g_parts_default)() = nullptr;
+/// (parts) a part's packets published in chunks of this many bytes while it is translated (a part of 512 draws is ~100-200 KB:
+/// most go over at their end, in one batch; a longer one is begun on by the recorder before its end). Tests change it
+inline size_t g_chunk_bytes = size_t(256) << 10;
+constexpr uint64_t kPartsSpin = 10000;   // (parts: the recorder's spin with nothing to run before it waits on W, ns)
 
 /// RX_VK_RECORDER: sync, defer, thread; anything else, or unset, off. (Triforce, 11-15) defer and thread are no longer refused with
 /// RX_VK_PARALLEL>=2: a parallel replay's segments make their calls directly, after segments_begin (tests/test_recorder_sync.py)
@@ -189,6 +217,10 @@ inline int mode_init() {
             if (atoi(mb) > 0) g_ring_bytes = size_t(std::min(atoi(mb), 1024)) << 20;
         if (const char* s = getenv("RX_VK_RECORDER_STATS")) g_stats_log = atoi(s) != 0;
         if (const char* s = getenv("RX_VK_RECORDER_SPIN_US")) g_spin_ns = (uint64_t)std::max(1, atoi(s)) * 1000;
+        const char* idle = getenv("RX_VK_RECORDER_IDLE");   // ((Triforce) opt-in)
+        g_idle_wait = idle && !strcmp(idle, "wait");
+        const char* pe = getenv("RX_VK_RECORDER_PARTS");    // ((Triforce) unset: Threaded rendering's say)
+        g_parts.store(pe && *pe ? atoi(pe) != 0 : g_parts_default && g_parts_default(), std::memory_order_relaxed);
     }
     int was = -1;
     if (!g_mode.compare_exchange_strong(was, m, std::memory_order_relaxed)) return was;   // (another thread read it first)
@@ -197,6 +229,13 @@ inline int mode_init() {
                       "reset, submit, wait, readback, destruction and replay lock release (a parallel replay's segments: made "
                       "directly)%s",
                       g_poison.load(std::memory_order_relaxed) ? "; the arena poisoned after each drain" : "");
+    else if (m == THREAD && g_parts.load(std::memory_order_relaxed))
+        ::mkwvk::logf("vk: RX_VK_RECORDER=thread: vkCmd* packed on the replay thread and run in order by a recorder thread, "
+                      "handed over by part (RX_VK_RECORDER_PARTS): a part's packets at its end, and its end and submit made by "
+                      "the recorder; the replay waits for it at a reset, begin, destruction or direct recording, and for a part's "
+                      "submit where a wait, a fence or the queue needs it; ring %zu KB, the recorder waits on the ring after %llu us%s",
+                      g_ring_bytes >> 10, (unsigned long long)(kPartsSpin / 1000),
+                      g_poison.load(std::memory_order_relaxed) ? "; packets poisoned once run" : "");
     else if (m == THREAD)
         ::mkwvk::logf("vk: RX_VK_RECORDER=thread: vkCmd* packed on the replay thread and run in order by a recorder thread; the "
                       "replay waits for it at each command buffer begin, end and reset, submit, wait, readback, destruction and "
@@ -271,14 +310,19 @@ struct Arena {
     }
     ~Arena();
 };
-inline thread_local Arena t_arena;
+// Function-local ownership keeps the nontrivial TLS initializer with its use under COFF ThinLTO.
+// The arena's self-referential tail prevents constant initialization; its destructor still drains and frees it.
+inline Arena& t_arena() {
+    static thread_local Arena arena;
+    return arena;
+}
 
 /// The decoder: runs one packet's call with its copies
 inline void execute(const Packet* p) { p->run(p); }
 
 /// (DEFER) runs every held packet, in order, and empties the arena
 inline void drain() {
-    Arena& a = t_arena;
+    Arena& a = t_arena();
     const Packet* p = a.head;
     a.head = nullptr, a.tail = &a.head;
     while (p) {
@@ -330,19 +374,55 @@ inline void (*g_test_idle_locked)() = nullptr;   // (tests: called in idle() wit
     std::_Exit(3);
 }
 
+/// ((Triforce) parts) the recorder thread itself: the calls a part's packet makes (its ends, the queue's lock, its submit) are
+/// the ring's own, made in its order, and wait for nothing (boundary(), Enc, settle)
+inline constinit thread_local bool t_recorder = false;
+/// ((Triforce) parts) the queue locks this thread holds (QueueMutex, vk_internal.h: dev.present_mu and the present queue's lock).
+/// The recorder takes dev.present_mu for a part's submit: a thread holding one of them never waits for a recorder stopped at that
+/// lock (queue_escaped)
+inline constinit thread_local int t_queue_held = 0;
+/// (parts) of those, dev.present_mu (the one the recorder takes); and whether this thread, holding it, is blocked on another queue
+/// lock: a holder of that one may then not wait for the recorder either (Recorder::chain_waiters)
+inline constinit thread_local int t_present_held = 0;
+inline constinit thread_local bool t_chain_wait = false;
+/// (parts) Settled scopes: this thread has waited for what it needs of the recorder itself (a slot's own part, a recording's
+/// submit) or needs none (the present thread): its waits and the queue's lock do not wait for every part
+inline constinit thread_local int t_settled = 0;
+struct Recorder;
+/// (THREAD) the ring, while this thread holds replay_mu; null otherwise
+inline constinit thread_local Recorder* t_prod = nullptr;
+
 struct Recorder {
     alignas(64) std::atomic<uint64_t> W{0};   // bytes published (the producer)
     alignas(64) std::atomic<uint64_t> R{0};   // bytes run (the recorder)
+    alignas(64) std::atomic<uint64_t> parts_sent{0};   // ((Triforce) parts) parts posted (the producer: post_part)
+    alignas(64) std::atomic<uint64_t> parts_done{0};   // (parts) parts ended and submitted (the recorder), in order: after R
+    std::atomic<bool> at_queue{false};   // (parts) the recorder blocked on dev.present_mu (held by another), at a part's submit
+    std::atomic<int> chain_waiters{0};   // (parts) holders of dev.present_mu blocked on another queue lock (t_chain_wait)
+    // (parts) a blocking wait for the parts ended unmet: the part with this number (the waiter's own, or the newest when it gave
+    // up), once submitted, sends what is held (take_flush_owed); 0: none owed
+    std::atomic<uint64_t> flush_owed_upto{0};
+    std::atomic<int> part_waiters{0};    // (parts) threads asleep in wait_until or spin
+    std::mutex part_mu;
+    std::condition_variable part_cv;
     alignas(64) std::atomic<bool> sleeping{false};
     std::atomic<bool> stop_req{false};
     std::atomic<bool> ready{false};    // ring made, thread running
     std::atomic<bool> broken{false};   // no ring or no thread: the calls made directly
-    std::atomic<bool> logged_direct{false}, logged_foreign{false};
+    std::atomic<bool> logged_direct{false}, logged_foreign{false}, logged_escape{false};
     uint8_t* base = nullptr;
     size_t cap = 0, mask = 0, room = 0;
     // (the producer's: its cursor, what of it is published (W), R as it last read it, and how much it writes before publishing)
     alignas(64) uint64_t w = 0, w_pub = 0, r_seen = 0, batch = 0;
     uint64_t spin_limit = 0;   // (the recorder's: g_spin_ns when it started)
+    // ((Triforce) set at start: RX_VK_RECORDER_PARTS, the bytes a part publishes at most before its end, and whether idle() waits
+    // on W: RX_VK_RECORDER_IDLE=wait, or the hand-off by part where WaitOnAddress is there)
+    bool parts = false, idle_on_w = false;
+    uint64_t chunk = 0;
+    // (parts, stats: publications, parts ended and submitted, waits given up under a queue lock, the recorder's time in parts'
+    // packets and blocked on the queue's lock)
+    std::atomic<uint64_t> batches{0}, parts_run{0}, escapes{0}, part_ns{0}, lock_ns{0}, lock_n{0};
+    uint64_t lock_t0 = 0;
     // (stats: written by the producer or the recorder, read by the recorder's stats line; never on a packet's path)
     std::atomic<uint64_t> wait_n[B_COUNT]{}, wait_ns[B_COUNT]{}, wait_max[B_COUNT]{};
     std::atomic<uint64_t> spin_ns{0}, sleeps{0}, short_sleeps{0};   // (the recorder idle: time spun, sleeps, those under 200 us)
@@ -361,19 +441,51 @@ struct Recorder {
     void log_stats(double secs);
 
     void wake() {
+        if (idle_on_w) {   // ((Triforce) RX_VK_RECORDER_IDLE=wait, or parts: idle() waits on W)
+            g_wake_by_address(&W);
+            return;
+        }
         { std::lock_guard lk(sleep_mu); }
         sleep_cv.notify_one();
+    }
+    /// ((Triforce) parts) a thread holding a queue lock while the recorder waits for dev.present_mu at a part's submit: it does not
+    /// wait for the recorder, or neither would go on. Its own queue work was ordered after every part handed over before it took
+    /// the lock (QueueMutex: settle_parts); what is past the recorder's place now was published after that
+    bool queue_escaped() const {
+        if (!t_queue_held || !at_queue.load(std::memory_order_seq_cst)) return false;
+        return t_present_held || chain_waiters.load(std::memory_order_seq_cst) > 0;   // (the recorder waits for this thread)
+    }
+    void note_escape(Bound k) {
+        escapes.fetch_add(1, std::memory_order_relaxed);
+        if (!logged_escape.exchange(true, std::memory_order_relaxed))
+            ::mkwvk::logf("vk: RX_VK_RECORDER_PARTS: a wait for the recorder at %s, under the queue's lock, while the recorder waited "
+                          "for that lock for a part's submit: not waited for (counted; logged once)",
+                          bound_name(k));
     }
     void kick() {   // (the recorder asleep with work published: a wake-up the packet's cheap check may have missed)
         std::atomic_thread_fence(std::memory_order_seq_cst);
         if (sleeping.load(std::memory_order_relaxed)) wake();
     }
+    /// Waits until done(): pauses, then yields. ((Triforce) parts: asleep on part_cv after the pauses, woken at each part's
+    /// submit, when the recorder runs out of work, when it blocks at the queue's lock; 0.2 ms at most: a part's submit can wait
+    /// behind a present for milliseconds, and a thread yielding through that keeps its core busy)
     template <class C>
     void spin(C done) {
         kick();
         for (uint32_t i = 0; !done(); i++) {
             if (i < 4096) cpu_pause();
-            else {
+            else if (parts) {
+                part_waiters.fetch_add(1, std::memory_order_seq_cst);
+                {
+                    std::unique_lock lk(part_mu);
+                    while (!done()) {
+                        kick();
+                        part_cv.wait_for(lk, std::chrono::microseconds(200));
+                    }
+                }
+                part_waiters.fetch_sub(1, std::memory_order_relaxed);
+                return;
+            } else {
                 std::this_thread::yield();
                 if ((i & 255) == 0) kick();
             }
@@ -391,6 +503,10 @@ struct Recorder {
         if (w == w_pub) return;
         W.store(w, std::memory_order_release);
         w_pub = w;
+        batches.fetch_add(1, std::memory_order_relaxed);
+        // ((Triforce) parts: the recorder sleeps between batches, and a wake-up missed is a part late by the sleep's 2 ms: W's store
+        // before the look at sleeping, as idle() sets sleeping before its look at W)
+        if (parts) std::atomic_thread_fence(std::memory_order_seq_cst);
         if (sleeping.load(std::memory_order_relaxed)) [[unlikely]]
             wake();
     }
@@ -400,20 +516,73 @@ struct Recorder {
         const uint64_t target = w;
         if (idle_at(target)) return;
         const uint64_t t0 = now_ns();
-        spin([&] { return idle_at(target); });
+        spin([&] { return idle_at(target) || queue_escaped(); });
         note_wait(k, now_ns() - t0);
+        if (!idle_at(target)) note_escape(k);
     }
     /// (a thread without replay_mu) what was published so far has reached the driver: its direct call comes after it. Idle in
-    /// the replay's design (replay_mu's unlock waits); otherwise counted, logged once
-    void foreign_wait() {
+    /// the replay's design without RX_VK_RECORDER_PARTS (replay_mu's unlock waits); otherwise counted, logged once
+    void foreign_wait(Bound k = B_FOREIGN) {
         const uint64_t target = W.load(std::memory_order_acquire);
         if (idle_at(target)) return;
-        if (!logged_foreign.exchange(true, std::memory_order_relaxed))
+        if (!logged_foreign.exchange(true, std::memory_order_relaxed) && !parts)
             ::mkwvk::logf("vk: RX_VK_RECORDER=thread: a command buffer or recorded call on a thread without the replay lock while the "
                           "recorder was busy: made after the recorder caught up (counted in the stats line; logged once)");
         const uint64_t t0 = now_ns();
-        spin([&] { return idle_at(target); });
-        note_wait(B_FOREIGN, now_ns() - t0);
+        spin([&] { return idle_at(target) || queue_escaped(); });
+        note_wait(k, now_ns() - t0);
+        if (!idle_at(target)) note_escape(k);
+    }
+    /// ((Triforce) parts) wakes the threads asleep in wait_until or spin (a part submitted, or the recorder at the queue's lock)
+    void notify_parts() {
+        if (!part_waiters.load(std::memory_order_seq_cst)) return;
+        { std::lock_guard lk(part_mu); }
+        part_cv.notify_all();
+    }
+    /// (parts, any thread) waits until done(), at most timeout_ns: a short spin, then asleep on part_cv (woken at each part's
+    /// submit, 0.5 ms at most). A thread holding a queue lock stops waiting when the recorder waits for it (queue_escaped).
+    /// Whether done(). Unmet (the time up, or the escape) with a time to wait (not a poll: polls come many times a frame, and
+    /// each would send the held batch), part `owe` (0: the newest handed over) owes a flush of what is held once submitted
+    /// (flush_owed_upto), as the caller's own flush before its driver wait may not find it held yet
+    template <class P>
+    bool wait_until(P done, Bound k, uint64_t timeout_ns = UINT64_MAX, uint64_t owe = 0) {
+        if (done()) return true;
+        if (t_prod == this) flush();   // (what it waits for, published)
+        const uint64_t t0 = now_ns();
+        const uint64_t until = timeout_ns > UINT64_MAX - t0 ? UINT64_MAX : t0 + timeout_ns;
+        bool ok = false;
+        const auto over = [&] { return queue_escaped() || now_ns() >= until; };
+        for (uint32_t i = 0; i < 2048 && !(ok = done()) && !((i & 63) == 63 && over()); i++) cpu_pause();
+        if (!ok && !over()) {
+            part_waiters.fetch_add(1, std::memory_order_seq_cst);
+            {
+                std::unique_lock lk(part_mu);
+                while (!(ok = done()) && !over()) {
+                    kick();
+                    part_cv.wait_for(lk, std::chrono::microseconds(500));
+                }
+            }
+            part_waiters.fetch_sub(1, std::memory_order_relaxed);
+        }
+        if (timeout_ns) note_wait(k, now_ns() - t0);
+        if (!ok) ok = done();
+        if (!ok) {
+            if (timeout_ns) {
+                const uint64_t want = owe ? owe : parts_sent.load(std::memory_order_acquire);
+                uint64_t was = flush_owed_upto.load(std::memory_order_relaxed);
+                while (want > was && !flush_owed_upto.compare_exchange_weak(was, want, std::memory_order_acq_rel)) {}
+            }
+            if (queue_escaped()) note_escape(k);
+        }
+        return ok;
+    }
+    /// (parts) part `t` (post_part's number; 0: none) ended and submitted by the recorder, waited for at most timeout_ns
+    bool wait_part(uint64_t t, Bound k = B_PART, uint64_t timeout_ns = UINT64_MAX) {
+        return !t || wait_until([&] { return parts_done.load(std::memory_order_seq_cst) >= t; }, k, timeout_ns, t);
+    }
+    /// (parts) every part handed over so far submitted: what a wait, a fence or the queue's next use may need
+    bool settle_parts(Bound k, uint64_t timeout_ns = UINT64_MAX) {
+        return wait_part(parts_sent.load(std::memory_order_acquire), k, timeout_ns);
     }
     /// (the producer) `need` contiguous-or-not free bytes: waits for the recorder (backpressure) when the ring has less
     void wait_room(uint64_t need) {
@@ -446,6 +615,11 @@ struct Recorder {
     }
     void publish(const Packet* p, const uint8_t* end) {
         w += (uint64_t)(end - reinterpret_cast<const uint8_t*>(p));
+        // ((Triforce) parts: held until the part's end (post_part), or a chunk of a long part: one wake-up a batch, not one a call)
+        if (parts) {
+            if (w - w_pub >= chunk) flush();
+            return;
+        }
         // (the recorder asleep: this packet now, and the wake-up with it, so that it runs while the replay goes on, not at its
         // next wait)
         if (w - w_pub >= batch || sleeping.load(std::memory_order_relaxed)) flush();
@@ -459,8 +633,6 @@ struct Recorder {
 /// ring is commands never to be submitted; it writes nothing else). stop() is the explicit teardown (vkDestroyDevice's boundary).
 /// tests/test_recorder_sync.py: recorder_exit_test.cpp
 inline Recorder& g_rec = *new Recorder;
-/// (THREAD) the ring, while this thread holds replay_mu; null otherwise
-inline constinit thread_local Recorder* t_prod = nullptr;
 
 inline bool Recorder::start() {   // (the producer, its first packet)
     std::lock_guard lk(life_mu);
@@ -485,6 +657,14 @@ inline bool Recorder::start() {   // (the producer, its first packet)
     R.store(at, std::memory_order_release), w = w_pub = r_seen = at, stop_req.store(false);
     batch = std::min(g_publish_bytes, room);
     spin_limit = 0;   // (set by the recorder: g_spin_ns, or adaptive)
+    if (g_idle_wait && (!g_wait_on_address || !g_wake_by_address)) {
+        g_idle_wait = false;
+        ::mkwvk::logf("vk: RX_VK_RECORDER_IDLE=wait: no WaitOnAddress here: the recorder idles with the spin and a condition variable");
+    }
+    parts = g_parts.load(std::memory_order_relaxed);
+    chunk = std::min<uint64_t>(g_chunk_bytes, cap / 4);
+    idle_on_w = g_idle_wait || (parts && g_wait_on_address && g_wake_by_address);
+    parts_done.store(parts_sent.load(std::memory_order_acquire), std::memory_order_seq_cst);   // (none left behind: stop() ran them)
     try {
         th = std::thread([this] { main(); });
     } catch (...) {
@@ -503,7 +683,9 @@ inline void Recorder::stop() {
     if (!th.joinable()) return;
     if (t_prod == this) flush();   // (the producer's own stop: what it wrote, published first)
     const uint64_t target = W.load(std::memory_order_acquire);
-    spin([&] { return idle_at(target); });
+    spin([&] { return idle_at(target) || queue_escaped(); });
+    if (!idle_at(target))   // ((Triforce) parts: the recorder waits for the queue's lock this thread holds: neither can go on)
+        recorder_fatal("stopped (the device destroyed) under the queue's lock, with a part's submit waiting for that lock");
     stop_req.store(true);
     wake();
     th.join();
@@ -513,6 +695,7 @@ inline void Recorder::stop() {
     base = nullptr, cap = 0;
 }
 inline void Recorder::main() {
+    t_recorder = true;
     if (g_thread_start_hook) g_thread_start_hook();
     try {
         loop();
@@ -525,7 +708,9 @@ inline void Recorder::main() {
 /// (the recorder, nothing published to run) spins a while, then sleeps until woken (or 2 ms); false: stop asked and nothing left
 inline bool Recorder::idle(uint64_t r, uint64_t& seen, uint64_t& last_log) {
     const uint64_t t0 = now_ns();
-    if (!spin_limit) spin_limit = g_spin_ns ? g_spin_ns : kSpinHi;   // (fixed, or adaptive from the top)
+    // (fixed, or adaptive from the top; (Triforce) parts: a batch comes at a part's end, the gaps between are a part's translation:
+    // short; RX_VK_RECORDER_IDLE=wait: 20 us)
+    if (!spin_limit) spin_limit = parts ? kPartsSpin : g_idle_wait ? kSpinLo : g_spin_ns ? g_spin_ns : kSpinHi;
     for (uint32_t i = 0;; i++) {
         if ((seen = W.load(std::memory_order_acquire)) != r || stop_req.load(std::memory_order_acquire)) {
             spin_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
@@ -541,7 +726,15 @@ inline bool Recorder::idle(uint64_t r, uint64_t& seen, uint64_t& last_log) {
         last_log = t0;
     }
     const uint64_t s0 = now_ns();
-    {
+    if (idle_on_w) {
+        // ((Triforce) RX_VK_RECORDER_IDLE=wait, or parts: sleeping set before W is compared, and WaitOnAddress returns at once when
+        // W is no longer r: a publish before the wait is not missed. The producer wakes the address only when it saw sleeping set
+        // (flush, kick); a publish that looked before it was set finds the recorder at the 2 ms timeout, or kick() while it waits)
+        sleeping.store(true, std::memory_order_seq_cst);
+        uint64_t compare = r;
+        if (!stop_req.load()) g_wait_on_address(&W, &compare, sizeof compare, 2);
+        sleeping.store(false, std::memory_order_relaxed);
+    } else {
         std::unique_lock lk(sleep_mu);
 #ifdef RX_REC_TEST_HOOKS
         if (g_test_idle_locked) g_test_idle_locked();
@@ -553,7 +746,7 @@ inline bool Recorder::idle(uint64_t r, uint64_t& seen, uint64_t& last_log) {
     seen = W.load(std::memory_order_acquire);
     const uint64_t slept = now_ns() - s0;
     if (slept < kSpinHi) short_sleeps.fetch_add(1, std::memory_order_relaxed);
-    if (!g_spin_ns) {   // (adaptive: a short sleep means a gap the longest spin covers; a long one, a spin to shorten)
+    if (!g_spin_ns && !idle_on_w && !parts) {   // (adaptive: a short sleep means a gap the longest spin covers; a long one, a spin to shorten)
         if (slept < kSpinHi && seen != r) spin_limit = kSpinHi;
         else if (slept >= kSpinHi) spin_limit = std::max(kSpinLo, spin_limit / 2);
     }
@@ -569,6 +762,7 @@ inline void Recorder::loop() {
                 busy_ns.fetch_add(busy, std::memory_order_relaxed), all_busy_ns.fetch_add(busy, std::memory_order_relaxed), busy0 = 0;
             }
             if (n) packets.fetch_add(n, std::memory_order_relaxed), all_packets.fetch_add(n, std::memory_order_relaxed), n = 0;
+            notify_parts();   // ((Triforce) parts: a thread asleep in spin() for R)
             if (!idle(r, seen, last_log)) return;
             continue;
         }
@@ -580,11 +774,19 @@ inline void Recorder::loop() {
             R.store(r, std::memory_order_release);
             continue;
         }
+        const bool part = p->op == OP_PART;
+        const uint64_t p0 = part ? now_ns() : 0;
         p->run(p);
+        if (part) part_ns.fetch_add(now_ns() - p0, std::memory_order_relaxed);
         const size_t len = (size_t)(reinterpret_cast<const uint8_t*>(p->next) - reinterpret_cast<const uint8_t*>(p));
         if (poison) std::memset(base + off, 0xCD, len);
         r += len, n++;
         R.store(r, std::memory_order_release);
+        if (part) {   // ((Triforce) parts: its end and submit made; said after R, so that a slot's wait for it finds R past it)
+            parts_done.store(parts_done.load(std::memory_order_relaxed) + 1, std::memory_order_seq_cst);
+            parts_run.fetch_add(1, std::memory_order_relaxed);
+            notify_parts();
+        }
     }
 }
 inline void Recorder::log_stats(double secs) {
@@ -596,7 +798,16 @@ inline void Recorder::log_stats(double secs) {
     const uint64_t short_slept = short_sleeps.exchange(0, std::memory_order_relaxed);
     const uint64_t pk = packets.exchange(0, std::memory_order_relaxed), busy = busy_ns.exchange(0, std::memory_order_relaxed);
     const uint64_t dr = direct.exchange(0, std::memory_order_relaxed);
-    if (!pk && !tot_n && !dr) return;
+    const uint64_t pr = parts_run.exchange(0, std::memory_order_relaxed), bt = batches.exchange(0, std::memory_order_relaxed);
+    const uint64_t esc = escapes.exchange(0, std::memory_order_relaxed), pns = part_ns.exchange(0, std::memory_order_relaxed);
+    const uint64_t lns = lock_ns.exchange(0, std::memory_order_relaxed), ln = lock_n.exchange(0, std::memory_order_relaxed);
+    if (!pk && !tot_n && !dr && !pr) return;
+    if (pr || esc)   // ((Triforce) parts: what of its busy time was parts' ends and submits, and blocked on the queue's lock)
+        ::mkwvk::logf("vk: recorder, by part (RX_VK_RECORDER_PARTS): %llu parts ended and submitted in %llu batches, %.2f s in their "
+                      "ends and submits, %.2f s of that blocked on the queue's lock (%llu times); %llu waits given up under the "
+                      "queue's lock, the recorder waiting for it",
+                      (unsigned long long)pr, (unsigned long long)bt, pns / 1e9, lns / 1e9, (unsigned long long)ln,
+                      (unsigned long long)esc);
     char top[512];
     size_t at = 0;
     top[0] = 0;
@@ -634,16 +845,90 @@ constexpr bool unordered(Bound k) {
     }
 }
 
+/// ((Triforce) THREAD, RX_VK_RECORDER_PARTS) The ring holds submissions too (a part's end and submit, post_part), so unordered()'s
+/// reason (each submission made after the ring is empty) no longer holds for the waits: a wait for a fence or a timeline value,
+/// and a fence's reset, need the parts handed over before them submitted (settle_parts), and nothing more of the ring: they name
+/// no command buffer or pool. A thread in a Settled scope has waited for what it needs itself and waits for no more
+constexpr bool parts_settle(Bound k) {
+    return k == B_vkWaitForFences || k == B_vkResetFences || k == B_vkWaitSemaphores;
+}
+/// (THREAD, parts) The calls made without any wait: unordered()'s, the query pools' host calls and a mapped allocation's
+/// invalidation. They touch no command buffer; the commands still in the ring are recordings not submitted, so no query they
+/// name is in use on the GPU and no memory they write is written yet, and whatever the caller reads of submitted work its own
+/// wait (on the timeline or a fence, settled) has made sure of
+constexpr bool parts_unordered(Bound k) {
+    return unordered(k) || k == B_vkGetQueryPoolResults || k == B_vkResetQueryPool || k == B_vmaInvalidateAllocation;
+}
+
+/// ((Triforce) THREAD, parts) A recording slot's own calls at its reuse: vk_replay.cpp's begin_recording resets the slot's two
+/// command pools and begins its command buffers, vk_draw.cpp's draw_slot_reset (or draw_begin_recording) resets its descriptor
+/// pool and destroys the extra pools it grew. Nothing still in the ring can name those: the slot's last part was ended and
+/// submitted by the recorder (its ends in the ring), and its submit is done (recording_wait: wait_part, then its fence), so what
+/// the ring holds since is other command buffers' and the new use's own, none from these pools. The calls stay direct, on the
+/// producer: only the wait goes. slot_begin() checks the recorder has run the slot's last end and submit (the ring's position
+/// after them); if not, the calls wait as before. OwnSlot marks the call sites, and only those: every other reset, begin and
+/// destruction still waits (the frame's command buffer, ImGui, NGX, FSR). With the hand-off by part only
+inline constinit thread_local bool t_slot_ready = false, t_own_slot = false;
+constexpr bool own_slot_call(Bound k) {
+    return k == B_vkResetCommandPool || k == B_vkBeginCommandBuffer || k == B_vkResetDescriptorPool || k == B_vkDestroyDescriptorPool;
+}
+/// (the producer) the ring's position after all it has written: at a slot's end, for that slot's next slot_begin()
+inline uint64_t produced() {
+    const Recorder* g = t_prod;
+    return g ? g->w : 0;
+}
+/// (the producer, a slot's reuse, before its own calls) whether OwnSlot may skip the wait for this slot's calls
+inline void slot_begin(uint64_t end_pos) {
+    t_slot_ready = false;
+    if (!g_parts.load(std::memory_order_relaxed) || g_mode.load(std::memory_order_relaxed) != THREAD) return;
+    const Recorder* g = t_prod;
+    if (g && end_pos && g->idle_at(end_pos)) t_slot_ready = true;
+}
+inline void slot_done() { t_slot_ready = false; }
+/// (a slot's own calls, within slot_begin() and slot_done())
+struct OwnSlot {
+    const bool was = t_own_slot;
+    OwnSlot() { t_own_slot = t_slot_ready; }
+    ~OwnSlot() { t_own_slot = was; }
+    OwnSlot(const OwnSlot&) = delete;
+    OwnSlot& operator=(const OwnSlot&) = delete;
+};
+
+/// (THREAD, parts) the longest a boundary's wait for the parts is (a fence or timeline wait, a fence's reset): a part's submit
+/// can wait behind a present holding the queue's lock; past this the call is made, as it was without the recorder
+constexpr uint64_t kSettleNs = 250000000;
+/// ((Triforce) THREAD, RX_VK_RECORDER_PARTS) boundary()'s waits with the hand-off by part. replay_mu's unlock publishes what its
+/// holder wrote and does not wait: the next holder goes on producing after it, and outside a hold the recorder may still be busy,
+/// so a thread without replay_mu waits for what was published before its call (foreign_wait), as the producer does for all it wrote
+inline void boundary_parts(Bound k) {
+    if (k == B_REPLAY_UNLOCK) {
+        if (Recorder* g = t_prod) g->flush();
+        return;
+    }
+    if (parts_settle(k)) {   // (bounded, as every wait is: unmet, the wait itself goes on, and the next part's submit flushes)
+        if (!t_settled) g_rec.settle_parts(k, kSettleNs);
+        return;
+    }
+    if (parts_unordered(k)) return;
+    if (t_own_slot && own_slot_call(k)) return;   // (a slot's own resets: its part waited for, OwnSlot)
+    if (t_settled && (k == B_vkQueuePresentKHR || k == B_vkAcquireNextImageKHR)) return;   // (the present thread: no part named)
+    if (Recorder* g = t_prod) g->wait_idle(k);
+    else g_rec.foreign_wait(k);
+}
+
 /// Before a call that begins, ends or resets command buffers, submits, presents or waits, reads back what the GPU did, or lets go of
 /// what recorded commands use (vk_work.h's second list), and when the replay's lock is let go: the thread's held packets reach the
 /// driver first. DEFER: drained; THREAD: on the producer, waits until the recorder has run all it published (vkDestroyDevice and
-/// vkDestroyInstance: the recorder stopped and joined first); otherwise a relaxed load and a branch
+/// vkDestroyInstance: the recorder stopped and joined first); ((Triforce) RX_VK_RECORDER_PARTS: boundary_parts; the recorder's own
+/// calls, a part's ends and submit, wait for nothing); otherwise a relaxed load and a branch
 inline void boundary(Bound k) {
     const int m = g_mode.load(std::memory_order_relaxed);
     if (m == DEFER) {
         drain();
     } else if (m == THREAD) {
+        if (t_recorder) return;   // ((Triforce) parts: the recorder's own, in the ring's order)
         if (k == B_vkDestroyDevice || k == B_vkDestroyInstance) g_rec.stop();
+        else if (g_parts.load(std::memory_order_relaxed)) boundary_parts(k);
         else if (unordered(k)) return;
         else if (Recorder* g = t_prod) g->wait_idle(k);
     }
@@ -698,8 +983,96 @@ inline void set_mode(int m) {
 
 /// THREAD: the recorder has run what this thread may depend on (the producer: all it published; another thread: what was published)
 inline void settle(Bound k) {
+    if (t_recorder) return;   // ((Triforce) parts: the recorder's own calls, in the ring's order)
     if (Recorder* g = t_prod) g->wait_idle(k);
     else g_rec.foreign_wait();
+}
+
+/// ((Triforce) THREAD, parts) a scope whose waits need nothing more of the recorder (t_settled): the caller waited for what it
+/// needs itself
+struct Settled {
+    Settled() { t_settled++; }
+    ~Settled() { t_settled--; }
+    Settled(const Settled&) = delete;
+    Settled& operator=(const Settled&) = delete;
+};
+/// (THREAD) whether a part's end and submit go to the recorder (post_part): RX_VK_RECORDER_PARTS, with the recorder the mode
+inline bool parts_wanted() { return g_mode.load(std::memory_order_relaxed) == THREAD && g_parts.load(std::memory_order_relaxed); }
+/// (parts, any thread) every part handed over so far submitted by the recorder, at most timeout_ns (none handed over, a Settled
+/// scope, or no hand-off by part: at once). Whether they are
+inline bool settle_parts(Bound k, uint64_t timeout_ns = UINT64_MAX) {
+    if (!parts_wanted() || t_recorder || t_settled) return true;
+    return g_rec.settle_parts(k, timeout_ns);
+}
+/// (parts, any thread) part `ticket` (post_part's number) submitted; 0, or no recorder: at once. Whether it is (false: only
+/// under a queue lock the recorder waits for)
+inline bool wait_part(uint64_t ticket) {
+    return !ticket || !parts_wanted() || t_recorder || g_rec.wait_part(ticket);
+}
+/// (parts, any thread) until done(), at most timeout_ns (less the time waited, on return): a recording's submit the caller knows
+/// by its own number (vk_replay.cpp wait_rec_seq), woken at each part's submit; at once when done() already, or without the
+/// hand-off by part. Whether done()
+template <class P>
+inline bool wait_submitted(P done, uint64_t& timeout_ns) {
+    if (!parts_wanted() || t_recorder) return true;
+    const uint64_t t0 = now_ns();
+    const bool ok = g_rec.wait_until(done, B_PART, timeout_ns);
+    const uint64_t spent = now_ns() - t0;
+    if (timeout_ns != UINT64_MAX) timeout_ns = spent < timeout_ns ? timeout_ns - spent : 0;
+    return ok;
+}
+/// (parts, the recorder's part submit) whether a wait for the parts ended unmet since: what is held is to be sent now, as the
+/// waiter's own flush may have come before this part was held. The recorder asks it for the part it is submitting (parts_done +
+/// 1): owed once that part reaches the waiter's; cleared then, unless a waiter has asked for a later part meanwhile. Another
+/// thread (a part made here) is owed whatever is owed
+inline bool take_flush_owed() {
+    uint64_t upto = g_rec.flush_owed_upto.load(std::memory_order_acquire);
+    if (!upto) return false;
+    const uint64_t cur = t_recorder ? g_rec.parts_done.load(std::memory_order_relaxed) + 1 : UINT64_MAX;
+    if (cur < upto) return false;
+    g_rec.flush_owed_upto.compare_exchange_strong(upto, 0, std::memory_order_acq_rel);
+    return true;
+}
+/// (parts) the recorder's part made on the calling thread instead (no recorder, or the queue's lock held): those that wait for
+/// parts are told
+inline void part_made_here() { g_rec.notify_parts(); }
+/// QueueMutex's events (vk_internal.h: dev.present_mu and the present queue's lock; vk_replay.cpp installs this as
+/// queue_lock_hook). 0: about to lock (not try_lock); 3: the lock is held by another, about to block for it; 1: locked; 2: about
+/// to unlock. settles: the replay's queue's lock (dev.present_mu), the one the recorder takes for a part's submit: a thread about
+/// to take it first waits for the parts handed over to be submitted (the queue's order: its submit, present or idle wait after
+/// them), unless it holds a queue lock already or is Settled. The recorder says it is blocked on the lock (at_queue), and a holder
+/// of present_mu blocked on another queue lock says so (chain_waiters), so that a thread the recorder waits for, through either,
+/// does not wait for it in turn (queue_escaped). Nothing at all without the hand-off by part
+inline void queue_lock_event(int phase, bool settles) {
+    if (!g_parts.load(std::memory_order_relaxed)) return;
+    if (phase == 2) {   // (never below 0: a lock taken before the mode was read)
+        if (t_queue_held > 0) t_queue_held--;
+        if (settles && t_present_held > 0) t_present_held--;
+        return;
+    }
+    if (phase == 1) {
+        t_queue_held++;
+        if (settles) t_present_held++;
+        if (t_recorder && settles) {
+            g_rec.at_queue.store(false, std::memory_order_seq_cst);
+            if (g_rec.lock_t0) {   // (the stats: the time it was blocked on the lock)
+                g_rec.lock_ns.fetch_add(now_ns() - g_rec.lock_t0, std::memory_order_relaxed);
+                g_rec.lock_n.fetch_add(1, std::memory_order_relaxed);
+                g_rec.lock_t0 = 0;
+            }
+        }
+        if (t_chain_wait) t_chain_wait = false, g_rec.chain_waiters.fetch_sub(1, std::memory_order_seq_cst);
+        return;
+    }
+    if (phase == 3) {
+        if (t_recorder && settles) g_rec.lock_t0 = now_ns(), g_rec.at_queue.store(true, std::memory_order_seq_cst), g_rec.notify_parts();
+        else if (!settles && t_present_held && !t_chain_wait) {
+            t_chain_wait = true, g_rec.chain_waiters.fetch_add(1, std::memory_order_seq_cst);
+            g_rec.notify_parts();
+        }
+        return;
+    }
+    if (settles && !t_recorder && !t_queue_held && !t_settled && parts_wanted()) g_rec.settle_parts(B_QUEUE_LOCK);
 }
 
 /// A call that is not packed (a pNext chain, an unknown descriptor type): what is held goes first, then the call itself
@@ -707,7 +1080,7 @@ template <class F>
 inline void fallback(const F& direct) {
     if (g_mode.load(std::memory_order_relaxed) == THREAD) settle(B_FALLBACK);
     else drain();
-    t_arena.fallbacks++;
+    t_arena().fallbacks++;
     direct();
 }
 
@@ -720,6 +1093,34 @@ void thunk_at(const Packet* p) {   // (THREAD: the closure at its offset in the 
     (*reinterpret_cast<const F*>(reinterpret_cast<const uint8_t*>(p) + p->size))();
 }
 
+inline uint8_t* align_up(uint8_t* p, size_t a) { return reinterpret_cast<uint8_t*>(((uintptr_t)p + a - 1) & ~(uintptr_t)(a - 1)); }
+/// ((Triforce) THREAD, RX_VK_RECORDER_PARTS, the producer) A part's end and submit, f (a closure of values: its command buffers'
+/// ends and its queue submit with what the producer chose), into the ring after the part's packets, and every packet published:
+/// the recorder makes them in order and the producer goes on at once. Its number (parts_sent), for wait_part; 0 when it is not
+/// taken (no hand-off by part, no ring, a queue lock held here, a parallel replay's segments): the caller runs f itself, whose
+/// ends wait for the ring as before
+template <class F>
+inline uint64_t post_part(const F& f) {
+    static_assert(std::is_trivially_copyable_v<F> && std::is_trivially_destructible_v<F>, "a packet holds values only");
+    static_assert(alignof(F) <= alignof(Packet), "a closure aligned beyond the header");
+    if (!parts_wanted() || t_queue_held || t_recorder || par_active.load(std::memory_order_relaxed)) return 0;
+    Recorder* g = t_prod;
+    if (!g || (!g->ready.load(std::memory_order_relaxed) && !g->start()) || !g->parts) return 0;
+    uint8_t* lim;
+    Packet* hdr = g->reserve(lim);
+    uint8_t* at = align_up(reinterpret_cast<uint8_t*>(hdr + 1), alignof(Packet));
+    if (at > lim || (size_t)(lim - at) < sizeof(F)) return 0;   // (a few dozen bytes: never, with the room a packet is given)
+    new (static_cast<void*>(at)) F(f);
+    hdr->run = &thunk_at<F>, hdr->op = OP_PART, hdr->size = (uint32_t)(at - reinterpret_cast<uint8_t*>(hdr));
+    uint8_t* end = align_up(at + sizeof(F), alignof(Packet));
+    hdr->next = reinterpret_cast<Packet*>(end);
+    const uint64_t ticket = g->parts_sent.load(std::memory_order_relaxed) + 1;
+    g->parts_sent.store(ticket, std::memory_order_release);
+    g->w += (uint64_t)(end - reinterpret_cast<uint8_t*>(hdr));
+    g->flush();
+    return ticket;
+}
+
 /// One packet being encoded: its copies, then emit() with the closure that makes the call and the direct call. Sync: run at emit, the
 /// arena rewound when the encoder goes out of scope. Defer: held; drained first when the held bytes reached the soft budget, and
 /// made at once (after a drain) while a parallel replay records (par_active: never held then). An allocation that fails (the hard
@@ -728,8 +1129,8 @@ void thunk_at(const Packet* p) {   // (THREAD: the closure at its offset in the 
 /// THREAD, on the producer (the replay lock's holder): the packet is written straight into the ring (header first, then the copies,
 /// then the closure) and published at emit; no room for it (bigger than the room a packet is given) or no ring: the producer waits
 /// until the recorder has run everything published, then makes the call directly. On another thread, or while par_active: the
-/// call made directly (PASS), after what was published has run
-inline uint8_t* align_up(uint8_t* p, size_t a) { return reinterpret_cast<uint8_t*>(((uintptr_t)p + a - 1) & ~(uintptr_t)(a - 1)); }
+/// call made directly (PASS), after what was published has run. ((Triforce) parts: on the recorder thread itself, inside a part's
+/// packet, made directly at once: it is the ring's own place)
 struct Enc {
     int md = mode();
     Arena* a = nullptr;   // (SYNC, DEFER)
@@ -744,7 +1145,7 @@ struct Enc {
             begin_thread();
             return;
         }
-        a = &t_arena;
+        a = &t_arena();
         if (md == DEFER) {
             if (par_active.load(std::memory_order_relaxed)) {
                 drain();
@@ -758,6 +1159,10 @@ struct Enc {
     }
     void begin_thread() {
         g = t_prod;
+        if (t_recorder) [[unlikely]] {   // ((Triforce) parts: in the ring's order already)
+            md = PASS, failed = true;
+            return;
+        }
         if (!g || par_active.load(std::memory_order_relaxed)) [[unlikely]] {
             settle(B_PAR);
             md = PASS, failed = true;

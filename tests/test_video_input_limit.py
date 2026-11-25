@@ -11,7 +11,7 @@ refusal until there is room. HOS_VIDEO_INPUT_LIMIT=<n> sets the limit; 0 takes e
 A decoder left full with its event clear, or a refused last submission, would hang the movie on a black screen, so on
 every system this compiles video_input.h alone and reads the source: the refusal comes before the submission is
 counted, under the decoder's lock, with the event cleared there; every call that ends with the count possibly lower
-(submit, Stop and Flush, the three exits of the acquire) sets the event again before it lets the lock go; a finalize
+(submit, Stop and Flush, the four exits of the acquire) sets the event again before it lets the lock go; a finalize
 leaves it set; the event's clear and its set under a lock take no virtual-core checkpoint; the switch is read once and
 is in the switches table.
 
@@ -195,8 +195,9 @@ def main():
              "a Stop or a Flush does not set the event again before it lets the lock go")
     acquire = vf.block(video, "static void dec_acquire(Ctx *c) {")
     exits = re.findall(r"input_room\(d\);[^\n]*\n\s+ReleaseSRWLockExclusive\(&d->lock\);\n\s+if \(away\) hos_vcore_back\(\);", acquire)
-    vf.check(len(exits) == 3 and acquire.count("if (away) hos_vcore_back();") == 3,
-             "dec_acquire does not look for room before each of its three last unlocks (found %d)" % len(exits))
+    # (four: no free buffer, nothing decoded, the last picture shown again while the next is early, and a picture handed out)
+    vf.check(len(exits) == 4 and acquire.count("if (away) hos_vcore_back();") == 4,
+             "dec_acquire does not look for room before each of its four last unlocks (found %d)" % len(exits))
     final = vf.block(video, "static void dec_finalize(Ctx *c) {")
     vf.check("if (d->ready_clear) hos_system_event_signal(d->ready);" in final, "a finalized decoder can leave its event clear")
     init = vf.block(video, "static void dec_init_sized(Ctx *c, enum AVCodecID id, const char *what, int w, int h) {")

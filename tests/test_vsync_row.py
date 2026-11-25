@@ -88,7 +88,7 @@ int main(int argc, char** argv) {
     for (int v = 0; v < 2; v++) {
         int n = 0;
         while (hn_vsync(v, n)) n++;
-        CHECK(n == 5 && !hn_vsync(v, 5));
+        CHECK(n == 6 && !hn_vsync(v, 6));   /* ((Triforce) 11-24: and Every refresh's line, variant 5) */
     }
     if (!std::strcmp(env, "fifo")) {
         for (int v = 0; v < 2; v++) CHECK(hn_vsync(v, -1) == hn_vsync(v, 3) && std::strstr(hn_vsync(v, -1), "RX_VK_FIFO"));
@@ -133,8 +133,8 @@ def main():
           "present_image does not make the swapchain again when the VSync row changes")
     menu = (vk / "vk_menu.cpp").read_text(encoding="utf-8")
     # ((Triforce, options_version 7) the Graphics tab's Frame rate & latency group)
-    row = re.search(r'\{TAB_GRAPHICS, "VSync", &opts\.vsync, 0, 1, 1, tx_onoff,.*?hn_vsync, false, true\},', menu, re.S)
-    check(row and "Changes at once" in row.group(0), "the VSync row is not an On / Off row of the Graphics tab that changes at once")
+    row = re.search(r'\{TAB_GRAPHICS, "VSync", &opts\.vsync, 0, 2, 1, tx_vsync,.*?hn_vsync, false, true\},', menu, re.S)
+    check(row and "Changes at once" in row.group(0), "the VSync row is not an On / Off / Every refresh row of the Graphics tab that changes at once")
     header = (vk / "vk_menu.h").read_text(encoding="utf-8")
     check(re.search(r"\bint vsync = 1;", header), "VSync is not on by default: the present mode would not be the one from before the row")
     readme = (ROOT / "readme.md").read_text(encoding="utf-8")

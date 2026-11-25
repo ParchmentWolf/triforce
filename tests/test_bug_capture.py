@@ -129,8 +129,18 @@ def check_sources():
     check("!(host && host->take_key_press) && (GetAsyncKeyState(VK_F8) & 0x8000) != 0" in tick and "share_ask.store(HOS_SHARE_CAPTURE_KEY" in tick,
           "where the window has no key handler of the host's (Linux) F8 is not read")
     check("share_notice_new.exchange(false" in tick and "share_lines[HOS_SHARE_NOTICE].c_str()" in tick, "the host's line for the foot of the screen is not shown")
-    for needle in ("| Bug capture (F8) |", "**F8**", "captures", "capture.txt", "frame.png", "log-tail.txt"):
+    for needle in ("| Bug capture (F8) |", "**F8**", "captures", "capture.txt", "frame.png", "log-tail.txt", "triforce_log.1.txt"):
         check(needle in readme, "readme.md does not say %r of the bug capture" % needle)
+    # ((Triforce) 11-24) the options changed from the defaults: the menu's rows, from the capture's thread, a byte a question
+    check("enum { HOS_OPT_BUG_SETTINGS = 286 };" in api, "HOS_OPT_BUG_SETTINGS is not 286, the bug capture's own id")
+    check("if (id == HOS_OPT_BUG_SETTINGS) return menu_take_bug_settings();" in option, "the host cannot read the options changed")
+    check("if (id == HOS_OPT_BUG_SETTINGS) {" in sets and "menu_bug_settings_begin();" in sets, "the host cannot ask for the options changed")
+    rows = block(menu, "std::string changed_rows_text() {")
+    check("static const Options defaults{};" in rows and "restart_inert(r)" in rows and '"a microphone by its name"' in rows,
+          "the options changed are not compared with the built-in defaults, show the Custom size's inert sides, or name a microphone")
+    # nothing is sent anywhere and nothing is opened: no address, no browser, no network
+    for word in ("http", "ShellExecute", "xdg-open", "socket(", "WinHttp", "InternetOpen", "curl"):
+        check(word not in capture, "host/bug_capture.c names %r: a capture is written on this PC only" % word)
 
 
 def run_pixels(cxx, tmp):
@@ -147,10 +157,10 @@ def folders(g):
     return sorted(p for p in d.iterdir() if p.is_dir()) if d.is_dir() else []
 
 
-def read_capture(g, folder, out, save_tag, picture, place=True, trigger="F8"):
+def read_capture(g, folder, out, save_tag, picture, place=True, trigger="F8", settings=True):
     """one capture's folder, whole: its files and what capture.txt says"""
     check(re.fullmatch(r"\d{8}-\d{6}(-\d+)?", folder.name), "the capture's folder is named " + folder.name)
-    want = {"capture.txt", "triforce_options.ini", "log-tail.txt"} | ({"frame.png"} if picture else set())
+    want = {"capture.txt", "triforce_options.ini", "log-tail.txt", "triforce_log.1.txt"} | ({"frame.png"} if picture else set())
     names = {p.name for p in folder.iterdir()}
     zips = [n for n in names if n.endswith(".zip")]
     check(names - set(zips) == want and len(zips) == 1 and re.fullmatch(r"Triforce-save-\d{8}-\d{6}\.zip", zips[0]), "%s holds %r" % (folder.name, sorted(names)))
@@ -189,6 +199,23 @@ def read_capture(g, folder, out, save_tag, picture, place=True, trigger="F8"):
     else:
         check("place = not known" in text, "capture.txt names a place nobody said:\n" + text)
     check(("picture = frame.png" in text) == picture and ("picture = none" in text) != picture, "capture.txt on its picture:\n" + text)
+    # ((Triforce) 11-24) the PC, the run before's log, the first sign of trouble, the options changed, the switches set
+    check(re.search(r"\ncpu = .+ \(\d+ threads\), \d+ GB\n", text) and re.search(r"\nsystem = Windows", text), "capture.txt on the CPU, RAM and system:\n" + text)
+    check((folder / "triforce_log.1.txt").read_bytes() == (g.dir / "triforce_log.1.txt").read_bytes(), "the run before's log is not copied as it is")
+    check(re.search(r"\nlog before = triforce_log\.1\.txt \(the run before's log: triforce v0\.3\.9-test \(source 89abcdef\), last written "
+                    r"\d{4}-\d\d-\d\d \d\d:\d\d, 0\.0 MB\)\n", text), "capture.txt on the run before's log:\n" + text)
+    check("\ntrouble = none in this run's log" in text and "\ntrouble before = CRASH: exception 0xc0000005 (write 0x8, guest 0x8)\n" in text,
+          "capture.txt on the first sign of trouble:\n" + text)
+    if settings:
+        check("\noptions changed from the defaults (as the Insert menu shows them; triforce_options.ini has them all):\n"
+              "  Field of view: 110% (default: 100%)\n  Text size: 125% (default: Off)\n" in text, "capture.txt on the options changed:\n" + text)
+    else:
+        check("\noptions changed from the defaults = not known" in text, "capture.txt names options changed a renderer did not say:\n" + text)
+    switches = re.search(r"\nswitches set = (\d+) \(the environment[^\n]*\n((?:  [^\n]*\n)*)", text)
+    check(switches and int(switches.group(1)) == switches.group(2).count("\n"), "capture.txt on the switches:\n" + text)
+    lines = switches.group(2).splitlines()
+    check("  HOS_LOG_REDACT=0" in lines and "  HOS_SAVE_EXPORT_DIR=(value left out)" in lines and lines == sorted(lines),
+          "capture.txt's switches: a number not written, a folder written, or not in order: %r" % lines)
     return text
 
 
@@ -198,6 +225,14 @@ def main():
     p.add_argument("--cxx", default="g++")
     a = p.parse_args()
     check_sources()
+    # ((Triforce) 11-24: log-tail.txt is written without the player's home folder and user name (host/log_redact.h), and this
+    # check's game folders are in the temporary folder, under the home folder: the copy is compared with the log as it is,
+    # so the redaction is off for these runs. tests/test_log_redact.py has the redaction itself, and that the capture calls it)
+    plain_run = share.Game.run   # (its runs take no HOS_ variable from here: handed over with each)
+
+    def run_as_it_is(self, *args, env=None, ok=True):
+        return plain_run(self, *args, env=dict({"HOS_LOG_REDACT": "0"}, **(env or {})), ok=ok)
+    share.Game.run = run_as_it_is
     cc, cxx = shutil.which(a.cc) or shutil.which("gcc") or shutil.which("clang"), shutil.which(a.cxx) or shutil.which("g++") or shutil.which("clang++")
     if not cxx:
         print("skip: no C++ compiler; the sources were checked")
@@ -217,12 +252,23 @@ def main():
                 "[hos host] vk: vendor fixes for NVIDIA (621.01): out-of-bounds texel fetches 0 0, NaN tests by bits 0, gather offset 0",
                 "[hos host] vk: Some GPU 9000, Vulkan 1.4, driver 0x9b404000; mesh shaders yes, host memory import yes, pipeline libraries yes"]
         (g.dir / "triforce_log.txt").write_bytes(("\n".join(head + ["[hos host] line %d of the run" % i for i in range(1000)]) + "\n").encode())
+        # ((Triforce) 11-24) the run before's, which crashed
+        (g.dir / "triforce_log.1.txt").write_bytes(b"[hos host] triforce v0.3.9-test (source 89abcdef)\r\n[hos host] a line of the run before\r\n"
+                                                    b"[hos Main] CRASH: exception 0xc0000005 (write 0x8, guest 0x8)\r\n[hos Main] CRASH: thread Main\r\n")
         g.run("play", "v1")
         check(share.tag_of(g.save) == "v1", "the fixture's save")
 
-        # F8 in play
-        out = g.run("capture", "picture")
+        # F8 in play; the switches' values: what is written and what is left out
+        out = g.run("capture", "picture", env={"RX_TEST_SIZE": "1920x1080", "RX_TEST_RATE": "-1.5", "RX_TEST_WORD": "Yes", "RX_TEST_TOKEN": "5",
+                                               "RX_TEST_LONG": "1234567890123", "RX_TEST_NAME": "C:\\Users\\Ann", "RX_TEST_MINUS_SIZE": "-1x2",
+                                               "VK_INSTANCE_LAYERS": "VK_LAYER_x", "NOT_A_SWITCH": "1"})
         made = folders(g)
+        text = (made[0] / "capture.txt").read_text(encoding="utf-8") if made else ""
+        for line, shown in (("  RX_TEST_SIZE=1920x1080", True), ("  RX_TEST_RATE=-1.5", True), ("  RX_TEST_WORD=Yes", True),
+                            ("  RX_TEST_TOKEN=(value left out)", True), ("  RX_TEST_LONG=(value left out)", True),
+                            ("  RX_TEST_NAME=(value left out)", True), ("  RX_TEST_MINUS_SIZE=(value left out)", True),
+                            ("  VK_INSTANCE_LAYERS=(value left out)", True), ("NOT_A_SWITCH", False), ("C:\\Users\\Ann", False)):
+            check((line in text) == shown, "capture.txt's switches on %r:\n%s" % (line, text))
         check(len(made) == 1, "F8 made %d capture folders:\n%s" % (len(made), out))
         check("where asked 1" in out and out.splitlines().count("shot asked") == 1 and "log: capture: F8 again: skipped" in out, "the press:\n" + out)
         row = g.said(out, share_capture_row())
@@ -237,7 +283,7 @@ def main():
         out = g.run("capture", "nopicture")
         made = folders(g)
         check(len(made) == 2 and "without a picture" in g.said(out, share_capture_row()), "a capture without a picture:\n" + out)
-        text = read_capture(g, made[1], out, "v1", picture=False)
+        text = read_capture(g, made[1], out, "v1", picture=False, settings=False)
         check("the renderer could not read the window's picture" in text, "capture.txt on a picture the renderer could not take:\n" + text)
         out = g.run("capture", "noframes")
         made = folders(g)

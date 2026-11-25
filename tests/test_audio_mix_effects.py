@@ -5,7 +5,8 @@ The "Volcano eruption audio bugged" ticket: the game's AddBiquadFilter, AddDelay
 SetSplitterBiquadFilterParameter were import stubs, so what it routes through them played unfiltered and too loud.
 Checked: a low pass passes a low tone and takes a high one down, a delay's echo lands at the delay time and decays by
 the feedback gain, the channel spread moves the echo to the other channel, the plain reverb adds a tail on top of the
-dry signal, a splitter destination's filter reaches the voice's mix through render_voice, and with
+dry signal, a splitter destination's filter reaches the voice's mix through render_voice with a history of each
+voice's own (a second voice through the same splitter does not hear the first one's), and with
 HOS_AUDIO_EFFECTS=0 every sample is left as it was. No game, SDK or output device is used.
 """
 import argparse
@@ -53,9 +54,19 @@ static void release_wb(Voice *voice, uint64_t buffer) { (void)voice; (void)buffe
     actual.extend(helper.block(source, marker) for marker in (
         "static void put_handle(", "static int get_handle(", "static float farg(", "static int mix_index(",
         "static Mix *mix_of(", "static int splitter_index(", "static Splitter *splitter_of("))
-    actual.extend([queue, helper.block(source, "static void apply("), helper.block(source, "static void submit("),
-                   helper.block(source, "static void commit("), effects,
+    # (the effects before the update queue, as in the file: apply names the Aux effects)
+    actual.extend([effects, queue, helper.block(source, "static void apply("), helper.block(source, "static void submit("),
+                   helper.block(source, "static void commit("),
                    "static int next_source_frame(Voice *v);   /* (the fixture's tone) */",
+                   """/* ((Triforce) the controller speaker (host/pad_speaker.c, host/audio_source.h), off: nothing classed, nothing sent */
+enum { AUDIO_SOURCE_NONE, AUDIO_SOURCE_NAVI_VOICE, AUDIO_SOURCE_NAVI_SOUND, AUDIO_SOURCE_TARGET, AUDIO_SOURCE_OCARINA };
+enum { HOS_PAD_SPEAKER_OFF = 0, HOS_PAD_SPEAKER_ONLY = 1, HOS_PAD_SPEAKER_BOTH = 2 };
+static int hos_pad_speaker_active(void) { return 0; }
+static int speaker_on, tv_delay;
+static int hos_pad_speaker_mode(int cls) { (void)cls; return HOS_PAD_SPEAKER_OFF; }
+static void hos_pad_speaker_ocarina_seen(void) {}
+static void speaker_voice(const Voice *v, float out[][FRAME], const int *pad) { (void)v, (void)out, (void)pad; }
+static float (*tv_stage(int mi))[FRAME] { (void)mi; return NULL; }""",
                    helper.block(source, "static void render_voice("),
                    helper.block(source, "static void set_split_biquad("),
                    helper.block(source, "HLE(" + SPLIT_BIQUAD + ")"), setters])

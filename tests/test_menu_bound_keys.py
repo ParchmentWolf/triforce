@@ -54,6 +54,7 @@ FIXTURE = r'''#include <cstdint>
 #include <cstdlib>
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); std::exit(1); } } while (0)
 @ENUMS@
+static int hos_pad_bindable(int p) { return (p >= 0 && p < HOS_PAD_N) || (p >= 26 && p <= 29); }   // (vk_api.h: the paddles too)
 enum {
     VK_INSERT = 0x2d, VK_UP = 0x26, VK_DOWN = 0x28, VK_LEFT = 0x25, VK_RIGHT = 0x27, VK_ESCAPE = 0x1b, VK_F1 = 0x70,
     VK_RETURN = 0x0d, VK_DELETE = 0x2e, VK_BACK = 8, VK_TAB = 9, VK_PRIOR = 0x21, VK_NEXT = 0x22, VK_HOME = 0x24,
@@ -281,7 +282,7 @@ def main():
           "the game's tab does not take its keys from the tick's reading")
 
     begin = tick.index("    bool bound_go[3] = {}, game_lr[2] = {};")
-    end_mark = "if (p >= 0 && p < HOS_PAD_N && !own && pad(p)) (side ? tab_right : tab_left) = true;\n        }\n    }\n"
+    end_mark = "if (hos_pad_bindable(p) && !own && pad(p)) (side ? tab_right : tab_left) = true;\n        }\n    }\n"
     end = tick.index(end_mark, begin) + len(end_mark)
     tracker = tick[begin:end]
     check("if (!menu_mods_typing()) tab_left |= bound_go[0], tab_right |= bound_go[1], press[5] |= bound_go[2];" in tracker,

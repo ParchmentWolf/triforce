@@ -262,7 +262,83 @@ static void test_game(void) {
     }
 }
 
+/* ((Triforce) a Flipper Zero NFC file of the tag: its pages as text; the same figure as the tag's bytes */
+static size_t flipper_text(char *out, size_t cap, int pages, int unread_page) {
+    uint8_t d[540];
+    tag_dump(d, sizeof d);
+    size_t o = (size_t)snprintf(out, cap, "Filetype: Flipper NFC device\nVersion: 4\nDevice type: NTAG/Ultralight\nUID: 04 A1\nPages total: 135\n");
+    for (int p = 0; p < pages && o < cap; p++) {
+        if (p == unread_page) o += (size_t)snprintf(out + o, cap - o, "Page %d: ?? ?? ?? ??\n", p);
+        else o += (size_t)snprintf(out + o, cap - o, "Page %d: %02X %02X %02X %02x\n", p, d[4 * p], d[4 * p + 1], d[4 * p + 2], d[4 * p + 3]);
+    }
+    return o;
+}
+static void test_flipper(void) {
+    static char text[8192];
+    uint8_t pages[540], d[540];
+    AmiiboTag t;
+    tag_dump(d, sizeof d);
+    size_t n = flipper_text(text, sizeof text, 135, -1);
+    char *g = (char *)guarded(n);
+    memcpy(g, text, n);   /* (no 0 at its end, and a read past it stops the test) */
+    CHECK(amiibo_flipper(g, n, pages) == 540 && !memcmp(pages, d, 540), "a Flipper NFC file's pages are not the tag's bytes");
+    CHECK(amiibo_parse(pages, 540, &t) == AMIIBO_OK && !memcmp(t.uid, kUid, 7) && !memcmp(t.model, kModel, 8), "a Flipper NFC file's figure is not taken");
+    for (size_t cut = 0; cut < n; cut += 97) amiibo_flipper(g + n - cut, cut, pages);   /* (cut short anywhere: no read past it) */
+    n = flipper_text(text, sizeof text, 135, 22);   /* (page 22, the end of the figure's bytes, unread: no figure there) */
+    CHECK(amiibo_flipper(text, n, pages) == 540 && amiibo_parse(pages, 540, &t) == AMIIBO_NOT_A_FIGURE, "an unread page is read");
+    n = flipper_text(text, sizeof text, 120, -1);
+    CHECK(amiibo_flipper(text, n, pages) == 0, "a Flipper NFC file of another tag (120 pages) is taken");
+    CHECK(amiibo_flipper("Filetype", 8, pages) == 0 && amiibo_flipper((const char *)d, sizeof d, pages) == 0, "a tag's bytes are read as text");
+}
+
+/* ((Triforce) the application area: made, opened by its game, kept across a lift, written out only when made or flushed */
+static void test_area(void) {
+    const int64_t ms = 1000000;
+    uint8_t model[NFP_MODEL_INFO_SIZE], out[NFP_AREA_SIZE + 8], file[NFP_AREA_FILE], data[300];
+    uint64_t size = 0;
+    int save = 7;
+    Nfp n;
+    nfp_reset(&n);
+    const AmiiboTag t = figure();
+    nfp_choose(&n, &t);
+    CHECK(nfp_area_open(&n, 0, 1 * ms, 0x1234) == NFP_WRONG_STATE && nfp_flush(&n, 0, 1 * ms, &save) == NFP_WRONG_STATE && !save,
+          "the area answers with no figure mounted");
+    nfp_start(&n, 0, 2 * ms), nfp_mount(&n, 0, 3 * ms), nfp_model_info(&n, 0, 3 * ms, model);
+    CHECK(nfp_area_open(&n, 0, 4 * ms, 0x1234) == NFP_AREA_NEEDS_CREATE, "a figure with no area opens one");
+    CHECK(nfp_area_get(&n, 0, 4 * ms, out, sizeof out, &size) == NFP_WRONG_STATE, "an area not opened is read");
+    for (int i = 0; i < (int)sizeof data; i++) data[i] = (uint8_t)(i + 1);
+    CHECK(nfp_area_create(&n, 0, 5 * ms, 0x1234, data, 3, 0, &save) == 0 && save == 1, "the area is not made, or not written out");
+    CHECK(nfp_area_create(&n, 0, 5 * ms, 0x1234, data, 3, 0, &save) == NFP_AREA_EXISTS && !save, "an area is made twice");
+    memset(out, 0xee, sizeof out);
+    CHECK(nfp_area_get(&n, 0, 6 * ms, out, sizeof out, &size) == 0 && size == NFP_AREA_SIZE && out[0] == 1 && out[2] == 3 && !out[3] &&
+          out[NFP_AREA_SIZE] == 0xee, "the area's first data is not what the game gave, or more than the area is written");
+    CHECK(nfp_area_set(&n, 0, 7 * ms, data, sizeof data) == 0 && nfp_area_get(&n, 0, 7 * ms, out, 4, &size) == 0 && out[3] == 4 &&
+          n.area.data[NFP_AREA_SIZE - 1] == (uint8_t)NFP_AREA_SIZE, "a set area is not the game's data, cut to its size");
+    CHECK(nfp_flush(&n, 0, 8 * ms, &save) == 0 && save == 1, "Flush does not write the area out");
+    CHECK(nfp_state(&n, 0, 8 * ms + NFP_HOLD_NS - 1) == NFP_MOUNT, "the figure is lifted off while the game uses its area");
+    amiibo_area_bytes(&n.area, file);
+    CHECK(nfp_state(&n, 0, 9 * ms + NFP_HOLD_NS) == NFP_DEACTIVE && !n.area.open, "the area stays open after the figure is lifted off");
+    NfpArea back;
+    memset(&back, 0, sizeof back);
+    CHECK(amiibo_area_parse(file, sizeof file, &back) && back.there && !back.open && back.id == 0x1234 && !memcmp(back.data, n.area.data, NFP_AREA_SIZE),
+          "the area's file does not give the area back");
+    CHECK(!amiibo_area_parse(file, sizeof file - 1, &back) && !amiibo_area_parse(data, sizeof file, &back), "a file that is not an area's is taken");
+    /* another game's ID; the same figure chosen again with its file */
+    nfp_choose(&n, &t);
+    CHECK(!n.area.there, "another choice keeps the last figure's area");
+    amiibo_area_parse(file, sizeof file, &n.area);
+    nfp_stop(&n, 0), nfp_start(&n, 0, 20 * ms), nfp_mount(&n, 0, 20 * ms);
+    CHECK(nfp_area_open(&n, 0, 21 * ms, 0x9999) == NFP_WRONG_ACCESS_ID && nfp_area_open(&n, 0, 21 * ms, 0x1234) == 0, "the access ID is not checked");
+    CHECK(nfp_area_create(&n, 0, 22 * ms, 0x9999, NULL, 0, 1, &save) == 0 && save && n.area.id == 0x9999 && !n.area.data[0],
+          "Recreate does not make the area anew");
+    char name[20];
+    amiibo_area_name(&t, name);
+    CHECK(!strcmp(name, "04a1b2c3d4e5f6.area") && amiibo_name_ok(name), "the area's file is not named by the serial number");
+}
+
 int main(void) {
+    test_flipper();
+    test_area();
     test_parse();
     test_infos();
     test_names();

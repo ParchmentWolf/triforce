@@ -105,6 +105,11 @@ Id EmitFPMul16(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
 }
 
 Id EmitFPMul32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
+    // ((Triforce) mma_layout.h mesh_fallback_strict_fmul: a * b as fma(a, b, -0.0), the same value to the last bit, which
+    // AMD's older Windows compiler does not take apart)
+    if (ctx.mesh_fallback && mesh_fallback_strict_fmul && inst->Flags<IR::FpControl>().no_contraction) {
+        return Decorate(ctx, inst, ctx.OpFma(ctx.F32[1], a, b, ctx.Const(-0.0f)));
+    }
     return Decorate(ctx, inst, ctx.OpFMul(ctx.F32[1], a, b));
 }
 

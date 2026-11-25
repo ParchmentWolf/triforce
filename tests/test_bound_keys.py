@@ -45,6 +45,7 @@ PRELUDE = r"""
 #include <string.h>
 #include <stdint.h>
 #include "vk_api.h"
+#include "../../host/hold_toggle.h"   /* ((Triforce) 11-24: hold-to-toggle's latch, beside the bindings) */
 typedef long LONG;
 typedef unsigned long DWORD;
 #define VK_LBUTTON 0x01
@@ -99,13 +100,29 @@ int main(int argc, char **argv) {
     CHECK(bound_down(HOS_KEY_CAM_LEFT, 0));
     /* the mouse's left button: held when the capture begins, it counts only after it was let go */
     release(), held[VK_LBUTTON] = 1;
-    mouse_buttons_arm(1);
+    mouse_buttons_arm(1, 0);
     CHECK(!bound_down(HOS_SW_Y, 1));
-    release(), mouse_buttons_arm(1), held[VK_LBUTTON] = 1, mouse_buttons_arm(1);
+    release(), mouse_buttons_arm(1, 0), held[VK_LBUTTON] = 1, mouse_buttons_arm(1, 0);
     CHECK(bound_down(HOS_SW_Y, 1));
     CHECK(!bound_down(HOS_SW_Y, 0));   /* not while the mouse is not captured */
-    mouse_buttons_arm(0);
+    mouse_buttons_arm(0, 0);
     CHECK(!bound_down(HOS_SW_Y, 1));   /* a new capture arms again */
+    /* one of the game's menus has the mouse: the side buttons stay their controls', the other three are its clicks */
+    hos_bind(HOS_BIND_KEY, HOS_SW_B, 1, VK_XBUTTON1), hos_bind(HOS_BIND_KEY, HOS_SW_X, 1, VK_XBUTTON2);
+    hos_bind(HOS_BIND_KEY, HOS_SW_R, 1, VK_MBUTTON);
+    release(), mouse_buttons_arm(0, 1);
+    held[VK_LBUTTON] = held[VK_RBUTTON] = held[VK_MBUTTON] = held[VK_XBUTTON1] = held[VK_XBUTTON2] = 1;
+    mouse_buttons_arm(0, 1);
+    CHECK(bound_down(HOS_SW_B, 1) && bound_down(HOS_SW_X, 1));
+    CHECK(!bound_down(HOS_SW_Y, 1) && !bound_down(HOS_SW_ZL, 1) && !bound_down(HOS_SW_R, 1));
+    mouse_buttons_arm(0, 0);           /* the menu closed and the mouse is free: no longer */
+    CHECK(!bound_down(HOS_SW_B, 1));
+    mouse_buttons_arm(0, 1);           /* held as the next menu opens: only after it was let go */
+    CHECK(!bound_down(HOS_SW_B, 1));
+    release(), mouse_buttons_arm(0, 1), held[VK_XBUTTON1] = 1, mouse_buttons_arm(1, 0), mouse_buttons_arm(0, 1);
+    CHECK(bound_down(HOS_SW_B, 1));    /* from the menu into play and back, held: one press */
+    hos_bind(HOS_BIND_KEY, HOS_SW_B, 1, 0), hos_bind(HOS_BIND_KEY, HOS_SW_X, 1, 0), hos_bind(HOS_BIND_KEY, HOS_SW_R, 1, 0);
+    release(), mouse_buttons_arm(0, 0);
     /* a key bound to a keys-only control is taken from the button that had it */
     hos_bind(HOS_BIND_KEY, HOS_KEY_CAM_UP, 0, 'E');
     CHECK(hos_binding(HOS_BIND_KEY, HOS_SW_A, 0) == 0 && hos_binding(HOS_BIND_KEY, HOS_KEY_CAM_UP, 0) == 'E');
@@ -121,16 +138,59 @@ int main(int argc, char **argv) {
     walk_vk = VK_SHIFT;
     CHECK(!bound_down(HOS_SW_B, 0) && bound_down(HOS_SW_X, 0));
     CHECK(hos_binding(HOS_BIND_KEY, HOS_SW_B, 0) == VK_SHIFT);
-    walk_vk = VK_TAB;   /* (one of a control's two keys: the other still presses it) */
-    release(), held[VK_TAB] = 1;
-    CHECK(!bound_down(HOS_SW_PLUS, 0));
-    release(), held[VK_RETURN] = 1;
-    CHECK(bound_down(HOS_SW_PLUS, 0));
+    walk_vk = 'X';   /* (one of a control's two keys: the other still presses it) */
+    release(), held['X'] = 1;
+    CHECK(!bound_down(HOS_SW_ZR, 0));
+    release(), held['F'] = 1;
+    CHECK(bound_down(HOS_SW_ZR, 0));
     walk_vk = 0;
+    /* (Plus is Tab alone: Enter, which controller software sends for a pad's A, presses nothing) */
+    release(), held[VK_RETURN] = 1;
+    for (int i = 0; i < HOS_KEY_N; i++) CHECK(!bound_down(i, 0));
+    CHECK(hos_binding(HOS_BIND_KEY, HOS_SW_PLUS, 0) == VK_TAB && hos_binding(HOS_BIND_KEY, HOS_SW_PLUS, 1) == 0);
     release(), held[VK_SHIFT] = held[VK_TAB] = 1;
     CHECK(bound_down(HOS_SW_B, 0) && bound_down(HOS_SW_PLUS, 0));
+    /* ((Triforce) 11-24) a Switch button's two gamepad inputs, Input 1 and Input 2: the file's pad_a=1,26 (the east face
+       button and a rear paddle), an old single one (pad_b), a second that is no input (pad_x); either presses the button */
+    const uint64_t face = 1ULL << HOS_PAD_EAST, paddle = 1ULL << HOS_PAD_RPADDLE1, a = 1ULL << HOS_SW_A;
+    CHECK(hos_binding(HOS_BIND_PAD, HOS_SW_A, 0) == HOS_PAD_EAST && hos_binding(HOS_BIND_PAD, HOS_SW_A, 1) == HOS_PAD_RPADDLE1);
+    CHECK(hos_binding(HOS_BIND_PAD, HOS_SW_B, 1) == -1 && hos_binding(HOS_BIND_PAD, HOS_SW_X, 1) == -1);
+    CHECK(bound_pad_buttons(face) == a && bound_pad_buttons(paddle) == a && bound_pad_buttons(face | paddle) == a);
+    CHECK(bound_pad_buttons(1ULL << HOS_PAD_TOUCHPAD) == 0 && bound_pad_buttons(1ULL << HOS_PAD_LS_UP) == 0);
+    hos_bind(HOS_BIND_PAD, HOS_SW_B, 1, HOS_PAD_RPADDLE1);   /* (taken from A's Input 2: A keeps its Input 1) */
+    CHECK(hos_binding(HOS_BIND_PAD, HOS_SW_A, 1) == -1 && bound_pad_buttons(paddle) == 1ULL << HOS_SW_B && bound_pad_buttons(face) == a);
+    hos_bind(HOS_BIND_PAD, HOS_SW_B, 1, -1);
+    CHECK(bound_pad_buttons(paddle) == 0 && bound_pad_buttons(face) == a);
+    hos_bind(HOS_BIND_PAD, HOS_SW_A, 1, HOS_PAD_RPADDLE1);
+    const int y0 = hos_binding(HOS_BIND_PAD, HOS_SW_Y, 0);   /* (another button's only input into an empty Input 2: refused) */
+    hos_bind(HOS_BIND_PAD, HOS_SW_B, 1, y0);
+    CHECK(hos_binding(HOS_BIND_PAD, HOS_SW_B, 1) == -1 && hos_binding(HOS_BIND_PAD, HOS_SW_Y, 0) == y0);
+    hos_bind(HOS_BIND_PAD, HOS_SW_B, 1, HOS_PAD_EAST);   /* (from a button with an Input 2: taken, its Input 2 moves up) */
+    CHECK(hos_binding(HOS_BIND_PAD, HOS_SW_B, 1) == HOS_PAD_EAST);
+    CHECK(hos_binding(HOS_BIND_PAD, HOS_SW_A, 0) == HOS_PAD_RPADDLE1 && hos_binding(HOS_BIND_PAD, HOS_SW_A, 1) == -1);
     hos_bind(HOS_BIND_KEY, -1, 0, 0);
     CHECK(hos_binding(HOS_BIND_KEY, HOS_KEY_MOVE_UP, 0) == 'W' && hos_binding(HOS_BIND_KEY, HOS_SW_A, 0) == 'E');
+    CHECK(hos_binding(HOS_BIND_PAD, HOS_SW_A, 1) == -1 && hos_binding(HOS_BIND_PAD, HOS_SW_B, 1) == -1);
+    /* ((Triforce) the Controls page's per-control reset and confirmed rebinds: a key another control has, asked about (nothing
+       changed), then taken; a reset refused while another control has a default, made once it does not; a gamepad input
+       another button has, asked about, then traded as hos_bind trades it */
+    uint64_t conflicts = 0;
+    CHECK(hos_binding_is_default(HOS_SW_A) && hos_binding_is_default(HOS_KEY_MOVE_UP));
+    CHECK(!hos_rebind_control(HOS_BIND_KEY, HOS_SW_A, 0, 'W', 0, &conflicts) && conflicts == 1ULL << HOS_KEY_MOVE_UP);
+    CHECK(hos_binding(HOS_BIND_KEY, HOS_SW_A, 0) == 'E' && hos_binding(HOS_BIND_KEY, HOS_KEY_MOVE_UP, 0) == 'W');
+    CHECK(hos_rebind_control(HOS_BIND_KEY, HOS_SW_A, 0, 'W', conflicts, &conflicts));
+    CHECK(hos_binding(HOS_BIND_KEY, HOS_SW_A, 0) == 'W' && hos_binding(HOS_BIND_KEY, HOS_KEY_MOVE_UP, 0) == 0);
+    CHECK(!hos_binding_is_default(HOS_SW_A) && !hos_binding_is_default(HOS_KEY_MOVE_UP));
+    CHECK(!hos_reset_binding(HOS_KEY_MOVE_UP) && hos_binding(HOS_BIND_KEY, HOS_KEY_MOVE_UP, 0) == 0);
+    CHECK(hos_reset_binding(HOS_SW_A) && hos_binding(HOS_BIND_KEY, HOS_SW_A, 0) == 'E' && hos_binding_is_default(HOS_SW_A));
+    CHECK(hos_reset_binding(HOS_KEY_MOVE_UP) && hos_binding_is_default(HOS_KEY_MOVE_UP));
+    CHECK(!hos_rebind_control(HOS_BIND_PAD, HOS_SW_A, 0, HOS_PAD_SOUTH, 0, &conflicts) && conflicts == 1ULL << HOS_SW_B);
+    CHECK(hos_binding(HOS_BIND_PAD, HOS_SW_A, 0) == HOS_PAD_EAST);
+    CHECK(hos_rebind_control(HOS_BIND_PAD, HOS_SW_A, 0, HOS_PAD_SOUTH, conflicts, &conflicts));
+    CHECK(hos_binding(HOS_BIND_PAD, HOS_SW_A, 0) == HOS_PAD_SOUTH && hos_binding(HOS_BIND_PAD, HOS_SW_B, 0) == HOS_PAD_EAST);
+    CHECK(!hos_binding_is_default(HOS_SW_B) && !hos_reset_binding(HOS_SW_B) && !hos_reset_binding(HOS_SW_A));   /* (each has the other's) */
+    hos_bind(HOS_BIND_PAD, HOS_SW_A, 0, -1);   /* (cleared: B's default is free) */
+    CHECK(hos_reset_binding(HOS_SW_B) && hos_reset_binding(HOS_SW_A) && hos_binding_is_default(HOS_SW_A) && hos_binding_is_default(HOS_SW_B));
     if (!fails) printf("PASS\n");
     return fails != 0;
 }
@@ -144,8 +204,10 @@ class BoundKeysTests(unittest.TestCase):
             self.skipTest("no C compiler")
         hid = (ROOT / "host" / "nn_hid.c").read_text(encoding="utf-8")
         code = [block(hid, "static int kmap_down("),
-                between(hid, "static const char *const bind_names[HOS_KEY_N]", "void hos_bind("),
-                between(hid, "static int mouse_vk_slot(", "static int bound_down(")]
+                between(hid, "static const char *const bind_names[HOS_KEY_N]", "\nvoid hos_bind("),   # (its definition: the live input declares it)
+                block(hid, "static uint64_t bound_pad_buttons("),
+                between(hid, "static int mouse_vk_slot(", "static int bound_down("),
+                between(hid, "int hos_binding_is_default(", "int hos_rebind_control(")]   # ((Triforce) the per-control reset)
         code = "\n".join(code).replace("GetModuleFileNameA(NULL,", "GetModuleFileNameA(0,")
         read = block(hid, "static void read_input(")
         for needle in ("bound_down(HOS_KEY_MOVE_UP,", "bound_down(HOS_KEY_CAM_RIGHT,", "mouse_buttons_arm(", "bound_down(i, 1)"):
@@ -154,7 +216,8 @@ class BoundKeysTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="hookshot-bound-keys-") as tmp:
             tmp = Path(tmp)
             # (the options file by its name now: as hookshot_options.ini, the name before, nothing read it)
-            (tmp / "triforce_options.ini").write_text("key_move_up=90,0\npad_move_up=0\n", encoding="utf-8")
+            (tmp / "triforce_options.ini").write_text("key_move_up=90,0\npad_move_up=0\npad_a=1,26\npad_b=0\npad_x=2,99\n",
+                                                      encoding="utf-8")
             (tmp / "t.c").write_text(PRELUDE + code + MAIN, encoding="utf-8")
             binary = tmp / ("t.exe" if sys.platform == "win32" else "t")
             build = subprocess.run([compiler, "-std=gnu11", "-Wall", "-Wno-unused-function", "-I", str(ROOT / "gpu" / "vk"),

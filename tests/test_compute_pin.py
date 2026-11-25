@@ -142,7 +142,7 @@ def check_source():
     if at < 0:
         raise SystemExit("vk_draw.cpp has no pin_compute")
     pin = draw[at:draw.index("\n}\n", at)]
-    first = "if (mode == compute_pin::Mode::All) return pin_subgroup(st, p.workgroup[0]);"
+    first = "if (mode == compute_pin::Mode::All) return pin_subgroup(st, p.workgroup[0], invocations);"
     if first not in pin or min(pin.find(n) for n in ("compute_pin::Facts f;", "st_pin_free++", "st_pin_pinned++")) < pin.index(first):
         raise SystemExit("pin_compute: with RX_VK_COMPUTE_PIN=all it is not pin_subgroup as it was, before anything is asked or counted")
     for needle in ("f.vote = i.uses_subgroup_vote", "f.mask = i.uses_subgroup_mask", "f.lane_index = i.uses_subgroup_invocation_id",
@@ -152,7 +152,7 @@ def check_source():
                    "if (!compute_pin::needed(mode, f)) {"):
         if needle not in pin:
             raise SystemExit("pin_compute does not fill the rule's facts: " + needle)
-    if pin.index("if (!compute_pin::needed(mode, f)) {") > pin.rindex("pin_subgroup(st, p.workgroup[0]);"):
+    if pin.index("if (!compute_pin::needed(mode, f)) {") > pin.rindex("pin_subgroup(st, p.workgroup[0], invocations);"):
         raise SystemExit("pin_compute pins before it asks the rule")
     # the four makers of a compute program's pipeline, and the two that are not asked
     makers = (("bool prepare_compute_pipeline(Program& p) {", "pin_compute(ci.stage, p);"),

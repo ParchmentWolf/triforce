@@ -25,7 +25,7 @@ public sealed partial class Backend
         this.host = host; this.content = content; this.ctx = ctx; this.start = start; this.dataDir = dataDir;
         content.Media = MediaFor;
         content.SavePicture = SavePicture;
-        RegisterCore(); RegisterSaves(); RegisterMods(); RegisterSettings(); RegisterBench(); RegisterGameOpts();
+        RegisterCore(); RegisterSaves(); RegisterMods(); RegisterSettings(); RegisterBench(); RegisterGameOpts(); RegisterTexturePack();
     }
 
     partial void RegisterSaves();

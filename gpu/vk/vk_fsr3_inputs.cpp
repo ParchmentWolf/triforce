@@ -22,6 +22,7 @@
 
 #include "dlss_checks.h"     // ((Triforce) scene_size_fits: the scenes the gameplay upscale's output can come from)
 #include "dlss_math.h"
+#include "temporal_jitter.h"   // ((Triforce) the host's jitter, one whole sample
 #include "fg_motion.h"   // ((Triforce, 11-22) DLSS frame generation given the camera's motion alone: the owner's flicker)
 #include "framegen_rows.h"   // ((Triforce) pose_of, camera_cut: a camera cut starts a new history)
 #include "vk_draw.h"   // (descriptors_disturbed)
@@ -92,7 +93,7 @@ struct State {
     Frame frame;              // (the last one prepared: take())
     bool have_frame = false;
     std::atomic<uint64_t> upscaled_frame{0};   // (the frame FSR's upscaler last drew: jitter_size, on the game's thread)
-    std::atomic<uint32_t> jitter_w{0}, jitter_h{0}, jitter_phases{8};
+    TemporalJitter jitter;   // ((Triforce) the scene's size and the jitter's length, one whole sample: jitter_sample)
     // ((Triforce) the first frame of a run of FSR 3.1's failures since it last drew (missed), 0: none; jitter_size)
     std::atomic<uint64_t> missed_from{0};
     // ((Triforce) the gameplay upscale's output size, as last seen (note_output): which scenes keep a camera)
@@ -102,7 +103,10 @@ struct State {
     bool have_pose = false;
     uint64_t cuts = 0;
     uint64_t used_frame = 0;   // (the frame prepare last ran or wanted() last held: release_idle)
-    struct Dead { uint64_t frame; std::function<void()> free; };
+    // (value: vk_retirement_value when let go. The frames counted are the replay's: where nothing waits for the present ring
+    // (no window, HOS_HEADLESS) only the recording ring bounds how far behind the GPU is, many frames when a frame has few
+    // recordings, so 4 frames on did not prove the GPU done with it. Freed once both have passed; never at 0)
+    struct Dead { uint64_t frame; uint64_t value; std::function<void()> free; };
     std::vector<Dead> dead;   // (what work in flight may still use: freed a few frames on)
     const char* reason = nullptr;
     int reason_repeats = 0;
@@ -126,12 +130,12 @@ bool fail(const char* why) {
     return false;
 }
 
-void later(std::function<void()> f) { st().dead.push_back({texture_frame_no(), std::move(f)}); }
+void later(std::function<void()> f) { st().dead.push_back({texture_frame_no(), vk_retirement_value(), std::move(f)}); }
 void free_dead() {
     State& s = st();
-    const uint64_t now = texture_frame_no();
+    const uint64_t now = texture_frame_no(), done = vk_timeline_completed();
     for (size_t i = 0; i < s.dead.size();) {
-        if (now - s.dead[i].frame > 4) {
+        if (now - s.dead[i].frame > 4 && s.dead[i].value && done >= s.dead[i].value) {
             s.dead[i].free();
             s.dead[i] = std::move(s.dead.back());
             s.dead.pop_back();
@@ -357,7 +361,7 @@ bool prepare(VkCommandBuffer cmd, Texture* in, VkImageView in_view, Frame& out, 
         }
     }
     s.last_pose = pose, s.have_pose = true;
-    const bool reset = gap || held || cut;
+    bool reset = gap || held || cut;
     struct {
         float reproject[16];
         float jitter[2];
@@ -371,6 +375,7 @@ bool prepare(VkCommandBuffer cmd, Texture* in, VkImageView in_view, Frame& out, 
     std::memcpy(previous, s.last_vp, sizeof previous);
     dlss_math::unjitter(previous, s.last_jitter);
     const bool motion = !reset && dlss_math::reprojection(cam.current, previous, pc.reproject);
+    if (!motion) reset = true;   // (without a valid reprojection, prior history has no mapping to this camera)
     pc.jitter[0] = cam.jitter[0], pc.jitter[1] = cam.jitter[1];
     pc.size[0] = (int32_t)rw, pc.size[1] = (int32_t)rh;
     pc.flags = (motion ? 1 : 0) | (camera.flip_depth ? 2 : 0) | (linear ? 4 : 0);
@@ -490,9 +495,10 @@ bool take(Frame& out) {
 void upscaled(uint32_t rw, uint32_t rh, uint32_t dw, uint32_t dh) {
     State& s = st();
     (void)dh;   // ((Triforce) AMD's rule is the width's: fsr3_math.h jitter_phases, 71 or 72 at Ultra Performance, not 64)
-    s.jitter_w = rw, s.jitter_h = rh, s.jitter_phases = fsr3_math::jitter_phases(rw, dw);
     s.missed_from.store(0, std::memory_order_relaxed);
-    s.upscaled_frame = texture_frame_no();
+    const uint64_t now = texture_frame_no();
+    s.jitter.publish(rw, rh, fsr3_math::jitter_phases(rw, dw), now);
+    s.upscaled_frame = now;
 }
 
 void missed() {
@@ -502,19 +508,23 @@ void missed() {
     s.missed_from.compare_exchange_strong(none, now ? now : 1, std::memory_order_relaxed);
 }
 
-uint32_t jitter_size(int axis) {
-    // (RX_VK_FSR_JITTER=0: none. 0 too once FSR has not drawn for a while: the camera as the game has it)
+MkwVkJitter jitter_sample() {
+    // (RX_VK_FSR_JITTER=0: none. None too once FSR has not drawn for a while: the camera as the game has it)
     static const bool off = env_switch("RX_VK_FSR_JITTER") == 0;
     State& s = st();
     const uint64_t last = s.upscaled_frame.load(std::memory_order_relaxed), now = texture_frame_no();
-    if (off || !last || now - last > 30 || !fsr3_wanted()) return 0;
+    if (off || !last || now - last > 30 || !fsr3_wanted()) return {};
     // ((Triforce) and once FSR 3.1 failed to draw the frames it was to draw for more than 3 in a row (not frames with no scene:
     // the pause screen keeps the 30 above): the game's own upscale then takes the frames, which a jitter only makes wobble.
     // A few frames, not one: this is asked on the game's thread, ahead of the replay that draws)
     const uint64_t miss = s.missed_from.load(std::memory_order_relaxed);
-    if (miss && now >= miss && now - miss > kMissedFrames) return 0;
-    if (axis == 2) return s.jitter_phases.load(std::memory_order_relaxed);
-    return axis ? s.jitter_h.load(std::memory_order_relaxed) : s.jitter_w.load(std::memory_order_relaxed);
+    if (miss && now >= miss && now - miss > kMissedFrames) return {};
+    return s.jitter.read(now);
+}
+
+uint32_t jitter_size(int axis) {
+    const MkwVkJitter sample = jitter_sample();
+    return axis == 2 ? sample.phases : axis ? sample.height : sample.width;
 }
 
 void release_idle() {

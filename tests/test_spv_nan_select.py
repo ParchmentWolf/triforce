@@ -80,7 +80,7 @@ def check_source():
         if needle not in body:
             raise SystemExit("make_module no longer has: " + needle)
     # (after the fog's patch, before the module is made; the record's SPIR-V, written from the translation, is not changed)
-    if not body.find("spv_fog::keep_froxels") < body.find("spv_nan_select::rewrite") < body.find("vkCreateShaderModule"):
+    if not body.find("spv_fog::keep_froxels") < body.find("spv_nan_select::rewrite") < body.find("extern_guarded_shader_module("):
         raise SystemExit("make_module rewrites the selects before the fog's patch or after the module is made")
     vendor = (ROOT / "gpu/vk/vk_vendor.h").read_text(encoding="utf-8")
     if "x.nan_bits = amd_older_compiler(f);" not in vendor or 'over("RX_VK_NAN_BITS", x.nan_bits);' not in vendor:

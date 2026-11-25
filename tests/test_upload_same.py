@@ -157,16 +157,18 @@ def main():
           "upload_astc_gpu does not read the check's copy in exactly its two reads of a layer")
     check(read(" " * 16, "own.data() + k * tail") in gpu_astc,
           "upload_astc_gpu's read into a BC1 image's own copy is not the check's copy, else guest memory")
-    check(read(" " * 8, "s.data + k * tail") in gpu_astc,
+    check(read(" " * 12, "dest") in gpu_astc,
           "upload_astc_gpu's staging read is not the check's copy, else guest memory")
     check(gpu_astc.count("guest_bytes(") == 2, "upload_astc_gpu reads the storage elsewhere than its two reads")
     # (same_units' ASTC units are what upload_astc_gpu stages: the same layer size, first kept level, layout check and layer start)
     for needle in ["const uint64_t layer_size = tex.layers > 1 ? tex.L.layer_size : std::max<uint64_t>(tex.L.layer_size, total);",
                    "const uint64_t tail0 = level_geo(tex, 0).offset;",
                    "if (!layer_size || tail0 >= layer_size || (tail0 & 15) || (layer_size & 15))",
-                   "for (uint32_t layer = 0; layer < tex.layers; layer++)",
-                   "if (at >= total) continue;"]:
+                   "for (uint32_t layer = 0; layer < tex.layers; layer++)"]:
         check(needle in gpu_astc and needle in units, "same_units' ASTC units and upload_astc_gpu differ in " + needle)
+    # ((Triforce) a layer past the storage: no unit, and upload_astc_gpu stages none of its bytes (zero there))
+    check("if (at >= total) continue;" in units and "const uint64_t n = at < total ? std::min(tail, total - at) : 0;" in gpu_astc,
+          "same_units' ASTC units and upload_astc_gpu differ in a layer past the storage")
     check("overlaps(dirty, (uint64_t)layer * layer_size + tail0, (uint64_t)(layer + 1) * layer_size)" in gpu_astc and
           gpu_astc.count("const uint64_t at = (uint64_t)layers[k] * layer_size + tail0;") == 2 and
           "const uint64_t at = (uint64_t)layer * layer_size + tail0;" in units,

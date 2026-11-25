@@ -40,6 +40,7 @@
     OOT_ITEM("Lens of Truth", "Armor_GlassTruth", 0) \
     OOT_ITEM("Magic Beans", "Item_MagicBean", 1) \
     OOT_ITEM("Megaton Hammer", "Item_Hammer", 0) \
+    OOT_ITEM("Zelda's Letter", "Item_ZeldaLetter", 0) \
     OOT_SECTION("Masks") \
     OOT_ITEM("Keaton Mask", "Armor_Child_Mask_Keaton", 0) \
     OOT_ITEM("Skull Mask", "Armor_Child_Mask_Skull", 0) \

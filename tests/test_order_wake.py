@@ -57,6 +57,7 @@ FIXTURE = r"""
 #include <cstdlib>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 static int fails = 0;
@@ -126,6 +127,11 @@ static void schedule() {
 static void burst_end() { trace += 'e'; }
 static void update_blocked() { trace += 'u'; }
 static void drain(int why) { CHECK(why == 3); trace += 'D'; blocked_n = 0; }
+// (hold_gpu.h's rule, tests/test_hold_gpu.py: no thread of the game's waits for the GPU here, so nothing is held on)
+static bool hold_gpu_holds(double held_ms) { CHECK(held_ms > hold_ms()); return false; }
+// (the met wait's capture, RX_VK_MET_WAIT_CAPTURE: the signal notes how many captures were begun)
+std::unordered_map<uint64_t, uint64_t> ev_cpu_captures;
+static uint64_t memory_captures_begun() { return 7; }
 static int turns = 0, turn_now = 0;
 static void script(int turn);
 
@@ -165,6 +171,7 @@ int main(int argc, char** argv) {
     CHECK(turn_now == turns && events_made == 1 && order_wake_event.load() == &the_event);
     CHECK((int)ev_cpu_pending.size() == signals && ev_cpu_any.load());   // (every signal queued and marked, on or off)
     CHECK((int)ev_cpu_signals.load() == signals);                        // ((Triforce, 11-22, SYNC-29) and counted, on or off)
+    CHECK((int)ev_cpu_captures.size() == signals);                       // (each signal's event noted with the captures begun)
     if (on) {
         CHECK(sleeps == 0 && event_waits == turns);
         CHECK(sets == signals_while_stopped && sets > 100 && st_wake_sets.load() == sets);   // (set exactly while a queue is stopped)
@@ -198,7 +205,8 @@ def main():
         "for (;;) {", "if (wake && order_wake_on()) woken = WaitForSingleObject(wake, 1) == WAIT_OBJECT_0;", "else Sleep(1);",
         "if (!blocked_n.load()) continue;", "std::unique_lock lk(sync_order_mu, std::try_to_lock);", "if (!lk) continue;",
         "burst_begin(0);", "schedule();", "burst_end();", "update_blocked();",
-        "if (woken) st_wake_looks++, st_wake_resumes += st_resumed != resumed0;", "if (blocked_n.load() && held > hold_ms()) {", "drain(3);")]
+        "if (woken) st_wake_looks++, st_wake_resumes += st_resumed != resumed0;", "if (blocked_n.load() && held > hold_ms()) {",
+        "if (hold_gpu_holds(held)) continue;", "drain(3);")]
     check(min(order) >= 0 and order == sorted(order), "sync_watch: the event, the wait or the sleep, the look and the forced drain are not there in that order")
     # (the part of event_signal_queued without the replay thread: its first statement, a block)
     signal = block(rep, "void event_signal_queued(uint64_t gpu, uint32_t value) {\n    if (!async_on()) {").split("\n", 1)[1]

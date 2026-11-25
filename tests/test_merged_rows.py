@@ -418,7 +418,7 @@ def main():
     parser.add_argument("--cxx", default="g++")
     args = parser.parse_args()
     menu = (VK / "vk_menu.cpp").read_text(encoding="utf-8")
-    check('out += "options_version=9\\n";' in definition(menu, "void save"), "save does not write options_version=9")
+    check('out += "options_version=10\\n";' in definition(menu, "void save"), "save does not write options_version=10")
     check("for (const char* dropped : merged_rows::kDropped) mine |= key == dropped;" in definition(menu, "void save"),
           "save writes back the lines of the rows that went")
     with tempfile.TemporaryDirectory(prefix="merged-rows-") as tmp:

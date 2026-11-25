@@ -77,7 +77,8 @@ def main():
     if os.name != "nt":
         raise SystemExit("Windows structured exceptions required")
     source=(args.source/'gpu/vk/vk_draw.cpp').read_text(encoding='utf-8')
-    wrapper=block(source,'__declspec(noinline) VkResult guarded_compute(')
+    # (the guard's own creation, once: guarded_compute asks it, and once more without the optimizer where the driver refuses it)
+    wrapper=block(source,'__declspec(noinline) VkResult guarded_compute_once(').replace('guarded_compute_once(','guarded_compute(',1)
     precompile=block(source,'void precompile_run(')
     arm=block(precompile,'if (i < computes.size()) {')
     # ci/made identities are checked at the boundary as well as inside the API spy.

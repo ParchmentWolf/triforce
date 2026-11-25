@@ -49,6 +49,7 @@ write_gen::Table gens;
 inline WriteGen next_gen() { return gens.next(); }
 inline WriteGen page_gen(uint64_t p) { return gens.page(p); }
 thread_local uintptr_t tl_stamp_who;
+void memory_gpu_writes_note(uint64_t, uint64_t) {}   // (RX_VK_UB_SNAPSHOT's guard: tests/test_ub_snapshot_gpu_writes.py)
 void stamp_src_note(WriteGen, uintptr_t) {}
 void memory_drop_shadow(uint64_t, uint64_t) {}
 void cap_view_bump() {}

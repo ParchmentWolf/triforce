@@ -95,6 +95,8 @@ static int logged(const char *text) {
     return n;
 }
 enum { HOS_OPT_DISPLAY_CAP = 60 };
+enum { HOS_OPT_FPS_CAP_ROW = 342 };   /* ((Triforce) gpu/vk/vk_api.h: the cap's row in play, host/nn_vi.c fps_row_asked) */
+static volatile int fps_row_asked = -100;
 enum { HOS_OPT_N64_FPS = 61 };
 static int n64_asked;   /* (the renderer's answer: vk_replay.cpp, n64_rules.h fps) */
 int rx_option(int id, int otherwise) { return id == HOS_OPT_N64_FPS ? n64_asked : otherwise; }

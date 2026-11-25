@@ -28,6 +28,24 @@ struct Sub {
     uint32_t down = 0;   // (a level the image left out, copied into its first at 1 / 2^down the size)
 };
 
+/// ((Triforce) A format's optimal-tiling features, asked of the driver once per format (a scaled copy checks both of its sides)
+VkFormatFeatureFlags tiling_features(VkFormat f) {
+    static std::atomic<uint64_t> known[256];   // (the core formats; bit 63: asked already)
+    if ((uint32_t)f >= 256) {
+        VkFormatProperties p{};
+        vkGetPhysicalDeviceFormatProperties(dev.physical, f, &p);
+        return p.optimalTilingFeatures;
+    }
+    uint64_t v = known[f].load(std::memory_order_relaxed);
+    if (!(v >> 63)) {
+        VkFormatProperties p{};
+        vkGetPhysicalDeviceFormatProperties(dev.physical, f, &p);
+        v = 1ull << 63 | p.optimalTilingFeatures;
+        known[f].store(v, std::memory_order_relaxed);
+    }
+    return (VkFormatFeatureFlags)v;
+}
+
 int warn_budget[16];
 void warn(int key, const char* what) {
     if (warn_budget[key]++ < 3) logf("vk: %s", what);
@@ -162,6 +180,28 @@ bool buffer_side(const NvnState& st, const Sub& s, uint64_t addr, uint64_t& size
 
 bool size_compatible(const Sub& a, const Sub& b) {
     return a.bpb == b.bpb && a.bw == b.bw && a.bh == b.bh;
+}
+
+/// ((Triforce) 0: float or normalized, 1: unsigned integer, 2: signed integer (a blit may not mix them)
+int format_class(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_R8_UINT: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8B8_UINT: case VK_FORMAT_R8G8B8A8_UINT:
+    case VK_FORMAT_B8G8R8A8_UINT: case VK_FORMAT_A2B10G10R10_UINT_PACK32: case VK_FORMAT_A2R10G10B10_UINT_PACK32:
+    case VK_FORMAT_R16_UINT: case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R32_UINT:
+    case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32B32_UINT: case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_S8_UINT:
+    case VK_FORMAT_A8B8G8R8_UINT_PACK32: case VK_FORMAT_R16G16B16_UINT: case VK_FORMAT_B8G8R8_UINT:
+    case VK_FORMAT_R64_UINT: case VK_FORMAT_R64G64_UINT: case VK_FORMAT_R64G64B64_UINT: case VK_FORMAT_R64G64B64A64_UINT:
+        return 1;
+    case VK_FORMAT_R8_SINT: case VK_FORMAT_R8G8_SINT: case VK_FORMAT_R8G8B8_SINT: case VK_FORMAT_R8G8B8A8_SINT:
+    case VK_FORMAT_B8G8R8A8_SINT: case VK_FORMAT_A2B10G10R10_SINT_PACK32: case VK_FORMAT_R16_SINT:
+    case VK_FORMAT_R16G16_SINT: case VK_FORMAT_R16G16B16A16_SINT: case VK_FORMAT_R32_SINT: case VK_FORMAT_R32G32_SINT:
+    case VK_FORMAT_R32G32B32_SINT: case VK_FORMAT_R32G32B32A32_SINT: case VK_FORMAT_A8B8G8R8_SINT_PACK32:
+    case VK_FORMAT_A2R10G10B10_SINT_PACK32: case VK_FORMAT_R16G16B16_SINT: case VK_FORMAT_B8G8R8_SINT:
+    case VK_FORMAT_R64_SINT: case VK_FORMAT_R64G64_SINT: case VK_FORMAT_R64G64B64_SINT: case VK_FORMAT_R64G64B64A64_SINT:
+        return 2;
+    default:
+        return 0;
+    }
 }
 
 bool b2t_gpu_on() {   // (RX_VK_B2T_CPU=1: buffer-to-texture copies on the CPU, every format)
@@ -368,6 +408,18 @@ void copy_t2t(VkCommandBuffer cmd, NvnState& st, const nvn_p_copy_tt& p) {
         VkImageCopy cp{layers(s), offset(s), layers(d), offset(d), extent(s)};
         vkCmdCopyImage(cmd, s.tex->image, VK_IMAGE_LAYOUT_GENERAL, d.tex->image, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
     } else {   // scaled or converting: nearest, or linear when the game asked for it (colour only)
+        // ((Triforce) what Vulkan allows a blit: BLIT_SRC/BLIT_DST, one format class on both sides, the same format for depth
+        // or stencil, single-sampled images, and linear filtering only where the source format supports it; outside that
+        // the result is undefined, and some drivers write garbage or lose the device)
+        if (!(tiling_features(s.tex->format) & VK_FORMAT_FEATURE_BLIT_SRC_BIT) ||
+            !(tiling_features(d.tex->format) & VK_FORMAT_FEATURE_BLIT_DST_BIT) ||
+            format_class(s.tex->format) != format_class(d.tex->format) ||
+            (!color && s.tex->format != d.tex->format) ||
+            s.tex->samples != VK_SAMPLE_COUNT_1_BIT || d.tex->samples != VK_SAMPLE_COUNT_1_BIT) {
+            warn(13, "texture blit the device cannot make: skipped");
+            full_barrier(cmd);
+            return;
+        }
         VkImageBlit bl{};
         bl.srcSubresource = layers(s);
         bl.dstSubresource = layers(d);
@@ -375,7 +427,9 @@ void copy_t2t(VkCommandBuffer cmd, NvnState& st, const nvn_p_copy_tt& p) {
         bl.srcOffsets[1] = {s.x + (int32_t)s.w, s.y + (int32_t)s.h, s.z + (int32_t)s.d};
         bl.dstOffsets[0] = offset(d);
         bl.dstOffsets[1] = {d.x + (int32_t)d.w, d.y + (int32_t)d.h, d.z + (int32_t)d.d};
-        const bool linear = ((p.flags & NVN_COPY_FLAGS_LINEAR_FILTER_BIT) || d.down > s.down) && color;
+        const bool linear = ((p.flags & NVN_COPY_FLAGS_LINEAR_FILTER_BIT) || d.down > s.down) && color &&
+                            (tiling_features(s.tex->format) & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) &&
+                            format_class(s.tex->format) == 0;
         vkCmdBlitImage(cmd, s.tex->image, VK_IMAGE_LAYOUT_GENERAL, d.tex->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl,
                        linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     }
@@ -392,7 +446,18 @@ void clear_tex(VkCommandBuffer cmd, NvnState& st, const nvn_p_clear_tex& p) {
     end_pass(cmd);
     GprofSpan gp(cmd, "xfer clear texture (with its barriers)");
     full_barrier(cmd);
-    if (whole && s.tex->type != VK_IMAGE_TYPE_3D) {
+    // ((Triforce) an image kept in ASTC blocks (a driver that samples ASTC itself): vkCmdClearColorImage does not take a
+    // compressed format, and the region path below works in BC blocks only; a colour written over ASTC blocks would be
+    // garbage, so the image is left as it is)
+    if (s.tex->format >= VK_FORMAT_ASTC_4x4_UNORM_BLOCK && s.tex->format <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK) {
+        warn(14, "clear of an ASTC texture: skipped");
+        return;
+    }
+    // ((Triforce) an image in BC blocks is cleared through its raw views, below, as a region of one is: vkCmdClearColorImage
+    // does not take a compressed format (it was called on them here: undefined, and a lost device on NVIDIA's Pascal))
+    const bool volume = s.tex->type == VK_IMAGE_TYPE_3D;
+    const bool raw = s.tex->format >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && s.tex->format <= VK_FORMAT_BC7_SRGB_BLOCK;
+    if (whole && !volume && !raw) {
         VkImageSubresourceRange rng{s.tex->aspect, s.level, 1, s.layer, s.layers};
         if (s.tex->aspect & VK_IMAGE_ASPECT_COLOR_BIT) {
             VkClearColorValue cv{};
@@ -406,21 +471,30 @@ void clear_tex(VkCommandBuffer cmd, NvnState& st, const nvn_p_clear_tex& p) {
         }
     } else {   // (a region: a pass over that level and layer, and vkCmdClearAttachments)
         const nvn_view* v = p.has_view ? &p.view : nullptr;
-        for (uint32_t k = 0; k < s.layers; k++) {
+        // ((Triforce) a 3D image's slices, z on, where it took its array layers: one, and only slice 0 was ever cleared)
+        const uint32_t slices = volume ? s.d : s.layers;
+        for (uint32_t k = 0; k < slices; k++) {
+            const uint32_t slice = (volume ? (uint32_t)std::max(0, s.z) : s.layer) + k;
             nvn_view lv = v ? *v : nvn_view{};
             // texture_view takes a guest mip level and subtracts skip itself.
             lv.set_levels = 1, lv.base_level = (uint8_t)(s.level + s.tex->skip), lv.nlevels = 1;
-            lv.set_layers = 1, lv.min_layer = (uint16_t)(s.layer + k), lv.nlayers = 1;
-            const VkImageView view = texture_view(s.tex, p.tex, &lv, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Attachment);
+            lv.set_layers = 1, lv.min_layer = (uint16_t)slice, lv.nlayers = 1;
+            // ((Triforce) texture_view's as an attachment, or a 3D BC image's block attachment: vk_texture.h texture_attachment)
+            const TextureAttachment attachment = texture_attachment(s.tex, p.tex, &lv);
+            const VkImageView view = attachment.view;
             if (!view) continue;
             // (an attachment view of a compressed image is a raw one, one texel a block: its area and the rect in blocks, as
             // targets() sizes a pass over it)
-            const bool raw = s.tex->format >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && s.tex->format <= VK_FORMAT_BC7_SRGB_BLOCK;
             const uint32_t aw = raw ? (lw + 3) / 4 : lw, ah = raw ? (lh + 3) / 4 : lh;
             const int32_t rx = raw ? s.x / 4 : s.x, ry = raw ? s.y / 4 : s.y;
             const uint32_t rw = std::min<uint32_t>(raw ? (s.x + s.w + 3) / 4 - rx : s.w, aw - std::min<uint32_t>(aw, (uint32_t)rx));
             const uint32_t rh = std::min<uint32_t>(raw ? (s.y + s.h + 3) / 4 - ry : s.h, ah - std::min<uint32_t>(ah, (uint32_t)ry));
             if (!rw || !rh) continue;
+            if (attachment.blocks) {   // ((Triforce) the slice's blocks into the attachment first, and back after the clear)
+                full_barrier(cmd);
+                copy_block_attachment(cmd, *s.tex, attachment.blocks, s.level, slice, true);
+                full_barrier(cmd);
+            }
             VkRenderingAttachmentInfo a{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
             a.imageView = view;
             a.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -441,6 +515,10 @@ void clear_tex(VkCommandBuffer cmd, NvnState& st, const nvn_p_clear_tex& p) {
             const VkClearRect rect{{{rx, ry}, {rw, rh}}, 0, 1};
             vkCmdClearAttachments(cmd, 1, &ca, 1, &rect);
             vkCmdEndRendering(cmd);
+            if (attachment.blocks) {
+                full_barrier(cmd);
+                copy_block_attachment(cmd, *s.tex, attachment.blocks, s.level, slice, false);
+            }
         }
     }
     full_barrier(cmd);

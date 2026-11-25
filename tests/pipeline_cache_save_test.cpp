@@ -55,6 +55,7 @@ unsigned long long program_cache_stamp() { return 0x1122334455667788ull; }
 std::uint64_t pcache_bound_bytes = 0;
 std::string pcache_path;
 std::atomic<int64_t> pcache_built_since_save{32};
+bool pcache_no_save = false;   // ((Triforce) RX_VK_PCACHE_LOAD=0: not set here)
 std::atomic<std::size_t> pcache_saved_size{0};
 // The size the driver gives for the cache's data; a case grows it for pipelines taken in between saves.
 std::atomic<std::size_t> cache_size{64};

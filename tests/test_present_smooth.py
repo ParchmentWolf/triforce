@@ -172,7 +172,7 @@ def check_source():
     # ((Triforce) or the Steady frame rate row's hold to its period, whatever the row and the switch say: tests/test_pace_steady.py)
     check("smooth_mine && !framegen_on() && !dlssg::active() && ((on && opts.pace != 0) || pace::steady_floor_ns() > 0)" in wanted,
           "the floor is not limited to the game's own pictures with the Frame pacing row on and no frame generation")
-    sp = block(replay, "void smooth_present(std::unique_lock<std::mutex>& qk) {")
+    sp = block(replay, "void smooth_present(std::unique_lock<QueueMutex>& qk) {")
     check("present_smooth_reset(&smooth)" in sp[:sp.index("const int64_t now")], "a floor switched off does not start afresh")
     check(sp.index("if (qk.owns_lock()) qk.unlock();") < sp.index("smooth_wait_until(at);"), "the picture waits with the queue's lock held")
     check("present_smooth_shown(&smooth, host->now_ns());" in sp, "the pictures' times are not noted")
@@ -182,7 +182,7 @@ def check_source():
     order = [image.index(s) for s in ("res = vkQueueSubmit2(dev.queue, 1, &si, f.done);", "return present_thread_hand(out);",
                                       "present_out(out, qk, false);")]
     check(order == sorted(order), "the present's last step does not come after the blit's submit")
-    out = block(replay, "static void present_out(const PresentOut& o, std::unique_lock<std::mutex>& qk, bool on_thread) {")
+    out = block(replay, "static void present_out(const PresentOut& o, std::unique_lock<QueueMutex>& qk, bool on_thread) {")
     order = [out.index(s) for s in ("smooth_present(qk);", "pi.pNext = reflex_present_id(nullptr);", "antilag_present();")]
     check(order == sorted(order), "the wait is not before the present's markers")
     check("if (qk.owns_lock()) qk.unlock();" in out and "if (!qk.owns_lock()) qk.lock();\n        res = vkQueuePresentKHR(dev.queue, &pi);" in out,

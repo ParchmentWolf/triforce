@@ -21,12 +21,14 @@ process, as before, on every system.
 """
 import bisect
 import collections
+import contextlib
 import glob
 import multiprocessing
 import os
 import re
 import threading
 import whole_write   # (rewrites written beside and moved over: issue 1197)
+import build_jobs   # ((Triforce) the workers the build was asked for: HOOKSHOT_JOBS)
 
 import a64_lift
 import emit_pool   # ((Triforce) the emit's processes where there is no fork)
@@ -67,13 +69,21 @@ def load(img_dir):
     path = os.path.join(img_dir, FILE)
     if not os.path.exists(path):
         return []
-    return [int(l, 16) for l in open(path) if l.strip() and not l.startswith("#")]
+    try:
+        with open(path, encoding="utf-8") as f:
+            return [int(l, 16) for l in f if l.strip() and not l.startswith("#")]
+    except (OSError, UnicodeDecodeError, ValueError) as e:
+        print("chunks: %s could not be read (%s); ignoring" % (path, e), flush=True)
+        return []
 
 
 def save(img_dir, starts):
-    with open(os.path.join(img_dir, FILE), "w") as f:
-        f.write("# first guest address of each lifted C chunk after the first (nx2/chunks.py)\n")
-        f.write("".join("%08x\n" % s for s in sorted(starts)))
+    # (lift.py --standalone writes this under <work>/image while its image.bin goes to <work>/sa/image, and nothing made
+    # that folder: a fresh work folder stopped the lift at its last step with FileNotFoundError. make_game.py prepares it)
+    os.makedirs(img_dir, exist_ok=True)
+    text = ("# first guest address of each lifted C chunk after the first (nx2/chunks.py)\n"
+            + "".join("%08x\n" % s for s in sorted(starts)))
+    whole_write.write_whole(os.path.join(img_dir, FILE), text, sync=True)   # (read by every later lift)
 
 
 def seed_from_gen(gen_dir):
@@ -156,6 +166,7 @@ def emit_jobs():
         n = len(os.sched_getaffinity(0))
     except AttributeError:
         n = os.cpu_count() or 1
+    n = build_jobs.cap(n)   # ((Triforce) no more than the build was asked for: HOOKSHOT_JOBS, nx2/build_jobs.py)
     if not FORK:
         n = max(1, min(SPAWN_MOST, n // 2))
         gb = _available_gb()
@@ -238,10 +249,49 @@ def gave_up(gen_dir):
     drop_lifted(gen_dir)
 
 
-def write(L, gen_dir, img_dir, rechunk=False, counters=(), jobs=None, setup=()):
+@contextlib.contextmanager
+def no_texts():
+    """(Triforce) a64_lift.Lifter.write with no texts of its own (an empty one per instruction, no FPX shape): for an emit whose
+    spawned processes make their own (emit_pool.run_texts). Translating every instruction of OoT here took ~15 s and 1-2 GB, and
+    only sent them on"""
+    import a64emit
+    translate, op_text = a64emit.translate, a64_lift.op_text
+    a64emit.translate = lambda items, batch=65536: ([""] * len(items), [0] * len(items))
+    a64_lift.op_text = lambda text, fpx: text
+    try:
+        yield
+    finally:
+        a64emit.translate, a64_lift.op_text = translate, op_text
+
+
+def fill_fpx(gen_dir, used):
+    """(Triforce) a64_fpx.h as the lifter writes it under no_texts(): its helpers for no FPX shape, at its head, become those for
+    used, the shapes the emit's processes found (what the lifter's own texts would have given: every instruction is in one run)"""
+    path = os.path.join(gen_dir, "a64_fpx.h")
+    with open(path, encoding="utf-8", newline="") as f:
+        text = f.read()
+    empty = a64_lift.fpx_header(set())
+    if not text.startswith(empty):
+        raise SystemExit("chunks: %s does not begin with the lifter's FPX helpers for no shape" % path)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(a64_lift.fpx_header(used) + text[len(empty):])
+
+
+def _translator_ready():
+    """(Triforce) The translator built and loaded here before the spawned processes start, when the lift translates with it (the
+    processes translate their runs at once: started before anything here translated, each would build it, into the same file)"""
+    import a64emit
+    if "a64emit.translate" in emit_pool.chain(a64emit.translate):
+        a64emit.lib()
+
+
+def write(L, gen_dir, img_dir, rechunk=False, counters=(), jobs=None, setup=(), beside=None):
     """L.write(gen_dir) with stable boundaries; returns its files. counters: dicts the emit adds to besides the
     lifter's own (poll.stats); jobs: emit processes (emit_jobs()); (Triforce) setup: what set the lifter's class up for
-    the emit in this process (poll.install), module-level functions the spawned processes call before they emit"""
+    the emit in this process (poll.install), module-level functions the spawned processes call before they emit.
+    (Triforce, 11-24) beside: a function run here first, while the spawned processes already emit (nx2/lift.py's coverage
+    report, which reads the functions and writes none of the C); without processes, before the write. Where they are spawned
+    this process makes no texts of its own (no_texts: they translate their runs) and writes a64_fpx.h from theirs (fill_fpx)"""
     global _workers
     starts = [] if rechunk else load(img_dir)
     if not starts and not rechunk:
@@ -251,27 +301,38 @@ def write(L, gen_dir, img_dir, rechunk=False, counters=(), jobs=None, setup=()):
     jobs = emit_jobs() if jobs is None else jobs
     spawned = jobs > 1 and not FORK and len(L.funcs) >= SPAWN_LEAST
     made = None
+    every = [L.stats, L.unhandled, L.ijump] + list(counters)
+    try:
+        if spawned:   # ((Triforce) started now: they translate and emit their runs while this process makes the report)
+            _translator_ready()
+            stop_workers(kill=True)   # (an earlier write()'s, which no edit_c() ended)
+            _workers = emit_pool.Workers(jobs, L, every, setup)
+            print("emit: %d processes (HOOKSHOT_LIFT_JOBS=<n> for another count, 1 for one process)" % _workers.jobs, flush=True)
+            made = emit_pool.emit(_workers, L, sorted(L.funcs), every)
+        if beside:
+            beside()
+    except BaseException:
+        if made is not None:
+            made.close()
+        if spawned:
+            gave_up(gen_dir)
+        raise
 
     def emit_function(e, texts):
         nonlocal made
-        global _workers
         b.current = e
         if made is None:   # (the first call: write() has its texts now, and asks for the functions in sorted order)
-            every = [L.stats, L.unhandled, L.ijump] + list(counters)
-            if spawned:
-                stop_workers(kill=True)   # (an earlier write()'s, which no edit_c() ended)
-                _workers = emit_pool.Workers(jobs, L, every, setup)
-                print("emit: %d processes (HOOKSHOT_LIFT_JOBS=<n> for another count, 1 for one process)" % _workers.jobs, flush=True)
-                made = emit_pool.emit(_workers, L, sorted(L.funcs), texts, every)
-            else:
-                made = parallel_emit(base_emit, sorted(L.funcs), texts, every, jobs)
+            made = parallel_emit(base_emit, sorted(L.funcs), texts, every, jobs)
         got = next(made, None)
         if got is None or got[0] != e:
             raise SystemExit("chunks: write() asked for f_%08x, the emit made %s" % (e, "f_%08x" % got[0] if got else "nothing"))
         return got[1], got[2]
     L.emit_function = emit_function
     try:
-        files = L.write(gen_dir, chunk_bytes=b)
+        with no_texts() if spawned else contextlib.nullcontext():
+            files = L.write(gen_dir, chunk_bytes=b)
+        if spawned:
+            fill_fpx(gen_dir, made.fpx)
     except BaseException:
         if spawned:   # ((Triforce) a process failed, died or hung, or this one was stopped: no part of a lift is left behind)
             gave_up(gen_dir)
@@ -361,15 +422,21 @@ def split_one(gen_dir, path, budget):
             cuts.append(i)
             k = run * parts // total + 1   # (past a giant function: the next share, not a sliver after it)
         run += c
+    if len(cuts) < 2:   # (no cut: a giant function last, past every share)
+        costs[os.path.basename(path)] = marks[0] + total
+        return made, costs, None
     bounds = [marks[i] for i in cuts] + [len(text)]
     preamble = text[:marks[0]]
-    for j in range(len(cuts)):
+    # (the chunk itself last: a process stopped part way leaves it whole, with every function, so whatever runs the split again
+    # cuts it again; written first, a stop left the chunk cut down to its first part beside only some of the others, and a second
+    # split of it made no parts and removed the ones written: their functions were gone from the lifted C without a word)
+    for j in reversed(range(len(cuts))):
         out = path if j == 0 else os.path.join(gen_dir, "code_%s_%d.c" % (m.group(1), j))
         piece = text[:bounds[1]] if j == 0 else preamble + text[bounds[j]:bounds[j + 1]]
         whole_write.write_whole(out, piece)
         costs[os.path.basename(out)] = len(preamble) + sum(cost[cuts[j]:cuts[j + 1] if j + 1 < len(cuts) else len(cost)])
         if j:
-            made.append(out)
+            made.insert(0, out)
     return made, costs, "chunks: %s (%d MB, cost %d MB) in %d parts" % (os.path.basename(path), len(text) >> 20, total >> 20, len(cuts))
 
 

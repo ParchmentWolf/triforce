@@ -27,6 +27,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 
 TITLE = "0400486024DEC000"
 NO_ACCOUNT = "0000000000000000"
@@ -39,8 +40,11 @@ Program = collections.namedtuple("Program", "name display folders processes alia
 # home folder); the saves are then found under it by LAYOUTS. processes: lower case, without .exe, for the
 # running-game check. The sources are in docs/saves.md.
 EDEN = {"linux": ["{data}/eden"], "windows": ["{appdata}/eden"]}
+# ((Triforce, 11-24, after Source A's) Lichii has a data folder of its own since its build 150, 2026-11-10; a build from before
+# keeps its saves in Eden's)
+LICHII = {"linux": ["{data}/lichii"] + EDEN["linux"], "windows": ["{appdata}/lichii"] + EDEN["windows"]}
 EMULATORS = [
-    Program("lichii", "Lichii", EDEN, ["lichii"], []),
+    Program("lichii", "Lichii", LICHII, ["lichii"], []),
     Program("frizti", "Frizti (Fritchii)", EDEN, ["lichii", "fritchii"], ["fritchii"]),
     Program("orchid", "Orchid", EDEN, ["orchid"], []),
     Program("pokedinner", "PokeDinner", EDEN, ["eglantine"], []),
@@ -283,17 +287,17 @@ def list_all(args):
         print("Hookshot: %s" % e)
     groups = collections.OrderedDict()
     for program in EMULATORS:
-        groups.setdefault(tuple(folders(program)), []).append(program.display)
-    for tried, displays in groups.items():
+        # ((Triforce, 11-24) by the folder import and export use, the first of a program's with saves, as locate: the programs
+        # whose saves are there)
+        tried = folders(program)
+        used = next((d for d in tried if os.path.isdir(d) and find_saves(d)), None)
+        groups.setdefault(used or tuple(tried), []).append(program.display)
+    for where, displays in groups.items():
         title = " / ".join(displays) + (" (one shared folder)" if len(displays) > 1 else "")
-        shown = False
-        for d in tried:
-            found = find_saves(d) if os.path.isdir(d) else {}
-            if found:
-                show(title, d, found)
-                shown = True
-        if not shown:
-            print("%s: nothing in %s" % (title, ", ".join(tried) or "(no default folder)"))
+        if isinstance(where, str):
+            show(title, where, find_saves(where))
+        else:
+            print("%s: nothing in %s" % (title, ", ".join(where) or "(no default folder)"))
     if args.folder:
         show("Folder", *locate(FOLDER, args.folder, "--from"))
 
@@ -347,13 +351,85 @@ def copy_saves(src, dst, backup, keep_settings, dry_run):
         return
     os.makedirs(os.path.dirname(backup), exist_ok=True)
     shutil.copytree(dst, backup)
-    for s in slots(dst):
-        shutil.rmtree(os.path.join(dst, s))
-    for s in names:   # (links were refused above; copied as links, never followed, all the same)
-        shutil.copytree(os.path.join(src, s), os.path.join(dst, s), symlinks=True)
-    for f in files:
-        shutil.copy2(os.path.join(src, f), os.path.join(dst, f), follow_symlinks=False)
+    # The new save is copied whole into a folder on the target's disk first, and the target's slots are swapped for it
+    # by renames only after that worked: a copy that fails (a full disk) leaves the target as it was. The target's slots
+    # used to be deleted before the copy began, so a copy that failed part way left half a save where a whole one had been.
+    # (Inside the target, so also when it links to another disk, is a disk of its own or sits in a folder that can't be
+    # written. The game reads only slot_* and the two .sav files there.)
+    incoming = tempfile.mkdtemp(prefix=".%s-incoming-" % os.path.basename(os.path.normpath(dst)), dir=dst)
+    try:
+        for s in names:   # (links were refused above; copied as links, never followed, all the same)
+            shutil.copytree(os.path.join(src, s), os.path.join(incoming, s), symlinks=True)
+        for f in files:
+            shutil.copy2(os.path.join(src, f), os.path.join(incoming, f), follow_symlinks=False)
+        aside = swap_in(dst, incoming, names + files, slots(dst) + [f for f in files if os.path.lexists(os.path.join(dst, f))],
+                        backup)
+    except BaseException:
+        if not remove_tree(incoming):
+            print("Could not delete %s: delete it by hand" % incoming, file=sys.stderr)
+        raise
+    left = [p for p in (incoming, aside) if not remove_tree(p)]
+    if left:
+        print("Copied, but could not delete %s: delete %s by hand." % (" and ".join(left), "them" if len(left) > 1 else "it"))
     print("Done. Backup of the old %s in %s" % (dst, backup))
+
+
+def remove_tree(path):
+    """Deletes path, also a file in it that is read-only (Windows refuses to delete those). True when it is gone."""
+    def writable_then_again(func, name, _):
+        # (the mode it has and this: S_IWRITE alone is Linux's 0200, a folder nobody can list, and one that still cannot be
+        # deleted would stay so)
+        os.chmod(name, os.stat(name).st_mode | stat.S_IWRITE)
+        func(name)
+    try:
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(path, onexc=writable_then_again)
+        else:
+            shutil.rmtree(path, onerror=writable_then_again)
+    except OSError:
+        pass
+    return not os.path.lexists(path)
+
+
+def swap_in(dst, incoming, new, old, backup):
+    """Moves the old entries of dst aside and the new ones from incoming into dst, all renames on one disk, and returns the
+    folder the old ones are in. If one fails the moves are undone, so dst has either all of its old entries or all of the
+    new ones; when a move back fails too (a file held open on Windows), the others are still put back and the old entries
+    that could not be stay in that folder, which is named in the error."""
+    aside = tempfile.mkdtemp(prefix=".%s-old-" % os.path.basename(os.path.normpath(dst)), dir=os.path.dirname(incoming))
+    moved, placed = [], []
+    try:
+        for n in old:
+            os.replace(os.path.join(dst, n), os.path.join(aside, n))
+            moved.append(n)
+        for n in new:
+            os.replace(os.path.join(incoming, n), os.path.join(dst, n))
+            placed.append(n)
+    except BaseException as error:
+        new_left, old_left = [], []
+        for n in reversed(placed):
+            try:
+                os.replace(os.path.join(dst, n), os.path.join(incoming, n))
+            except OSError:
+                new_left.append(n)
+        for n in reversed(moved):
+            try:
+                if os.path.lexists(os.path.join(dst, n)):   # (its new one could not be moved out)
+                    raise FileExistsError(n)
+                os.replace(os.path.join(aside, n), os.path.join(dst, n))
+            except OSError:
+                old_left.append(n)
+        if not new_left and not old_left:
+            os.rmdir(aside)
+            raise
+        left = []
+        if old_left:
+            left.append("old ones left in %s: %s" % (aside, ", ".join(sorted(old_left))))
+        if new_left:
+            left.append("new ones left in the target: %s" % ", ".join(sorted(new_left)))
+        raise Fail("copying into %s failed (%s), and so did putting everything back (%s). Close whatever holds those "
+                   "files, then put the old save back from the backup, %s" % (dst, error, "; ".join(left), backup)) from error
+    return aside
 
 
 def program_named(name):

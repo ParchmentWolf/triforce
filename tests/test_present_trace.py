@@ -56,6 +56,7 @@ static int pace_fps(void) { return fps_max(); }
 static int n64_rate;
 static int n64_pace_interval(int rate, int interval) { return rate > 0 ? 1 : interval; }
 void hos_bench_present(int64_t now) { (void)now; }   /* (benchmark mode's note of each present: not on here) */
+static int64_t present_phases[4];   /* ((Triforce) nn_vi.c's: no phases given here, 0 in every row */
 '''
 
 SUFFIX = r'''

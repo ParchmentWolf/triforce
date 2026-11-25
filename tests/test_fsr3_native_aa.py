@@ -36,7 +36,7 @@ def main():
     args = parser.parse_args()
     vk = ROOT / "gpu" / "vk"
     rows = (vk / "upscaler_rows.h").read_text(encoding="utf-8")
-    check(re.search(r"enum \{ GAME = 0, DLSS = 1, DLAA = 2, FSR3 = 3, FSR4 = 4, FSR4_AA = 5, FSR3_AA = 6, kUpscalers = 7 \};", rows),
+    check(re.search(r"enum \{ GAME = 0, DLSS = 1, DLAA = 2, FSR3 = 3, FSR4 = 4, FSR4_AA = 5, FSR3_AA = 6, OFF = 7, XESS = 8, XESS_AA = 9, kUpscalers = 10 \};", rows),
           "upscaler_rows.h: the saved values moved, or FSR 3.1's native AA is not the one after them")
 
     # FSR 3.1 runs for either of its values, and as its Native AA for the second (RX_VK_FSR=2 for a run)
@@ -76,7 +76,7 @@ def main():
 
     # the menu: what runs is shown, both of FSR 3.1's are offered where it runs, and the Render resolution row says Native
     menu = (vk / "vk_menu.cpp").read_text(encoding="utf-8")
-    check("int upscaler() { return fsr3_wanted() ? (int)(fsr3_native() ? ur::FSR3_AA : ur::FSR3) : temporal_mode(); }" in menu,
+    check("int upscaler() {\n    if (fsr3_wanted()) return fsr3_native() ? ur::FSR3_AA : ur::FSR3;" in menu,   # ((Triforce) 11-24: Off after it)
           "the menu does not show FSR 3.1's Native AA when it runs")
     check("ur::fsr3_bits(fsr3::supported())" in function(menu, "unsigned upscalers_available() {"),
           "the Upscaler row does not offer both of FSR 3.1's where it runs")
@@ -85,8 +85,8 @@ def main():
     names = function(menu, "const char* tx_upscaler(int) {")
     table = re.search(r"static const char\* t\[ur::kUpscalers\] = \{(.*?)\};", names, re.S)
     check(table and [n.strip().strip('"') for n in table.group(1).replace("\n", " ").split(",")] ==
-          ["Game", "NVIDIA DLSS", "NVIDIA DLSS", "AMD FSR 3.1", "AMD FSR 4", "AMD FSR 4", "AMD FSR 3.1"],
-          "tx_upscaler's names are not the seven values' engines in their saved order")
+          ["Game", "NVIDIA DLSS", "NVIDIA DLSS", "AMD FSR 3.1", "AMD FSR 4", "AMD FSR 4", "AMD FSR 3.1", "Off", "Intel XeSS", "Intel XeSS"],   # ((Triforce) 11-24: Off; Intel XeSS after it)
+          "tx_upscaler's names are not the ten values' engines in their saved order")
     # ((Triforce, FSR4-7) FSR 4 by the version AMD's library runs, fsr4_name, the engine's name too)
     check("const int up = ur::engine(std::clamp(upscaler(), 0, ur::kUpscalers - 1));" in names and "return t[up];" in names,
           "tx_upscaler does not name what runs by its engine")
@@ -96,7 +96,7 @@ def main():
           "the Render resolution row does not say Native (100%) with a native AA")
     check("if (ur::full_scale(up))" in function(menu, "const char* hn_resolution(int v, int variant) {"),
           "the Render resolution row's help has no line for a native AA")
-    check("ur::step_resolution(upscaler(), *r.value, dir)" in function(menu, "void set_row("),
+    check("ur::step_resolution(upscaler(), ur::snap(upscaler(), *r.value), dir)" in function(menu, "void set_row("),
           "the Render resolution row does not step through Native (100%)")
     readme = (ROOT / "readme.md").read_text(encoding="utf-8")
     check("| Upscaler | Game, NVIDIA DLSS, AMD FSR 3.1, AMD FSR 4" in readme and

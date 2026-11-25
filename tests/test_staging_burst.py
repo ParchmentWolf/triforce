@@ -74,6 +74,9 @@ static bool vram_usage(uint64_t* used, uint64_t* allowed) {
     return card_mb != 0;
 }
 static void logf(const char*, ...) {}
+// ((Triforce) vk_internal.h's levels: the slow arena's line is a debug one)
+enum LogLevel : int { log_error, log_warn, log_info, log_debug, log_trace };
+static void logf_at(LogLevel, const char*, ...) {}
 // ((Triforce, 11-22) MEM-141's swap hold, merged into the loop: off, as it always is on Windows
 #include "linux_pressure.h"
 static bool memory_swap_hold() { return false; }

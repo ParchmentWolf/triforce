@@ -31,19 +31,25 @@ struct Present {
     bool hudless_wanted;   // AMD FSR 4's frame generation is the row's (fsr4fg::frames_wanted)
     bool have_images;      // the shared images are there (fg.w)
     bool have_hudless;     // the images of the picture without the HUD are there
+    // ((Triforce) 11-24) AMD FSR 3.1's frame interpolation (the Frame generation by row), whose own images (vk_fsr3fi.cpp, and
+    // the HUD's: vk_framegen.cpp hud_source) are counted by its own use alone: a set the renderer's own made leaves them unused
+    bool fsr_wanted = false;   // asked by the rows (fsr3fi::frames_wanted, frame generation on)
+    bool fsr_used = false;     // this present gave it a frame (fsr3fi::generate called: a history alone or a reset too)
 };
 struct Counts {
-    uint32_t off = 0, hudless_off = 0;
+    uint32_t off = 0, hudless_off = 0, fsr_off = 0;
 };
 struct Release {
     bool shared, hudless;
+    bool fsr = false;   // AMD FSR 3.1's frame interpolation's images (fsr3fi::release: nothing to do once they are gone)
 };
-/// The two counts after this present, and what it lets go. keep: RX_VK_FG_KEEP, nothing ever
+/// The counts after this present, and what it lets go. keep: RX_VK_FG_KEEP, nothing ever
 inline Release step(Counts& c, const Present& p, bool keep) {
     c.off = next_off(c.off, p.on, p.recorded);
     c.hudless_off = next_off(c.hudless_off, p.on && p.hudless_wanted, false);
+    c.fsr_off = next_off(c.fsr_off, p.fsr_wanted, p.fsr_used);
     if (keep) return {false, false};
-    return {due(c.off, p.have_images), due(c.hudless_off, p.have_hudless)};
+    return {due(c.off, p.have_images), due(c.hudless_off, p.have_hudless), c.fsr_off >= kPresents};
 }
 
 }   // namespace framegen_idle

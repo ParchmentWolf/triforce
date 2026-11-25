@@ -10,15 +10,21 @@
                 HOS_NVN_CONTINUE=1 (go on past nvnBootstrapLoader). */
 #include "hos.h"
 #include "hos_paths.h"
+#include "oot_heart_containers.h"   /* ((Triforce) the Discord status's pieces of heart) */
 #include "hos_instance.h"   /* ((Triforce) one game at a time for a game folder) */
 #include "hos_bench.h"      /* ((Triforce, 11-19) benchmark mode: HOS_BENCHMARK */
+#include "ws_floor.h"       /* ((Triforce) the game's memory kept in RAM: HOS_WS_FLOOR_MB) */
 #include "../gpu/vk/vk_api.h"
 #include "../gpu/vk/oot_cheat_items.h"
 #include "../gpu/vk/oot_debug_link.h"   /* ((Triforce) the Game flags and Cutscenes pages' lines) */
 #include "achievements.h"               /* ((Triforce) what an achievement asks of the save data: host/achievements.c) */
 #include "save_files.h"                 /* ((Triforce) the title's file select: host/save_files.c) */
+#include "flight_jump.h"                /* ((Triforce, 11-24) the no-clip flight's Jump: the game's Swap Jump Controls */
+#include "pouch_live.h"                 /* ((Triforce, 11-24) the Inventory's items given to the game's live pouch */
 #include "../gpu/vk/ultrawide_rows.h"   /* ((Triforce) the Ultrawide row's shapes: ultrawide_ratio) */
 #include "../gpu/vk/output_sizes.h"   /* ((Triforce) the picture for the Output resolution and a shape: output_picture) */
+#include "oot_teleport_check.h"   /* ((Triforce) 11-24: the teleport's follow-up: a dropped request sent again) */
+#include "prepare_args.h"   /* ((Triforce, 11-24) a supervised --prepare-shaders run's arguments (gpu/vk/prepare_journal.h) */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -82,6 +88,22 @@ static int no_power_throttling(void) {
     if (set(GetCurrentProcess(), 4, &s, sizeof s)) return 2;
     s.control = 0x1;
     return set(GetCurrentProcess(), 4, &s, sizeof s) ? 1 : 0;
+}
+#endif
+
+#ifdef _WIN32
+/* (Triforce) The game's memory kept in RAM under memory pressure: a soft working-set minimum (host/ws_floor.h, HOS_WS_FLOOR_MB) */
+static void ws_floor(void) {
+    uint64_t mb, ram_mb;
+    unsigned long err;
+    const int r = ws_floor_apply(getenv("HOS_WS_FLOOR_MB"), &mb, &ram_mb, &err);
+    if (r > 0)
+        hos_log("mem: the working set's minimum is %llu MB of the PC's %llu MB: Windows keeps that much of the game in RAM before "
+                "it trims below it (HOS_WS_FLOOR_MB=0: Windows' own)", (unsigned long long)mb, (unsigned long long)ram_mb);
+    else if (!r)
+        hos_log("mem: the working set's minimum is Windows' own (HOS_WS_FLOOR_MB=0)");
+    else
+        hos_log("mem: a working set minimum of %llu MB was refused (error %lu): Windows' own stays", (unsigned long long)mb, err);
 }
 #endif
 
@@ -196,6 +218,13 @@ static int reserve_guest(void) {
         int usable = 0;
         {
             const int u = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+            /* ((Triforce, 11-24, after Source A's) a /dev/udmabuf the player may not open (its group or a udev rule leaves the
+               user out) says so: GPU imports then stay the slower host-pointer kind, on AMD's RADV above all. Never by running
+               the game as root) */
+            if (u < 0 && (errno == EACCES || errno == EPERM))
+                hos_log("WARNING: /dev/udmabuf permission denied (%s); GPU imports may be slower, especially on AMD/RADV. Ask for "
+                        "access through its device group or a udev rule for the device. Do not run the game as root",
+                        strerror(errno));
             if (u >= 0) {
                 close(u);
                 usable = 1;
@@ -283,20 +312,79 @@ void hos_update_check(void);   /* (host/hos_update.c) */
    in one step (triforce/ itself may hold the builder already, so the saves get a folder of their own there); if that cannot
    be done the saves stay in the old folder. The launcher looks in both, the new one first.)
    A user/ folder beside the executable from before is moved there the first time, entry by entry. Anything that
-   cannot be moved keeps the old place. --user still wins. */
+   cannot be moved keeps the old place. --user still wins.
+   ((Triforce, 11-24, after Source A's) A symbolic link in it, to saves the player keeps elsewhere (a synced folder, another
+   drive), is made again in the new place, to the same folder (or, to an entry that moves too, to where that one goes), and
+   never entered. It was moved as it stood, and one written from where it stood ("../../saves") then named nothing; from
+   another drive it was copied as the folder it names and delete_tree emptied that folder, which is not Triforce's: the next
+   start found the link still here, kept the old place, and showed no saves. A user/ that is a link itself is the player's
+   choice of place, and is used as it is. And the move is all or nothing: looked at first (with an entry the new place has
+   already, the old place keeps them all), then moved; one that cannot go (a copy that fails on a full disk) brings back the
+   entries that went before it, and a copied entry's old place goes only once all are there.) */
 static int is_dir(const char *p) {
     const DWORD a = GetFileAttributesA(p);
     return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
 }
+static int is_link(const char *p) {
+    struct stat st;
+    return lstat(p, &st) == 0 && S_ISLNK(st.st_mode);
+}
+static const char *move_old, *move_from, *move_new;   /* (the user folder on the move, as realpath names it and as given, and the new place) */
+static int moved_to(char *target, const char *dir) {   /* (a target under dir: named where it will be) */
+    char there[MAX_PATH];
+    const size_t n = dir && dir[0] == SEP ? strlen(dir) : 0;
+    if (!n || strncmp(target, dir, n) || target[n] != SEP) return 0;
+    snprintf(there, sizeof there, "%s%s", move_new, target + n);
+    snprintf(target, MAX_PATH, "%s", there);
+    return 1;
+}
+static int copy_link(const char *from, const char *to) {   /* (to what it names, in full; one that names nothing: as written) */
+    char target[MAX_PATH];
+    if (!realpath(from, target)) {
+        const ssize_t n = readlink(from, target, sizeof target - 1);
+        if (n < 0) return 0;
+        target[n] = 0;
+    }
+    /* (to an entry that moves too: where it will be. One whose entry went first names nothing by now, so its text is
+       checked too) */
+    if (!moved_to(target, move_old)) moved_to(target, move_from);
+    return symlink(target, to) == 0;
+}
+static int has_link(const char *p) {
+    if (is_link(p)) return 1;
+    if (!is_dir(p)) return 0;
+    char pattern[MAX_PATH];
+    snprintf(pattern, sizeof pattern, "%s" SEP_S "*", p);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    int found = 0;
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+            char a[MAX_PATH];
+            snprintf(a, sizeof a, "%s" SEP_S "%s", p, fd.cFileName);
+            found = has_link(a);
+        } while (!found && FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    return found;
+}
 static int copy_tree(const char *from, const char *to) {
+    if (is_link(from)) return copy_link(from, to);
     if (!is_dir(from)) {
-        FILE *in = fopen(from, "rb"), *out = in ? fopen(to, "wb") : NULL;
+        /* ((Triforce) 11-24: each file whole under its name, or not there: copied beside it first. A kill while a save
+           was copied left a cut save under its name in the new folder) */
+        char fresh[MAX_PATH + 8];
+        snprintf(fresh, sizeof fresh, "%s.new", to);
+        FILE *in = fopen(from, "rb"), *out = in ? fopen(fresh, "wb") : NULL;
         int ok = in && out;
         char buf[1 << 16];
         for (size_t n; ok && (n = fread(buf, 1, sizeof buf, in)) > 0;) ok = fwrite(buf, 1, n, out) == n;
         ok = ok && in && !ferror(in);
         if (in) fclose(in);
         if (out && fclose(out)) ok = 0;
+        if (ok && !MoveFileExA(fresh, to, MOVEFILE_REPLACE_EXISTING)) ok = 0;
+        if (!ok && out) remove(fresh);
         return ok;
     }
     if (!CreateDirectoryA(to, NULL) && !is_dir(to)) return 0;
@@ -318,7 +406,7 @@ static int copy_tree(const char *from, const char *to) {
     return ok;
 }
 static void delete_tree(const char *p) {
-    if (!is_dir(p)) {
+    if (!is_dir(p) || is_link(p)) {   /* (a link goes; what it names stays) */
         DeleteFileA(p);
         return;
     }
@@ -340,6 +428,7 @@ static void delete_tree(const char *p) {
 static const char *saves_dir(const char *beside) {
     static char dir[MAX_PATH];
     const char *xdg = getenv("XDG_DATA_HOME"), *home = getenv("HOME");
+    if (is_link(beside)) return beside;   /* ((Triforce, 11-24) a user/ that is a link: the player's place, used as it is) */
     if (xdg && xdg[0] == '/') snprintf(dir, sizeof dir, "%s", xdg);
     else if (home && home[0] == '/') {
         snprintf(dir, sizeof dir, "%s/.local", home);
@@ -365,21 +454,47 @@ static const char *saves_dir(const char *beside) {
     if (GetFileAttributesA(dir) == INVALID_FILE_ATTRIBUTES) return beside;
     char pattern[MAX_PATH];
     snprintf(pattern, sizeof pattern, "%s" SEP_S "*", beside);
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) return dir;
     int moved = 0, kept = 0;
-    do {
-        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+    char real[MAX_PATH];
+    move_old = realpath(beside, real), move_from = beside, move_new = dir;
+    /* ((Triforce, 11-24) looked at first, then moved, all or nothing: see above) */
+    struct { char *name; int copied; } *went = NULL;
+    size_t n_went = 0;
+    for (int move = 0; move < 2 && !kept; move++) {
+        WIN32_FIND_DATAA fd;
+        HANDLE h = FindFirstFileA(pattern, &fd);
+        if (h == INVALID_HANDLE_VALUE) return dir;
+        do {
+            if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..") || (move && kept)) continue;
+            char from[MAX_PATH], to[MAX_PATH];
+            snprintf(from, sizeof from, "%s" SEP_S "%s", beside, fd.cFileName);
+            snprintf(to, sizeof to, "%s" SEP_S "%s", dir, fd.cFileName);
+            if (!move) {
+                kept += GetFileAttributesA(to) != INVALID_FILE_ATTRIBUTES;
+                continue;
+            }
+            void *more = realloc(went, (n_went + 1) * sizeof *went);
+            char *name = more ? strdup(fd.cFileName) : NULL;
+            if (more) went = more;
+            if (!name) kept++;
+            else if (!has_link(from) && MoveFileExA(from, to, 0)) went[n_went].name = name, went[n_went++].copied = 0;
+            else if (copy_tree(from, to)) went[n_went].name = name, went[n_went++].copied = 1;
+            else delete_tree(to), free(name), kept++;
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    for (size_t i = 0; i < n_went; i++) {   /* (all went: the copied ones' old places go; one did not: the others come back) */
         char from[MAX_PATH], to[MAX_PATH];
-        snprintf(from, sizeof from, "%s" SEP_S "%s", beside, fd.cFileName);
-        snprintf(to, sizeof to, "%s" SEP_S "%s", dir, fd.cFileName);
-        if (GetFileAttributesA(to) != INVALID_FILE_ATTRIBUTES) kept++;
-        else if (MoveFileExA(from, to, 0)) moved++;
-        else if (copy_tree(from, to)) delete_tree(from), moved++;
-        else delete_tree(to), kept++;
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
+        snprintf(from, sizeof from, "%s" SEP_S "%s", beside, went[i].name);
+        snprintf(to, sizeof to, "%s" SEP_S "%s", dir, went[i].name);
+        if (!kept) {
+            moved++;
+            if (went[i].copied) delete_tree(from);
+        } else if (went[i].copied) delete_tree(to);
+        else if (!MoveFileExA(to, from, 0)) hos_log("saves: %s could not come back to %s", to, from);
+        free(went[i].name);
+    }
+    free(went);
     if (kept) {
         hos_log("saves: %d of %s's entries could not go to %s: the saves stay in %s", kept, beside, dir, beside);
         return beside;
@@ -433,11 +548,12 @@ static int env_line_allowed(const char *name, const char *value) {
        the file select) */
     static const char *const by_name[] = {
         "HOS_AUDIO_DUMP", "HOS_AUDIO_WB_DUMP", "HOS_SHADER_DUMP", "HOS_FS_OVERLAY", "HOS_MODS", "HOS_INPUT_LIVE",
-        "HOS_INPUT_SCRIPT", "HOS_SAMPLE_ALL", "HOS_WATCH", "HOOKSHOT_BUILDER_HOME", "RX_VK_SHOTS", "RX_VK_SHOT_GO",
+        "HOS_INPUT_SCRIPT", "HOS_SAMPLE_ALL", "HOS_CHAIN", "HOS_WATCH", "HOOKSHOT_BUILDER_HOME", "RX_VK_SHOTS", "RX_VK_SHOT_GO",
         "RX_VK_FRAMELOG", "RX_VK_HANG_DUMP", "RX_VK_DUMP", "RX_VK_DUMP_SPV", "RX_VK_DUMP_MESH_SPV", "RX_VK_DUMP_STAGES",
         "RX_VK_DUMP_FAILED", "RX_VK_IR", "RX_VK_MENU_SCRIPT", "RX_DUMP_WGSL", "RX_DUMP_SLOW_WGSL", "RX_DUMP_TICS",
         "RX_WGSL_OVERRIDE"};
     for (size_t i = 0; i < sizeof by_name / sizeof *by_name; i++) names_file |= !strcmp(name, by_name[i]);
+    names_file |= !strcmp(name, "HOS_CRASH_TEST");   /* ((Triforce) a crash on purpose: the environment's only (hos_crash_dialog.c) */
     /* RX_VK_DLSS_DIR: a folder on this PC, not a share (\\server\x or //server/x) or a device path */
     if (!strcmp(name, "RX_VK_DLSS_DIR"))
         return !((value[0] == '\\' || value[0] == '/') && (value[1] == '\\' || value[1] == '/'));
@@ -457,6 +573,8 @@ static void load_hookshot_env(void) {
     }
     FILE *f = fopen(path, "r");
     if (!f) return;
+    char set_names[256][64];   /* ((Triforce) the names the file set so far: its later lines replace them) */
+    int set_n = 0;
     char line[512];
     while (fgets(line, sizeof line, f)) {
         char *s = line;
@@ -467,10 +585,30 @@ static void load_hookshot_env(void) {
         if (!len || *s == '#' || !strchr(s, '=')) continue;
         char *eq = strchr(s, '=');
         *eq = 0;
+        /* ((Triforce) a note after the value ("HOS_AUDIO=0  # mute"): cut at a '#' that follows a space or a tab, and the spaces
+           before it, so the note is not read as part of the value: the renderer's switch rule (vk_memory.cpp env_value_off)
+           read "0  # mute" as on) */
+        for (char *v = eq + 1; *v; v++)
+            if (*v == '#' && v > eq + 1 && (v[-1] == ' ' || v[-1] == 9)) {
+                *v = 0;
+                while (v > eq + 1 && (v[-1] == ' ' || v[-1] == 9)) *--v = 0;
+                break;
+            }
         if (!(other && *other) && !env_line_allowed(s, eq + 1)) {
             fprintf(stderr, "env: triforce_env.txt: %s left out (only the game's switches, and no paths, are taken from it)\n", s);
             continue;
         }
+        /* ((Triforce, 11-24) a switch set for this launch (in the environment before the file was read: a script's, a launcher's,
+           HOS_FULLSCREEN=0 ./triforce) keeps its value: the file's line goes over it no longer. Within the file a later line
+           still replaces an earlier one) */
+        int by_file = 0;
+        for (int i = 0; i < set_n; i++) by_file |= !strcmp(set_names[i], s);
+        if (!by_file && getenv(s)) {
+            fprintf(stderr, "env: triforce_env.txt: %s left out (set for this launch already, which goes first)\n", s);
+            continue;
+        }
+        if (!by_file && set_n < (int)(sizeof set_names / sizeof *set_names) && strlen(s) < sizeof set_names[0])
+            snprintf(set_names[set_n++], sizeof set_names[0], "%s", s);
 #ifdef _WIN32
         *eq = '=';
         _putenv(s);
@@ -573,6 +711,9 @@ static void driver_cache_folder(void) {
 
 int hos_oot_protect_hearts;
 volatile int hos_oot_live_action;   /* (test runs) the live input file's "!cheat <action>": host/nn_hid.c */
+/* ((Triforce, 11-24) the game's Swap Jump Controls, for the no-clip flight's Jump (host/flight_jump.h, host/nn_hid.c): 1 on,
+   0 off, -1 not read yet. Read at Link's update once a second, oot_update_player_cheats) */
+volatile int hos_oot_jump_swapped = -1;
 
 int hos_oot_hearts_enabled(void) {
     int rx_option(int id, int otherwise);
@@ -588,6 +729,56 @@ int hos_oot_is_player(Ctx *c, uint64_t actor) {
     return resource && recomp_load32(c, resource + 88) == 0x79616c50 &&
            recomp_load16(c, resource + 92) == 0x7265 &&
            recomp_load8(c, resource + 94) == 0;
+}
+
+/* ((Triforce) the Debug tab's Movement speed tool) Link's character controller and the tool's percent, as oot_player_speed
+   saw them at his last update (0: none, which it is at 1x and with the tools off) */
+static uint64_t oot_speed_controller;
+static int oot_speed_percent = 100;
+
+/* A character controller's forward speed being set (nx2/oot_patches.py patch_cct_speed: s0, in metres a second, or a frame
+   when per_second is 0): Link's is scaled by the tool while it is above 1x and the player steers him (a scene's walk, as the
+   one into a map, keeps its pace), and the physics step moves him by it with its collisions. Only speeds up to 15 m/s (his
+   run is 4.5): a ledge climb sets some 55 for a frame, and scaled it threw him past the ledge. Every other controller, and
+   Link's at 1x, as the game set it: the call returns at its first line */
+void hos_oot_cct_speed(Ctx *c, uint64_t controller, int per_second) {
+    if (!controller || controller != __atomic_load_n(&oot_speed_controller, __ATOMIC_RELAXED)) return;
+    const int percent = __atomic_load_n(&oot_speed_percent, __ATOMIC_RELAXED);
+    int hos_move_stick_held(void);   /* host/nn_hid.c */
+    if (percent <= 100 || percent > 400 || !hos_move_stick_held()) return;
+    float speed;
+    memcpy(&speed, &c->vreg[0][0], sizeof speed);
+    if (!(fabsf(speed) * (per_second ? 1.0f : 60.0f) <= 15.0f)) return;   /* (and not a number) */
+    speed *= percent / 100.0f;
+    memcpy(&c->vreg[0][0], &speed, sizeof speed);
+}
+
+/* ---- (Triforce) What the Discord status may say (host/discord_rpc.c, host/discord_activity.c) ----
+   The map the game is in (Sequence_CurrentBanc), whether an event plays, a map loads, Link is the child, and his life, its
+   most (quarter hearts), his rupees, Gold Skulltula tokens and pieces of heart: read on the game's thread at Link's update
+   (oot_discord_refresh, every 2 s), and only while the Discord thread asks for them (hos_oot_discord_watch: connected, its
+   row on, and a template of the player's that shows one of them; the default shows none, so nothing is read). Kept here for
+   the Discord thread behind a small lock; the last ones known stay through loads and menus, where Link is not updated. */
+static int oot_discord_watching;
+static int oot_discord_busy;   /* (the lock: a few dozen bytes copied under it) */
+static char oot_discord_map[80];
+static int oot_discord_flags = -1;   /* (1 an event playing, 2 a map loading, 4 the child; -1 not read yet) */
+static int oot_discord_stats[5] = {-1, -1, -1, -1, -1};
+static void oot_discord_lock(void) {
+    while (__atomic_exchange_n(&oot_discord_busy, 1, __ATOMIC_ACQUIRE))
+        ;
+}
+static void oot_discord_unlock(void) { __atomic_store_n(&oot_discord_busy, 0, __ATOMIC_RELEASE); }
+void hos_oot_discord_watch(int on) { __atomic_store_n(&oot_discord_watching, on ? 1 : 0, __ATOMIC_RELAXED); }
+/* Link's life and its most in quarter hearts, his rupees, Gold Skulltula tokens and pieces of heart, each -1 when not known;
+   0 before any */
+int hos_oot_stats(int *life, int *max_life, int *rupees, int *tokens, int *pieces) {
+    oot_discord_lock();
+    const int have = oot_discord_flags >= 0;
+    *life = oot_discord_stats[0], *max_life = oot_discord_stats[1], *rupees = oot_discord_stats[2];
+    *tokens = oot_discord_stats[3], *pieces = oot_discord_stats[4];
+    oot_discord_unlock();
+    return have;
 }
 
 #if defined(_WIN32) || defined(__linux__)   /* (the debug tools: host/posix has what they call) */
@@ -606,6 +797,44 @@ static int oot_pouch_count(Ctx *c, const char *name) {
     const int n = (int)(int32_t)c->x[0];
     *c = saved;
     return n;
+}
+
+/* ((Triforce, 11-24) The live pouch changed through the game's own add and remove, as its event action
+   OneShotAddOrRemovePouchContent (f_828d4a70) calls them. The game asks the pouch manager whether Link has an item
+   (QueryIsExistInPouch: f_805b63e0 over the manager's own lists), not GameData: an item set in GameData alone showed in the
+   save and on the Inventory page, and the game did not see it (the owner, 11-24: "item unlocks not detecting in game").
+   f_8112d570(manager, &name, 0, count, reason, 0, 0, 0; a byte 0 on the stack) adds, reason 9 being "Script" in the
+   action's table (PickUp, Use, Put, Break, Sell, Buy, Borrow, Event, Seq, Script, EnemyMuseum, EnemyMuseumRestore);
+   f_833c4fa0(manager, &name, count, 0, 0, 0) removes. The name as the action passes it: a pointer to its text, the size
+   of its buffer, then the buffer. 1 when the game took it: an add says so in bit 0 of what it returns (what the action
+   passes on as "added"), a remove says nothing and is taken; 0 not asked or refused. The pouch writes GameData itself, a
+   frame later and by the difference, so GameData's count is not set again over a change the pouch took (a Stock set to
+   23 and the pouch's +3 after it made 26). HOS_POUCH_LIVE=0: GameData alone, as before (host/pouch_live.h) */
+static int oot_pouch_change(Ctx *c, const char *name, int delta) {
+    const uint64_t manager = recomp_load64(c, 0x84e98e28ULL);
+    A64Fn add = a64_lookup(0x8112d570ULL), take = a64_lookup(0x833c4fa0ULL);
+    const size_t len = strlen(name);
+    if (!manager || !add || !take || !delta || len >= POUCH_NAME_ROOM) return 0;
+    const Ctx saved = *c;
+    const uint64_t frame = (c->x[31] - 0x100) & ~0xfULL;   /* (frame: the stack argument; frame + 0x10: the name) */
+    const uint64_t text = frame + 0x10;
+    recomp_store64_sp(c, frame, 0);
+    recomp_store64_sp(c, text, text + 0xc);
+    recomp_store32_sp(c, text + 8, POUCH_NAME_ROOM);
+    memcpy(A64_PTR(text + 0xc), name, len + 1);
+    c->x[31] = frame;
+    c->x[0] = manager, c->x[1] = text;
+    int took = 1;
+    if (delta > 0) {
+        c->x[2] = 0, c->x[3] = (uint64_t)(uint32_t)delta, c->x[4] = POUCH_REASON_SCRIPT, c->x[5] = 0, c->x[6] = 0, c->x[7] = 0;
+        add(c);
+        took = (int)(c->x[0] & 1);
+    } else {
+        c->x[2] = (uint64_t)(uint32_t)-delta, c->x[3] = 0, c->x[4] = 0, c->x[5] = 0;
+        take(c);
+    }
+    *c = saved;
+    return took;
 }
 
 static int oot_item_get(Ctx *c, const char *name);
@@ -634,6 +863,8 @@ static const unsigned char oot_item_kinds[] = {OOT_CHEAT_ITEMS(OOT_NO_SECTION, O
 #define OOT_ITEM_COUNT (sizeof oot_item_names / sizeof oot_item_names[0])
 
 static int oot_gamedata_bool(Ctx *c, uint32_t hash, int *value);
+static int oot_gamedata_string(Ctx *c, uint32_t hash, char *buf, size_t size);
+static int oot_first_night_fix(Ctx *c, const char *map);   /* (below, after the tools it uses) */
 
 static void oot_inventory_refresh(Ctx *c, int64_t now) {
     void rx_option_set(int id, int value);
@@ -642,6 +873,28 @@ static void oot_inventory_refresh(Ctx *c, int64_t now) {
     next = now + 500000000LL;
     /* (a save is loaded once the pouch answers: before that GameData holds a new game's values, shown as unknown) */
     const int loaded = oot_pouch_count(c, oot_item_names[0]) >= 0;
+    {   /* (the map Link is in, Sequence_CurrentBanc: the first night's time lock is Hyrule Field's alone) */
+        char map[80] = "";
+        if (loaded && oot_gamedata_string(c, 0x1d6189dau, map, sizeof map) && map[0]) oot_first_night_fix(c, map);
+        /* ((Triforce) the map and Link's age, logged when either changes: the window after a crash says "while you were
+           playing" from these lines (host/hos_crash_dialog.h), and a log's reader sees where a problem happened */
+        static char logged[100];
+        int child = 1;
+        char line[100];
+        if (map[0]) {
+            snprintf(line, sizeof line, "%s (%s)", map,
+                     oot_gamedata_bool(c, 0xcea220d3u, &child) ? (child ? "child" : "adult") : "age not known");
+            if (strcmp(line, logged)) hos_log("map: %s", line), snprintf(logged, sizeof logged, "%s", line);
+        }
+        /* ((Triforce) and the renderer's Simulated turf page, whose values are each area's: the map when it changes, "" none,
+           gpu/vk/vk_api.h HOS_OPT_SIM_TURF_AREA) */
+        static char said[80];
+        if (strcmp(map, said)) {
+            for (const char *p = map; *p; p++) rx_option_set(HOS_OPT_SIM_TURF_AREA_TEXT, (unsigned char)*p);
+            rx_option_set(HOS_OPT_SIM_TURF_AREA, map[0] != 0);
+            snprintf(said, sizeof said, "%s", map);
+        }
+    }
     for (unsigned i = 0; i < OOT_ITEM_COUNT; i++)
         rx_option_set(OOT_CHEAT_ITEM_BASE + (int)i, loaded ? oot_item_get(c, oot_item_names[i]) : -1);
     {   /* Link's age for the Debug tab's Switch age row: 0 child, 1 adult, -1 no save loaded (Sequence_IsChildhood) */
@@ -819,8 +1072,9 @@ static int oot_event_arg(Ctx *c, uint64_t arg, const char *name, uint32_t type, 
     const uint64_t name_buf = recomp_load64(c, entry + 8);
     const uint32_t name_cap = recomp_load32(c, entry + 16);
     const size_t length = strlen(name);
-    if (!name_buf || length + 1 > name_cap) return 0;
-    memcpy(A64_PTR(name_buf), name, length + 1);
+    void *to = name_buf && length + 1 <= name_cap ? hos_guest_range(name_buf, length + 1) : NULL;   /* ((Triforce) guest memory only) */
+    if (!to) return 0;
+    memcpy(to, name, length + 1);
     if (type == 4) recomp_store8(c, entry + 152, value & 1);
     else recomp_store64(c, entry + 152, value);
     recomp_store32(c, entry, type);
@@ -831,6 +1085,12 @@ static int oot_event_arg(Ctx *c, uint64_t arg, const char *name, uint32_t type, 
 static struct {
     int64_t requested_at, check_at;
     unsigned destination;
+    /* ((Triforce) 11-24, oot_teleport_followup) the follow-up sent this request again: not a third time; and the map of
+       the last request sent from the menu, which the follow-up checks ("" none, and for the crawl's, which asks again
+       itself) */
+    int resent;
+    char pending[80];
+    const char *why, *banc;   /* ((Triforce) the last call's: why it was not sent, the map it was sent to (the control bridge's reply) */
 } teleport;
 static uint64_t teleport_result;   /* ((Triforce) the last request's own result, oot_teleport: benchmark mode's retry */
 
@@ -876,11 +1136,15 @@ void hos_oot_live_crawl(const char *line) {
     ReleaseSRWLockExclusive(&crawl.lock);
 }
 
+static void oot_teleport_minimap(Ctx *c);   /* (below, after the game's own setters) */
+
 static int oot_teleport(Ctx *c, uint64_t actor, unsigned index) {
+    teleport.why = "no such destination", teleport.banc = NULL;   /* ((Triforce) the control bridge's reply: why not, or where) */
     if (!crawl_banc && index >= sizeof oot_destinations / sizeof oot_destinations[0]) return 0;
     const int64_t now = hos_now_ns();
     if (teleport.requested_at && now - teleport.requested_at < 8000000000LL) {
         hos_log("cheats: teleport ignored, a request is still in progress");
+        teleport.why = "another teleport is still in progress (one every 8 s)";
         return 0;
     }
     const uint64_t events = oot_singleton(c, OOT_EVENTMGR_SLOT);
@@ -888,15 +1152,18 @@ static int oot_teleport(Ctx *c, uint64_t actor, unsigned index) {
     A64Fn set_link = a64_lookup(0x802dc440ULL), release_link = a64_lookup(0x8022b6f0ULL);
     if (!events || !make_arg || !request || !set_link || !release_link) {
         hos_log("cheats: teleport unavailable (event manager %#llx)", (unsigned long long)events);
+        teleport.why = "the game's event manager is not there yet";
         return 0;
     }
     if (recomp_load64(c, events + 104)) {   /* (the Main sequence's "Event" test: an event is playing) */
         hos_log("cheats: teleport waits until the current event ends");
+        teleport.why = "an event is playing (a cutscene, a map change's)";
         return 0;
     }
     int loading = 0, child = 1;
     if (oot_gamedata_bool(c, 0xef2b60c2u, &loading) && loading) {   /* Sequence_IsLoadingBanc */
         hos_log("cheats: teleport ignored while a map loads");
+        teleport.why = "a map is loading";
         return 0;
     }
     if (!oot_gamedata_bool(c, 0xcea220d3u, &child)) hos_log("cheats: Sequence_IsChildhood not found, using child maps");
@@ -907,13 +1174,14 @@ static int oot_teleport(Ctx *c, uint64_t actor, unsigned index) {
     if (crawl_banc) banc = crawl_banc, start = crawl_start, boot = crawl_boot;   /* (the crawl's "!banc": any map) */
     if (!banc) {
         hos_log("cheats: teleport %u has no %s map", index, child ? "child" : "adult");
+        teleport.why = child ? "this destination has no map for the child" : "this destination has no map for the adult";
         return 0;
     }
 
     /* The event reads its string arguments after this request returns, so they live in memory that stays. */
     static uint64_t strings;
     if (!strings) strings = hos_sys_alloc(512, 16);
-    if (!strings) return 0;
+    if (!strings) return teleport.why = "out of memory", 0;
     memset(A64_PTR(strings), 0, 512);
     memcpy(A64_PTR(strings), banc, strlen(banc) + 1);
     memcpy(A64_PTR(strings + 128), start, strlen(start) + 1);
@@ -934,8 +1202,9 @@ static int oot_teleport(Ctx *c, uint64_t actor, unsigned index) {
     {   /* the event's name: arg+6800 points at its buffer, arg+6808 the capacity */
         const uint64_t buf = recomp_load64(c, arg + 6800);
         const uint32_t cap = recomp_load32(c, arg + 6808);
-        if (!buf || strlen(event) + 1 > cap) ok = 0;
-        else memcpy(A64_PTR(buf), event, strlen(event) + 1);
+        void *to = buf && strlen(event) + 1 <= cap ? hos_guest_range(buf, strlen(event) + 1) : NULL;   /* ((Triforce) guest memory only) */
+        if (!to) ok = 0;
+        else memcpy(to, event, strlen(event) + 1);
     }
     ok = ok && oot_event_arg(c, arg, "NextBanc", 1, strings);
     ok = ok && oot_event_arg(c, arg, "NextStartPos", 1, strings + 128);
@@ -962,14 +1231,19 @@ static int oot_teleport(Ctx *c, uint64_t actor, unsigned index) {
         release_link(c);
     }
     *c = saved;
+    if (ok && result) oot_teleport_minimap(c);   /* (only once the event manager takes the request: 0, it did not, and Link stays) */
     teleport_result = ok ? result : 0;   /* ((Triforce) benchmark mode: 0 = the event manager did not take it) */
     const int refused = crawl_banc && (!ok || !result);   /* (the crawl: asked again soon, not after the 8 s of a request under way) */
     teleport.requested_at = refused ? 0 : now;
     teleport.check_at = refused ? 0 : now + 1500000000LL;
     teleport.destination = index;
+    teleport.resent = 0;   /* ((Triforce) 11-24: a new request: the follow-up may send it once more) */
+    snprintf(teleport.pending, sizeof teleport.pending, "%s", ok && !crawl_banc ? banc : "");
     hos_log("cheats: teleport %s to %s at %s (boot %s, event %s, starter %d): request %s, result %#llx",
             child ? "child" : "adult", banc, start, boot, event, with_starter, ok ? "sent" : "not built",
             (unsigned long long)result);
+    if (ok) teleport.banc = banc;   /* ((Triforce) the control bridge's reply) */
+    else teleport.why = "the game's event request could not be built";
     if (crawl_banc) return ok && result != 0;   /* (the crawl asks again until the event manager takes the request) */
     return ok;   /* (sent; the request's own result is only logged) */
 }
@@ -992,6 +1266,28 @@ static int oot_gamedata_set_bool(Ctx *c, uint32_t hash, int value) {
         return 1;
     }
     return 0;
+}
+
+/* The first adult night's time lock: f_8347c020 holds the clock at 20:00 while the saved Bool
+   HrlField_isFirstNightTime_Adult (0x8592aa82) is 1 and quest 0x4dbca27f is not Ready. The flag belongs to Hyrule
+   Field's first night only. A save in any other map that still holds it cannot leave night (the Sun's Song and the Debug
+   tab's time are overwritten, the clock snaps back): clear it there with the game's own Bool, once, and say so, never
+   while an event (the escape's cutscene) is running. HOS_OOT_FIRST_NIGHT_FIX=0 turns the repair off for a run. Returns 1
+   when it cleared the flag. Asked by oot_inventory_refresh, twice a second while a save is loaded. */
+static int oot_first_night_fix(Ctx *c, const char *map) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("HOS_OOT_FIRST_NIGHT_FIX");
+        on = !(e && *e && atoi(e) == 0);
+    }
+    if (!on || !map[0] || !strncmp(map, "HyruleField", 11)) return 0;
+    const uint64_t events = oot_singleton(c, OOT_EVENTMGR_SLOT);
+    if (events && recomp_load64(c, events + 104)) return 0;   /* (the Main sequence's "Event" test: an event is playing) */
+    int set = 0;
+    if (!oot_gamedata_bool(c, 0x8592aa82u, &set) || !set) return 0;
+    if (!oot_gamedata_set_bool(c, 0x8592aa82u, 0)) return 0;
+    hos_log("oot: cleared the first adult night's time lock (the save was in %s, outside Hyrule Field)", map);
+    return 1;
 }
 
 /* ---- (Triforce, 11-13) The inventory in GameData ----
@@ -1079,6 +1375,22 @@ static int oot_gd_set(Ctx *c, uint64_t mgr, uint32_t hash, uint32_t value, int i
     return 1;
 }
 
+/* A map-hiding area sets the saved flag MapIconDeactivateByAreaActor while Link is in it and shows the minimap again as he
+   walks out. The teleport's map change takes him out without that: the flag stayed set, and no area had a minimap from then
+   on, in that save and every one made from it. oot_teleport clears it once its request is taken; the map he arrives in sets it
+   again where it hides its own. Through the game's own Bool setter (oot_gd_set: it queues the change for the live value and
+   the save's copy; the live byte alone restored the HUD until the next load, and saves kept the old hidden value). A save it
+   is already stuck in is mended by its next teleport. */
+static void oot_teleport_minimap(Ctx *c) {
+    int hidden = 0;
+    if (!oot_gamedata_bool(c, 0x9a4dd779u, &hidden) || !hidden) return;   /* MapIconDeactivateByAreaActor */
+    if (oot_gd_set(c, oot_singleton(c, OOT_GAMEDATA_SLOT), 0x9a4dd779u, 0, 1))
+        hos_log("cheats: teleport: the area left had hidden the minimap (MapIconDeactivateByAreaActor): restore queued");
+    else   /* (another game build: say so, a report's log then shows why the minimap stayed away) */
+        hos_log("cheats: teleport: the area left had hidden the minimap (MapIconDeactivateByAreaActor): the game's Bool setter "
+                "or its game data manager not found, left hidden");
+}
+
 /* a Bool's entry by its hash, 0 none (24-byte entries, the current value at +22, as oot_gamedata_set_bool has them) */
 static uint64_t oot_gd_bool(Ctx *c, uint64_t mgr, uint32_t hash) {
     const int64_t i = oot_gd_lookup(c, recomp_load64(c, mgr + 32), recomp_load32(c, mgr + 44), hash);
@@ -1162,6 +1474,16 @@ static int oot_item_give(Ctx *c, const char *name, int count) {
             oot_gd_set(c, mgr, hash, (uint32_t)oot_bags[fits].max, 0);
         }
     }
+    {   /* ((Triforce, 11-24) the live pouch, through the game's own add or remove: host/pouch_live.h */
+        static int live_on = -1;
+        if (live_on < 0) live_on = pouch_live_env(getenv("HOS_POUCH_LIVE"));
+        const int live = oot_pouch_count(c, name), delta = pouch_live_delta(live_on, live, count);
+        const int took = delta && oot_pouch_change(c, name, delta);
+        if (delta)
+            hos_log("cheats: pouch %s: %d -> %d %s", name, live, count,
+                    took ? "taken by the game's pouch (it writes GameData)" : "refused by the game's pouch: GameData set");
+        if (took) return 1;   /* (the pouch writes the count: setting it too counted the change twice) */
+    }
     if (oot_pouch_set(c, mgr, name, count)) return 1;
     const uint32_t first = oot_gd_member(c, oot_gd_struct(c, mgr, 0xade0ef78u), oot_murmur3(name));
     if (first && oot_gd_bool(c, mgr, first)) return oot_gd_set(c, mgr, first, count > 0, 1);   /* (a song: its flag) */
@@ -1169,12 +1491,14 @@ static int oot_item_give(Ctx *c, const char *name, int count) {
 }
 
 /* Age toggle: flips Sequence_IsChildhood (what the Temple of Time event sets) and reloads the current map, or the
-   Market when this map is not in oot_destinations, through the teleport so the other age's map and Link load. */
-static void oot_toggle_age(Ctx *c, uint64_t actor) {
+   Market when this map is not in oot_destinations, through the teleport so the other age's map and Link load. ((Triforce)
+   1: the map change was sent (teleport.banc its map); 0: not, teleport.why says why (the control bridge's reply)) */
+static int oot_toggle_age(Ctx *c, uint64_t actor) {
     int child = 1;
     if (!oot_gamedata_bool(c, 0xcea220d3u, &child)) {
         hos_log("cheats: age toggle: Sequence_IsChildhood not found");
-        return;
+        teleport.why = "Link's age is not in the game's data (Sequence_IsChildhood not found)", teleport.banc = NULL;
+        return 0;
     }
     char current[80];
     oot_gamedata_string(c, 0x1d6189dau, current, sizeof current);   /* Sequence_CurrentBanc */
@@ -1189,25 +1513,161 @@ static void oot_toggle_age(Ctx *c, uint64_t actor) {
     }
     if (!oot_gamedata_set_bool(c, 0xcea220d3u, !child)) {
         hos_log("cheats: age toggle: could not write Sequence_IsChildhood");
-        return;
+        teleport.why = "Link's age could not be written (Sequence_IsChildhood)", teleport.banc = NULL;
+        return 0;
     }
     hos_log("cheats: age toggle: %s -> %s, reloading via destination %u (current map \"%s\")",
             child ? "child" : "adult", child ? "adult" : "child", target, current);
     if (!oot_teleport(c, actor, target)) {
         oot_gamedata_set_bool(c, 0xcea220d3u, child);
         hos_log("cheats: age toggle undone, the map change was not requested");
+        return 0;
     }
+    return 1;
 }
 
-static void oot_teleport_followup(Ctx *c) {
+static void oot_teleport_followup(Ctx *c, uint64_t actor) {
     if (!teleport.check_at || hos_now_ns() < teleport.check_at) return;
     teleport.check_at = 0;
-    char next[80], current[80];
+    char next[80] = "", current[80] = "";
     oot_gamedata_string(c, 0xee27bf71u, next, sizeof next);     /* Sequence_ReservedNextBanc */
     oot_gamedata_string(c, 0x1d6189dau, current, sizeof current);   /* Sequence_CurrentBanc */
     const uint64_t events = oot_singleton(c, OOT_EVENTMGR_SLOT);
-    hos_log("cheats: teleport check: reserved \"%s\", current \"%s\", event playing %d", next, current,
-            events && recomp_load64(c, events + 104) ? 1 : 0);
+    const int playing = events && recomp_load64(c, events + 104) ? 1 : 0;
+    int loading = 0;
+    oot_gamedata_bool(c, 0xef2b60c2u, &loading);   /* Sequence_IsLoadingBanc */
+    hos_log("cheats: teleport check: reserved \"%s\", current \"%s\", event playing %d", next, current, playing);
+    /* ((Triforce) 11-24) dropped by the game, as a request a few frames after a save has loaded is: sent once more, the
+       8 s guard aside (oot_teleport_check.h). Not in benchmark mode, whose tour asks again itself for a request the event
+       manager refused and for one that brought no map change (oot_bench_tick, host/hos_bench.c): one retry a request */
+    if (oot_teleport_dropped(next, current, teleport.pending, playing, loading, teleport_result, teleport.resent, hos_bench_on())) {
+        hos_log("cheats: teleport to %s dropped by the game (answered 0, nothing reserved, no event): sending it again",
+                teleport.pending);
+        teleport.requested_at = 0;
+        const int sent = oot_teleport(c, actor, teleport.destination);
+        teleport.resent = 1;   /* (oot_teleport set it for a new request: this one is the same) */
+        if (!sent) hos_log("cheats: the dropped teleport was not sent again");
+    }
+}
+
+/* (Triforce) the control bridge (host/control.c, HOS_CONTROL): the map the game is in (Sequence_CurrentBanc), read on the
+   game's thread with the player's update every 250 ms and kept for the bridge's thread; the last one known (it stays through
+   loads and menus, where Link is not updated). And the debug teleport by destination, as the Debug tab asks for it: taken at
+   the next update of the player, in play, and what came of it (sent, or refused and why) kept for the bridge's reply.
+   Without HOS_CONTROL nothing asks: oot_map_refresh returns at once, and the take reads one int */
+static SRWLOCK oot_map_lock = SRWLOCK_INIT;
+static char oot_map[80];
+static int oot_flags = -1;   /* (1 an event playing, 2 a map loading, 4 the child; -1 not read yet) */
+static void oot_map_refresh(Ctx *c, int64_t now) {
+    extern volatile int hos_control_on;
+    if (!hos_control_on) return;
+    static int64_t next;
+    if (now < next) return;
+    next = now + 250000000LL;
+    char map[80];
+    if (!oot_gamedata_string(c, 0x1d6189dau, map, sizeof map) || !map[0]) return;   /* Sequence_CurrentBanc */
+    int loading = 0, child = 1;
+    oot_gamedata_bool(c, 0xef2b60c2u, &loading);   /* Sequence_IsLoadingBanc */
+    oot_gamedata_bool(c, 0xcea220d3u, &child);     /* Sequence_IsChildhood */
+    const uint64_t events = oot_singleton(c, OOT_EVENTMGR_SLOT);
+    const int flags = (events && recomp_load64(c, events + 104) ? 1 : 0) | (loading ? 2 : 0) | (child ? 4 : 0);
+    AcquireSRWLockExclusive(&oot_map_lock);
+    memcpy(oot_map, map, sizeof oot_map);
+    oot_flags = flags;
+    ReleaseSRWLockExclusive(&oot_map_lock);
+}
+/* (with the map) whether an event (a cutscene, a map change's) is playing, a map is loading, Link is the child: 0 before any */
+int hos_oot_state(int *event, int *loading, int *child) {
+    AcquireSRWLockShared(&oot_map_lock);
+    const int f = oot_flags;
+    ReleaseSRWLockShared(&oot_map_lock);
+    if (f < 0) return 0;
+    *event = f & 1, *loading = (f >> 1) & 1, *child = (f >> 2) & 1;
+    return 1;
+}
+int hos_oot_current_map(char *out, size_t cap) {
+    AcquireSRWLockShared(&oot_map_lock);
+    const int have = oot_map[0] != 0;
+    if (have) snprintf(out, cap, "%s", oot_map);
+    ReleaseSRWLockShared(&oot_map_lock);
+    return have;
+}
+int hos_oot_destination(int index, const char **child, const char **adult) {
+    if (index < 0 || index >= (int)(sizeof oot_destinations / sizeof oot_destinations[0])) return 0;
+    *child = oot_destinations[index].child_banc, *adult = oot_destinations[index].adult_banc;
+    return 1;
+}
+/* The bridge's teleport: asked on its thread, taken at the player's next update (oot_bridge_teleport_take), and what came
+   of it kept for the bridge, by ticket. A later ask replaces one not taken yet. (oot_map_lock) */
+#define OOT_BRIDGE_AGE 0x10000   /* (oot_bridge_tp.asked: the age switch to the child, | 1 to the adult; not a destination) */
+static struct {
+    int asked;    /* the destination + 1 waiting to be taken, OOT_BRIDGE_AGE | adult the age switch; 0 none */
+    int ticket;   /* the last ask's */
+    int taking;   /* the ticket taken by the player's update and not done yet (it is not replaced meanwhile) */
+    int done_ticket, result, accepted;   /* the last one taken: 1 sent, -1 refused, 2 (the age switch) Link was that age
+                                            already; accepted: the event manager's answer */
+    char why[96], map[80];
+} oot_bridge_tp;
+int hos_oot_teleport_ask(int index) {
+    if (index < 0 || index >= (int)(sizeof oot_destinations / sizeof oot_destinations[0])) return 0;
+    AcquireSRWLockExclusive(&oot_map_lock);
+    const int ticket = ++oot_bridge_tp.ticket;
+    __atomic_store_n(&oot_bridge_tp.asked, index + 1, __ATOMIC_RELAXED);   /* (read without the lock first: take) */
+    ReleaseSRWLockExclusive(&oot_map_lock);
+    return ticket;
+}
+/* The bridge's age switch to the adult (1) or the child (0): the Debug tab's Switch age (oot_toggle_age), asked and taken as
+   a teleport is, with the same tickets, result and cancel. The age wanted goes with it and is checked when it is taken (the
+   bridge's sample of Link's age can be old): already that age, nothing is done (result 2) */
+int hos_oot_age_ask(int adult) {
+    AcquireSRWLockExclusive(&oot_map_lock);
+    const int ticket = ++oot_bridge_tp.ticket;
+    __atomic_store_n(&oot_bridge_tp.asked, OOT_BRIDGE_AGE | (adult ? 1 : 0), __ATOMIC_RELAXED);
+    ReleaseSRWLockExclusive(&oot_map_lock);
+    return ticket;
+}
+/* 1 sent (map: the map it goes to; accepted: whether the game's event manager took the request), -1 refused (why: the
+   reason), 2 (the age switch) Link was that age already, nothing done, 0 not taken yet (or being taken), -2 replaced by a
+   later ask or cancelled */
+int hos_oot_teleport_result(int ticket, char *why, size_t why_cap, char *map, size_t map_cap, int *accepted) {
+    AcquireSRWLockShared(&oot_map_lock);
+    int r = -2;
+    if (oot_bridge_tp.done_ticket == ticket) {
+        r = oot_bridge_tp.result, *accepted = oot_bridge_tp.accepted;
+        snprintf(why, why_cap, "%s", oot_bridge_tp.why);
+        snprintf(map, map_cap, "%s", oot_bridge_tp.map);
+    } else if (oot_bridge_tp.taking == ticket || (oot_bridge_tp.ticket == ticket && oot_bridge_tp.asked)) r = 0;
+    ReleaseSRWLockShared(&oot_map_lock);
+    return r;
+}
+void hos_oot_teleport_cancel(int ticket) {   /* (the bridge gave up waiting: not taken later behind its back) */
+    AcquireSRWLockExclusive(&oot_map_lock);
+    if (oot_bridge_tp.ticket == ticket) __atomic_store_n(&oot_bridge_tp.asked, 0, __ATOMIC_RELAXED);
+    ReleaseSRWLockExclusive(&oot_map_lock);
+}
+static int oot_bridge_teleport_take(int *ticket) {   /* (the player's update) the destination + 1 asked for, or 0 */
+    if (!__atomic_load_n(&oot_bridge_tp.asked, __ATOMIC_RELAXED)) return 0;
+    AcquireSRWLockExclusive(&oot_map_lock);
+    const int asked = oot_bridge_tp.asked;
+    *ticket = oot_bridge_tp.ticket;
+    if (asked) oot_bridge_tp.taking = *ticket;   /* (still "not taken yet" to the bridge until done) */
+    __atomic_store_n(&oot_bridge_tp.asked, 0, __ATOMIC_RELAXED);
+    ReleaseSRWLockExclusive(&oot_map_lock);
+    return asked;
+}
+static void oot_bridge_teleport_done(int ticket, int sent) {   /* sent: 1, 0 refused (teleport.why), 2 already that age */
+    AcquireSRWLockExclusive(&oot_map_lock);
+    if (sent == 2) {
+        oot_bridge_tp.done_ticket = ticket, oot_bridge_tp.result = 2, oot_bridge_tp.taking = 0, oot_bridge_tp.accepted = 0;
+        oot_bridge_tp.why[0] = oot_bridge_tp.map[0] = 0;
+        ReleaseSRWLockExclusive(&oot_map_lock);
+        return;
+    }
+    oot_bridge_tp.done_ticket = ticket, oot_bridge_tp.result = sent ? 1 : -1, oot_bridge_tp.taking = 0;
+    oot_bridge_tp.accepted = sent && teleport_result != 0;
+    snprintf(oot_bridge_tp.why, sizeof oot_bridge_tp.why, "%s", sent || !teleport.why ? "" : teleport.why);
+    snprintf(oot_bridge_tp.map, sizeof oot_bridge_tp.map, "%s", sent && teleport.banc ? teleport.banc : "");
+    ReleaseSRWLockExclusive(&oot_map_lock);
 }
 
 /* ---- (Triforce) A save file's card on the file select (host/save_files.c, on unless HOS_SAVE_FILES=0): what the game's own
@@ -1308,8 +1768,9 @@ static int oot_start_event(Ctx *c, uint64_t actor, int loaded, const char *name,
     {   /* the event's name: arg+6800 points at its buffer, arg+6808 the capacity */
         const uint64_t buf = recomp_load64(c, arg + 6800);
         const uint32_t room = recomp_load32(c, arg + 6808);
-        if (!buf || strlen(name) + 1 > room) ok = 0;
-        else memcpy(A64_PTR(buf), name, strlen(name) + 1);
+        void *to = buf && strlen(name) + 1 <= room ? hos_guest_range(buf, strlen(name) + 1) : NULL;   /* ((Triforce) guest memory only) */
+        if (!to) ok = 0;
+        else memcpy(to, name, strlen(name) + 1);
     }
     uint64_t result = 0;
     if (ok) {
@@ -1440,6 +1901,61 @@ static _Thread_local uint64_t flight_pose_actor;
 static _Thread_local float flight_transform_yaw;
 static int64_t flight_player_seen;
 
+/* ((Triforce) the Debug tab's Movement speed tool, HOS_OPT_CHEAT_SPEED in percent) Link's controller (vtable 0x84c54f10, the
+   one OneShotPhysicsCctChangePosition moves, found from his components as the flight finds it) and the percent, for
+   hos_oot_cct_speed, which scales the forward speed the game sets on it. At 1x no controller is looked for and none is
+   kept. (The controller's speed rate beside it, +476, is no use: the game sets it again before each step.) */
+static void oot_player_speed(Ctx *c, uint64_t components) {
+    int rx_option(int id, int otherwise);
+    static int logged = 100;
+    int percent = rx_option(HOS_OPT_CHEAT_SPEED, 100);
+    if (percent < 100 || percent > 400) percent = 100;
+    uint64_t controller = 0;
+    if (percent > 100) {
+        static const unsigned offsets[] = {80, 32, 16, 8};
+        controller = components;
+        for (unsigned i = 0; controller && i < sizeof offsets / sizeof offsets[0]; i++) controller = recomp_load64(c, controller + offsets[i]);
+        if (controller && recomp_load64(c, controller) != 0x84c54f10ULL) controller = 0;
+    }
+    __atomic_store_n(&oot_speed_controller, controller, __ATOMIC_RELAXED);
+    __atomic_store_n(&oot_speed_percent, percent, __ATOMIC_RELAXED);
+    if (percent != logged) hos_log("cheats: movement speed %d%%", percent);
+    logged = percent;
+}
+
+/* ((Triforce) the Discord status's state above, every 2 s while it is asked for: GameData read where the game's own getters
+   keep it (the map's String64 and two Bools through them, the Ints through oot_gd_int), the tokens and the held pieces
+   counted as the Cheats page counts them. Reads only */
+static void oot_discord_refresh(Ctx *c, int64_t now) {
+    static int64_t next;
+    if (!__atomic_load_n(&oot_discord_watching, __ATOMIC_RELAXED) || now < next) return;
+    next = now + 2000000000LL;
+    char map[80];
+    if (!oot_gamedata_string(c, 0x1d6189dau, map, sizeof map) || !map[0]) return;   /* Sequence_CurrentBanc */
+    int loading = 0, child = 1;
+    oot_gamedata_bool(c, 0xef2b60c2u, &loading);   /* Sequence_IsLoadingBanc */
+    oot_gamedata_bool(c, 0xcea220d3u, &child);     /* Sequence_IsChildhood */
+    const uint64_t events = oot_singleton(c, OOT_EVENTMGR_SLOT);
+    const int flags = (events && recomp_load64(c, events + 104) ? 1 : 0) | (loading ? 2 : 0) | (child ? 4 : 0);
+    int stats[5] = {-1, -1, -1, -1, -1};
+    static const uint32_t hashes[3] = {0x31ab5580u, 0xfbe01da1u, 0xa77921d7u};   /* PlayerStatus.Life, .MaxLife, .CurrentRupee */
+    const uint64_t mgr = oot_singleton(c, OOT_GAMEDATA_SLOT);
+    for (int i = 0; i < 3 && mgr; i++) {
+        const uint64_t entry = oot_gd_int(c, mgr, hashes[i]);
+        const int v = entry ? (int)recomp_load32(c, entry + 0x1c) : -1;
+        if (v >= 0 && v < 100000) stats[i] = v;
+    }
+    /* (the Gold Skulltula tokens, -1 none; the pieces of heart he found: from those he holds, 0-3, his most life and the boss
+       containers he took (host/oot_heart_containers.c); -1 until their ids are read) */
+    stats[3] = oot_pouch_count(c, "Item_Token_Gold");
+    stats[4] = heart_pieces_total(stats[1], hos_oot_heart_containers_taken(), oot_pouch_count(c, "Obj_Heart_Piece"));
+    oot_discord_lock();
+    memcpy(oot_discord_map, map, sizeof oot_discord_map);
+    oot_discord_flags = flags;
+    memcpy(oot_discord_stats, stats, sizeof oot_discord_stats);
+    oot_discord_unlock();
+}
+
 static void oot_update_player_cheats(Ctx *c, uint64_t actor, uint64_t components) {
     int rx_option(int id, int otherwise);
     static uint64_t flying_actor, marked_actor, marked_controller;
@@ -1453,22 +1969,72 @@ static void oot_update_player_cheats(Ctx *c, uint64_t actor, uint64_t components
     last_player_tick = now;
     int action = rx_option(HOS_OPT_CHEAT_ACTION, 0);
     if (!action) action = __atomic_exchange_n(&hos_oot_live_action, 0, __ATOMIC_RELAXED);
-    oot_teleport_followup(c);
+    int bridge_ticket = 0;   /* ((Triforce) the control bridge's teleport or age switch, host/control.c: what came of it is kept for its reply) */
+    int bridge_adult = -1;   /* (the bridge's age switch: the age wanted, 1 the adult) */
+    if (!action) {
+        const int asked = oot_bridge_teleport_take(&bridge_ticket);
+        if (asked & OOT_BRIDGE_AGE) action = OOT_AGE_ACTION, bridge_adult = asked & 1;
+        else if (asked) action = OOT_TELEPORT_ACTION + asked - 1;
+    }
+    {   /* ((Triforce) input recordings, host/input_movie.c) a playback gives the recording's actions at their frame and takes
+           none of the player's (the menu's, HOS_INPUT_LIVE's, the bridge's, which is told so). Nothing played: as it was */
+        int hos_input_movie_action(int live, int *dropped);
+        int dropped;
+        const int live = action;
+        action = hos_input_movie_action(live, &dropped);
+        if (dropped && bridge_ticket) {
+            teleport.why = "an input recording is playing: its own teleports and age switches are taken";
+            oot_bridge_teleport_done(bridge_ticket, 0);
+            bridge_ticket = 0;
+        }
+        if (action != live) bridge_adult = -1;   /* (the recording's age switch: a switch, as it was taken) */
+    }
+    int taken = action;   /* ((Triforce) what the game took, for an input recording: not an age switch to the age Link has) */
+    oot_map_refresh(c, now);   /* ((Triforce) the control bridge's map and state; nothing without HOS_CONTROL) */
+    oot_teleport_followup(c, actor);
+    {   /* ((Triforce, 11-24) the game's Swap Jump Controls, once a second, for the no-clip flight's Jump: host/flight_jump.h) */
+        static int64_t next_jump_read;
+        int swapped = 0;
+        if (now >= next_jump_read) {
+            next_jump_read = now + 1000000000LL;
+            const int was = hos_oot_jump_swapped, is = oot_gamedata_bool(c, FLIGHT_JUMP_HASH, &swapped) ? swapped : -1;
+            if (is != was) {
+                hos_oot_jump_swapped = is;
+                hos_log("cheats: the game's Jump is %s (Swap Jump Controls %s): no-clip flight takes off with it", is > 0 ? "B" : "X",
+                        is < 0 ? "not found" : is ? "on" : "off");
+            }
+        }
+    }
     oot_bench_tick(c, actor, now);   /* ((Triforce, 11-19) benchmark mode: its tour, host/hos_bench.c */
     oot_inventory_refresh(c, now);
     oot_link_tick(c, actor, now);   /* ((Triforce) the Game flags and Cutscenes pages) */
     oot_achievements_tick(c, now);   /* ((Triforce) host/achievements.c) */
     oot_save_card_tick(c, now);      /* ((Triforce) host/save_files.c: this save file's card) */
+    oot_discord_refresh(c, now);     /* ((Triforce) host/discord_rpc.c: a status of the player's that names the place) */
+    oot_player_speed(c, components);   /* ((Triforce) the Debug tab's Movement speed tool) */
     if (action >= OOT_CHEAT_ITEM_ACTION && action < OOT_CHEAT_ITEM_ACTION + 256 * (int)OOT_ITEM_COUNT) {
         oot_inventory_edit(c, action);
     } else if (action == OOT_AGE_ACTION) {
-        oot_toggle_age(c, actor);
+        int child = 1;   /* ((Triforce) the bridge's: Link's age now, not its sample's; already the age wanted, nothing to flip) */
+        if (bridge_adult >= 0 && oot_gamedata_bool(c, 0xcea220d3u, &child) && (!child) == bridge_adult) {
+            hos_log("cheats: age toggle: Link is the %s already", child ? "child" : "adult");
+            oot_bridge_teleport_done(bridge_ticket, 2);
+            taken = 0;
+        } else {
+            const int sent = oot_toggle_age(c, actor);
+            if (bridge_ticket) oot_bridge_teleport_done(bridge_ticket, sent);
+        }
     } else if (action >= OOT_TELEPORT_ACTION) {
-        oot_teleport(c, actor, (unsigned)(action - OOT_TELEPORT_ACTION));
+        const int sent = oot_teleport(c, actor, (unsigned)(action - OOT_TELEPORT_ACTION));
+        if (bridge_ticket) oot_bridge_teleport_done(bridge_ticket, sent);
     } else if (action >= 200) {
         oot_edit_pouch(c, action);
     } else if (action >= 100 && action < 124) {
         oot_set_time(c, action - 100);
+    }
+    {
+        void hos_input_movie_action_taken(int a);
+        hos_input_movie_action_taken(taken);   /* ((Triforce) recording: the action at its frame; else one load and back) */
     }
     /* (Triforce, lab) the crawl's commands: see crawl above */
     static float crawl_target[3];
@@ -1675,6 +2241,45 @@ const int give_pending = crawl.give_pending;
 }
 #endif
 
+/* ((Triforce) host/discord_rpc.c) when Link's update last ran (hos_now_ns), 0 never: the place in the Discord status is his
+   map's while he has been seen lately */
+int64_t hos_oot_player_seen_ns(void) {
+#if defined(_WIN32) || defined(__linux__)
+    return __atomic_load_n(&flight_player_seen, __ATOMIC_RELAXED);
+#else
+    return 0;
+#endif
+}
+
+/* ((Triforce) host/oot_heart_containers.c, on the game's thread: the boss heart containers taken) a Bool64bitKey flag of the
+   game data, the kind named by an actor's 64-bit placement id: 1 set, 0 not, -1 not known. Their container is at
+   GameDataMgr + 0xc58 (the game's f_80e1f1c0 hands that to its loader, f_805ce6b0): the count (u32) at +0, the entries at +8,
+   16 bytes each, the id (u64) at +0 and the value at +12 (a save's taken heart pieces and containers read 1 there, the rest
+   0). *at keeps where id was found, so a read after the first is one entry, not a search (-1: not found yet). Read only,
+   each address checked to be the guest's */
+int hos_oot_gamedata_bool64(uint64_t id, int *at) {
+    const uint64_t *holder = hos_guest_range(0x84c9e180ULL, 8);   /* (OOT_GAMEDATA_SLOT) */
+    const uint64_t *mgr_at = holder && *holder ? hos_guest_range(*holder, 8) : NULL;
+    const uint64_t mgr = mgr_at ? *mgr_at : 0;
+    const uint8_t *head = mgr ? hos_guest_range(mgr + 0xc58, 16) : NULL;
+    if (!head) return -1;
+    uint32_t count;
+    uint64_t entries, k;
+    memcpy(&count, head, 4), memcpy(&entries, head + 8, 8);
+    if (!count || count > (1u << 20) || entries < 0x100000) return -1;
+    const uint8_t *e = hos_guest_range(entries, (uint64_t)count * 16);
+    if (!e) return -1;
+    if (*at >= 0 && (uint32_t)*at < count && (memcpy(&k, e + (size_t)*at * 16, 8), k == id)) return e[(size_t)*at * 16 + 12] != 0;
+    for (uint32_t i = 0; i < count; i++) {
+        memcpy(&k, e + (size_t)i * 16, 8);
+        if (k == id) {
+            *at = (int)i;
+            return e[(size_t)i * 16 + 12] != 0;
+        }
+    }
+    return -1;
+}
+
 int hos_oot_flight_shortcut_ready(void) {
 #if defined(_WIN32) || defined(__linux__)   /* (the debug tools: host/posix has what they call) */
     const int64_t seen = __atomic_load_n(&flight_player_seen, __ATOMIC_RELAXED);
@@ -1721,6 +2326,37 @@ void hos_oot_flight_pose(Ctx *c, uint64_t actor, uint64_t matrix) {
 #endif
 }
 
+/* ((Triforce) input recordings, host/input_movie.c) HOS_INPUT_SYNC: Link put at a position through the game's own move of
+   his character controller (OneShotPhysicsCctChangePosition, found from his components as the Mark / Return cheats find
+   it: oot_update_player_cheats), so his physics body moves with him; 0 when the controller or the move is not there */
+#if defined(_WIN32) || defined(__linux__)   /* (the debug tools: host/posix has what they call) */
+static int oot_put_link(Ctx *c, uint64_t components, const float pos[3]) {
+    static const unsigned offsets[] = {80, 32, 16, 8};
+    uint64_t controller = components;
+    for (unsigned i = 0; controller && i < sizeof offsets / sizeof offsets[0]; i++) controller = recomp_load64(c, controller + offsets[i]);
+    if (!controller || recomp_load64(c, controller) != 0x84c54f10ULL || recomp_load64(c, 0x84c54f10ULL + 0xe8) != 0x806d2530ULL)
+        return 0;
+    A64Fn change_position = a64_lookup(0x806d2530ULL);
+    if (!change_position) return 0;
+    const Ctx saved = *c;
+    const uint64_t arg = c->x[31] - 16;
+    for (unsigned i = 0; i < 3; i++) {
+        uint32_t bits;
+        memcpy(&bits, &pos[i], sizeof bits);
+        recomp_store32_sp(c, arg + i * 4, bits);
+    }
+    recomp_store32_sp(c, arg + 12, 0);
+    c->x[31] = arg;
+    c->x[0] = controller;
+    c->x[1] = arg;
+    flight_pose_actor = 0;
+    flight_transform_controller = 0;
+    change_position(c);
+    *c = saved;
+    return 1;
+}
+#endif
+
 void hos_oot_lift_player(Ctx *c, uint64_t actor) {
 #if defined(_WIN32) || defined(__linux__)   /* (the debug tools: host/posix has what they call) */
     flight_pose_actor = 0;
@@ -1733,11 +2369,40 @@ void hos_oot_lift_player(Ctx *c, uint64_t actor) {
         void vr_body_lift(Ctx *c, uint64_t actor);
         vr_body_lift(c, actor);
     }
+    void hos_oot_note_link(uint64_t components);   /* host/oot_high_fps.c: his driven body's target above 60 fps (here, in the
+                                                     debug tools' block, as the player's other hooks: built on both) */
+    hos_oot_note_link(components);
+    {   /* ((Triforce) the Skip opening row, host/oot_opening.c: the opening has let Link go, so later events keep their own
+           skip. Asked only while one of the opening's requests is the current one, which it never is with the row Off) */
+        int hos_oot_opening_armed(void);
+        int hos_oot_opening(Ctx *c, int mode);
+        if (hos_oot_opening_armed()) {
+            const uint64_t events = oot_singleton(c, OOT_EVENTMGR_SLOT);
+            if (!(events && recomp_load64(c, events + 104))) hos_oot_opening(c, 3);
+        }
+    }
 
     // Link can be updated by different guest workers on successive frames.
     static SRWLOCK cheats_lock = SRWLOCK_INIT;
     if (!TryAcquireSRWLockExclusive(&cheats_lock)) return;
     oot_update_player_cheats(c, actor, components);
+    void hos_oot_state_tap(uint64_t actor);   /* ((Triforce) the control bridge's copied snapshot and per-connection samples */
+    hos_oot_state_tap(actor);
+    /* ((Triforce) input recordings, host/input_movie.c) the marks and anchors, and a replay held to them: Link's position
+       (+0x31c, as the state tap reads it) after each update; nothing read with nothing recorded or played */
+    int hos_input_movie_active(void);
+    if (hos_input_movie_active()) {
+        int hos_input_movie_link(const float pos[3], float to[3]);
+        float pos[3], to[3];
+        for (int i = 0; i < 3; i++) {
+            const uint32_t bits = (uint32_t)recomp_load32(c, actor + 0x31c + 4 * (uint64_t)i);
+            memcpy(&pos[i], &bits, 4);
+        }
+        if (hos_input_movie_link(pos, to) && !oot_put_link(c, components, to)) {   /* (HOS_INPUT_SYNC: put back) */
+            static int said;
+            if (!said++) hos_log("input: HOS_INPUT_SYNC: Link's character controller was not found: he is not put back");
+        }
+    }
     ReleaseSRWLockExclusive(&cheats_lock);
 #else
     (void)c;
@@ -1867,6 +2532,19 @@ static int memory_notice_text(unsigned long long ram_mb, unsigned long long swap
                  ram_mb / 1024.0);
         return 1;
     }
+#if defined(__linux__) && !defined(_WIN32)
+    /* ((Triforce, 11-24, after Source A's) On Linux below that much physical RAM too, whatever the swap: swap can keep a
+       small PC from running out without keeping it responsive. Not a promise that 10 GB is enough */
+    if (ram_mb < HOS_MEMORY_NEEDED_MB) {
+        snprintf(out, cap,
+                 "This PC has %.1f GB of RAM and %.1f GB of swap. Triforce recommends 16 GB of RAM or more; the game alone can "
+                 "use more than 13 GB.\n\nSwap can prevent an out-of-memory exit, but heavy swapping can make the game and the "
+                 "desktop unresponsive. Close other programs before playing. More swap is not a replacement for RAM. The game "
+                 "starts anyway.",
+                 ram_mb / 1024.0, swap_mb / 1024.0);
+        return 1;
+    }
+#endif
     if (ram_mb + swap_mb >= HOS_MEMORY_NEEDED_MB) return 0;
     snprintf(out, cap,
              "This PC has %.1f GB of memory and %.1f GB of swap (the page file on Windows). The game needs about %llu GB of the "
@@ -1897,6 +2575,11 @@ static void memory_notice(void) {
     }
     if (swap == 0 && ram + swap >= HOS_MEMORY_NEEDED_MB)   /* ((Triforce, 11-18) memory_notice_text's no-swap case) */
         hos_log("boot: NO PAGE FILE: %llu MB of memory, 0 MB of swap: loading a save can run out of memory (error 1455)", ram);
+#if defined(__linux__) && !defined(_WIN32)
+    else if (ram < HOS_MEMORY_NEEDED_MB)   /* ((Triforce, 11-24) memory_notice_text's Linux case: physical RAM, whatever the swap */
+        hos_log("boot: LOW MEMORY: %llu MB of memory, %llu MB of swap; below %llu MB of physical RAM: heavy swapping can make the "
+                "game and the desktop unresponsive (16 GB of RAM or more recommended)", ram, swap, HOS_MEMORY_NEEDED_MB);
+#endif
     else
         hos_log("boot: LOW MEMORY: %llu MB of memory, %llu MB of swap, below the ~%llu MB the game needs", ram, swap, HOS_MEMORY_NEEDED_MB);
     if (getenv("HOS_HEADLESS")) return;
@@ -1976,6 +2659,11 @@ int main(int argc, char **argv) {
 static int game_main(int argc, char **argv) {
 #endif
 #ifdef _WIN32
+    {   /* ((Triforce) the crash window's helper of a run (host/hos_crash_dialog.c): first, so it starts nothing of the game */
+        int hos_crash_helper_main(int argc, char **argv);
+        const int helper = hos_crash_helper_main(argc, argv);
+        if (helper >= 0) return helper;
+    }
     if (!narrow_paths_ok(argc, argv)) return 1;
     load_hookshot_env();
 #endif
@@ -2013,6 +2701,12 @@ static int game_main(int argc, char **argv) {
             }
         }
 #endif
+#ifdef __linux__
+        {
+            void hos_relaunch_keep_env(void);   /* ((Triforce, 11-24) host/hos_relaunch.c: whether the game was given a stderr, for a restart */
+            hos_relaunch_keep_env();
+        }
+#endif
         HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
         /* ((Triforce, 11-21, ticket "Linux: games started with the launcher's Play write no triforce_log.txt") HOS_LOG_FILE=1:
            the log file whatever stderr is. The launcher's Play on Linux gives the game pipes it reads and drops (so a full pipe
@@ -2020,10 +2714,31 @@ static int game_main(int argc, char **argv) {
            session started from the launcher left nothing to send with a report, nor with an F8 capture) */
         const char *lf = getenv("HOS_LOG_FILE");
         const int log_file = lf && *lf && *lf != '0';
-        if (log_file || !err || err == INVALID_HANDLE_VALUE || GetFileType(err) == FILE_TYPE_UNKNOWN) {
+        void hos_crash_record_prepare(const char *log_path);   /* ((Triforce) host/mkw_glue.c, host/hos_crash_record.c */
+        const DWORD err_kind = (!err || err == INVALID_HANDLE_VALUE) ? FILE_TYPE_UNKNOWN : GetFileType(err);
+        /* ((Triforce, 11-24, after Source A's) Steam's Gaming mode hands the game its own log pipe on stderr (measured on a
+           Steam Deck: fd 2 an anonymous FIFO shared with Steam, drained into Steam's console-linux.txt), which the player
+           cannot see: a Gaming-mode session left no triforce_log.txt to send. Steam's pipe counts as nowhere to log to, as
+           /dev/null does. It is told from a pipe the player chose by Steam's marker variables (SteamGameId / SteamAppId, set in
+           everything Steam starts) and stdin, which Steam gives as /dev/null where a developer's terminal has a tty. A
+           --prepare-shaders run is a builder's step, whose pipe the builder reads: never this) */
+        int prepare_only = 0;
+        for (int i = 1; i < argc; i++)
+            if (!strcmp(argv[i], "--prepare-shaders")) prepare_only = 1;
+        (void)prepare_only;
+        if (log_file || err_kind == FILE_TYPE_UNKNOWN
+#ifndef _WIN32
+            || (!prepare_only && err_kind == FILE_TYPE_PIPE && (getenv("SteamGameId") || getenv("SteamAppId")) &&
+                !isatty(STDIN_FILENO))
+#endif
+            ) {
             char path[MAX_PATH + 32];
             DWORD n = hos_game_path_a(path, MAX_PATH);
             while (n && path[n - 1] != 92 && path[n - 1] != 47) n--;
+            /* ((Triforce) the local crash record: the run before's marker read (an unclean end recorded) before its log moves to
+               .1, and this run's log named, as it will be opened below) */
+            memcpy(path + n, "triforce_log.txt", 17);
+            hos_crash_record_prepare(path);
             /* (the four runs before stay as triforce_log.1.txt (the last) to .4.txt: a player who started the game again after a
                crash sent in the new run's log, and the crash was gone) */
             char from[MAX_PATH + 32], to[MAX_PATH + 32];
@@ -2033,11 +2748,35 @@ static int game_main(int argc, char **argv) {
                 memcpy(to, path, n), snprintf(to + n, 32, "triforce_log.%d.txt", k);
                 MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING);
             }
+            {   /* ((Triforce) the run before's log without the player's user name: its own lines were written so, and what wrote
+                   to stderr itself (the Vulkan loader, SDL) is redacted here when its crash window's helper did not
+                   (host/log_redact.h; HOS_LOG_REDACT=0: not even read) */
+                int hos_log_redact_file(const char *path, const char *run_id);
+                hos_log_redact_file(to, NULL);
+            }
             memcpy(path + n, "triforce_log.txt", 17);
             if (freopen(path, "w", stderr)) setvbuf(stderr, NULL, _IONBF, 0);
-        }
+        } else hos_crash_record_prepare(NULL);   /* ((Triforce) a stderr given by whoever started the game: not the game's log */
     }
     hos_log("triforce %s", HOOKSHOT_VERSION);   /* (the log's first line: which build a report comes from) */
+    {   /* ((Triforce) this run's id: its crash records carry it (host/hos_crash_record.c), and the window after a crash finds
+           the run's own log by it (host/hos_crash_dialog.c) */
+        const char *hos_report_run_id(void);
+        void hos_crash_record_log_notes(void);
+        hos_log("run_id: %s", hos_report_run_id());
+        /* (the run's own boundary on disk before anything written straight to stderr: hos_log queues its lines, and a start
+           that fails right after ("cannot reserve the guest window", an image that cannot be opened) writes its line direct,
+           before the queued banner, where the crash window, which reads this run's lines from its banner on, missed it.
+           One write at the start) */
+        hos_log_flush();
+        hos_crash_record_log_notes();
+    }
+    {   /* ((Triforce) the window after a crash: a helper that waits for this run to end (host/hos_crash_dialog.c), started
+           before the guest, the renderer, the sound and the input; none for --prepare-shaders, HOS_HEADLESS,
+           HOS_WINDOW_NOACTIVATE or HOS_CRASH_WATCH=0 */
+        void hos_crash_watch_start(int argc, char **argv);
+        hos_crash_watch_start(argc, argv);
+    }
 #ifdef __linux__
     if (driver_room_line[0]) hos_log("%s", driver_room_line);   /* ((Triforce, 11-22) the performance audit's PIPE-97: decided in main, before this log was open */
     if (driver_folder_line[0]) hos_log("%s", driver_folder_line);   /* ((Triforce, 11-22) the performance audit's PIPE-98: likewise */
@@ -2057,7 +2796,12 @@ static int game_main(int argc, char **argv) {
                                         : "Windows' throttling of a window not in front left as it is (HOS_POWER_THROTTLING=1)");
     }
 #endif
+    {   /* ((Triforce) HOS_CONTROL=<socket>: the control bridge, host/control.c; nothing listens without it */
+        void hos_control_start(const char *version);
+        hos_control_start(HOOKSHOT_VERSION);
+    }
     hos_sim_cpu_apply();   /* ((Triforce, 11-22, the performance audit's OS-49) HOS_SIM_CPU, a lab switch: before any thread */
+    hos_prepare_args_env(argc, argv);   /* ((Triforce, 11-24) a supervised preparation's journal, skips and limit: prepare_args.h */
     const char *image = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--romfs") && i + 1 < argc) hos_romfs_dir = argv[++i];
@@ -2077,6 +2821,7 @@ static int game_main(int argc, char **argv) {
             printf("@@error no usable Vulkan here: the game prepares its shaders at its first start\n");
             return 3;
         }
+        else if (hos_prepare_arg_switch(argv[i]) && i + 1 < argc) i++;   /* ((Triforce, 11-24) taken above: no image */
         else if (!image) image = argv[i];
     }
 #ifdef _WIN32
@@ -2099,7 +2844,6 @@ static int game_main(int argc, char **argv) {
             snprintf(beside_romfs, MAX_PATH, "%s" SEP_S "romfs", dir);
             snprintf(beside_user, MAX_PATH, "%s" SEP_S "user", dir);
             if (GetFileAttributesA(beside_image) != INVALID_FILE_ATTRIBUTES) {
-                hos_update_check();   /* (a game folder from the builder: is a newer release out? host/hos_update.c) */
                 image = beside_image;
                 if (!hos_romfs_dir) hos_romfs_dir = beside_romfs;
 #ifndef _WIN32
@@ -2107,6 +2851,9 @@ static int game_main(int argc, char **argv) {
 #else
                 if (!hos_user_dir) hos_user_dir = beside_user;
 #endif
+                /* (a game folder from the builder: is a newer release out? host/hos_update.c. (Triforce, 11-24) After the
+                   saves' place is known: on Linux the check keeps its "Skip this version" there) */
+                hos_update_check();
                 /* ((Triforce) the title's file select, host/save_files.c: the folder of the file last chosen; off, or a
                    folder named with --user: the one above) */
                 if (!user_given) hos_user_dir = hos_save_files_start(dir, hos_user_dir);
@@ -2124,6 +2871,10 @@ static int game_main(int argc, char **argv) {
     if (!reserve_guest()) {
         fprintf(stderr, "cannot reserve the guest window\n");
         return 1;
+    }
+    {   /* ((Triforce) HOS_CRASH_TEST: a crash on purpose, once the crash handlers are set up: host/hos_crash_dialog.c */
+        void hos_crash_test_arm(void);
+        hos_crash_test_arm();
     }
 #ifdef A64_MEM_ZERO
     web_fs_init(NULL, hos_romfs_dir);
@@ -2241,8 +2992,11 @@ static int game_main(int argc, char **argv) {
     uint64_t sp = c->x[31];
     void hos_prof_start(void);
     hos_prof_start();   /* HOS_PROFILE=<seconds> */
+    void hos_chain_start(void);
+    hos_chain_start();  /* ((Triforce) HOS_CHAIN=<path>, hos_chain.c) */
 #ifdef _WIN32
     timeBeginPeriod(1);   /* 1 ms timer resolution: the 60 Hz vsync and the game's frame pacing sleep in short steps */
+    ws_floor();   /* ((Triforce) the game's memory kept in RAM under memory pressure: host/ws_floor.h) */
 #endif
     void hos_display_start(void);
     hos_display_start();  /* the game's window; HOS_HEADLESS=1 for none */
@@ -2265,7 +3019,14 @@ static int game_main(int argc, char **argv) {
         call_guest(c, hos_module_init[i], sp, what);
     }
     call_guest(c, hos_entry_nnMain, sp, "nnMain");
+    /* ((Triforce) the game is over: RenHDrum's backends stop and let go of the pads, host/rumble_renhdrum.c) */
+    void hos_sdl_vibration_shutdown(void);
+    hos_sdl_vibration_shutdown();
     hos_log("nnMain returned");
+    void hos_pad_speaker_shutdown(void);   /* ((Triforce) host/pad_speaker.c: a DualSense's sound back to its jack) */
+    hos_pad_speaker_shutdown();
+    void hos_crash_clean_end(void);
+    hos_crash_clean_end();   /* ((Triforce) a clean end: no unclean-end record (host/hos_crash_record.c) */
     return 0;
 }
 
@@ -2278,9 +3039,17 @@ static DWORD WINAPI game_thread(void *p) {
     (void)p;
     void hos_stack_guarantee(void);   /* (hos_thread.c: room for a stack overflow's crash report) */
     hos_stack_guarantee();
-    ExitProcess((UINT)game_main(game_argc, game_argv));
+    const UINT result = (UINT)game_main(game_argc, game_argv);
+    void hos_crash_clean_end(void);
+    hos_crash_clean_end();   /* ((Triforce) ExitProcess is quick_exit here, which runs no atexit: host/hos_crash_record.c */
+    ExitProcess(result);
 }
 int main(int argc, char **argv) {
+    {   /* ((Triforce) the crash window's helper of a run (host/hos_crash_dialog.c): first, so it starts nothing of the game */
+        int hos_crash_helper_main(int argc, char **argv);
+        const int helper = hos_crash_helper_main(argc, argv);
+        if (helper >= 0) return helper;
+    }
     int hos_display_init(void);
     void hos_display_loop(void);
     load_hookshot_env();
@@ -2293,7 +3062,7 @@ int main(int argc, char **argv) {
     int prepare_shaders = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--prepare-shaders")) prepare_shaders = 1;
-        else if (!strcmp(argv[i], "--romfs") || !strcmp(argv[i], "--user")) i++;
+        else if (!strcmp(argv[i], "--romfs") || !strcmp(argv[i], "--user") || hos_prepare_arg_switch(argv[i])) i++;
     }
     /* The builder's preparation worker needs Vulkan, but no SDL display. */
     const int window = prepare_shaders ? 0 : hos_display_init();

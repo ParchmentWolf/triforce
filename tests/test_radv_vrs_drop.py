@@ -69,7 +69,10 @@ def check_source(src, dev):
     linux = src.rfind("#ifdef __linux__", 0, choose)
     if linux < 0 or "#endif" in src[linux:choose]:
         fail("driver_env_choose is not Linux's alone")
-    main = block(src, "int main(int argc, char **argv) {\n    int hos_display_init(void);")
+    # (Linux's main: the one whose crash-window helper block, host/hos_crash_dialog.c, is followed by the display's start)
+    main = block(src, "int main(int argc, char **argv) {\n    {   /* ((Triforce) the crash window's helper")
+    if "        if (helper >= 0) return helper;\n    }\n    int hos_display_init(void);" not in main:
+        fail("Linux's main does not start with the crash window's helper, then the display's start")
     load, call = main.index("load_hookshot_env();"), main.index("driver_env_choose();")
     if not load < call < main.index("hos_display_init();") or call > main.index("--prepare-shaders"):
         fail("Linux's main does not call driver_env_choose between the env file and the display, before the builder's run")

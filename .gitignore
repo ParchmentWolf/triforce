@@ -46,3 +46,5 @@ renodx_spv.h
 # Triforce Setup's build output (setup\build.ps1, setup\pack_tools.ps1)
 setup/out/
 build1.done
+# (Triforce) RenHDrum built by hand (scripts/renhdrum.py): the .dll is *.dll above
+third_party/renhdrum/renhdrum.so

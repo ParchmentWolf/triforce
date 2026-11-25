@@ -31,11 +31,23 @@ LONG64 InterlockedCompareExchange64(volatile LONG64 *p, LONG64 value, LONG64 exp
 }
 static int64_t now_ns = 10000000000LL, sampling;
 static int key_bind[HOS_KEY_N][2], pad_raw_now;   /* (the keys-only controls after the Switch's buttons) */
+/* ((Triforce) 11-24: the ocarina's note layer's words, which host/nn_hid.c keeps beside its bindings: no note wait here
+   (hos_oc_wait stays 0) and no note row bound, so nothing is consumed and the game's word is the buttons' own) */
+static int pad_bind[HOS_KEY_N][2];   /* (Input 1 and Input 2) */
+static uint64_t pad_after_menu;
+static uint64_t oc_consumed_pads __attribute__((unused));   /* (read by bound_pad_buttons, a stand-in here) */
+static long oc_consumed_keys[256];
+static int oc_live;
+volatile uint64_t hos_oc_note_bits;
+volatile int hos_oc_wait, hos_oc_last_kind;
+volatile unsigned hos_oc_beat;
 static unsigned char *memory;
 static char last_log[256];
 volatile int64_t hos_hid_last_read;
 volatile int hos_nvn_sync_log_on;
 static void *at(uint64_t address) { CHECK(address <= 512 - 8); return memory + address; }
+/* (host/hos.h's, over this fixture's 512 bytes: NULL unless all n bytes lie in them) */
+static void *hos_guest_range(uint64_t a, uint64_t n) { return a <= 512 && n <= 512 - a ? memory + a : NULL; }
 #define GP(a) at(a)
 #define G32(a) (*(uint32_t *)at(a))
 #define G64(a) (*(uint64_t *)at(a))
@@ -48,6 +60,15 @@ static int walk_row, walk_scale, walk_held;
    button held, and the game's Back tapped for it) */
 static int options_open, options_front, right_held;
 static char tapped[64];
+/* (the "held-input" case: the keys and the pad hold only what the case holds, the Z key (ZL's here) and the pad's buttons) */
+static int quiet, z_held;
+/* (the "menu-side-buttons" case: whether one of the game's menus has the mouse, and Mouse 4, A's here, is held) */
+static int game_menu_mouse, side_held;
+/* ((Triforce) 11-24, the "deck-mouse" case: the Steam Deck's built-in controls give the input, host/pad_sdl.c's answer;
+   the mouse captured, its left button, Y's here, held, and its motion as the right stick) */
+static int deck_builtin, mouse_captured, left_held;
+static int32_t mouse_motion;
+static uint64_t pad_held;
 int rx_option(int id, int otherwise) {
     if (id == HOS_OPT_WALK_KEY) return walk_row;
     if (id == 1 && options_open) return 1;
@@ -67,25 +88,37 @@ LONG_PTR GetWindowLongPtrA(HWND window, int index) { (void)window; (void)index; 
 int GetClassNameA(HWND window, char *text, int size) { (void)window; return snprintf(text, (size_t)size, "fixture"); }
 short GetAsyncKeyState(int key) {
     key_queries++;
+    if (quiet) return (z_held && key == 'Z') || (side_held && key == VK_XBUTTON1) || (left_held && key == VK_LBUTTON) ? (short)-32768 : 0;
     return key == 'P' || key == 'D' || (walk_held && key == VK_CAPITAL) || (right_held && key == VK_RBUTTON) ? (short)-32768 : 0;
 }
 int hos_sdl_pads(uint64_t *buttons, int32_t stick[4]) {
     bootstrap_polls++; *buttons = 1ULL << B_Y; stick[0] = -31000; return 1;
 }
+int hos_sdl_pads_deck_builtin(void) { return deck_builtin; }   /* (host/pad_sdl.c's: the "deck-mouse" case) */
+/* (the pads' inputs still held after the Insert menu: none here, pad_raw_now staying 0, so the bindings are never asked) */
+static uint64_t pad_raw_game;
+static uint64_t bound_pad_buttons(uint64_t raw) { (void)raw; CHECK(!"no pad input was held after the menu"); return 0; }
 void pads_read(uint64_t *buttons, int32_t stick[4]) {
     /* The physical backend boundary is a spy; actual routing merges its result with the script below. */
+    if (quiet) { pad_merges++; *buttons |= pad_held; return; }
     pad_merges++; *buttons |= 1ULL << B_B; stick[0] = -12000; stick[2] = 8000;
 }
 void binds_load(void) {
-    key_bind[B_X][0] = 'P';
+    key_bind[B_X][0] = 'P', key_bind[B_ZL][0] = 'Z';
+    key_bind[B_A][1] = VK_XBUTTON1;   /* (Mouse 4 on A, for the "menu-side-buttons" case; held in no other) */
+    key_bind[B_Y][1] = VK_LBUTTON;    /* (the mouse's left button on Y, as out of the box, for the "deck-mouse" case) */
     /* (the left stick's and the camera's keys are bindings too: the defaults, WASD and the arrows) */
     key_bind[HOS_KEY_MOVE_UP][0] = 'W', key_bind[HOS_KEY_MOVE_DOWN][0] = 'S', key_bind[HOS_KEY_MOVE_LEFT][0] = 'A';
     key_bind[HOS_KEY_MOVE_RIGHT][0] = 'D', key_bind[HOS_KEY_CAM_UP][0] = VK_UP, key_bind[HOS_KEY_CAM_DOWN][0] = VK_DOWN;
     key_bind[HOS_KEY_CAM_LEFT][0] = VK_LEFT, key_bind[HOS_KEY_CAM_RIGHT][0] = VK_RIGHT;
+    pad_bind[HOS_KEY_TOGGLE_HUD][0] = pad_bind[HOS_KEY_TOGGLE_HUD][1] = -1;   /* ((Triforce) Toggle HUD unbound, as out of the box) */
 }
+/* ((Triforce) host/hos_wide_ui.c's: Toggle HUD is unbound here, so never pressed) */
+void hos_gameplay_hud_toggle(void) { CHECK(!"Toggle HUD pressed with nothing bound to it"); }
 /* the native mouse look (no camera found: the motion goes to mouse_stick) and the mouse's sensitivity, which
    read_input calls */
 int hos_mouse_native(void) { return -1; }
+int hos_mouse_in_game_menu(void) { return game_menu_mouse; }   /* (host/display.c's) */
 void hos_mouse_native_free(int free) { (void)free; }
 /* ((Triforce, 11-22) whether the right stick turns the camera, told after every read: behind another window too, where the
    pads alone turned it, and the native mouse put the angles back each frame) */
@@ -93,10 +126,13 @@ static int native_held = -1;
 void hos_mouse_native_stick(int held) { native_held = held; }
 static void mouse_setup(void) {}
 static void mouse_sens_keys(void) {}
-int mouse_stick(int32_t *x, int32_t *y, int held) { (void)x; (void)y; (void)held; mouse_queries++; return 0; }
+int mouse_stick(int32_t *x, int32_t *y, int held) { (void)y; (void)held; mouse_queries++; *x = mouse_motion; return mouse_captured; }
 /* (the options tabs inside the game's own Options screen, which read_input looks at: never open here, so the Back it
    would tap for the game is never asked for) */
 int hos_binding(int set, int button, int slot) { (void)set; (void)button; (void)slot; return -1; }
+void hos_prompts_live(void) {}   /* ((Triforce) host/prompts.c: the button prompts follow the controls) */
+volatile int hos_prompts_row = -1;   /* (host/prompts.c: "!prompts" in the live input) */
+void hos_bind(int set, int button, int slot, int code) { (void)set, (void)button, (void)slot, (void)code; }   /* ("!bind") */
 int hos_oot_options_front(void) { return options_front; }
 /* (the sprint button, which takes its press out of the buttons while Link plays: off here; and the pipeline crawl's
    lines of a live script, which no case writes) */
@@ -107,6 +143,12 @@ void rx_request_frame_dump(void) { commands++; }
 void rx_set_screenshot_ms(int64_t ms) { (void)ms; commands++; }
 void rx_request_rdoc_capture(int frames) { (void)frames; commands++; }
 void rx_flash_dark_arm(void) { commands++; }
+/* ((Triforce) host/input_movie.c: no recording and no playback here: every read is the player's, and each one is offered
+   to the recording once) */
+#include "../host/input_movie.h"
+static int movie_begins, movie_ends;
+int hos_input_movie_begin(MoviePad *given) { (void)given; movie_begins++; return 0; }
+void hos_input_movie_end(const MoviePad *p) { (void)p; movie_ends++; CHECK(movie_ends == movie_begins); }
 
 #include "input_actual.inc"
 
@@ -276,6 +318,80 @@ int main(int argc, char **argv) {
         packet(all, 32767, 32767, 8000);
         CHECK(bootstrap_polls == 1);
         printf("PASS: the walk key scales the movement keys' stick alone %s\n", name);
+        free(memory);
+        return 0;
+    }
+    if (!strcmp(name, "menu-side-buttons")) {
+        /* While one of the game's menus has the mouse (the capture gone to it), a side button bound to A is still A, as
+           a key is: it confirmed nothing in the text box's choices. Free in play (no menu, no capture) it is no control;
+           one held as the menu takes the mouse counts only after it was let go. Through the real read_input */
+        const uint64_t a = 1ULL << B_A;
+        front = quiet = 1;
+        packet(0, 0, 0, 0);
+        side_held = 1; packet(0, 0, 0, 0);          /* the mouse free in play: no control */
+        game_menu_mouse = 1; packet(0, 0, 0, 0);    /* held as the menu opens: not until let go */
+        side_held = 0; packet(0, 0, 0, 0);
+        side_held = 1; packet(a, 0, 0, 0);          /* pressed in the menu: A */
+        packet(a, 0, 0, 0);
+        side_held = 0; packet(0, 0, 0, 0);
+        game_menu_mouse = 0; side_held = 1; packet(0, 0, 0, 0);   /* the menu closed, the mouse free again: no control */
+        side_held = 0; packet(0, 0, 0, 0);
+        printf("PASS: the mouse's side buttons stay their controls' while one of the game's menus has the mouse %s" "%c", name, 10);
+        free(memory);
+        return 0;
+    }
+    if (!strcmp(name, "deck-mouse")) {
+        /* The Steam Deck's built-in controls show the system a mouse as well as the pad (in Steam's Desktop layout R2 is
+           a left click, L2 a right one, and the right stick moves it), so a control bound to a mouse button fired twice,
+           once from the pad and once from that click. While those controls give the input the mouse's buttons are no
+           control's and its motion steers nothing; it is still taken in, and one of the game's menus keeps its side
+           buttons. Any other pad, and a PC without a Steam Deck's controls, as before. Through the real read_input */
+        const uint64_t a = 1ULL << B_A, y = 1ULL << B_Y;
+        front = quiet = mouse_captured = 1;
+        packet(0, 0, 0, 0);
+        left_held = 1; packet(y, 0, 0, 0);            /* an ordinary pad: the left button is Y, as its binding says */
+        mouse_motion = 20000; packet(y, 0, 0, 20000); /* and the mouse's motion is the camera's */
+        pad_held = a; deck_builtin = 1;
+        int before = mouse_queries;
+        packet(a, 0, 0, 0);                           /* the Deck's own controls: the click is not Y, the motion not the camera's */
+        CHECK(mouse_queries > before);                /* (the pointer still taken in) */
+        left_held = 0; packet(a, 0, 0, 0);            /* let go and pressed again while they give the input: still nothing */
+        left_held = 1; packet(a, 0, 0, 0);
+        pad_held = 0; deck_builtin = 0;
+        packet(0, 0, 0, 20000);                       /* the controls go, the button held through: let go first */
+        left_held = 0; packet(0, 0, 0, 20000);
+        left_held = 1; packet(y, 0, 0, 20000);
+        left_held = 0; mouse_motion = 0; packet(0, 0, 0, 0);
+        deck_builtin = 1; mouse_captured = 0; game_menu_mouse = 1;   /* one of the game's menus has the mouse: */
+        packet(0, 0, 0, 0);
+        side_held = 1; packet(a, 0, 0, 0);            /* its side button is still A's there, the Deck's controls or not */
+        side_held = 0; packet(0, 0, 0, 0);
+        deck_builtin = 0; game_menu_mouse = 0;
+        printf("PASS: a Steam Deck's built-in controls give their actions once, not again through the mouse they also show %s" "%c", name, 10);
+        free(memory);
+        return 0;
+    }
+    if (!strcmp(name, "held-input")) {
+        /* The player's input hides the game menus' cursor until the mouse moves (host/display.c gm_cursor_shown), so an
+           input counts when it goes down, not at every read while it stays down: the ocarina's song sheet is open while ZL
+           is held, and a ZL held on a pad or the Z key counted at every read, so the cursor the mouse had just shown was
+           hidden again before the menu used it and its hover failed. Through the real read_input */
+        const uint64_t zl = 1ULL << B_ZL, l = 1ULL << B_L;
+        front = quiet = 1;
+        packet(0, 0, 0, 0); CHECK(player_stamps == 0);
+        z_held = 1; packet(zl, 0, 0, 0); CHECK(player_stamps == 1);   /* a key goes down: the player's input */
+        for (int i = 0; i < 5; i++) packet(zl, 0, 0, 0);
+        CHECK(player_stamps == 1);                                    /* held: not at every read */
+        z_held = 0; packet(0, 0, 0, 0); CHECK(player_stamps == 1);    /* let go: not an input */
+        z_held = 1; packet(zl, 0, 0, 0); CHECK(player_stamps == 2);   /* down again: one more */
+        z_held = 0; packet(0, 0, 0, 0);
+        pad_held = zl; packet(zl, 0, 0, 0); CHECK(player_stamps == 3);   /* a pad's button the same */
+        for (int i = 0; i < 5; i++) packet(zl, 0, 0, 0);
+        CHECK(player_stamps == 3);
+        pad_held = zl | l; packet(zl | l, 0, 0, 0); CHECK(player_stamps == 4);   /* a second one, the first held */
+        pad_held = l; packet(l, 0, 0, 0); CHECK(player_stamps == 4);
+        pad_held = 0; packet(0, 0, 0, 0); CHECK(player_stamps == 4);
+        printf("PASS: an input held down is the player's input when it goes down, not at every read %s\n", name);
         free(memory);
         return 0;
     }

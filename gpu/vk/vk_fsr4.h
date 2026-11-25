@@ -16,6 +16,16 @@ namespace mkwvk {
 
 struct TemporalEngine;
 
+/// (Triforce) FSR 4's network model: Auto lets AMD pick (the default, as before), Lite forces ffxProvider_FSR4Lite_Int8
+/// (fsr4_models.h: only for the one upscaler library whose layout is known, by its SHA-256)
+enum Fsr4Model { FSR4_MODEL_AUTO = 0, FSR4_MODEL_LITE = 1 };
+/// The model the engine asks for next: RX_VK_FSR4_MODEL when set, else the menu's FSR 4 model row (opts.fsr4_model)
+Fsr4Model fsr4_model();
+/// RX_VK_FSR4_MODEL as parsed: -1 unset, else FSR4_MODEL_AUTO/LITE (an invalid value logs once and is Auto)
+int fsr4_model_env();
+/// Whether this GPU (AMD's) and library have a Lite provider whose answers are hooked: the menu's row is shown
+bool fsr4_lite_available();
+
 /// Whether this build has FSR in it (HOOKSHOT_FSR)
 bool fsr4_built();
 /// Why FSR 4 cannot be chosen here (the Upscaler row says it), FSR_OK when it can or is not known yet
@@ -27,6 +37,12 @@ const char* fsr4_name(bool native_aa);
 /// Loads AMD's library once and asks it for an FSR 4 upscaler for this device, so fsr4_why knows before the first upscale
 /// (the menu, when it opens). Nothing in a build without FSR, or before the device is made
 void fsr4_probe();
+/// (Triforce) A start that only prepares, with AMD FSR 4's tune on (RX_VK_FSR4_TUNE=1): its pipelines made and its unrolled
+/// layers built now, into their own cache, with one frame on cleared images. Nothing otherwise, or in a build without FSR
+void fsr4_prepare_shaders();
+/// The window closing (mkwvk_close_asked): the tuned layers' background builds stopped, the one in the driver waited for
+/// (10 s at most). Nothing in a build without FSR
+void fsr4_close();
 /// (linux) a Vulkan FSR 4 library is there and records with descriptor buffers: the device has to enable them
 bool fsr4_wants_descriptor_buffer();
 /// FSR 4 as the temporal upscaler's engine (FSR 4 and its native AA on the Upscaler row); nullptr in a build without it

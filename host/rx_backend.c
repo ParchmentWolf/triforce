@@ -59,6 +59,11 @@ int hos_binding(int set, int button, int slot);
 int hos_mic_count(void);            /* nn_audio_in.c: the microphones, for the Insert menu */
 const char *hos_mic_name(int index);
 void hos_mic_select(int mode, const char *name, int index);
+int hos_mic_test(int enabled, int *levels);   /* ((Triforce) 20: the Test microphone row) */
+int hos_prompts_live_parts(void);   /* ((Triforce) 23: prompts.c) */
+int hos_reset_binding(int button);   /* ((Triforce) 23: nn_hid.c, the Controls page's per-control reset) */
+int hos_rebind_control(int set, int button, int slot, int code, uint64_t approved, uint64_t *conflicts);
+int hos_binding_is_default(int button);
 void hos_bind(int set, int button, int slot, int code);
 int hos_prompts_face(void);         /* prompts.c */
 int hos_prompts_pad_face(void);
@@ -282,6 +287,8 @@ static float host_wide_menus(uint32_t keep_mask) {   /* (MkwVkHost.wide_menus) *
        asked every time, each says its own changes in the log) */
     int rx_option(int id, int otherwise);
     const int covers = oot_movie_cover_recent(), menu = oot_menu_over_movie() || rx_option(HOS_OPT_MODS_MUSIC, 0) == 2;
+    void hos_wide_ui_tick(void);   /* ((Triforce) host/hos_wide_ui.c: the HUD's and Extended menus' layout for the picture, each present) */
+    hos_wide_ui_tick();
     return oot_wide_menu_margin(hos_wide_margin, covers, menu);
 }
 static int host_wide_backdrop(void) {
@@ -294,6 +301,7 @@ int hos_sdl_gyro_status(void);   /* pad_sdl.c */
 extern const char *hos_romfs_dir;   /* nn_fs.c, set by hos_main.c */
 static const char *host_romfs_dir(void) { return hos_romfs_dir; }
 #include "hos_bench.h"   /* ((Triforce) MkwVkHost.bench: benchmark mode's panel, hos_bench_state) */
+#include "audio_output_devices.h"   /* ((Triforce) 20: MkwVkHost.audio_output_*, the Audio tab's Output device row) */
 
 #ifdef _WIN32
 static unsigned char menu_key_press[256];
@@ -329,6 +337,10 @@ static const MkwVkHost vk_host = {
     host_watch_guest_writes, hos_pad_raw, hos_binding, hos_bind, host_aspect_ratio, host_take_key_press,
     hos_mouse_pointer, hos_mic_count, hos_mic_name, hos_mic_select, hos_sdl_gyro_status, hos_log_flush, hos_prompts_face,
     host_romfs_dir, host_wide_menus, hos_bench_state, hos_prompts_pad_face, host_screens, host_wide_backdrop,
+    hos_audio_output_count, hos_audio_output_info, hos_audio_output_select, hos_audio_output_state,   /* ((Triforce) 20) */
+    hos_mic_test,
+    hos_prompts_live_parts,   /* ((Triforce) 23: the button prompts' live part, host/prompts.c) */
+    hos_reset_binding, hos_rebind_control, hos_binding_is_default,   /* ((Triforce) 23: the Controls page, host/nn_hid.c) */
 };
 
 static const MkwVkRenderer *vk;   /* the Vulkan back end, when it was chosen and started */
@@ -431,7 +443,18 @@ int rx_async_replay(void) {
     static volatile int on = -1;
     if (on < 0) {
         const char *e = getenv("RX_VK_ASYNC");
-        on = e && atoi(e) != 0;
+        if (e) {
+            on = atoi(e) != 0;
+        } else if (vk && vk->option) {
+            /* ((Triforce) unset: the renderer's answer, resolved once (HOS_OPT_RENDER_THREAD: the Debug tab's Threaded rendering
+               row or RX_VK_THREADED, gpu/vk/threaded_rendering.h; off by default, so 0 as before) */
+            on = vk->option(HOS_OPT_RENDER_THREAD) > 0;
+        } else {
+            /* (asked before the renderer runs: hos_reserved_cpus at its device's pick. RX_VK_THREADED=1 or on says it already;
+               otherwise off for now, and asked again) */
+            const char *t = getenv("RX_VK_THREADED");
+            return t && (!strcmp(t, "1") || !_stricmp(t, "on"));
+        }
     }
     return on;
 }
@@ -453,7 +476,18 @@ static const MkwVkRenderer *load_vulkan(const char *dll) {
     memcpy(slash + 1, dll, strlen(dll) + 1);
     HMODULE m = LoadLibraryA(path);
     if (!m) {
+#ifdef _WIN32
         hos_log("rx: RX_BACKEND=vulkan, but %s did not load (%lu): WebGPU", path, GetLastError());
+#else   /* ((Triforce, 11-24, after Source A's) why, as dlerror() said: a missing file, a glibc too old, a wrong ELF class. The
+           line names the file LoadLibraryA opened (the .so) and drops dlerror()'s leading "<that file>: ", so the path,
+           home folder included, is in it once. Linux has no WebGPU: nothing is drawn) */
+        char *ext = strrchr(path, '.');
+        if (ext && !strcmp(ext, ".dll")) strcpy(ext, ".so");
+        const char *why = hos_load_error();
+        const size_t n_path = strlen(path);
+        if (!strncmp(why, path, n_path) && !strncmp(why + n_path, ": ", 2)) why += n_path + 2;
+        hos_log("rx: RX_BACKEND=vulkan, but %s did not load (%s): nothing is drawn", path, why);
+#endif
         return NULL;
     }
     vk_module = m;
@@ -502,6 +536,9 @@ int rx_prepare_shaders(void) {
 /* (hookshot) the window is being closed: a back end still preparing its shaders stops and keeps what it made first (a few
    seconds at most). One without the export (an older one) has nothing to keep */
 void rx_close_asked(void) {
+    /* ((Triforce) first, before anything that takes time: the player asked to quit, so however the process ends from here
+       (a second close of a window that stopped answering) it is no crash (host/hos_crash_record.c, hos_crash_dialog.h) */
+    { void hos_crash_quit_asked(void); hos_crash_quit_asked(); }
     if (!vk_module) return;
     void (*close_asked)(void) = (void (*)(void))(void *)GetProcAddress(vk_module, "mkwvk_close_asked");
     if (close_asked) close_asked();
@@ -561,19 +598,32 @@ void rx_nvn_present(const nvn_tex *t, const int crop[4]) {
    the Halton (2, 3) sequence, over as many frames as the upscaler's scale wants (HOS_OPT_DLSS_JITTER_PHASES: gpu/vk/dlss_math.h
    dlss_jitter_phases, 8 for DLAA up to 64). */
 int hos_dlss_jitter_clip(uint64_t projection, float out[2]) {
+    /* ((Triforce, version 22) the renderer's sample whole (jitter_sample): the size and the sequence's length asked one at a
+       time were three answers a resize or a scale change could fall between. And the frame's cache under a lock of its
+       own, the frame read under it: two views asking at once never take a cache still being filled, or one rolled back to
+       an older frame. A renderer without it: the three questions, as before) */
+    static SRWLOCK lock = SRWLOCK_INIT;
     static LONG at = -1;
-    static float w, h;
-    static int phases;
+    static MkwVkJitter jitter;
+    MkwVkJitter sample;
+    AcquireSRWLockExclusive(&lock);
     const LONG frame = presents;
     if (frame != at) {   /* (asked once a frame: the renderer's lock is not taken for every view) */
         at = frame;
-        w = (float)rx_option(HOS_OPT_DLSS_JITTER_W, 0), h = (float)rx_option(HOS_OPT_DLSS_JITTER_H, 0);
-        phases = rx_option(HOS_OPT_DLSS_JITTER_PHASES, 16);
+        jitter = (MkwVkJitter){0};
+        if (vk && vk->jitter_sample) {
+            vk->jitter_sample(&jitter);
+        } else {
+            jitter.width = (uint32_t)rx_option(HOS_OPT_DLSS_JITTER_W, 0), jitter.height = (uint32_t)rx_option(HOS_OPT_DLSS_JITTER_H, 0);
+            jitter.phases = (uint32_t)rx_option(HOS_OPT_DLSS_JITTER_PHASES, 16);
+        }
     }
+    sample = jitter;
+    ReleaseSRWLockExclusive(&lock);
     float p[16];
     memcpy(p, GP(projection), sizeof p);
     extern volatile float hos_wide_ratio;
-    return dlss_jitter_clip(p, hos_wide_ratio, (unsigned)frame, phases, w, h, out);
+    return dlss_jitter_clip(p, hos_wide_ratio, (unsigned)frame, (int)sample.phases, (float)sample.width, (float)sample.height, out);
 }
 static void forward(const early_call *c) {
     switch (c->kind) {
@@ -633,6 +683,9 @@ void rx_nvn_texture_created(const nvn_tex *t) {
     if (vk && vk->nvn_texture_created) vk->nvn_texture_created(t);
 }
 void rx_nvn_program_released(const nvn_prog *p) { vk ? vk->nvn_program_released(p) : wgr_nvn_program_released(p); }
+void rx_nvn_program_created(const nvn_prog *p) {
+    if (vk && vk->nvn_program_created) vk->nvn_program_created(p);
+}
 /* ((Triforce, 11-21, the performance audit's THREAD-20, after Source A's) ReadTexels and WriteTexels reach the back end, which
    waits for all the GPU work submitted (its finish) and then for the replay's lock: a GPU drain of 6 ms and more, at an
    area's arrival and at boot, where the game calls them from its loading threads. The thread kept its virtual core through
@@ -736,7 +789,18 @@ int rx_memory_holders(char *out, size_t n) {
     return fn ? fn(out, n) : 0;
 }
 /* (nvn_native.c: the CPU set an event's value) in order with the submits, for the GPU's waits on it */
-int rx_option(int id, int otherwise) { return vk && vk->option ? vk->option(id) : otherwise; }
+/* (Triforce) An input recording's playback answers the Debug tools rows it holds (host/input_movie.c): the player's menu
+   changes nothing in a replay, nor the replay the player's menu. With nothing played, one atomic load */
+#include "input_movie.h"
+_Static_assert(MOVIE_OPT_HEARTS == HOS_OPT_CHEAT_HEARTS && MOVIE_OPT_FLIGHT == HOS_OPT_CHEAT_FLIGHT &&
+               MOVIE_OPT_CAMERA == HOS_OPT_CHEAT_CAMERA && MOVIE_OPT_SPEED == HOS_OPT_CHEAT_SPEED &&
+               MOVIE_OPT_DAMAGE == HOS_OPT_DAMAGE_TAKEN, "host/input_movie.h's Debug tools rows are vk_api.h's");
+int hos_input_movie_option(int id, int *v);
+int rx_option(int id, int otherwise) {
+    int v;
+    if (hos_input_movie_option(id, &v)) return v;
+    return vk && vk->option ? vk->option(id) : otherwise;
+}
 /* (Triforce VR) the renderer's VR table (gpu/vk/vk_xr.cpp), for host/vr_game.c, nn_hid.c and nn_vi.c; NULL without one */
 const MkwVkXr *rx_xr(void) {
     static const MkwVkXr *xr;
@@ -747,6 +811,38 @@ const MkwVkXr *rx_xr(void) {
    screen_point); as it is without the renderer's answer */
 void rx_screen_point(int *x, int *y, int w, int h) { if (vk && vk->screen_point) vk->screen_point(x, y, w, h); }
 void rx_option_set(int id, int value) { if (vk && vk->option_set) vk->option_set(id, value); }
+/* ---- (Triforce) the control bridge (host/control.c, HOS_CONTROL): the Vulkan back end's, none with WebGPU (0) ---- */
+#include "control.h"
+int rx_control_frame_info(int64_t *presents, int64_t *draws, int *width, int *height) {
+    if (!vk || !vk->frame_info) return 0;
+    vk->frame_info(presents, draws, width, height);
+    return 1;
+}
+int rx_control_shot(const char *path, int64_t after, void (*done)(void *ctx, int64_t present, int ok), void *ctx) {
+    return vk && vk->shot ? vk->shot(path, after, done, ctx) : 0;
+}
+#define CTL_SAME(f) (sizeof ((HosControlSetting *)0)->f == sizeof ((MkwVkSetting *)0)->f)
+_Static_assert(CTL_SAME(key) && CTL_SAME(name) && CTL_SAME(text) && CTL_SAME(tab), "control.h and vk_api.h: one setting");
+#undef CTL_SAME
+static void control_setting_copy(HosControlSetting *to, const MkwVkSetting *from) {   /* (the same fields, field by field) */
+    memcpy(to->key, from->key, sizeof to->key), memcpy(to->name, from->name, sizeof to->name);
+    memcpy(to->text, from->text, sizeof to->text), memcpy(to->tab, from->tab, sizeof to->tab);
+    to->value = from->value, to->lo = from->lo, to->hi = from->hi, to->step = from->step;
+    to->restart = from->restart, to->fixed = from->fixed;
+}
+int rx_control_setting(int index, HosControlSetting *out) {
+    MkwVkSetting s;
+    if (!vk || !vk->setting || !vk->setting(index, &s)) return 0;
+    control_setting_copy(out, &s);
+    return 1;
+}
+int rx_control_setting_set(const char *key, int value, HosControlSetting *out) {
+    MkwVkSetting s;
+    memset(&s, 0, sizeof s);
+    const int r = vk && vk->setting_set ? vk->setting_set(key, value, &s) : 0;
+    if (r) control_setting_copy(out, &s);
+    return r;
+}
 void rx_nvn_event_signal(uint64_t gpu, uint32_t value) {
     if (vk && vk->nvn_event_signal) vk->nvn_event_signal(gpu, value);
 }

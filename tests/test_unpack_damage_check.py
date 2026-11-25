@@ -114,24 +114,22 @@ class TheBuildTakesTheNote(unittest.TestCase):
             self.assertEqual(seen, UnpackNotesDamagedFiles.WANT)
             said = io.StringIO()
             with patch.object(nup, "damaged_game_files", side_effect=AssertionError("every file was opened again")), \
-                    contextlib.redirect_stdout(said):
+                    contextlib.redirect_stdout(said), self.assertRaises(SystemExit):
                 make_game.stand_in_damaged_files(str(out), str(out / "romfs"), seen)
             self.assertEqual((out / "romfs/Model/b_Alb.bntx.zs").read_bytes(), WHOLE)   # (a whole texture of its kind)
             self.assertEqual((out / "romfs/Pack/e.zs").read_bytes(), b"\0\0")            # (nothing similar beside it)
-            self.assertEqual((out / ".triforce_romfs_checked").read_text(), (out / ".triforce_romfs").read_text())
+            # ((Triforce, 11-24) one with no stand-in stops the build, and the unpack is not marked checked)
+            self.assertFalse((out / ".triforce_romfs_checked").exists())
             self.assertIn("as they were unpacked: 4 .zs files, 2 damaged", said.getvalue())
             self.assertIn("Your game dump is incomplete: 2 game files", said.getvalue())
+            self.assertIn("1 damaged file with no replacement", said.getvalue())
             self.assertNotIn("@@progress", said.getvalue())
-            # (checked under this unpack's stamp: not again)
-            with patch.object(nup, "stand_in_damaged", side_effect=AssertionError("checked twice")):
-                make_game.stand_in_damaged_files(str(out), str(out / "romfs"), seen)
-                make_game.stand_in_damaged_files(str(out), str(out / "romfs"))
 
     def test_without_a_note_every_file_is_opened_as_before(self):
         with tempfile.TemporaryDirectory(prefix="unpack-check-") as temp:
             out, seen = self.folder(temp, None)
             self.assertIsNone(seen)
-            with contextlib.redirect_stdout(io.StringIO()) as said:
+            with contextlib.redirect_stdout(io.StringIO()) as said, self.assertRaises(SystemExit):   # ((Triforce) Pack/e.zs has none)
                 make_game.stand_in_damaged_files(str(out), str(out / "romfs"), seen)
             self.assertEqual((out / "romfs/Model/b_Alb.bntx.zs").read_bytes(), WHOLE)
             self.assertIn("every .zs file is opened", said.getvalue())
@@ -153,11 +151,13 @@ class TheNoteIsWrittenAndReadInTime(unittest.TestCase):
         self.assertIn("ZS_CHECKED", main)
         build = (ROOT / "nx2/make_game.py").read_text(encoding="utf-8")
         body = build[build.index("\ndef main("):]
-        read, moved, gone = (body.index(text) for text in ("unpacked_seen = unpack_seen(game)",
+        # ((Triforce, 11-24) in read_assets, which runs before the lift or, for a large first read, beside it)
+        read, moved, gone = (body.index(text) for text in ("seen_holder[0] = unpack_seen(game)",
                                                            'shutil.move(os.path.join(game, "romfs"), romfs)',
-                                                           "shutil.rmtree(game, ignore_errors=True)\n            shutil.rmtree(kept"))
+                                                           "shutil.rmtree(game, ignore_errors=True)\n                shutil.rmtree(kept"))
         self.assertTrue(read < moved < gone, "the note is read after the folder it lies in is moved or deleted")
         self.assertIn("stand_in_damaged_files(out, romfs, unpacked_seen)", body)
+        self.assertIn("stand_in_damaged_files(out, romfs, seen_holder[0])", body)   # (after a read beside the lift)
 
 
 if __name__ == "__main__":

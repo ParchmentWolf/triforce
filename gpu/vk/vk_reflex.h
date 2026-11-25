@@ -31,6 +31,12 @@ void reflex_present_begins();
 void reflex_submit_ends();
 /// The present: a VkPresentIdKHR for VkPresentInfoKHR's pNext (or null), and the present's start marker
 const void* reflex_present_id(const void* next);
+/// ((Triforce) 11-24) A queue submit's VkLatencySubmissionPresentIdNV, chained in front of `next` for VkSubmitInfo2's pNext: the
+/// game frame its GPU work belongs to (the frame being made, its present id), so the driver times that frame's rendering from
+/// it rather than guessing. `next` itself unless RX_VK_REFLEX_SUBMIT_IDS=1, Reflex on and the frame's start markers given.
+/// Off by default: the driver's own guess, as before (the coordinator's comparison decides). The struct is the calling
+/// thread's until its next call: take it right before the submit
+const void* reflex_submit_id(const void* next);
 void reflex_presented();
 /// After the present: the driver's sleep until the next frame should start, then that frame's start markers (left out while
 /// the game's thread takes it where its frame starts: reflex_pace)

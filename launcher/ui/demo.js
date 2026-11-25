@@ -15,7 +15,7 @@
     { slot: 6, label: 'File 6', place: 'Hyrule Castle', when: '9 Nov', meta: '5 h 50 min played · Saved 9 Nov', time: '5 h 50 min played', pic: 'img/save5.jpg' },
   ];
   const NEWS = { title: 'New in 0.5.2', items: [{ b: 'Battle music', p: 'ends again after the last enemy.' }, { b: 'Menu text', p: 'always shows on every screen.' }, { b: 'Updates', p: 'download 12 MB and keep your shaders.' }], more: true };
-  const st = { lang: 'English (US)', folder: 'D:\\Games\\Triforce', ver: '0.5.2', update: false, timer: 0, kind: '', sound: { music: .4, sfx: .7, muted: false } };
+  const st = { lang: 'English (US)', folder: 'D:\\Games\\Triforce', ver: '0.5.2', update: false, timer: 0, kind: '', evil: 0, pack: { have: 'none', busy: false, frac: 0, line: '', size: '18.4 GB' }, packTimer: 0, sound: { music: .4, sfx: .7, muted: false } };
   const SET = () => [
     { h: 'Launcher' }, { id: 'music', label: 'Music', kind: 'slider' }, { id: 'sfx', label: 'Sounds', kind: 'slider' },
     { id: 'autostart', label: 'Start with Windows', value: 'No', actLabel: 'Change' },
@@ -27,6 +27,10 @@
   ];
   function home() {
     const s = { t: 'state', files: FILES, settings: SET(), bench: { available: true, last: 'Not run yet on this PC' }, sound: st.sound };
+    // ((Triforce, 11-25) the game's own settings, Evil HD's row alone: the home screen's switch shows it)
+    s.gameopts = { tabs: [{ id: 'graphics', name: 'Graphics' }], locked: false, note: '', data: { graphics: [{ h: 'Evil HD', rows: [
+      { key: 'evil_hd', label: 'Evil HD', value: st.evil ? 'On' : 'Off', v: st.evil, kind: 'choice', lo: 0, hi: 1, step: 1, restart: false, help: 'The fullest picture the game can give, for a powerful PC.' }] }] } };
+    s.texpack = Object.assign({}, st.pack);   // ((Triforce, 11-25) the Remastered textures row
     if (st.update) {
       s.home = { mode: 'update', eb: 'An update is ready', title: 'Version 0.5.3', meta: '12 MB download · About 4 minutes · your saves and mods stay', button: 'Update', act: 'update',
         links: [{ html: '<b>Play 0.5.2 first</b>', act: 'playold' }, { html: 'See all changes', act: 'open:changes' }], news: { title: 'New in 0.5.3', items: [{ b: 'RX 580', p: 'no more white speckles on grass and Link.' }, { b: 'Controller', p: 'LB and RB reach every menu tab.' }, { b: 'Mods', p: 'the whole list, and online co-op.' }] } };
@@ -119,6 +123,7 @@
     receive(m, fn) {
       out = fn;
       if (m.t === 'ready') { emit({ t: 'hello', chrome: true, os: 'windows' }); emit({ t: 'state', sound: st.sound, media: { art: false, music: false, sfx: true } }); const j = location.hash.slice(1); if (j) window.DEMO.jump(j, fn); else emit({ t: 'go', s: 'welcome' }); return; }
+      if (m.t === 'gopt.value' && m.key === 'evil_hd') { st.evil = +m.value ? 1 : 0; return emit(home()); }
       if (m.t === 'pick') return check(m.kind === 'folder' ? 'OcarinaOfTime (folder)' : 'OcarinaOfTime.nup');
       if (m.t === 'drop') return check(m.names[0] || 'file');
       if (m.t === 'win') return emit({ t: 'toast', html: 'Window button: ' + m.a + ' <span style="color:var(--text3)">· in the launcher only</span>' });
@@ -139,6 +144,21 @@
       else if (c === 'saves.importfrom') emit({ t: 'toast', html: '<b>&#9670;</b> 6 files brought in from Eden · the old ones are in backups', sfx: 'success' });
       else if (c === 'saves.export') emit({ t: 'choice', title: 'Copy saves out', text: 'Your files, copied. Nothing here changes.', ok: 'Copy them out', reply: 'saves.exportto', options: [{ id: 'eden', name: 'To Eden', sub: 'its files are backed up first', sel: true }, { id: 'dir', name: 'To a folder…' }] });
       else if (c === 'saves.exportto') emit({ t: 'toast', html: '<b>&#9670;</b> 6 files copied out', sfx: 'success' });
+      else if (c === 'texpack') {   // ((Triforce, 11-25) the Remastered textures row: a pretend download, 19 parts
+        if (st.pack.have === 'installed') emit({ t: 'ask', title: 'Remastered textures', html: '<p>Evil HD\'s remastered textures are installed in your game folder. The game shows them while <b>Evil HD</b> is on.</p><p>Remove them to free 18.4 GB. You can download them again any time.</p>', reply: 'texpack.go', buttons: [{ id: 'no', label: 'Keep them', main: true }, { id: 'rm', label: 'Remove' }] });
+        else emit({ t: 'ask', title: 'Remastered textures', html: '<p>4,505 of the game\'s textures, remastered at twice the detail with their own grain kept. The game shows them while <b>Evil HD</b> is on, from its next start.</p><p><b>18.4 GB to download</b> (about 26 minutes at 100 Mbit/s), unpacked into your game folder as it comes. You can stop any time: it goes on where it stopped.</p><p>They take more video memory: best with a graphics card of 10 GB or more.</p>', reply: 'texpack.go', buttons: [{ id: 'no', label: 'Not now' }, { id: 'go', label: st.pack.have === 'partial' ? 'Continue' : 'Download', main: true }] });
+      }
+      else if (c === 'texpack.go' && m.id === 'go') {
+        st.pack.busy = true; emit(home()); clearInterval(st.packTimer);
+        st.packTimer = setInterval(() => {
+          st.pack.frac = Math.min(1, st.pack.frac + 0.02); const n = Math.min(19, 1 + Math.floor(st.pack.frac * 19));
+          st.pack.line = (st.pack.frac * 19 % 1 > 0.9 ? 'Unpacking part ' : 'Downloading part ') + n + ' of 19';
+          if (st.pack.frac >= 1) { clearInterval(st.packTimer); st.pack = { have: 'installed', busy: false, frac: 1, line: '', size: '18.4 GB' }; emit({ t: 'toast', html: '<b>&#9670;</b> Remastered textures installed · turn on <b>Evil HD</b> to see them' }); }
+          emit(home());
+        }, 300);
+      }
+      else if (c === 'texpack.go' && m.id === 'rm') { st.pack = { have: 'none', busy: false, frac: 0, line: '', size: '18.4 GB' }; emit({ t: 'toast', html: 'Remastered textures removed' }); emit(home()); }
+      else if (c === 'texpackstop') { clearInterval(st.packTimer); st.pack.busy = false; st.pack.have = 'partial'; emit({ t: 'toast', html: 'Download stopped · it goes on where it stopped next time' }); emit(home()); }
       else if (c === 'setting' && m.id === 'uninstall') emit({ t: 'ask', title: 'Uninstall Triforce?', html: '<p>Removes the launcher, its tools and the built game.</p><p>Your saves and mods stay in a backup folder.</p>', reply: 'uninstall', buttons: [{ id: 'no', label: 'Keep it' }, { id: 'yes', label: 'Uninstall', main: true }] });
       else if (c === 'setting') emit({ t: 'toast', html: m.id + ' <span style="color:var(--text3)">· the launcher does this</span>' });
       else if (c === 'bench') bench();

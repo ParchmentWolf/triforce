@@ -133,13 +133,13 @@ def checks(fsr3, inputs, temporal):
     check("const bool held = !gap && present_held_last();" in prep, "FSR 3.1's inputs start no new history after a held present")
     check("framegen_rows::camera_cut(s.last_pose, pose, dt, framegen_rows::kUpscalerCut)" in prep,
           "FSR 3.1's inputs have no camera cut, or not with the upscalers' 30-degree rule")
-    check("const bool reset = gap || held || cut;" in prep, "FSR 3.1's inputs' reset is not the gap, the hold and the cut")
+    check("bool reset = gap || held || cut;" in prep, "FSR 3.1's inputs' reset is not the gap, the hold and the cut")
     check("s.frame.width != rw" not in prep, "FSR 3.1's inputs still start a new history at another render size")
-    check(prep.index("const bool reset = gap || held || cut;") < prep.index("const bool motion = !reset &&"),
+    check(prep.index("bool reset = gap || held || cut;") < prep.index("const bool motion = !reset &&"),
           "the reset is decided after the motion it turns off")
     chain = function(temporal, "bool chain(VkCommandBuffer cmd, int mode, Engine& engine, const Camera& cam,", last=True)
     check("framegen_rows::camera_cut(s.last_pose, pose, dt, framegen_rows::kUpscalerCut)" in chain and
-          "const bool reset = !last || now - last > 2 || present_held_last() || cut;" in chain,
+          "bool reset = !last || now - last > 2 || present_held_last() || cut;" in chain,
           "the chain (DLSS, FSR 4) starts no new history at a camera cut")
     # FSR3-02: the frame's render size into the constants and the downsampler, the images' size as the max
     up = function(fsr3, "bool upscale(VkCommandBuffer cmd, const Inputs& in) {")
@@ -158,8 +158,8 @@ def checks(fsr3, inputs, temporal):
     check("fsr3_math::jitter_phases(rw, dw)" in done and "dlss_jitter_phases" not in done,
           "FSR 3.1's jitter length is not AMD's")
     check("s.missed_from.store(0" in done, "a frame FSR 3.1 drew does not end a run of failures")
-    jitter = function(inputs, "uint32_t jitter_size(int axis) {")
-    check("now - miss > kMissedFrames) return 0;" in jitter, "the jitter goes on while FSR 3.1 fails to draw")
+    jitter = function(inputs, "MkwVkJitter jitter_sample() {")   # ((Triforce) jitter_size asks it: one whole sample
+    check("now - miss > kMissedFrames) return {};" in jitter, "the jitter goes on while FSR 3.1 fails to draw")
     fail = function(fsr3, "bool fail(const char* why, bool real = true) {")
     check("if (real) fsr3_inputs::missed();" in fail, "FSR 3.1's failures do not stop the jitter")
     check('fail("its inputs could not be made", false)' in fsr3, "a frame with no scene camera counts as a failure")
@@ -183,11 +183,11 @@ def checks(fsr3, inputs, temporal):
 
 
 MUTATIONS = [
-    ("the old reset", "inputs", "const bool reset = gap || held || cut;", "const bool reset = gap || cut;"),
+    ("the old reset", "inputs", "bool reset = gap || held || cut;", "bool reset = gap || cut;"),
     ("the old cut rule", "inputs", "framegen_rows::camera_cut(s.last_pose, pose, dt, framegen_rows::kUpscalerCut)",
      "framegen_rows::camera_cut(s.last_pose, pose, dt)"),
-    ("the old chain reset", "temporal", "const bool reset = !last || now - last > 2 || present_held_last() || cut;",
-     "const bool reset = !last || now - last > 2 || present_held_last();"),
+    ("the old chain reset", "temporal", "bool reset = !last || now - last > 2 || present_held_last() || cut;",
+     "bool reset = !last || now - last > 2 || present_held_last();"),
     ("the old max render size", "fsr3", "k.max_render_size[0] = (int32_t)g.render_width", "k.max_render_size[0] = rw"),
     ("the old exposure clear", "fsr3", "info.float32[0] = -1.0f, info.float32[1] = 1e8f;",
      "info.float32[0] = -1.0f, info.float32[1] = 1.0f;"),

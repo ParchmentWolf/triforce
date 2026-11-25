@@ -78,7 +78,7 @@ int main(int argc, char**) {
     for (int v = 0; v <= 3; v++) {
         int n = 0;
         while (hn_tex_detail(v, n)) n++;
-        CHECK(n == 4 && !hn_tex_detail(v, 4) && !hn_tex_detail(v, 5));
+        CHECK(n == 5 && hn_tex_detail(v, 4) && !hn_tex_detail(v, 5));   /* ((Triforce, 11-23) 4: Evil HD on) */
         CHECK(std::strstr(hn_tex_detail(v, 3), "RX_VK_TEX_DETAIL=low"));
         const char* now = hn_tex_detail(v, -1);
         CHECK(now && (env ? now == hn_tex_detail(v, 3) : now == hn_tex_detail(v, 0)));
@@ -105,7 +105,8 @@ def menu_fixture():
         raise SystemExit("vk_menu.cpp: the Texture detail row no longer takes a restart, or lost its line about the value")
     if "Applies after a restart" not in entry:
         raise SystemExit("vk_menu.cpp: the Texture detail row's help does not say that it applies after a restart")
-    if "tex_detail_at_start = opts.tex_detail;" not in definition(menu, "void menu_init"):
+    # ((Triforce, 11-23) as Evil HD has it: Full while on, evil_hd.h; tests/test_evil_hd.py)
+    if "tex_detail_at_start = evil_hd::tex_detail(opts.evil_hd, opts.tex_detail);" not in definition(menu, "void menu_init"):
         raise SystemExit("menu_init does not keep the Texture detail the game started with")
     fixture = MENU_FIXTURE.replace("@ROOT@", ROOT.as_posix())
     for mark, text in (("@OPTIONS@", re.search(r"struct Options \{.*?\n\};", header, re.S).group(0)),

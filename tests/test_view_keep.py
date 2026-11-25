@@ -84,10 +84,10 @@ def check_source(tex, draw, header, dev):
     view = block(draw, "VkImageView texture_view_of(")
     in_order("vk_draw.cpp texture_view_of", view,
              ["const uint64_t dgen = texture_destroy_generation();", "view_keep::pass(view_pass, dgen,",
-              "fn(kv.second.destroy_gen, kv.second.id, kv.second.stable)", "texture_views_gone_since, view_gone()",
+              "fn(h.destroy_gen, h.id, h.stable)", "texture_views_gone_since, view_gone()",
               "handle_hits().find(key)", "it->second.destroy_gen == dgen",
               "const bool stable = view && tex && !(want == VK_IMAGE_VIEW_TYPE_3D && tex->type != VK_IMAGE_TYPE_3D);",
-              "tex ? tex->id : 0u, stable};"])
+              "tex ? tex->id : 0u, use == ViewUse::Sample || use == ViewUse::Storage, known, stable};"])
     need("vk_draw.cpp", draw, ['#include "view_keep.h"', "thread_local view_keep::Pass view_pass;",
                                "view_keep::wanted(getenv(\"RX_VK_VIEW_KEEP\"))"])
     need("docs/development.md", dev, ["`RX_VK_VIEW_KEEP=0`"])

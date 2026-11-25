@@ -23,6 +23,7 @@
 #include "vk_draw.h"      // (descriptors_disturbed)
 #include "vk_gprof.h"     // (RX_VK_PASS_TIMING: a span per pass, so the report names them)
 #include "vk_menu.h"
+#include "vk_reactive.h"   // ((Triforce) RX_VK_REACTIVE: the reactive mask)
 #include "vk_n64.h"       // ((Triforce, N64 Classic) its 3D pass takes the gameplay upscale while it is on: fsr3_wanted)
 #include "vk_temporal.h"   // (temporal_env_chosen: RX_VK_DLSS / RX_VK_FSR4 over the row's FSR 3.1)
 #include "vk_texture.h"
@@ -204,13 +205,8 @@ struct State {
     // render size is the dispatch's (upscale): smaller frames of the game's dynamic resolution keep the images and the history
     uint32_t render_width = 0, render_height = 0, upscale_width = 0, upscale_height = 0;
     uint64_t used_frame = 0;   ///< texture_frame_no of the last evaluation (release_idle)
-    // The uniform buffer the constant blocks are written into, one set of slots per frame in flight so a frame being read
-    // is not overwritten.
-    VkBuffer uniforms = VK_NULL_HANDLE;
-    VmaAllocation uniforms_memory = nullptr;
-    void* uniforms_mapped = nullptr;
+    // Constant block layout; storage belongs to each recording, not a fixed frame ring.
     VkDeviceSize slot_fsr = 0, slot_spd = 0, slot_lut = 0, frame_stride = 0;   // (and cbRCAS after the Lanczos table)
-    uint32_t uniform_frame = 0;
     // History, as fsr3upscalerDispatch carries it.
     int32_t previous_render_size[2]{};
     int32_t previous_upscale_size[2]{};
@@ -219,11 +215,12 @@ struct State {
     uint32_t parity = 0;
     bool first_evaluation = true;   ///< the images are new: their first layout, cleared
     bool lut_uploaded = false;
-    // Images of an earlier size, freed once the frames that may still read them are done (texture_frame_no)
-    std::vector<std::pair<uint64_t, Image>> dead;
+    // Images of an earlier size, released only after their GPU uses complete: a few frames on (texture_frame_no) and once the
+    // timeline has passed the value that followed the work recorded with them (vk_retirement_value; never at 0). The frames
+    // alone did not prove the GPU done with them when it ran late
+    struct Dead { uint64_t frame; uint64_t value; Image image; };
+    std::vector<Dead> dead;
 };
-
-constexpr uint32_t kUniformFrames = 4;   // (more than the swapchain's images in flight)
 
 State g;
 
@@ -234,17 +231,17 @@ void destroy_now(Image& t) {
     t = Image{};
 }
 
-/// An image let go: destroyed a few presents on, as work recorded with it may still be in flight
+/// Retain every view and its image until a later submission covers the old recordings.
 void drop_image(Image& t) {
-    if (t.image) g.dead.push_back({texture_frame_no(), std::move(t)});
+    if (t.image) g.dead.push_back({texture_frame_no(), vk_retirement_value(), std::move(t)});
     t = Image{};
 }
 
 void free_dead() {
-    const uint64_t now = texture_frame_no();
+    const uint64_t now = texture_frame_no(), done = vk_timeline_completed();
     for (size_t i = 0; i < g.dead.size();) {
-        if (now - g.dead[i].first > 4) {
-            destroy_now(g.dead[i].second);
+        if (now - g.dead[i].frame > 4 && g.dead[i].value && done >= g.dead[i].value) {
+            destroy_now(g.dead[i].image);
             g.dead[i] = std::move(g.dead.back());
             g.dead.pop_back();
         } else {
@@ -366,17 +363,15 @@ bool formats_supported() {
     return true;
 }
 
-/// The uniform buffer the two constant blocks (and the Lanczos table, once) are written into: host visible and mapped, with
-/// a set of slots per frame in flight so writing one frame cannot disturb a frame still being read.
-bool make_uniforms() {
+/// Aligned constant block offsets; the recording supplies storage for each evaluation (vk_internal.h uniform_upload: a
+/// four-frame ring of our own was written again while a dispatch queued four evaluations earlier could still read it).
+void make_uniform_layout() {
     const VkDeviceSize align = std::max<VkDeviceSize>(dev.props.limits.minUniformBufferOffsetAlignment, 16);
     const auto round_up = [align](VkDeviceSize n) { return (n + align - 1) / align * align; };
     g.slot_fsr = round_up(sizeof(Constants));
     g.slot_spd = round_up(sizeof(SpdConstants));
     g.slot_lut = round_up(128 * sizeof(int16_t));
     g.frame_stride = g.slot_fsr + g.slot_spd + g.slot_lut + round_up(4 * sizeof(uint32_t));   // (cbRCAS: rcasConfig)
-    return create_buffer(g.frame_stride * kUniformFrames, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                         true, g.uniforms, g.uniforms_memory, &g.uniforms_mapped);
 }
 
 /// Records one pass: its descriptors pushed in the order the pass file numbers them, then the two samplers it declares at
@@ -446,7 +441,8 @@ bool prepare(uint32_t render_width, uint32_t render_height, uint32_t upscale_wid
     if (!supported()) return false;
     if (!g.tried) {
         g.tried = true;
-        g.ok = make_samplers() && make_uniforms();
+        make_uniform_layout();
+        g.ok = make_samplers();
         for (size_t i = 0; i < kPassCount && g.ok; i++) {
             const bool needed = g.wave ? (i != P_LUMA_PYRAMID_NOWAVE && i != P_SHADING_CHANGE_PYRAMID_NOWAVE)
                                        : (i != P_LUMA_PYRAMID && i != P_SHADING_CHANGE_PYRAMID);
@@ -553,6 +549,10 @@ bool upscale(VkCommandBuffer cmd, const Inputs& in) {
     if (!in.color || !in.depth || !in.motion) return false;
     if (!prepare(in.render_width, in.render_height, in.upscale_width, in.upscale_height, in.dynamic)) return false;
 
+    // (before any history or first-layout state is consumed: no recording or no room rejects the evaluation whole)
+    const UniformUpload uniforms = uniform_upload(g.frame_stride);
+    if (!uniforms.binding) return false;
+
     const bool first = g.first_evaluation;
     const bool reset = in.reset || first;
     g.first_evaluation = false;
@@ -604,10 +604,9 @@ bool upscale(VkCommandBuffer cmd, const Inputs& in) {
     spd.num_work_groups = spd_x * spd_y;
     spd.render_size[0] = (uint32_t)rw, spd.render_size[1] = (uint32_t)rh;
 
-    // This frame's slots, written through the mapped buffer.
-    const VkDeviceSize base = (VkDeviceSize)(g.uniform_frame % kUniformFrames) * g.frame_stride;
-    g.uniform_frame++;
-    uint8_t* const mapped = (uint8_t*)g.uniforms_mapped + base;
+    // This evaluation owns its constants until its recording has completed.
+    const VkDeviceSize base = uniforms.binding.offset;
+    uint8_t* const mapped = uniforms.mapped;
     memcpy(mapped, &k, sizeof k);
     memcpy(mapped + g.slot_fsr, &spd, sizeof spd);
     const VkDeviceSize lut_at = g.slot_fsr + g.slot_spd;
@@ -637,7 +636,7 @@ bool upscale(VkCommandBuffer cmd, const Inputs& in) {
         else
             logf("vk: fsr3: its own sharpening off%s", g.sharpen ? "" : " (its passes were not made)");
     }
-    flush_mapped(g.uniforms_memory, g.frame_stride * kUniformFrames);
+    flush_mapped_range(uniforms.memory, uniforms.binding.offset, uniforms.binding.size);
 
     const uint32_t p = g.parity, q = p ^ 1u;
 
@@ -676,7 +675,7 @@ bool upscale(VkCommandBuffer cmd, const Inputs& in) {
         copy.bufferOffset = base + lut_at;
         copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         copy.imageExtent = {128, 1, 1};
-        vkCmdCopyBufferToImage(cmd, g.uniforms, g.lanczos_lut.image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+        vkCmdCopyBufferToImage(cmd, uniforms.binding.buffer, g.lanczos_lut.image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
     }
     // Per frame: the nearest-depth scratch, the SPD counter and its mips; the history on a reset.
     const VkClearColorValue zero{};
@@ -702,8 +701,8 @@ bool upscale(VkCommandBuffer cmd, const Inputs& in) {
     const Resource color{in.color}, depth{in.depth}, motion{in.motion};
     const Resource exposure = tex(g.frame_info);   // (FSR computes its own exposure)
     const Resource current_luma = tex(g.luma[p]);
-    const Resource cb_fsr{VK_NULL_HANDLE, g.uniforms, base, g.slot_fsr};
-    const Resource cb_spd{VK_NULL_HANDLE, g.uniforms, base + g.slot_fsr, g.slot_spd};
+    const Resource cb_fsr{VK_NULL_HANDLE, uniforms.binding.buffer, base, g.slot_fsr};
+    const Resource cb_spd{VK_NULL_HANDLE, uniforms.binding.buffer, base + g.slot_fsr, g.slot_spd};
     const auto groups = [](int32_t size, uint32_t tile) { return ((uint32_t)std::max(1, size) + tile - 1) / tile; };
     const auto run = [&](size_t pass, std::initializer_list<Resource> res, uint32_t gx, uint32_t gy) {
         record_pass(cmd, pass, res.begin(), res.size(), gx, gy);
@@ -730,7 +729,8 @@ bool upscale(VkCommandBuffer cmd, const Inputs& in) {
         spd_x, spd_y);
     run(P_SHADING_CHANGE, {tex(g.spd_mips), tex(g.shading_change), cb_fsr}, groups(rw / 2, 8), groups(rh / 2, 8));
     run(P_PREPARE_REACTIVITY,
-        {tex(g.previous_nearest_depth), tex(g.dilated_motion_vectors), tex(g.dilated_depth), tex(g.default_reactive),
+        {tex(g.previous_nearest_depth), tex(g.dilated_motion_vectors), tex(g.dilated_depth),
+         in.reactive ? Resource{in.reactive} : tex(g.default_reactive),   // ((Triforce) RX_VK_REACTIVE: vk_reactive.h)
          tex(g.default_reactive), tex(g.accumulation[p]), tex(g.shading_change), current_luma, exposure,
          tex(g.dilated_reactive_masks), tex(g.new_locks), tex(g.accumulation[q]), cb_fsr},
         groups(rw, 8), groups(rh, 8));
@@ -746,7 +746,7 @@ bool upscale(VkCommandBuffer cmd, const Inputs& in) {
          tex(g.internal_upscaled[q]), tex(g.output), tex(g.new_locks), cb_fsr},
         groups(uw, 8), groups(uh, 8));
     if (sharpen) {
-        const Resource cb_rcas{VK_NULL_HANDLE, g.uniforms, base + rcas_at, 4 * sizeof(uint32_t)};
+        const Resource cb_rcas{VK_NULL_HANDLE, uniforms.binding.buffer, base + rcas_at, 4 * sizeof(uint32_t)};
         run(P_RCAS, {exposure, tex(g.internal_upscaled[q]), tex(g.output), cb_fsr, cb_rcas}, groups(uw, 16), groups(uh, 16));
     }
     g.parity = q;
@@ -760,7 +760,8 @@ bool sharpens() { return supported() && (!g.tried || (g.ok && g.sharpen)); }
 
 namespace {
 /// ((Triforce, S1) RCAS alone, over another upscaler's picture (fsr3::rcas): its pipeline, samplers, a 1 x 1 exposure of 1
-/// and a ring of the two constant blocks it declares. Made at its first use; -1 when it could not be, for the run
+/// and the layout of the two constant blocks it declares (their storage each recording's own, as the upscaler's). Made at
+/// its first use; -1 when it could not be, for the run
 struct Lone {
     std::mutex mu;
     std::atomic<int> ok{0};   // (read without the lock by rcas_ok, on the present's thread)
@@ -768,11 +769,7 @@ struct Lone {
     VkSampler point = VK_NULL_HANDLE, linear = VK_NULL_HANDLE;
     Image exposure;
     bool exposure_set = false;
-    VkBuffer uniforms = VK_NULL_HANDLE;
-    VmaAllocation uniforms_memory = nullptr;
-    void* mapped = nullptr;
     VkDeviceSize slot_fsr = 0, stride = 0;
-    uint32_t at = 0;
 };
 Lone& lone() {
     static Lone& l = *new Lone;   // (never destroyed, as the chain's: the device outlives the exit)
@@ -790,10 +787,6 @@ bool lone_make(Lone& l) {
     const auto round_up = [align](VkDeviceSize n) { return (n + align - 1) / align * align; };
     l.slot_fsr = round_up(sizeof(Constants));   // (cbFSR3Upscaler, declared by the pass and not read by RCAS: zeros)
     l.stride = l.slot_fsr + round_up(4 * sizeof(uint32_t));
-    if (!create_buffer(l.stride * kUniformFrames, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, true, l.uniforms, l.uniforms_memory,
-                       &l.mapped))
-        return false;
-    memset(l.mapped, 0, (size_t)(l.stride * kUniformFrames));
     if (!make_image(l.exposure, VK_FORMAT_R32_SFLOAT, 1, 1)) return false;
     return make_pipeline(l.pipe, PASSES[P_RCAS]);
 }
@@ -811,6 +804,8 @@ bool rcas(VkCommandBuffer cmd, VkImageView in, VkImageView out, uint32_t w, uint
                                                                                          "the window");
     }
     if (l.ok < 0) return false;
+    const UniformUpload uniforms = uniform_upload(l.stride);   // (this recording's own: before anything is recorded)
+    if (!uniforms.binding) return false;
     if (!l.exposure_set) {   // (its first layout, and 1: RCAS multiplies the colour by it and divides it out again)
         l.exposure_set = true;
         VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
@@ -826,17 +821,18 @@ bool rcas(VkCommandBuffer cmd, VkImageView in, VkImageView out, uint32_t w, uint
         one.float32[0] = 1.0f;
         vkCmdClearColorImage(cmd, l.exposure.image, VK_IMAGE_LAYOUT_GENERAL, &one, 1, &ALL_LEVELS);
     }
-    const VkDeviceSize base = (VkDeviceSize)(l.at++ % kUniformFrames) * l.stride;
+    const VkDeviceSize base = uniforms.binding.offset;
     uint32_t con[4];
     sharpen_rules::rcas_config(sharpness, con);
-    memcpy((uint8_t*)l.mapped + base + l.slot_fsr, con, sizeof con);
-    flush_mapped(l.uniforms_memory, l.stride * kUniformFrames);
+    memset(uniforms.mapped, 0, (size_t)l.slot_fsr);   // (cbFSR3Upscaler: zeros, as lone_make says)
+    memcpy(uniforms.mapped + l.slot_fsr, con, sizeof con);
+    flush_mapped_range(uniforms.memory, uniforms.binding.offset, uniforms.binding.size);
     // (what was written before, the picture and the exposure's clear, visible to the pass)
     memory_barrier(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
     const Resource res[5] = {Resource{l.exposure.view}, Resource{in}, Resource{out},
-                             Resource{VK_NULL_HANDLE, l.uniforms, base, sizeof(Constants)},
-                             Resource{VK_NULL_HANDLE, l.uniforms, base + l.slot_fsr, 4 * sizeof(uint32_t)}};
+                             Resource{VK_NULL_HANDLE, uniforms.binding.buffer, base, sizeof(Constants)},
+                             Resource{VK_NULL_HANDLE, uniforms.binding.buffer, base + l.slot_fsr, 4 * sizeof(uint32_t)}};
     record(cmd, PASSES[P_RCAS], l.pipe, l.point, l.linear, res, 5, (w + 15) / 16, (h + 15) / 16);
     return true;
 }
@@ -1012,6 +1008,8 @@ bool fsr3_pre(VkCommandBuffer cmd, Texture* scene, VkImageView scene_view, uint3
     ai.camera = f.camera;
     ai.frame_time_ms = f.frame_ms;
     ai.reset = f.reset;
+    // ((Triforce) what the scene's transparent draws changed, when RX_VK_REACTIVE asks for it and there were any: vk_reactive.h)
+    if (reactive::Mask m; reactive::mask(cmd, f.width, f.height, f.width, f.height, f.color, m)) ai.reactive = m.view;
     ai.sharpness = own_sharpness(f.width, ow);   // ((Triforce, S1) before the bloom too: the scene's own, the HUD not in it)
     if (!fsr3::upscale(cmd, ai)) return fail("its passes could not be recorded");
     upscale_lod_note(f.width, f.height, ow);   // ((Triforce, S8) the texture LOD bias for the next frames' scene: vk_draw.cpp)
@@ -1063,12 +1061,27 @@ bool fsr3_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
     // ((Triforce, FG-4) frame generation's inputs made already this frame: by the upscaler chain before the bloom, from the
     // scene, with what moves by itself (vk_temporal.cpp fg_inputs_from_chain). Not made again here with the camera's alone)
     if (!upscaling && fsr3_inputs::made_this_frame()) return false;
+    // ((Triforce) 11-24) no engine and AMD FSR 3.1's frame interpolation asked (vk_temporal.h temporal_fg_motion): the chain's
+    // redraws of what moves by itself go into these inputs' motion as they go into FSR 3.1 upscaling's, below
+    const bool fg_own = !upscaling && temporal_fg_motion();
     fsr3_inputs::Frame f;
     if (!fsr3_inputs::prepare(cmd, in, in_view, f, hdr)) {
-        if (upscaling) (void)temporal_fsr3_motion(cmd, nullptr);   // ((Triforce) this frame's stored draws let go)
+        if (upscaling || fg_own) (void)temporal_fsr3_motion(cmd, nullptr);   // ((Triforce) this frame's stored draws let go)
         return upscaling ? fail("its inputs could not be made", false) : false;
     }
-    if (!upscaling) return false;   // (frame interpolation's inputs alone: the network or DLSS upscales)
+    if (!upscaling) {   // (frame interpolation's inputs alone: the network or DLSS upscales)
+        if (fg_own) {
+            // (RX_VK_FG_OWN_MOTION=0: the camera's alone, as vk_fsr3_inputs.cpp chain_motion; the stored draws let go then)
+            static const bool camera_only = getenv("RX_VK_FG_OWN_MOTION") && atoi(getenv("RX_VK_FG_OWN_MOTION")) == 0;
+            const int own = temporal_fsr3_motion(cmd, camera_only ? nullptr : &f);
+            static bool told = false;
+            if (own > 0 && !told)
+                told = true, logf("vk: fsr3 inputs: AMD FSR 3.1's frame interpolation has what moves by itself in its motion with "
+                                  "the game's own upscaler: %d draws drawn again over the camera's (frame %llu)",
+                                  own, (unsigned long long)f.frame);
+        }
+        return false;
+    }
     // ((Triforce, FSR3-03) what moves by itself into the motion, over the camera's: the chain's redraws, with this frame's
     // draws that stored their positions. Before, FSR 3.1 had the camera's motion alone, and Link and the others trailed)
     const int own = temporal_fsr3_motion(cmd, &f);
@@ -1093,6 +1106,8 @@ bool fsr3_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
     ai.camera = f.camera;
     ai.frame_time_ms = f.frame_ms;
     ai.reset = f.reset;
+    // ((Triforce) what the scene's transparent draws changed, when RX_VK_REACTIVE asks for it and there were any: vk_reactive.h)
+    if (reactive::Mask m; reactive::mask(cmd, f.width, f.height, f.width, f.height, f.color, m)) ai.reactive = m.view;
     ai.sharpness = own_sharpness(f.width, ow);   // ((Triforce, S1) into the picture before the HUD is drawn over it)
     if (!fsr3::upscale(cmd, ai)) return fail("its passes could not be recorded");
     upscale_lod_note(f.width, f.height, ow);   // ((Triforce, S8) the texture LOD bias for the next frames' scene: vk_draw.cpp)

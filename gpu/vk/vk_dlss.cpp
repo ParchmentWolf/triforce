@@ -33,6 +33,7 @@
 #include "lab_ab.h"         // ((Triforce, 11-22, PRESENT-38) the lab's "dlssstrict" phases)
 #include "upscaler_rows.h"
 #include "vk_menu.h"
+#include "vk_reactive.h"   // ((Triforce) RX_VK_REACTIVE: the reactive mask)
 #include "vk_paths.h"
 #include "vk_temporal.h"
 #include "vk_texture.h"
@@ -342,8 +343,6 @@ int prepare(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t
     else
         snprintf(why, sizeof why, "the render size %ux%u left its range, %ux%u to %ux%u", rw, rh, s.min_rw, s.min_rh,
                  s.feature_rw, s.feature_rh);
-    const uint64_t key = (uint64_t)ow << 44 ^ (uint64_t)oh << 24 ^ (uint64_t)preset << 1 ^ (hdr ? 1 : 0) ^ 1ull << 63;
-    if (s.refused == key) return *fail = "its feature was not made", 0;   // (until a DLSS setting changes: upstream #2550)
     if (found_range) s.range_seen = true;
     // (the quality mode whose range of render sizes holds this one: the network's 3/4 is DLSS's MaxQuality range)
     // (DLAA's when the render size is the output's)
@@ -395,7 +394,25 @@ int prepare(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t
         }
     }
     // (a size no mode takes: the feature there is stays, so the next size one takes does not make it again)
-    if (!found) return *fail = "no DLSS mode takes this render size", 0;
+    if (!found) {
+        // (the size in the log. vk_temporal.cpp's fail() logs a reason again only when its pointer changes: two buffers, the
+        // other one for a new size, so each refused size is logged once, by fail() as any reason)
+        static char refused[2][112];
+        static unsigned last[4];
+        static int at = 0;
+        if (last[0] != rw || last[1] != rh || last[2] != ow || last[3] != oh) {
+            at ^= 1;
+            snprintf(refused[at], sizeof refused[at], "no DLSS mode takes the render size %ux%u for %ux%u", rw, rh, ow, oh);
+            last[0] = rw, last[1] = rh, last[2] = ow, last[3] = oh;
+        }
+        return *fail = refused[at], 0;
+    }
+    // (what a creation is refused for: the output, the quality mode, the preset and HDR. The quality mode with them: the
+    // Render resolution row asks for another feature of the same output, and a refusal for one mode held the others off too.
+    // Until one of them changes, or DLSS is let go: release)
+    const uint64_t key = (uint64_t)ow << 44 ^ (uint64_t)oh << 24 ^ (uint64_t)((int)mode & 7) << 8 ^ (uint64_t)preset << 1 ^
+                         (hdr ? 1 : 0) ^ 1ull << 63;
+    if (s.refused == key) return *fail = "its feature was not made", 0;
     if (s.feature) {   // (only now is the old one let go: a mode takes this size, and a feature is made for it)
         NVSDK_NGX_Handle* old = s.feature;
         temporal_later([old] { NVSDK_NGX_VULKAN_ReleaseFeature(old); });
@@ -448,7 +465,8 @@ int prepare(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t
         // HDR) changes, not for the rest of the run. Quick DLSS model switches left several features alive, and NGX then
         // refused the next one (0xbad00002): DLSS was gone until a restart, with no word why)
         s.refused = key;
-        logf("vk: NVIDIA DLSS: the game's upscale until a DLSS setting changes (the DLSS model row, the output, HDR)");
+        logf("vk: NVIDIA DLSS: the game's upscale until a DLSS setting changes (the DLSS model row, the quality mode the "
+             "Render resolution row asks for, the output, HDR) or the Upscaler row leaves DLSS and comes back");
         return *fail = "its feature was not made", 0;
     }
     s.retries = 0, s.retry_frame = 0, s.refused = 0;
@@ -478,6 +496,15 @@ bool evaluate(VkCommandBuffer cmd, const TemporalFrame& f) {
     ep.InRenderSubrectDimensions = {f.render_w, f.render_h};
     ep.InReset = f.reset ? 1 : 0;
     ep.InMVScaleX = ep.InMVScaleY = 1.0f;
+    // ((Triforce) what the scene's transparent draws changed, when RX_VK_REACTIVE asks for it and there were any
+    // (vk_reactive.h): DLSS's mask of where to lean on this frame's colour, as large as the chain's inputs. Without one the
+    // parameter stays null, as before)
+    NVSDK_NGX_Resource_VK bias{};
+    if (reactive::Mask m; reactive::mask(cmd, f.render_w, f.render_h, f.color.width, f.color.height, f.color.view, m)) {
+        bias = NVSDK_NGX_Create_ImageView_Resource_VK(m.view, m.image, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}, m.format,
+                                                      m.image_width, m.image_height, false);
+        ep.pInBiasCurrentColorMask = &bias;
+    }
     ::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);   // (NGX records into cmd itself: what this thread recorded through vk_work.h reaches cmd first)
     const NVSDK_NGX_Result r = NGX_VULKAN_EVALUATE_DLSS_EXT(cmd, s.feature, s.params, &ep);
     note_work(cmd);   // (as at its creation: the barrier after it, and the game's next one, are recorded)
@@ -490,6 +517,7 @@ bool evaluate(VkCommandBuffer cmd, const TemporalFrame& f) {
 
 void release() {
     State& s = st();
+    s.refused = 0;   // (another engine chosen, or the chain idle: DLSS asked again makes its feature again)
     if (!s.feature) return;
     NVSDK_NGX_Handle* old = s.feature;
     temporal_later([old] { NVSDK_NGX_VULKAN_ReleaseFeature(old); });

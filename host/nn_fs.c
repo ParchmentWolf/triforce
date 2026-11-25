@@ -19,8 +19,8 @@
 /* (hookshot, #1468) A game folder whose deepest file passes 260 characters (MAX_PATH: "E:\Games\...\romfs\Event\EventSetting\
    Ev..." at 262) is read too. The host paths here are up to HOS_FS_PATH bytes, and on Windows each file call goes through
    its wide function: the path converted from the game's UTF-8 strings and, when it is
-   long and absolute, given the extended-length prefix \\?\ (with its / made \), which Windows takes without its long-paths
-   setting. Short paths are as they were. */
+   long and absolute, given the extended-length prefix \\?\ (with its / made \ and a doubled separator made one), which
+   Windows takes without its long-paths setting. Short paths are as they were. */
 #define HOS_FS_PATH 1024
 #ifdef _WIN32
 static const wchar_t *fs_wide(const char *p, wchar_t *w, size_t cap) {
@@ -36,9 +36,19 @@ static const wchar_t *fs_wide(const char *p, wchar_t *w, size_t cap) {
         if (unc) p++;   /* (\\server\share -> \\?\UNC\server\share) */
     }
     if (MultiByteToWideChar(CP_UTF8, 0, p, -1, w + at, (int)(cap - at)) <= 0) w[0] = 0;
-    if (extended)
-        for (wchar_t *q = w; *q; q++)
-            if (*q == L'/') *q = L'\\';
+    if (extended) {
+        /* (under the prefix Windows takes a path as it is: a / is no separator, and a doubled one is an invalid name
+           (ERROR_INVALID_NAME), where a short path has both tidied. The game doubles one itself, in its streamed
+           voices' "Voice/Resource//Stream/...": in a game folder long enough their files were "not found" and the
+           cutscenes silent. So here every / is a \, and a run of them one) */
+        wchar_t *d = w + at;
+        for (const wchar_t *q = w + at; *q; q++) {
+            const wchar_t c = *q == L'/' ? L'\\' : *q;
+            if (c == L'\\' && d > w + at && d[-1] == L'\\') continue;
+            *d++ = c;
+        }
+        *d = 0;
+    }
     return w;
 }
 #define FS_W(p) fs_wide((p), (wchar_t[HOS_FS_PATH + 8]){0}, HOS_FS_PATH + 8)
@@ -284,12 +294,29 @@ HLE(_ZN2nn2fs8MountRomEPKc) {
     RET(mount(gstr(ARG(0)), hos_romfs_dir, 0) ? 0 : R_NOT_MOUNTED);
 }
 
+/* (Triforce) the folder the game's saves are mounted from, for the control bridge's saves (host/control.c, HOS_CONTROL) */
+static char save_root[HOS_FS_PATH];
+int hos_fs_save_root(char *out, size_t cap) {
+    AcquireSRWLockShared(&mount_lock);
+    const int have = save_root[0] != 0;
+    if (have) snprintf(out, cap, "%s", save_root);
+    ReleaseSRWLockShared(&mount_lock);
+    return have;
+}
+static void save_root_note(const char *root) {
+    AcquireSRWLockExclusive(&mount_lock);
+    snprintf(save_root, sizeof save_root, "%s", root);
+    ReleaseSRWLockExclusive(&mount_lock);
+}
+
 static int user_mount(const char *name, const char *sub) {
     char root[HOS_FS_PATH];
     snprintf(root, sizeof root, "%s\\%s", hos_user_dir, sub);
     make_dirs(root);
     CreateDirectoryA(root, NULL);
-    return mount(name, root, 1);
+    const int ok = mount(name, root, 1);
+    if (ok && !strncmp(sub, "save\\", 5)) save_root_note(root);   /* (Triforce: the control bridge's saves) */
+    return ok;
 }
 
 /* nn::fs::IsSaveDataExisting(ApplicationId, account::Uid const&) -> bool */
@@ -479,7 +506,12 @@ HLE(_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE) {
     char sub[64], root[HOS_FS_PATH];
     snprintf(sub, sizeof sub, "save\\%016llx%016llx", (unsigned long long)G64(ARG(1) + 8), (unsigned long long)G64(ARG(1)));
     hos_save_share_start();   /* (triforce: the System tab's save rows answer from the first save mount on) */
-    if (tx_mount(gstr(ARG(0)), sub + 5, root, sizeof root)) { RET(mount(gstr(ARG(0)), root, 1) ? 0 : R_NOT_MOUNTED); return; }
+    if (tx_mount(gstr(ARG(0)), sub + 5, root, sizeof root)) {
+        const int ok = mount(gstr(ARG(0)), root, 1);
+        if (ok) save_root_note(root);   /* (Triforce: the control bridge's saves) */
+        RET(ok ? 0 : R_NOT_MOUNTED);
+        return;
+    }
     RET(user_mount(gstr(ARG(0)), sub) ? 0 : R_NOT_MOUNTED);
 }
 /* MountSaveDataReadOnly(char const*, ApplicationId, account::Uid const&) */
@@ -571,6 +603,13 @@ static int fs_trace(void) {
     if (on < 0) on = getenv("HOS_FS_TRACE") != NULL;
     return on;
 }
+/* (Triforce) For host/oot_damaged_files.c's look at a texture's first bytes: a file opened to be read with this file's
+   own CreateFileA (UTF-8 and long paths, as OpenFile's), and a game file's host path by the mounts and the mods, as
+   OpenFile finds it */
+HANDLE hos_fs_open_read(const char *path) {
+    return CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+}
+int hos_fs_resolve_read(const char *guest, char *path, size_t cap) { return host_path(guest, path, cap, NULL) != 0; }
 /* OpenFile(FileHandle*, char const* path, int mode): mode bit 0 read, bit 1 write, bit 2 append */
 HLE(_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci) {
     char path[HOS_FS_PATH];
@@ -603,7 +642,17 @@ HLE(_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci) {
     if (want_write) { void hos_save_card_wrote(const char *guest_path); hos_save_card_wrote(g); }
     /* (mkw-recomp) HOS_NO_MOVIES=1: MKW's WebM movies (cup openings, billboards, emblems) are not found, and the
        game goes on without them (decoded by nn_video.c otherwise) */
-    if (!want_write && getenv("HOS_NO_MOVIES")) {
+    /* ((Triforce) 11-24: the two switches of an open, HOS_NO_MOVIES and HOS_FS_OVERLAY below, are read once, not at every
+       open: getenv walks the whole environment under the C runtime's lock, and the game's loader threads open files by
+       the thousand. The value first, then the mark, so a thread that sees the mark has the value) */
+    static const char *volatile overlay;
+    static volatile LONG no_movies, switches_read;
+    if (!switches_read) {
+        overlay = getenv("HOS_FS_OVERLAY");
+        InterlockedExchange(&no_movies, getenv("HOS_NO_MOVIES") != NULL);
+        InterlockedExchange(&switches_read, 1);
+    }
+    if (!want_write && no_movies) {
         const size_t n = strlen(g);
         if (n > 5 && !_stricmp(g + n - 5, ".webm")) {
             static int logged;
@@ -622,7 +671,7 @@ HLE(_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci) {
         return;
     }
     {   /* HOS_FS_OVERLAY=<folder> (a test): a file of the game's data found there is read in place of the game's own */
-        const char *ov = getenv("HOS_FS_OVERLAY");
+        const char *ov = overlay;
         const char *rel = !want_write && ov ? strstr(g, ":/") : NULL;
         if (rel) {
             char alt[HOS_FS_PATH];
@@ -636,6 +685,8 @@ HLE(_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci) {
     /* (mkw-recomp 16bc3bc: the host's file calls block, so the virtual core goes to another thread meanwhile, as
        Horizon would run another while this one waits for the file system. OoT's ARes loaders held it up to 250 ms) */
     if (open_keep_core) away = hos_vcore_away();   /* ((Triforce, 11-21, IO-24) otherwise given up already, above) */
+    { int hos_stand_in_damaged(const char *guest, char *path, size_t cap);   /* (oot_damaged_files.c: an incomplete dump) */
+      if (!want_write) hos_stand_in_damaged(g, path, sizeof path); }
     HANDLE h = CreateFileA(path, GENERIC_READ | (want_write ? GENERIC_WRITE : 0), FILE_SHARE_READ | FILE_SHARE_WRITE,
                            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     const DWORD open_err = h == INVALID_HANDLE_VALUE ? GetLastError() : 0;   /* (before the core is taken back) */
@@ -736,6 +787,12 @@ HLE(_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE) {
     G64(ARG(0)) = (uint64_t)sz.QuadPart;
     RET(0);
 }
+/* ((Triforce, 11-24) HOS_WRITE_KEEP_CORE=1: WriteFile and FlushFile keep their virtual core, as before) */
+static int fs_write_keep_core(void) {
+    static int keep = -1;
+    if (keep < 0) keep = getenv("HOS_WRITE_KEEP_CORE") != NULL;
+    return keep;
+}
 /* WriteFile(FileHandle, long offset, void const* buf, unsigned long size, WriteOption const&) */
 HLE(_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE) {
     Handle *fh = get_handle(c, ARG(0));
@@ -745,12 +802,18 @@ HLE(_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE) {
     DWORD put = 0;
     /* (hookshot) from guest memory only, and the whole size: a DWORD cut wrote less than asked and said so */
     if (ARG(3) <= 0xFFFFFFFFu && hos_guest_range(ARG(2), ARG(3))) {
+        /* ((Triforce, 11-24) no virtual core held through the write, as the read and the open (IO-24): the host's write
+           blocks, and a slow one (a save on a busy or network disk, a virus scanner) held every thread pinned to this
+           thread's core for as long. Only host code and the kernel run until the core is back; the answer is written after
+           it. HOS_WRITE_KEEP_CORE=1: the core held through writes and flushes, as before */
+        const int away = fs_write_keep_core() ? 0 : hos_vcore_away();
         const int64_t stall0 = stall_host_begin();   /* ((Triforce, OS-51) the host's part of a long frame: stall_host.h) */
         hos_guest_touch(ARG(2), ARG(3));   /* ((Triforce, 11-21, MEM-09) as the read: touched before the kernel reads them) */
         const int io = hos_guest_io_begin(GP(ARG(2)), ARG(3));   /* (Triforce: the kernel reads there: rx_backend.c) */
         WriteFile(fh->h, GP(ARG(2)), (DWORD)ARG(3), &put, &ov);
         hos_guest_io_end(io);
         stall_host_end(STALL_HOST_WRITE, stall0, put);
+        if (away) hos_vcore_back();
     }
     RET(put == ARG(3) ? 0 : 0x2EE202);
 }
@@ -763,9 +826,12 @@ HLE(_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl) {
     RET(0);
 }
 HLE(_ZN2nn2fs9FlushFileENS0_10FileHandleE) {
+    Handle *fh = get_handle(c, ARG(0));
+    const int away = fs_write_keep_core() ? 0 : hos_vcore_away();   /* ((Triforce, 11-24) as WriteFile: a flush is the slow one) */
     const int64_t stall0 = stall_host_begin();   /* ((Triforce, OS-51) the host's part of a long frame: stall_host.h) */
-    FlushFileBuffers(get_handle(c, ARG(0))->h);
+    FlushFileBuffers(fh->h);
     stall_host_end(STALL_HOST_FLUSH, stall0, 0);
+    if (away) hos_vcore_back();
     RET(0);
 }
 HLE(_ZN2nn2fs9CloseFileENS0_10FileHandleE) {

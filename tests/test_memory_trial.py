@@ -178,7 +178,8 @@ def main():
     need("vk_vma.cpp: textures_pool()", block(vma, "VmaPool textures_pool() {"),
          ["memory_trial_refused(MEMTRIAL_COMPACT);", "if (!texture_pool) memory_trial_refused(MEMTRIAL_COMPACT);"])
     # (v0.5.1: the work is create_image_inner_, create_image_inner names the image for RX_VK_RT_MAP around it)
-    need("vk_vma.cpp: create_image_inner_()", block(vma, "bool create_image_inner_(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated, bool target, bool textures) {"),
+    need("vk_vma.cpp: create_image_inner_()", block(vma, "bool create_image_inner_(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated, bool target, bool textures,\n"
+                                                     "                         ImageNeed* need) {"),
          ["if (pool == texture_pool) memory_trial_used(MEMTRIAL_COMPACT);", "== VK_SUCCESS) return made();"])
     enum = [line for line in internal.splitlines() if line.startswith("enum MemoryTrialPart")]
     if len(enum) != 1:

@@ -107,7 +107,7 @@ def main():
     check(other < bg.index("notes = pipe_notes_read();") < bg.index("predicted = predict_rebuild(notes, plan);") < bg.index("if (keys.empty()) {"),
           "predict_background reads every note or rebuilds the plan with the switch on")
     first = bg[bg.index("if (stream) {"):other]
-    check("predict_stream::index(f, program_cache_stamp(), sizeof(PipeNote), rec.get(), [&] { return note_sane(*rec); });" in first and
+    check("predict_stream::index(f, notes_stamp(), sizeof(PipeNote), rec.get(), [&] { return note_sane(*rec); });" in first and
           "groups = predict_stream::group(plan, at, had);" in first and "if (!plan_read(&plan)) return no_plan();" in first,
           "the records' index or the plan's groups are not made as predict_stream.h makes them")
     check("std::unordered_map<uint64_t, uint32_t> at;" in first and "std::vector<PredictPlan> plan;" in first,

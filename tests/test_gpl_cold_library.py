@@ -128,7 +128,7 @@ def check_source(draw):
     # ((Triforce) the whole build first is now RX_VK_PIPE_FAST_WORKERS=0's job: by default the cold libraries come first and the
     # link makes the entry ready, the whole build a job of its own that no draw waits for (gpu/vk/pipe_wait.h libs_first,
     # tests/test_pipe_wait.py). This one keeps its order)
-    job = between(draw, "    jobs_push([job] {\n        // (over a linked one", "}, false, &e->ready);")
+    job = between(draw, "    jobs_push([job] {\n        // (over a linked one", "}, false, &e->ready,")
     # ((Triforce) the entry is made ready by gpl_rules::built, the whole build's rule: gpu/vk/gpl_rules.h, tests/test_gpl_rules.py)
     if job.index("gpl_rules::built(*job->e") > job.index("gpl_build_cold("):
         raise SystemExit("the cold libraries are handed to the workers before the pipeline the draw waits for is ready")

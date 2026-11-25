@@ -44,7 +44,8 @@ struct VkSetLatencyMarkerInfoNV {int type;uint64_t presentID=0;int marker=0;};
 struct PresentId {const void* pNext=nullptr;unsigned swapchainCount=0;const uint64_t* pPresentIds=nullptr;};
 void (*before_lock)()=nullptr;
 namespace lab_ab { inline bool on(const char*) { return false; } }   // ((Triforce) the lab's in-run A/B knobs: none here)
-namespace gpu_wait_kinds { struct Exclude { Exclude() {} }; }   // ((Triforce, 11-22, SYNC-27) the sleep's wait is left out of the GPU waits' count: tests/test_gpu_waits.py)
+namespace gpu_wait_kinds { struct Exclude { Exclude() {} }; }
+namespace rec { struct Settled { Settled() {} }; }   // ((Triforce) Threaded rendering's recorder: vk_recorder.h)   // ((Triforce, 11-22, SYNC-27) the sleep's wait is left out of the GPU waits' count: tests/test_gpu_waits.py)
 struct TestMutex {
     std::mutex native;
     void lock(){auto hook=before_lock;before_lock=nullptr;if(hook)hook();native.lock();}

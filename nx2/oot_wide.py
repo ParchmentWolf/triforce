@@ -3,8 +3,8 @@
 The game draws a 2560x1440 picture whatever the screen and renders its scene at 1920x1080; its cameras use a 16:9 ratio.
 With these patches the picture takes the window's shape (the height stays the game's, the width grows on an ultrawide
 screen and shrinks on a 16:10 or 4:3 one), the 16:9 cameras take the picture's ratio, the HUD and menus keep their 16:9
-shape in the middle of a wider picture (a narrower one: its whole width), story movies play in that middle 16:9,
-title movies fill the picture up to 12:5,
+shape in the middle of a wider picture (a narrower one: its whole width), story movies keep their 16:9 shape (in that
+middle 16:9, or across a narrower picture with bars above and below), title movies fill the picture up to 12:5,
 and the picture a save keeps shows that middle 16:9 (a narrower picture: its middle band, at the texture's shape). Every patch reads host globals
 (host/hos_wide.c) that stay 0 for a 16:9 window, so the game runs as shipped then.
 
@@ -25,6 +25,10 @@ UI_M00, UI_M11 = "(2.0f / 3840.0f)", "(2.0f / 2160.0f)"   # (the UI's full-scree
 # it all: bit 0 cleared, that capture went into the middle at twice its width, and a fade in the middle alone left the
 # picture showing at its sides while a place loaded)
 KEEP_VTABLES = (MAIN + 0x4bed098, MAIN + 0x4be4fb0, MAIN + 0x4be61c8, MAIN + 0x4be7b30)
+# ((Triforce) and bit 4, UISystemOverlayScreen (MAIN + 0x4bef4a0): the system menus' header and button guides, and from the
+# item wheel's first opening on its background too. host/oot_wide_hud.h keeps it whole only while the wheel's background is
+# drawn (vk_framegen.cpp wide_sides): kept whole always, the header and guides that this game's options line up with
+# (gpu/vk/game_grid.h) would be stretched over the whole picture)
 
 
 def _ratio(vreg, base=None):
@@ -35,6 +39,20 @@ def _ratio(vreg, base=None):
             "memcpy(&_r, c->vreg[%d], 4); const float _d = _r - (16.0f / 9.0f); if (_d <= 0.01f && _d >= -0.01f) { "
             "uint32_t _u; memcpy(&_u, &_w, 4); a64_vset64(c->vreg[%d], _u); %s} } }   /* (nx2/oot_wide.py: camera ratio) */"
             % (vreg, vreg, store))
+
+
+def _clearance(vreg):
+    """The camera's near-plane clearance sphere keeps the game's ratio, not the picture's: a ratio just loaded into s<vreg>
+    that is exactly the picture's becomes 16:9 for that calculation alone. The camera sizes the sphere it keeps clear of walls
+    from h = tan(fov / 2) * near, w = h * ratio and sqrt(w * w + h * h); fed a 32:9 picture's ratio (which the camera
+    carries since _ratio gave it the picture's) the sphere was 1.8 times its 16:9 size, too big for a crawl passage, and the
+    camera stayed at the entrance while Link crawled away. The stored ratio, its other readers, the drawing matrices and
+    culling stay the picture's."""
+    return ("{ extern volatile float hos_wide_ratio; const float _w = hos_wide_ratio; "
+            "if (_w > 0.0f && _w != (16.0f / 9.0f)) { float _r; memcpy(&_r, c->vreg[%d], 4); "
+            "if (_r == _w) { "
+            "const float _normal = 16.0f / 9.0f; uint32_t _u; memcpy(&_u, &_normal, 4); "
+            "a64_vset64(c->vreg[%d], _u); } } }   /* (nx2/oot_wide.py: camera clearance) */" % (vreg, vreg))
 
 
 def _size(name):
@@ -52,15 +70,35 @@ HUD = ("{ extern volatile float hos_wide_squeeze; if (hos_wide_squeeze > 0.0f) {
        "   /* (nx2/oot_wide.py: HUD in the middle 16:9, or at the screen's edges) */"
        % (UI_M00, UI_M11))
 
+# The speech bubble over a talking NPC (BalloonMessage_00): the game anchors it at the speaker's place on the screen times the
+# canvas's half size (x * 1920 in s0, y * 1080 in s1, then stp s0, s1 to the bubble), but its screen draws through the HUD's
+# projection, which on a picture wider than 16:9 is squeezed across into the middle (HUD, above: times hos_wide_squeeze), so
+# the bubble was pulled toward the middle of the screen, away from its speaker. The anchor's x is divided by the squeeze, and
+# the bubble lands over its speaker. (The site is the ultrawide IPS mod's, there 1920 / squeeze in place of 1920. A picture
+# narrower than 16:9 has a squeeze of 1: nothing changes there, nor at 16:9, where it is 0)
+BUBBLE = ("{ extern volatile float hos_wide_squeeze; const float _q = hos_wide_squeeze; "
+          "if (_q > 0.0f && _q < 1.0f) { float _x; memcpy(&_x, c->vreg[0], 4); _x /= _q; memcpy(c->vreg[0], &_x, 4); } }"
+          "   /* (nx2/oot_wide.py: the speech bubble over its speaker) */")
+
 # Within f_83b7c710 the movie site (main+0x3b5c758) and its SetViewport (main+0x284824) run
 # on the same thread. Between 0x83b7c758 and the unconditional call at 0x83b7c78c, only f_809ebaf0 runs; it calls no viewport helper.
 # Leave the scissor full width and consume the mark only at SetViewport.
+# Keep the movie at 16:9. Inset its left and right bounds on wider pictures, or its top and bottom bounds on
+# narrower pictures (16:10, 4:3: the movie filled the whole picture there, squeezed across). The viewport is at
+# x29 - 40, with float bounds in left, top, right, bottom order from +8.
 MOVIE = ("{ extern int hos_movie_cover_begin(float); extern volatile float hos_wide_ratio; "
-         "extern volatile float hos_wide_margin; const float _m = hos_wide_margin; if (!hos_movie_cover_begin(hos_wide_ratio) && _m > 0.0f) { "
+         "extern volatile float hos_wide_margin; const float _m = hos_wide_margin; const int _cover = hos_movie_cover_begin(hos_wide_ratio); "
+         "if (!_cover && _m > 0.0f) { "
          "const uint64_t _vp = c->x[29] - 40; uint32_t _ua = (uint32_t)recomp_load32(c, _vp + 8), _ub = (uint32_t)recomp_load32(c, _vp + 16); "
          "float _a, _b; memcpy(&_a, &_ua, 4); memcpy(&_b, &_ub, 4); const float _in = (_b - _a) * _m; _a += _in; _b -= _in; "
-         "memcpy(&_ua, &_a, 4); memcpy(&_ub, &_b, 4); recomp_store32(c, _vp + 8, _ua); recomp_store32(c, _vp + 16, _ub); } }"
-         "   /* (nx2/oot_wide.py: movies in the middle 16:9) */")
+         "memcpy(&_ua, &_a, 4); memcpy(&_ub, &_b, 4); recomp_store32(c, _vp + 8, _ua); recomp_store32(c, _vp + 16, _ub); } "
+         "else if (!_cover) { const float _r = hos_wide_ratio; const float _game = 16.0f / 9.0f; "
+         "if (_r > 0.0f && _r < _game * 0.99f) { const uint64_t _vp = c->x[29] - 40; "
+         "uint32_t _ua = (uint32_t)recomp_load32(c, _vp + 12), _ub = (uint32_t)recomp_load32(c, _vp + 20); "
+         "float _a, _b; memcpy(&_a, &_ua, 4); memcpy(&_b, &_ub, 4); const float _in = (_b - _a) * (1.0f - _r / _game) / 2.0f; "
+         "_a += _in; _b -= _in; memcpy(&_ua, &_a, 4); memcpy(&_ub, &_b, 4); "
+         "recomp_store32(c, _vp + 12, _ua); recomp_store32(c, _vp + 20, _ub); } } }"
+         "   /* (nx2/oot_wide.py: movies at 16:9, with side bars on wider pictures or top and bottom bars on narrower ones) */")
 
 # The save's picture (issue 952): the pause menu draws the whole picture into a 543 x 306 texture, the save's JPEG, through the
 # game's viewport-and-scissor helper (f_802a46e0: SetScissor, then SetViewport(x, y, w, h) in w1-w4 from [x8], called by blr x8).
@@ -77,6 +115,52 @@ THUMB = ("{ extern int hos_movie_cover_viewport(uint64_t *, uint64_t *); "
          "c->x[2] = (uint32_t)((306 - _h) / 2); c->x[4] = (uint32_t)_h; } } }"
          "   /* (nx2/oot_wide.py: the save's picture, the middle 16:9) */")
 
+# ((Triforce) The HUD's layout for a wider screen, and the menus' with Menu sides at Extended (host/hos_wide_ui.c; the sites are
+# ozwaldorf's, NotRexed/Hookshot pull request 2843). A 2D layout pane's final transform is made by f_8154cab0 (main+0x152cab0) when
+# its dirty bit 6 is set (f_8154caa0 checks it and falls into it); the pane is x0 there and x19 in it. The parent it multiplies
+# by is x0 after main+0x152cdd4; main+0x152cd98 is where every path without one joins. The translation is stored at
+# main+0x152ce64, before the stored transform is read back to tell whether the children need theirs remade. f_8154ac30 reads a
+# pane's size as drawn (ldp s0, s1, [x0, #0x58]). f_8154a730, the calculate pass, skips a pane with no dirty bits at all.
+# A picture's draw: f_815505b0 packs its record into the frame's constants (the call to f_8154f1c0 returns them at sp + 8,
+# read into x8, x9 at main+0x15306f4), the drawer keeps them at +0x48; f_81550720 (main+0x1530720) draws with them. The pause
+# menu's background is drawn in pieces there (Ultrawide menus: Extended). f_81545d60 builds a layout's panes (the layout x19
+# after it, main+0x1525ca0).
+UI_FORCE = ("{ extern volatile uint32_t hos_wide_ui_force; if (hos_wide_ui_force) c->x[8] |= 0x40; }"
+            "   /* (nx2/oot_wide.py: every pane remakes its transform) */")
+# (the calculate pass, f_8154a730, returns at once for a pane with no dirty bits: a pane that never changes would never remake
+# its transform. While forced its bit 6 is set where the pass reads the bits, so it reaches f_8154caa0)
+UI_FORCE_PASS = ("{ extern volatile uint32_t hos_wide_ui_force; if (hos_wide_ui_force) { c->x[8] |= 0x40; "
+                 "recomp_store32(c, c->x[0], (uint32_t)c->x[8]); } }   /* (nx2/oot_wide.py: every pane remakes its transform) */")
+UI_PARENT = ("{ extern void hos_wide_ui_parent(uint64_t parent); hos_wide_ui_parent(%s); }"
+             "   /* (nx2/oot_wide.py: the pane's parent) */")
+UI_PLACED = ("{ extern void hos_wide_ui_placed(Ctx *c, uint64_t pane); hos_wide_ui_placed(c, c->x[19]); }"
+             "   /* (nx2/oot_wide.py: the HUD's side panes at the screen's edges) */")
+UI_SIZE = ("{ extern void hos_wide_ui_size(Ctx *c, uint64_t pane); hos_wide_ui_size(c, c->x[0]); }"
+           "   /* (nx2/oot_wide.py: spanning panes the screen's width) */")
+UI_BG = ("{ extern void hos_wide_ui_bg(Ctx *c); hos_wide_ui_bg(c); }"
+         "   /* (nx2/oot_wide.py: the pause menu's background in pieces) */")
+UI_BG_DRAW = ("{ extern void hos_wide_ui_bg_draw(Ctx *c); hos_wide_ui_bg_draw(c); }"
+              "   /* (nx2/oot_wide.py: the pause menu's background in pieces) */")
+UI_BUILT = ("{ extern void hos_wide_ui_built(Ctx *c, uint64_t layout); hos_wide_ui_built(c, c->x[19]); }"
+            "   /* (nx2/oot_wide.py: a list widened as it is built) */")
+UI_SITES = (
+    (0x152a730, 0xb9400008, UI_FORCE_PASS),         # ldr w8, [x0]: the calculate pass's first look at the dirty bits
+    (0x152caa0, 0xb9400008, UI_FORCE),              # ldr w8, [x0]: the pane's dirty bits
+    (0x152cd98, 0xad4207e0, UI_PARENT % "0"),       # ldp q0, q1, [sp, #0x40]: no parent
+    (0x152cdd4, 0xb9403008, UI_PARENT % "c->x[0]"), # ldr w8, [x0, #0x30]: the parent's transform
+    (0x152ce64, 0xfc04c263, UI_PLACED),             # stur d3, [x19, #0x4c]: the translation stored
+    (0x152ac40, 0x2d4b0400, UI_SIZE),               # ldp s0, s1, [x0, #0x58]: the size as drawn
+    (0x15306f4, 0xa940a7e8, UI_BG),                 # ldp x8, x9, [sp, #8]: a picture's constants packed, before the drawer keeps them
+    (0x1530740, 0xaa0003f6, UI_BG_DRAW),            # mov x22, x0: a picture drawn (the drawer x0, x1 what it draws with)
+    (0x1525ca0, 0x91004260, UI_BUILT),              # add x0, x19, #0x10: a layout's panes built (f_81545d60 returned)
+)
+
+# AArch64 LDR (immediate, unsigned offset), 32-bit SIMD/FP: fixed fields and
+# imm12 scaled by four, Rn and Rt, from the Arm Architecture Reference Manual.
+def _ldr_s(rt, rn, offset):
+    return (0b1011110101 << 22) | ((offset // 4) << 10) | (rn << 5) | rt
+
+
 # (main offset, the original instruction word there, the C after it)
 SITES = (
     # the picture: the graphics setup and the display settings object build {2560, 1440} in x8 (mov, then this movk)
@@ -91,13 +175,18 @@ SITES = (
     (0x4f1e8, 0x2d558ea0, _ratio(3, 21)),
     (0x23b9a8, 0x2d558c00, _ratio(3, 0)),
     (0x33b82c, 0x2d558440, _ratio(1, 2)),
+    # the near-plane clearance sphere and its follow-up branch (f_8073a4a0): ldr s10/s14, [x19, #0x51c]
+    (0x71a844, _ldr_s(10, 19, 0x51c), _clearance(10)),
+    (0x71b624, _ldr_s(14, 19, 0x51c), _clearance(14)),
     # the 2D canvas setup: the layout's projection rows (ldp q1, q4, [x2]); the canvas is x0, its screen 0x1b8 before it
     (0x774368, 0xad401041, HUD),
+    # the speech bubble's anchor: after fmul s1, s2, s1 (y * 1080; x * 1920 already in s0)
+    (0x20c2c8, 0x1e210841, BUBBLE),
     # the movie layer's draw: its viewport (min x at x29 - 32, max x at x29 - 24) after ldp x9, x8, [x19, #0x18]
     (0x3b5c758, 0xa941a269, MOVIE),
     # the viewport helper's SetViewport, after the call's address is loaded (ldr x8, [x8]), before blr x8
     (0x284824, 0xf9400108, THUMB),
-)
+) + UI_SITES   # ((Triforce) host/hos_wide_ui.c's: each returns at once while nothing is planned)
 
 
 def install(lifter, img):

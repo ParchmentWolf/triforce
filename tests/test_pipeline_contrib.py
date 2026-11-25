@@ -73,7 +73,7 @@ def main():
         code, out = run("--check", sound)
         need(code == 0 and "sound, 3 pipelines" in out, "a sound list is not passed: " + out)
         bad_cases = {
-            "head.bin": (b"HKSTATE9" + listing(rec(1))[8:], "no HKSTATE1 head"),
+            "head.bin": (b"HKSTATE9" + listing(rec(1))[8:], "no HKSTATE2 or HKSTATE1 head"),
             "size.bin": (tool.MAGIC + struct.pack("<I", 520) + rec(1), "record size 520"),
             "cut.bin": (listing(rec(1), rec(2))[:-100], "cut short"),
             "targets.bin": (listing(rec(1), rec(2, n=9)), "9 colour targets"),

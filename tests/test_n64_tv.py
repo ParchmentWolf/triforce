@@ -322,7 +322,7 @@ def check_sources():
     init = block(framegen, "bool init_tv() {")
     if "make_pipe(scale.tv, N64_TV_COMP_SPV, sizeof N64_TV_COMP_SPV, {S, I, S, S}, 48)" not in init or "init_scale()" not in init:
         fail("init_tv: the TV's pipeline is not n64_tv.comp's, with its four bindings and 48 bytes of push constants")
-    scale = block(framegen, "VkImage framegen_scale(")
+    scale = block(framegen, "VkImage scale_picture(")   # ((Triforce) 11-24: framegen_scale is scale_picture, then the colour vision pass
     tv = block(scale, "if (!pq && n64_tv_now(pq) && init_tv()) {")
     in_order(scale, ["if (!pq && n64_tv_now(pq) && init_tv()) {", "const bool fsr1 = opts.upscale == 3"],
              "framegen_scale: the TV no longer runs before AMD FSR 1 and the filter")
@@ -370,16 +370,18 @@ def check_sources():
              "record_layer: the background list is not drawn into a cleared layer at the picture's place, GENERAL for the TV's pass")
     if "ii.ImageCount = 8;" not in imgui:
         fail("vk_imgui.cpp: the backend's vertex buffers are not enough for two draws a frame over three frames in flight")
-    # ((11-22) the game's own menus' mouse under the curve: the renderer's screen_point, last of its table, at version 19 (16-18 ultrawide's on next/update))
+    # ((11-22) the game's own menus' mouse under the curve: the renderer's screen_point, last of its table at version 19 (16-18
+    # ultrawide's on next/update); (11-24) version 20 adds nvn_program_created after it, the load of a program at its create call)
     api = (VK / "vk_api.h").read_text(encoding="utf-8")
-    if not re.search(r"void \(\*screen_point\)\(int \*x, int \*y, int w, int h\);\s*\} MkwVkRenderer;", api) or \
-            "#define MKWVK_API_VERSION 19" not in api:
-        fail("vk_api.h: MkwVkRenderer has no screen_point last, at version 19")
+    # ((Triforce) version 20 put the control bridge's functions after it: screen_point is in the table from version 19 on)
+    if not re.search(r"void \(\*screen_point\)\(int \*x, int \*y, int w, int h\);", api) or \
+            int(re.search(r"#define MKWVK_API_VERSION (\d+)", api).group(1)) < 19:
+        fail("vk_api.h: MkwVkRenderer has no screen_point, at version 19 or later")
     if "void rx_screen_point(int *x, int *y, int w, int h) { if (vk && vk->screen_point) vk->screen_point(x, y, w, h); }" not in \
             (ROOT / "host" / "rx_backend.c").read_text(encoding="utf-8"):
         fail("host/rx_backend.c: rx_screen_point does not ask the renderer")
     oot = block((ROOT / "host" / "oot_menu.c").read_text(encoding="utf-8"), "static void mouse_tick_locked(Ctx *c, uint64_t screen) {")
-    in_order(oot, ["const int got = hos_mouse_game_pointer(&px, &py, &w, &h, &pressed, &wheel);", "if (!got) return;",
+    in_order(oot, ["const int got = hos_mouse_game_pointer(&px, &py, &w, &h, &pressed, &wheel);", "if (!got) {",
                    "rx_screen_point(&px, &py, w, h);", "hit.x = (float)(px - w / 2) * scale"],
              "host/oot_menu.c: the game's menus' cursor is not taken through the TV's curve before it is tested")
     present = block((VK / "vk_replay.cpp").read_text(encoding="utf-8"), "void present_image(")

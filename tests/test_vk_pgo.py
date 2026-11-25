@@ -71,7 +71,7 @@ def main():
               "the hot code's own profile flag is renamed too: its key would change")
 
     jobs = build[build.index("vk_pgo = vk_pgo_flags()"):build.index("if NGX_SDK and not LINUX and toolchain.mingw():")]
-    check("vflags + ([] if lib else vk_pgo) +" in jobs and 'lib = os.path.relpath(src, vk).split(os.sep)[0] in ("eden", "sirit")' in jobs,
+    check('vflags + ([] if lib else vk_pgo + ["-MD"]) +' in jobs and 'lib = os.path.relpath(src, vk).split(os.sep)[0] in ("eden", "sirit")' in jobs,
           "the profile's flags are not on the renderer's own files alone")
     check('if VK_PGO == "gen" and not LINUX:' in jobs and 'os.path.join(HOST, "pgo_rt.c"), os.path.join(obj_dir, "vk_pgo_rt.o")' in jobs and
           "'-DPGO_ENV=\"RX_VK_PGO_FILE\"'" in jobs, "a counting renderer has nothing to write its counters, or writes them for another variable")
@@ -84,7 +84,7 @@ def main():
     check('if "RX_VK_PGO" not in os.environ and os.path.exists(vk_profile) and profile_readable(vk_profile):' in make and
           'env["RX_VK_PGO"] = vk_profile' in make,
           "the shipped profile is passed over a set RX_VK_PGO, or without asking whether the compiler can read it")
-    check('COMPILE_ONLY_ENV = ("RX_VK_PGO", "RX_VK_PGO_FILE")' in make, "the renderer profile's variables are not named as the compile's alone")
+    check('COMPILE_ONLY_ENV = ("RX_VK_PGO", "RX_VK_PGO_FILE"' in make, "the renderer profile's variables are not named as the compile's alone")
     key = make[make.index("def lift_key(exefs, work, env, chunks=True):"):make.index("def key_after_lift(")]
     check(key.index("lift_env = dict(env,") < key.index("for name in COMPILE_ONLY_ENV:") < key.index("lift_env.pop(name, None)") <
           key.index("h.update(repr(sorted(lift_env.items())).encode())"),

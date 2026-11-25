@@ -29,11 +29,16 @@ def main():
     a = p.parse_args()
     source = (a.source / "gpu/vk/vk_draw.cpp").read_text(encoding="utf-8")
     nvn = (a.source / "gpu/render/rx_nvn.h").read_text(encoding="utf-8")
-    actual = "\n".join(block(source, marker) for marker in [
+    # The samplers' section up to its first function: what owns the samplers made (the book, sampler_room and the rest)
+    head = source[source.index("// ---- samplers (by NVN sampler parameters) ----"):source.index("VkSamplerAddressMode wrap(")]
+    actual = head + "\n".join(block(source, marker) for marker in [
         "VkSamplerAddressMode wrap(", "uint32_t aniso_override() {", "VkCompareOp compare_op(",
         "VkSampler sampler_make(int id, bool compare, bool scene) {", "VkSampler sampler_for(int id, bool compare, bool scene) {"])
     # Keep standard-container behavior, replacing only the allocator to target an individual cache.
     for old, new in [
+        ("std::unordered_map<SamplerInfo, Made, SamplerInfoHash> made", "FaultMap<SamplerInfo, Made, Owner, SamplerInfoHash> made"),
+        ("std::unordered_map<uint64_t, Made*> keys", "FaultMap<uint64_t, Made*, Alias> keys"),
+        ("std::vector<Retired> retired", "FaultVector<Retired, Retire> retired"),
         ("std::unordered_map<int, std::pair<uint32_t, nvn_samp_par>> seen", "FaultMap<int, std::pair<uint32_t, nvn_samp_par>, Seen> seen"),
         ("std::unordered_map<uint64_t, VkSampler> mine", "FaultMap<uint64_t, VkSampler, Mine> mine"),
         ("std::unordered_set<uint64_t> failed", "FaultSet<uint64_t, Failure> failed"),
@@ -60,7 +65,9 @@ def main():
              "compare-pcf-off", "custom-border", "standard-border", "reduction", "compare-reduction", "anisotropy", "anisotropy-clamped",
              "unknown-id", "force-linear", "wrap", "lod-clamp", "custom-reduction",
              "descriptor-push", "descriptor-pool", "descriptor-compute", "descriptor-old", "descriptor-whole",
-             "scene-bias", "scene-clamped", "scene-off"]
+             "scene-bias", "scene-clamped", "scene-off",
+             "limit", "limit-full", "limit-reuse", "limit-alias-commit", "limit-retire-commit", "limit-held"]
+    failed = []
     with tempfile.TemporaryDirectory(prefix="sampler-admission-") as temp:
         cpp, exe = Path(temp) / "fixture.cpp", Path(temp) / "fixture.exe"
         cpp.write_text(fixture, encoding="utf-8")
@@ -70,8 +77,15 @@ def main():
                         str(cpp), "-o", str(exe)], check=True)
         for route in ["id", "make", "cache-off"]:
             for case in cases:
-                subprocess.run([str(exe), route, case], check=True, timeout=20)
-    print(f"{len(cases) * 3} sampler cache/admission/policy cases passed")
+                r = subprocess.run([str(exe), route, case], timeout=20, capture_output=True, text=True)
+                if r.returncode:
+                    last = (r.stderr.strip().splitlines() or ["exit %d" % r.returncode])[-1]
+                    failed.append(f"{route} {case}: {last}")
+    for f in failed:
+        print("FAIL: " + f)
+    if failed:
+        raise SystemExit(f"{len(failed)} of {len(cases) * 3} sampler cache/admission/policy/limit cases failed")
+    print(f"{len(cases) * 3} sampler cache/admission/policy/limit cases passed")
 
 
 if __name__ == "__main__":

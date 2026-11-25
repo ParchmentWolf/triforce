@@ -53,8 +53,24 @@ def main():
         before = away_part[:at].rstrip()
         check(before.endswith("if (away) hos_vcore_back();"), "a return before the open answers the game without taking the core back: ..." + before[-80:])
     after = code[create:]
-    check(after.index("if (away) hos_vcore_back();") < after.index("INVALID_HANDLE_VALUE"), "the core is not taken back right after the host's open")
+    # (the open's error is read before the take-back, which waits and may change it: that one line is all there is between)
+    back = after.index("if (away) hos_vcore_back();")
+    between = after[after.index(";") + 1:back].strip()
+    check(between in ("", "const DWORD open_err = h == INVALID_HANDLE_VALUE ? GetLastError() : 0;"),
+          "the core is not taken back right after the host's open: " + between[:120])
+    check(back < after.index("if (h == INVALID_HANDLE_VALUE)"), "the open's answer is looked at before the core is taken back")
     check(code.count("hos_vcore_away()") == 2 and code.count("hos_vcore_back()") == 5, "a give-up or take-back this test does not know")
+    # ((Triforce, 11-24) WriteFile and FlushFile: the core given up around the host's call alone, the answer after it is back
+    for name, call in (("_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE", "WriteFile(fh->h"),
+                       ("_ZN2nn2fs9FlushFileENS0_10FileHandleE", "FlushFileBuffers(fh->h)")):
+        w = re.sub(r"/\*.*?\*/", " ", block(fs, "HLE(%s) {" % name), flags=re.S)
+        at = [w.index(p) for p in ("get_handle(c, ARG(0))", "fs_write_keep_core() ? 0 : hos_vcore_away();", call,
+                                   "if (away) hos_vcore_back();", "RET(")]
+        check(at == sorted(at), name + ": the core is not given up around the host's call")
+        check(w.count("RET(") == 1 and w.count("hos_vcore_away()") == 1 and w.count("hos_vcore_back()") == 1,
+              name + ": a way out this test does not know")
+    dev = (ROOT / "docs" / "development.md").read_text(encoding="utf-8")
+    check("`HOS_WRITE_KEEP_CORE=1`" in dev, "docs/development.md: HOS_WRITE_KEEP_CORE=1 is not in the switches table")
     prompts = (ROOT / "host" / "prompts.c").read_text(encoding="utf-8")
     font = block(prompts, "int hos_prompts_font_file(const char *key, char *out, size_t cap) {")
     at = [font.index(p) for p in ("if (strcmp(key, FONT_PATH)) return 0;", "const int away = hos_vcore_away();",

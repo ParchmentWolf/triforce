@@ -129,6 +129,15 @@ struct Reader {
         if (latin && !font.empty() && !has_latin(font)) font.clear();
         return font;
     }
+    /// ((Triforce) the menu's languages) A font of another script by name, for the letters the menu's fonts lack (vk_imgui.cpp
+    /// script_fonts): the .bfotf or the .bfttf, whatever letters it has; empty when the files do not have it
+    std::vector<unsigned char> read_script(const char* name) const {
+        std::vector<unsigned char> packed, raw;
+        if (!dict) return {};
+        for (const char* ext : {".Nin_Ounce_NVN2.bfotf.zs", ".Nin_Ounce_NVN2.bfttf.zs"})
+            if (read_file(romfs + "Font2/Scalable/" + name + ext, packed) && unzstd(packed, dict, raw)) return bfotf_font(raw);
+        return {};
+    }
     /// A file of the romfs packed with the dictionary (path from the romfs folder), whole; false when it is not there
     bool read_packed(const char* path, std::vector<unsigned char>& out) const {
         std::vector<unsigned char> packed;

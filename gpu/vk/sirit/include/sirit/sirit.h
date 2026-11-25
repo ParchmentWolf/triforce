@@ -718,6 +718,10 @@ public:
     Id OpCooperativeMatrixMulAddKHR(Id result_type, Id a, Id b, Id c);
     /// (hookshot) SPV_KHR_cooperative_matrix: load from memory (layout and stride are ids).
     Id OpCooperativeMatrixLoadKHR(Id result_type, Id pointer, Id layout, Id stride);
+    /// (Triforce) SPV_KHR_cooperative_matrix: load with a memory operand (e.g. NonPrivatePointer).
+    Id OpCooperativeMatrixLoadKHR(Id result_type, Id pointer, Id layout, Id stride, spv::MemoryAccessMask memory_operand);
+    /// (Triforce) SPV_KHR_cooperative_matrix: store to memory (layout and stride are ids).
+    Id OpCooperativeMatrixStoreKHR(Id pointer, Id object, Id layout, Id stride, spv::MemoryAccessMask memory_operand = spv::MemoryAccessMask::MaskNone);
 
     /// Full signed interger multiplication of Operand 1 and Operand 2.
     Id OpSMulExtended(Id result_type, Id operand_1, Id operand_2);
@@ -1300,6 +1304,9 @@ public:
     // the resulting value is undefined.
     Id OpGroupNonUniformBallotFindLSB(Id result_type, Id scope, Id value);
 
+    // True for one active invocation in the subgroup.
+    Id OpGroupNonUniformElect(Id result_type, Id scope);
+
     // Result is the Value of the invocation identified by the id Id to all active invocations in
     // the group.
     Id OpGroupNonUniformBroadcast(Id result_type, Id scope, Id value, Id id);
@@ -1385,6 +1392,9 @@ public:
     /// 2) get a New Value by integer addition of Original Value and Value, and
     /// 3) store the New Value back through Pointer.
     Id OpAtomicIAdd(Id result_type, Id pointer, Id memory, Id semantics, Id value);
+
+    /// (hookshot) SPV_EXT_shader_atomic_float_add: the same as OpAtomicIAdd, by floating-point addition.
+    Id OpAtomicFAddEXT(Id result_type, Id pointer, Id memory, Id semantics, Id value);
 
     /// Perform the following steps atomically with respect to any other atomic accesses within
     /// Scope to the same location:

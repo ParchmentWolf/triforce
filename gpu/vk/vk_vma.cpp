@@ -6,6 +6,8 @@
 #define VMA_DYNAMIC_VULKAN_FUNCTIONS 1
 #include "vk_internal.h"
 #include "vk_paths.h"   // (game_module_path: RX_VK_RT_MAP's files beside the game)
+#include "vram_compact.h"   // ((Triforce) an allowance the driver gives as the count itself: past_allowance)
+#include "target_pool.h"    // ((Triforce, RX_VK_TARGET_REUSE_MEMORY) the size classes: create_image_in_class)
 #include <vk_mem_alloc.h>
 #include <algorithm>
 #include <atomic>
@@ -231,9 +233,28 @@ VmaPool images_pool() {
     pi.priority = prio(PrioKind::Other);   // ((Triforce, 11-22, TEX-47) the other images: the driver's own 0.5)
     pi.memoryTypeIndex = type;
     pi.blockSize = kImageBlock;
-    if (vmaCreatePool(vma, &pi, &image_pool) != VK_SUCCESS) image_pool = VK_NULL_HANDLE;
-    logf("vk: images from a pool of %llu MB blocks (memory type %u)%s", (unsigned long long)(kImageBlock >> 20), type,
-         image_pool ? "" : ": not made");
+    {   // ((Triforce) RX_VK_IMAGE_PREALLOC, off unless set: part of the pool's blocks made now, at the start, and kept, not when the
+        // game first needs them. Each is a vkAllocateMemory of the block's size, measured elsewhere at ~170 ms on AMD's driver (RX
+        // 7800 XT) on the replay thread: ~70 of them in a walk across Hyrule Field, the frame rate in the low 40s whenever new
+        // ground came in. =1: 15% of the card's memory, 2 to 24 blocks; =<n> (2 or more): n blocks. Kept for the session, so
+        // the VRAM rules see them as used: off until a lab pair says so)
+        const char* e = getenv("RX_VK_IMAGE_PREALLOC");
+        uint64_t n = e ? (uint64_t)std::max(0, atoi(e)) : 0;
+        if (n == 1) {
+            uint64_t heap = 0;
+            for (uint32_t h = 0; h < dev.memory.memoryHeapCount; h++)
+                if (dev.memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) heap = std::max<uint64_t>(heap, dev.memory.memoryHeaps[h].size);
+            n = std::clamp<uint64_t>(heap / 100 * 15 / kImageBlock, 2, 24);
+        }
+        pi.minBlockCount = (size_t)n;
+        if (n && vmaCreatePool(vma, &pi, &image_pool) != VK_SUCCESS) {   // (no room for them: as before, made as needed)
+            pi.minBlockCount = 0;
+            image_pool = VK_NULL_HANDLE;
+        }
+    }
+    if (!image_pool && vmaCreatePool(vma, &pi, &image_pool) != VK_SUCCESS) image_pool = VK_NULL_HANDLE;
+    logf("vk: images from a pool of %llu MB blocks (memory type %u), %zu made at the start (RX_VK_IMAGE_PREALLOC)%s",
+         (unsigned long long)(kImageBlock >> 20), type, (size_t)pi.minBlockCount, image_pool ? "" : ": not made");
     return image_pool;
 }
 
@@ -327,7 +348,8 @@ bool image_compact_pass_end(uint64_t* freed_bytes, uint32_t* freed_blocks) {
     return compact_over(freed_bytes, freed_blocks);
 }
 
-bool create_image_inner(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated, bool target, bool textures);
+bool create_image_inner(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated, bool target, bool textures,
+                        ImageNeed* need);
 thread_local int create_image_path = 0;   // (the last create_image_inner: 0 its pool or a dedicated one, 1 the pool refused, 2 system memory)
 // (Triforce) Every image made and its time, render targets apart, for the stall line (vk_replay.cpp status_tick: vma_image_stats)
 std::atomic<int64_t> st_images_made{0}, st_images_ns{0}, st_targets_made{0}, st_targets_ns{0};
@@ -337,7 +359,8 @@ void vma_image_stats(int64_t* images, int64_t* images_ns, int64_t* targets, int6
 }
 /// (Triforce) An image that takes over 3 ms to make: what it was, how long, and whether its pool took a new block for it (60
 /// lines). A player's session had frames of 50 to 150 ms in play that were all "texture lookups", 24 render targets made in one
-bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated, bool target, bool textures) {
+bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated, bool target, bool textures,
+                  ImageNeed* need) {
     const auto blocks = [&]() -> uint32_t {
         VmaPool pool = textures ? texture_pool : target ? target_image_pool : image_pool;
         if (!pool) return 0;
@@ -348,7 +371,7 @@ bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& al
     const uint32_t before = blocks();
     const auto t0 = std::chrono::steady_clock::now();
     create_image_path = 0;
-    const bool ok = create_image_inner(ci, image, allocation, dedicated, target, textures);
+    const bool ok = create_image_inner(ci, image, allocation, dedicated, target, textures, need);
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     (target ? st_targets_made : st_images_made).fetch_add(1, std::memory_order_relaxed);   // (Triforce: vma_image_stats)
     (target ? st_targets_ns : st_images_ns).fetch_add((int64_t)(ms * 1e6), std::memory_order_relaxed);
@@ -500,10 +523,12 @@ void vma_blocks_ahead_check() {
         if (VmaAllocation r = a->held.exchange(nullptr)) vmaFreeMemory(vma, r), st_ahead_back++;
     }
 }
-bool create_image_inner_(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated, bool target, bool textures);
+bool create_image_inner_(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated, bool target, bool textures,
+                         ImageNeed* need);
 int rt_map_every();
-bool create_image_inner(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated, bool target, bool textures) {
-    const bool ok = create_image_inner_(ci, image, allocation, dedicated, target, textures);
+bool create_image_inner(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated, bool target, bool textures,
+                        ImageNeed* need) {
+    const bool ok = create_image_inner_(ci, image, allocation, dedicated, target, textures, need);
     if (ok && rt_map_every() && allocation) {   // (RX_VK_RT_MAP: each image named, the time it was made in ms since the start)
         static const auto t0 = std::chrono::steady_clock::now();
         char name[96];
@@ -514,7 +539,32 @@ bool create_image_inner(const VkImageCreateInfo& ci, VkImage& image, VmaAllocati
     }
     return ok;
 }
-bool create_image_inner_(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated, bool target, bool textures) {
+// ((Triforce) the user data of the allocations made in the render targets' blocks (the targets' pool and the small targets'):
+// allocation_fit_info tells them by it. VMA makes no memory of their own there (their pools' block size is set), so another
+// target may be bound to one (vk_texture.cpp pool_take_memory, RX_VK_TARGET_REUSE_MEMORY))
+char target_blocks_tag;
+/// ((Triforce) Whether an image may go in the render targets' blocks: their memory type among those it can use. VMA does not
+/// check an image's memoryTypeBits against a custom pool's type (vk_mem_alloc.h AllocateMemory: a pool's allocation goes to
+/// its block vector as it is), and an image bound to memory of a type it cannot use is invalid. A depth or multisampled
+/// target a driver keeps from that type (none known on the cards played here) is made outside them. Not known (no
+/// vkGetDeviceImageMemoryRequirements): yes, as before. RX_VK_TARGET_TYPE_CHECK=0: not checked, as before)
+bool target_pool_takes(const VkImageCreateInfo& ci, ImageNeed* need) {
+    static const bool on = !(getenv("RX_VK_TARGET_TYPE_CHECK") && !atoi(getenv("RX_VK_TARGET_TYPE_CHECK")));
+    if (!on) return true;
+    VkMemoryRequirements asked{};
+    const VkMemoryRequirements* mr = need ? need->get() : image_requirements(ci, &asked) ? &asked : nullptr;
+    const bool ok = !mr || target_pool_type >= 32 || (mr->memoryTypeBits >> target_pool_type & 1);
+    if (!ok) {
+        static std::atomic<int> told{0};
+        if (told++ < 8)
+            logf("vk: a %ux%u render target (format %d, %u samples) cannot use the render targets' blocks' memory type %u "
+                 "(its types %#x): made outside them", ci.extent.width, ci.extent.height, (int)ci.format, (unsigned)ci.samples,
+                 target_pool_type, mr->memoryTypeBits);
+    }
+    return ok;
+}
+bool create_image_inner_(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated, bool target, bool textures,
+                         ImageNeed* need) {
     VmaAllocationCreateInfo ai{};
     // ((Triforce, 11-22, TEX-47) for an image that gets memory of its own; in a pool the pool's priority counts. The copies
     // of this info below keep it)
@@ -535,10 +585,12 @@ bool create_image_inner_(const VkImageCreateInfo& ci, VkImage& image, VmaAllocat
     if (VmaPool pool = no_pool ? VK_NULL_HANDLE
                        : textures && textures_pool() ? textures_pool()
                        : small ? small
-                       : target && target_images_pool() ? target_images_pool() : images_pool()) {
+                       : target && target_images_pool() ? target_images_pool() : images_pool();
+                       pool && ((pool != target_image_pool && pool != small_target_pool) || target_pool_takes(ci, need))) {
         VmaAllocationCreateInfo pai = ai;
         pai.pool = pool;
         pai.usage = VMA_MEMORY_USAGE_UNKNOWN;
+        if (pool == target_image_pool || pool == small_target_pool) pai.pUserData = &target_blocks_tag;   // (allocation_fit_info)
         // (Triforce: a texture made in the compacted pool: the compaction ran, for the memory trial, vk_memory.cpp memory_trial_used)
         const auto made = [&] {
             if (pool == texture_pool) memory_trial_used(MEMTRIAL_COMPACT);
@@ -557,6 +609,15 @@ bool create_image_inner_(const VkImageCreateInfo& ci, VkImage& image, VmaAllocat
         create_image_path = 1;   // (the pool refused it: the allocator's own blocks, or a memory object of its own)
     }
     if (vmaCreateImage(vma, &ci, &ai, &image, &allocation, nullptr) == VK_SUCCESS) return true;
+    // ((Triforce) refused by the budget's rule, which is VMA's own count against what the driver allows, not the driver's word:
+    // once more in VRAM without it, before system memory)
+    if (ai.flags & VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT) {
+        static std::atomic<int> told_budget{0};
+        if (told_budget++ < 10) logf("vk: image over budget, retrying without WITHIN_BUDGET");
+        VmaAllocationCreateInfo vai = ai;
+        vai.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+        if (vmaCreateImage(vma, &ci, &vai, &image, &allocation, nullptr) == VK_SUCCESS) return true;
+    }
     create_image_path = 2;
     // (hookshot) VRAM is full (a 4 GB card at a high resolution, #96): an image left unmade is a black screen, so it goes
     // to system memory instead, slow but drawn
@@ -577,6 +638,80 @@ uint64_t allocation_size(VmaAllocation allocation) {
     if (allocation) vmaGetAllocationInfo(vma, allocation, &info);
     return info.size;
 }
+// ---- (Triforce, RX_VK_TARGET_REUSE_MEMORY) a render target's image on a pooled one's memory: vk_texture.cpp pool_take_memory ----
+bool allocation_fit_info(VmaAllocation allocation, uint64_t* bytes, uint64_t* offset, uint32_t* memory_type, bool* dedicated) {
+    if (!allocation) return false;
+    VmaAllocationInfo info{};
+    vmaGetAllocationInfo(vma, allocation, &info);
+    *bytes = info.size, *offset = info.offset, *memory_type = info.memoryType;
+    *dedicated = info.pUserData != &target_blocks_tag;   // (not known to be a share of the targets' blocks: taken as its own)
+    return true;
+}
+bool image_requirements(const VkImageCreateInfo& ci, VkMemoryRequirements* mr) {
+    if (!vkGetDeviceImageMemoryRequirements) return false;
+    VkDeviceImageMemoryRequirements in{VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS};
+    in.pCreateInfo = &ci;
+    VkMemoryDedicatedRequirements own{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS};
+    VkMemoryRequirements2 out{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, &own};
+    vkGetDeviceImageMemoryRequirements(dev.device, &in, &out);
+    *mr = out.memoryRequirements;
+    return mr->size != 0 && !own.requiresDedicatedAllocation;   // (an image that must have memory of its own: never on another's)
+}
+uint64_t target_block_bytes() { return target_block(); }
+uint32_t device_local_types() {
+    uint32_t mask = 0;
+    for (uint32_t i = 0; i < dev.memory.memoryTypeCount && i < 32; i++)
+        if (dev.memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) mask |= 1u << i;
+    return mask;
+}
+bool create_image_in_class(ImageNeed& need, VkImage& image, VmaAllocation& allocation) {
+    image = VK_NULL_HANDLE, allocation = nullptr;
+    static const bool no_pool = getenv("RX_VK_NO_IMAGE_POOL") != nullptr;
+    // (a small target keeps its own blocks when RX_VK_SMALL_TARGETS puts it there: made as before)
+    const VmaPool pool = no_pool || small_target(*need.ci) ? VK_NULL_HANDLE : target_images_pool();
+    const VkMemoryRequirements* mr = pool ? need.get() : nullptr;
+    // (VMA allocates in the pool's memory type whatever the requirements say: an image that cannot use it, made as before)
+    if (!pool || !mr || target_pool_type >= 32 || !(mr->memoryTypeBits >> target_pool_type & 1)) return false;
+    const uint64_t cls = target_pool::class_bytes(mr->size, target_block());
+    if (!cls) return false;
+    // (the class's size, and an alignment any image of it may ask: what the next image on this allocation will need)
+    VkMemoryRequirements cr = *mr;
+    cr.size = cls, cr.alignment = std::max<VkDeviceSize>(mr->alignment, target_pool::kClassAlign);
+    VmaAllocationCreateInfo ai{};
+    ai.priority = prio(PrioKind::Target);   // ((Triforce, 11-22, TEX-47) in a pool the pool's priority counts)
+    ai.pool = pool;
+    ai.pUserData = &target_blocks_tag;
+    if (dev.memory_budget) ai.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+    bool ok = false;
+    if (Ahead* a = ahead_of(pool)) {   // (in the blocks the pool has; else in the one made ahead, as create_image does)
+        VmaAllocationCreateInfo nai = ai;
+        nai.flags |= VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT;
+        ok = vmaAllocateMemory(vma, &cr, &nai, &allocation, nullptr) == VK_SUCCESS;
+        if (ok) ahead_ask(pool, *a);
+        else ok = ahead_take(pool, *a) && vmaAllocateMemory(vma, &cr, &nai, &allocation, nullptr) == VK_SUCCESS;
+    }
+    if (!ok && vmaAllocateMemory(vma, &cr, &ai, &allocation, nullptr) != VK_SUCCESS) return allocation = nullptr, false;
+    if (vmaCreateAliasingImage(vma, allocation, need.ci, &image) != VK_SUCCESS) {
+        vmaFreeMemory(vma, allocation);
+        image = VK_NULL_HANDLE, allocation = nullptr;
+        return false;
+    }
+    return true;
+}
+bool create_aliasing_image(const VkImageCreateInfo& ci, VmaAllocation allocation, VkImage& image) {
+    image = VK_NULL_HANDLE;
+    return vmaCreateAliasingImage(vma, allocation, &ci, &image) == VK_SUCCESS;
+}
+// ((Triforce) RX_VK_BUFFER_BUDGET=0: a host-visible buffer made where VMA prefers it whatever its heap's budget, as before)
+static bool buffer_budget_on() {
+    static const bool on = [] {
+        const char* e = getenv("RX_VK_BUFFER_BUDGET");
+        const bool v = !(e && atoi(e) == 0);   // (unset is on)
+        if (!v) logf("vk: host-visible buffers made where VMA prefers them whatever their heap's budget, as before (RX_VK_BUFFER_BUDGET=0)");
+        return v;
+    }();
+    return on;
+}
 bool create_buffer(uint64_t size, VkBufferUsageFlags usage, bool host_visible, VkBuffer& buffer,
                    VmaAllocation& allocation, void** mapped, bool dedicated) {
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -591,7 +726,21 @@ bool create_buffer(uint64_t size, VkBufferUsageFlags usage, bool host_visible, V
     static const bool blocks = getenv("RX_VK_BLOCK_BUFFERS") != nullptr;
     if (dedicated && !blocks) ai.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
     VmaAllocationInfo info{};
-    if (vmaCreateBuffer(vma, &bi, &ai, &buffer, &allocation, &info) != VK_SUCCESS) return false;
+    // ((Triforce) a host-visible buffer first where its heap's budget has room: asked to stay within the budgets, VMA takes the
+    // next memory type the buffer can use when the heap of the one it prefers is full. Not asked, it put a host-visible buffer
+    // the GPU reads (the staging arenas: STORAGE, for the ASTC decoder) in DEVICE_LOCAL | HOST_VISIBLE whatever that heap held.
+    // On a Legion Go (Radeon 780M, 8 GB UMA, no resizable BAR) that heap is the carve-out's 256 MB window, of which AMD's
+    // Windows driver allows 243 MB; a save load's or an area's staging took it to 252-277 MB while VRAM as a whole stood at 1.9
+    // of 7.8 GB, and the driver refused every submit after (VK_ERROR_OUT_OF_DEVICE_MEMORY, the log's "submit ... failed
+    // (-2)"): a black screen, the sound going on. Now such an arena goes to system memory, which the GPU reads as well (the
+    // same RAM on an APU). Where no heap has room, made as before)
+    VkResult made = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    if (host_visible && dev.memory_budget && buffer_budget_on()) {
+        VmaAllocationCreateInfo within = ai;
+        within.flags |= VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+        made = vmaCreateBuffer(vma, &bi, &within, &buffer, &allocation, &info);
+    }
+    if (made != VK_SUCCESS && vmaCreateBuffer(vma, &bi, &ai, &buffer, &allocation, &info) != VK_SUCCESS) return false;
     if (mapped) *mapped = info.pMappedData;
     return true;
 }
@@ -609,6 +758,13 @@ bool create_buffer_cached(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buf
     if (dedicated) ai.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;   // (its own memory object: no part of a 64 MB block left unused)
     VmaAllocationInfo info{};
     if (vmaCreateBuffer(vma, &bi, &ai, &buffer, &allocation, &info) != VK_SUCCESS) return false;
+    if (mapped && !info.pMappedData) {   // ((Triforce) asked mapped and not mapped: no buffer, rather than one the caller drops unfreed)
+        vmaDestroyBuffer(vma, buffer, allocation);
+        buffer = VK_NULL_HANDLE;
+        allocation = nullptr;
+        *mapped = nullptr;
+        return false;
+    }
     if (mapped) *mapped = info.pMappedData;
     return true;
 }
@@ -803,6 +959,23 @@ bool vram_usage(uint64_t* used, uint64_t* budget, uint64_t* block_free) {
     // (a test: RX_VK_TEST_ALLOWED_MB=<n> reports what the driver allows as at most n MB, so a 16 GB card plays the eviction and
     // keep-rendered paths an 8 GB card takes when its VRAM fills (the rainbow textures of issue 993 were never seen here otherwise))
     static const uint64_t test_allowed = getenv("RX_VK_TEST_ALLOWED_MB") ? (uint64_t)atoi(getenv("RX_VK_TEST_ALLOWED_MB")) << 20 : 0;
+    // ((Triforce) an allowance the driver gives as the count itself is past: AMD's Windows driver, once a process is over what
+    // it allows, reports the allowance as what the process uses (an RX 6600 at 3.4 of 7.2 GB entered Hyrule Field and sat at
+    // 5940 of 5940 MB, the allowance rising with the count). Taken as it is, the count is within it: room in the blocks kept
+    // the 97% squeeze waiting and the hold's line rose with the count, while the driver paged (frames of 1.2 to 15.7 s on
+    // cards of 8 GB or less). vram_compact::past_allowance makes it a tenth under the count, so every rule sees the count
+    // past it and gives back until the driver reports an allowance over the count again. By the driver's own two numbers,
+    // before the test's and the blocks made ahead come off them. RX_VK_ALLOWED_AT_COUNT=0: as the driver says, as before)
+    static const bool at_count_rule = !getenv("RX_VK_ALLOWED_AT_COUNT") || atoi(getenv("RX_VK_ALLOWED_AT_COUNT")) != 0;
+    if (at_count_rule) {
+        const uint64_t was = t;
+        t = vram_compact::past_allowance(u, t);
+        static std::atomic<int> told{0};
+        if (t != was && told.fetch_add(1, std::memory_order_relaxed) < 8)
+            logf("vk: the driver's allowance is the count itself (%llu MB used of %llu): past it, taken as %llu MB "
+                 "(RX_VK_ALLOWED_AT_COUNT=0: as the driver says)", (unsigned long long)(u >> 20), (unsigned long long)(was >> 20),
+                 (unsigned long long)(t >> 20));
+    }
     if (test_card_ballast) u -= std::min(u, test_card_ballast), t -= std::min(t, test_card_ballast);   // (RX_VK_TEST_CARD_MB)
     u -= std::min(u, ahead_held_bytes());   // (Triforce: the blocks made ahead are nobody's until something needs them)
     if (test_allowed && t > test_allowed) t = test_allowed;

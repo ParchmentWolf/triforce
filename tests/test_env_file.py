@@ -1,7 +1,7 @@
-"""HOS_ENV_FILE names the switches file a run reads instead of hookshot_env.txt beside the game.
+"""HOS_ENV_FILE names the switches file a run reads instead of triforce_env.txt beside the game.
 
-A scripted or A/B test run brings its own switches this way, and the player's hookshot_env.txt is neither read nor
-changed. Unset or empty, the game reads hookshot_env.txt as before. A named file that does not exist sets nothing: the
+A scripted or A/B test run brings its own switches this way, and the player's triforce_env.txt is neither read nor
+changed. Unset or empty, the game reads triforce_env.txt as before. A named file that does not exist sets nothing: the
 run does not fall back to the player's switches.
 
 python -I -B tests/test_env_file.py [--cc gcc]
@@ -36,7 +36,7 @@ def main():
         game = tmp / "game"
         game.mkdir()
         # (the player's file sets the game's switches only: not the system's variables, HOS_ENV_FILE or paths)
-        (game / "hookshot_env.txt").write_text(
+        (game / "triforce_env.txt").write_text(
             "HOS_T_BESIDE=1\nHOS_T_SHARED=beside\nVK_ADD_LAYER_PATH=/x\nLD_PRELOAD=/x.so\nPATH=C:\\x\nSDL_DYNAMIC_API=/x.so\n"
             "HOS_ENV_FILE=other.txt\nHOS_SAMPLE_FILE=/home/x/.bashrc\nRX_VK_DUMP_DIR=C:\\Users\\x\nRX_VK_SKIP_CODE=2c56,ab\n"
             "RX_VK_DLSS_DIR=/opt/ngx\nHOS_T_HOME=~\nSDL_VULKAN_LIBRARY=x.dll\nSDL_VIDEO_EGL_DRIVER=x.so\n"
@@ -89,6 +89,12 @@ int main(int argc, char **argv) {
     CHECK(getenv("PATH") == NULL || strcmp(getenv("PATH"), "C:\\x"));
 
     clear();
+    setenv("HOS_T_SHARED", "launch", 1);           /* ((Triforce) set for this launch: it goes over the file's line */
+    unsetenv("HOS_ENV_FILE");
+    load_hookshot_env();
+    CHECK(is("HOS_T_SHARED", "launch") && is("HOS_T_BESIDE", "1"));
+
+    clear();
     setenv("HOS_ENV_FILE", "", 1);                 /* empty: as if unset */
     load_hookshot_env();
     CHECK(is("HOS_T_BESIDE", "1") && is("HOS_T_OTHER", NULL));
@@ -102,7 +108,7 @@ int main(int argc, char **argv) {
     setenv("HOS_ENV_FILE", argv[2], 1);            /* a file that is not there: nothing, not the player's switches */
     load_hookshot_env();
     CHECK(is("HOS_T_BESIDE", NULL) && is("HOS_T_OTHER", NULL) && is("HOS_T_SHARED", NULL));
-    printf("PASS: HOS_ENV_FILE replaces hookshot_env.txt; unset or empty reads it as before; the player's file sets only the game's switches\n");
+    printf("PASS: HOS_ENV_FILE replaces triforce_env.txt; unset or empty reads it as before; the player's file sets only the game's switches\n");
     return 0;
 }
 '''
@@ -111,10 +117,10 @@ int main(int argc, char **argv) {
         out = tmp / "fixture"
         subprocess.run([a.cc, "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-Wall", "-Werror", str(src), "-o", str(out)],
                        check=True)
-        before = (game / "hookshot_env.txt").read_text(encoding="utf-8")
+        before = (game / "triforce_env.txt").read_text(encoding="utf-8")
         subprocess.run([str(out), str(tmp / "test_env.txt"), str(tmp / "missing.txt")], check=True)
-        if (game / "hookshot_env.txt").read_text(encoding="utf-8") != before:
-            raise SystemExit("the player's hookshot_env.txt was changed")
+        if (game / "triforce_env.txt").read_text(encoding="utf-8") != before:
+            raise SystemExit("the player's triforce_env.txt was changed")
 
 
 if __name__ == "__main__":

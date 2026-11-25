@@ -70,9 +70,13 @@ def check_source():
     machine = (ROOT / "gpu/vk/perf_machine.cpp").read_text(encoding="utf-8")
     # (the row: the field and the key it always had, 0 to 2, off by default; 0 and 1 are Off and the counter, unchanged: no
     # options migration)
-    check('{TAB_DISPLAY, "FPS counter", &opts.show_fps, 0, 2, 1, tx_perf,' in menu,
-          "the row is not the Display tab's FPS counter, 0 to 2, on opts.show_fps (its name is its key in the options file: fps_counter)")
-    check('const char* tx_perf(int v) { return v == 1 ? "On" : v >= 2 ? "Full" : "Off"; }' in menu, "the row's values are not Off, On, Full")
+    # ((Triforce) and the levels between On and Full after them, 3 to 6: fps_levels.h; 2 is Full still)
+    check('{TAB_DISPLAY, "FPS counter", &opts.show_fps, 0, fps_levels::kMax, 1, tx_perf,' in menu,
+          "the row is not the Display tab's FPS counter, 0 to fps_levels::kMax, on opts.show_fps (its name is its key in the options file: fps_counter)")
+    levels = (ROOT / "gpu/vk/fps_levels.h").read_text(encoding="utf-8")
+    check("const char* tx_perf(int v) { return fps_levels::name(v); }" in menu and 'case kOn: return "On";' in levels and
+          'case kFull: return "Full";' in levels and 'default: return "Off";' in levels and "kOff = 0, kOn = 1, kFull = 2" in levels,
+          "the row's values are not Off, On, Full (then the levels between On and Full)")
     check("show_fps" not in block(menu, "const char* ini_key(const Row& r) {"), "the row's key is no longer its name's")
     check(re.search(r"\n    int show_fps = 0;", menu_h) is not None, "the overlay is not off by default")
     # ((Triforce, options_version 7) the Display tab's Overlay group, after RenoDX's rows)
@@ -119,8 +123,10 @@ def check_source():
 
     # (nothing measured unless the row is on Full: the frame times, the sample, the machine's sampler)
     note = block(menu, "void menu_note_frame(bool game_frame, int shown) {")
-    check(re.search(r"if \(game_frame && opts\.show_fps == 2\) \{[^}]*perf_stats::note\(perf_ring, prof_now\(\)\);", note) is not None,
-          "frame times are written while the overlay is not on Full")
+    # ((Triforce) on Full and the levels past On, which show the frame times too: fps_levels.h measures)
+    check(re.search(r"if \(game_frame && fps_levels::measures\(opts\.show_fps\)\) \{[^}]*perf_stats::note\(perf_ring, prof_now\(\)\);", note) is not None
+          and "inline bool measures(int v) { return v == kFull || shows_time(v); }" in (ROOT / "gpu/vk/fps_levels.h").read_text(encoding="utf-8"),
+          "frame times are written while the overlay is not on Full or a level that shows them")
     check(menu.count("perf_stats::note(") == 1, "frame times are written somewhere else too")
     tick = menu[menu.index("void menu_tick()"):menu.index("void menu_record(")]
     check("if (opts.show_fps == 2) perf_sample(shown, game);" in tick and menu.count("perf_sample(") == 2, "the panel's numbers are read while it is not shown")
@@ -315,7 +321,7 @@ def check_source():
     names = names[:names.index("};")]
     for art in ("SystemCaptionBg_00", "OptionSeparateMark_00", "SystemLine_03"):
         check('"%s"' % art in names, "the options' %s is not read from the player's game files" % art)
-        check('art("%s")' % art in ui_h, "vk_ui.h does not draw with %s" % art)
+        check('skin("%s")' % art in ui_h, "vk_ui.h does not draw with %s" % art)   # ((Triforce) the game's look's art: skin
     check("const ImVec2 b(std::floor(c.w - ui::lu(c, 30))" not in draw, "the panel is still the old one at the right edge, halfway down")
     # (see-through: the plate at the share the options dim the game by; text and dividers whole)
     check("constexpr float kPerfOpacity = ui::kDimAlpha / 255.0f;" in menu, "the panel's opacity is not the options' dim")
@@ -387,6 +393,8 @@ const char* fsr4_version = "";
 namespace mkwvk::dlssg { int multiplier() { return dlss_mult; } }
 namespace fsr4fg { bool offered_known() { return fsr4_known; } const char* version() { return fsr4_version; } }
 namespace fsr3fi { unsigned frames_wanted() { return fsr3 ? 1 : 0; } }
+enum { kMakerFsr3 = 2 };
+int framegen_maker() { return fsr3 ? kMakerFsr3 : 0; }   // ((Triforce) 11-24: who made the last frames, vk_framegen.h)
 bool framegen_on() { return fg_on; }
 const char* tx_framegen(int v) { static const char* t[] = {"Off", "Auto", "2x", "3x", "4x", "5x", "6x", "7x", "8x", "2x"}; return t[v]; }
 int upscaler() { return up; }
@@ -414,7 +422,7 @@ int main() {
             "Off|0",                        # (the row at 2x, where frame generation cannot run: not by the row)
             "NVIDIA DLSS 3x|1",             # (DLSS frame generation at 3x, whatever the row)
             "NVIDIA DLSS 2x|1",
-            "AMD FSR 3.1|1",
+            "AMD FSR 3.1, 2x|1",            # ((Triforce) 11-24: the Frame generation by row, with the row's value)
             "AMD FSR 4 library (4.0.2)|1",  # (NX2navi's fg4_label, with the version AMD's library runs)
             "AMD FSR 4 library|1",
             "Triforce's own, 2x|1",         # (AMD FSR 4 set where AMD's library cannot: the renderer's own at 2x)

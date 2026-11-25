@@ -112,6 +112,16 @@ static void bench_menu(Ctx *c, uint64_t screen, uint64_t vt) {
     int entry = -1;
     if (hos_bench_menu(screen, vt, 1, l.index, n, &entry) == HOS_BENCH_MENU_PRESS_A) hos_hid_tap("0:A/120");
 }
+/* ((Triforce) the System tab's Skip title screen row, host/oot_autoload.c: the same screens pressed through the same way,
+   A on the focused button. hos_oot_autoload_wants is 0 for the whole run once the row is known Off, the default: nothing of
+   the screen is read then) */
+int hos_oot_autoload_wants(void);
+int hos_oot_autoload_menu(uint64_t vt, int focused_entry);
+static void autoload_menu(uint64_t screen, uint64_t vt) {
+    BenchLook l = {-1, 0};
+    each_entry(screen, 64, bench_entry, &l);
+    if (hos_oot_autoload_menu(vt, l.index)) hos_hid_tap("0:A/120");
+}
 
 #if defined(_WIN32) && !defined(HOS_OOT_MENU_NO_MOUSE)   /* (the macro: tests/test_oot_menu_mouse.py builds the other half on Windows) */
 #include <windows.h>
@@ -120,6 +130,11 @@ static void bench_menu(Ctx *c, uint64_t screen, uint64_t vt) {
 #include <stdlib.h>
 #include <string.h>
 #include "../gpu/vk/vk_api.h"   /* (HOS_MOUSE_*) */
+#include "input_movie.h"         /* ((Triforce) MovieMenu: an input recording's menu choices, host/input_movie.c) */
+void hos_input_movie_menu(int kind, uint64_t screen, uint64_t button, const char *key);
+int hos_input_movie_menu_take(uint64_t screen, MovieMenu *out);
+void hos_input_movie_menu_done(int met);
+int hos_input_movie_playing(void);
 
 /* a printable C string at a (else "-") */
 static const char *text_at(uint64_t a, char *buf, size_t cap) {
@@ -153,6 +168,7 @@ static int set_focus(Ctx *c, uint64_t screen, uint64_t button) {
     fn(c);
     const int r = (int)(c->x[0] & 1);
     *c = saved;
+    hos_input_movie_menu(1, screen, button, NULL);   /* ((Triforce) HOS_INPUT_RECORD: the mouse's focus change, given again in a replay) */
     return r;
 }
 
@@ -221,6 +237,7 @@ static int set_item_key(Ctx *c, uint64_t screen, const char *key) {
     c->x[0] = screen, c->x[1] = screen + 760, c->x[30] = 0;
     fn(c);
     *c = saved;
+    hos_input_movie_menu(2, screen, 0, key);   /* ((Triforce) HOS_INPUT_RECORD: the mouse's item choice) */
     return 1;
 }
 
@@ -331,6 +348,23 @@ static int map_floors(int *cur, int *top, int *bottom) {
 static const char *const item_keys[9] = {"Item_Medal_Shadow", "Item_Medal_Light", "Item_Medal_Forest", "Item_Stone_Forest",
                                          "Item_Stone_Fire", "Item_Stone_Water", "Item_Medal_Spirit", "Item_Medal_Water",
                                          "Item_Medal_Fire"};
+/* ((Triforce) a replay's checks of what its file names, before the game is called with it: hos_oot_menu_tick) */
+typedef struct { uint64_t button; int found; } ButtonFind;
+static void button_found(int i, uint64_t entry, uint64_t button, void *arg) {
+    (void)i, (void)entry;
+    ButtonFind *b = arg;
+    b->found |= button && button == b->button;
+}
+static int screen_has_button(uint64_t screen, uint64_t button) {   /* (one of the screen's list's buttons now) */
+    ButtonFind b = {button, 0};
+    each_entry(screen, 400, button_found, &b);
+    return b.found;
+}
+static int item_key_known(const char *key) {   /* (one of Key Items' items) */
+    for (int i = 0; i < 9; i++)
+        if (!strcmp(key, item_keys[i])) return 1;
+    return 0;
+}
 static void item_found(const char *key, float x, float y, void *arg) {
     struct { int *found; float *x, *y; } *a = arg;
     for (int i = 0; i < 9; i++) {
@@ -497,7 +531,10 @@ static void item_choice_tick(void) {
 }
 
 static void mouse_tick_locked(Ctx *c, uint64_t screen) {
+    /* a left press on a panel page, its click at the release (below) */
+    static int ldown, ldrag, lx0, ly0, llx, lly;
     if (peek64(screen) == ITEM_CHOICE_VTABLE) {
+        ldown = ldrag = 0;
         item_choice_tick();
         return;
     }
@@ -505,7 +542,10 @@ static void mouse_tick_locked(Ctx *c, uint64_t screen) {
     int px, py, w, h, wheel;
     uint32_t pressed;
     const int got = hos_mouse_game_pointer(&px, &py, &w, &h, &pressed, &wheel);
-    if (!got) return;
+    if (!got) {   /* (outside the window or under the Insert menu: a release there is not seen, so no click on return) */
+        ldown = ldrag = 0;
+        return;
+    }
     /* ((Triforce, 11-22, N64 Classic) the game's screens under its TV's curve: the cursor where the curve showed them) */
     rx_screen_point(&px, &py, w, h);
     const int hidden = got == 2;   /* (the cursor hidden while the pad is in use: the wheel only, no pointing) */
@@ -526,7 +566,6 @@ static void mouse_tick_locked(Ctx *c, uint64_t screen) {
        Key Items' stones are): a drag there turns it, off the buttons; the page's slots at the left (to x about 100),
        the tabs above (y 900), the prompts below (-960) */
     const int item_model = pause && page_now == 2, pan = page >= 0 || item_model;
-    static int ldown, ldrag, lx0, ly0, llx, lly;
     if (pan) {
         const int held = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
         const int was_down = ldown;
@@ -1176,9 +1215,26 @@ void hos_oot_menu_tick(Ctx *c, uint64_t screen) {
     const uint64_t vt_now = me->vt;
     ReleaseSRWLockExclusive(&seen_lock);
     if (focus_now && hos_bench_on()) bench_menu(c, screen, vt_now);   /* ((Triforce, 11-19) benchmark mode: the start's screens) */
+    else if (focus_now && hos_oot_autoload_wants()) autoload_menu(screen, vt_now);   /* ((Triforce) the Skip title screen row) */
     mods_call(c, &mods_now);
     if (gone) hos_mouse_game_menu_gone();
-    if (mine) mouse_tick(c, screen);
+    /* ((Triforce) HOS_INPUT_PLAY: the mouse is the recording's here, not the player's: its focus changes and item choices
+       given at the frame they were made at, on their screen; its clicks and scrolls are the recording's pad. The file's
+       button is a guest address: the game's setter gets it only when it is one of this screen's buttons now (a screen's
+       buttons can be made again while it lives, and a recording of another build names others), and an item key only when
+       it is one of the page's items; any other, or one the setter is not there for or refuses, is counted as not met.
+       Nothing played: one atomic load) */
+    if (hos_input_movie_playing()) {
+        MovieMenu m;
+        while (hos_input_movie_menu_take(screen, &m)) {
+            int met;
+            if (m.kind == 1) met = screen_has_button(screen, m.button) && set_focus(c, screen, m.button) >= 0;   /* (-1: no setter) */
+            else met = item_key_known(m.key) && set_item_key(c, screen, m.key);
+            hos_input_movie_menu_done(met);
+        }
+    } else if (mine) {
+        mouse_tick(c, screen);
+    }
     if (screen == pause_screen_now()) InterlockedIncrement(&ticks);
 }
 #else
@@ -1191,7 +1247,12 @@ void hos_oot_menu_tick(Ctx *c, uint64_t screen) {
 #include <string.h>
 #include "../gpu/vk/vk_api.h"   /* (HOS_OPT_GAME_OPTIONS) */
 static int64_t options_seen_ns;   /* (the screens' updates run on several of the game's threads: read and written whole) */
-void hos_oot_menu_focus(Ctx *c, uint64_t screen, uint64_t pane, uint64_t lr) { (void)c, (void)screen, (void)pane, (void)lr; }
+void hos_input_clear_toggles(void);   /* ((Triforce) 11-24: host/nn_hid.c, hold-to-toggle's latches) */
+/* (the pause page's focus hook runs here too, without the mouse's menu navigation: a latched button is let go for it) */
+void hos_oot_menu_focus(Ctx *c, uint64_t screen, uint64_t pane, uint64_t lr) {
+    (void)c, (void)screen, (void)pane, (void)lr;
+    hos_input_clear_toggles();
+}
 /* ((Triforce, 11-22) benchmark mode: a screen's focused button as the Windows half's focus_entry finds it (its state set and its
    box shown, the screen's focus manager there), then bench_menu as there */
 static void bench_focus_entry(int i, uint64_t entry, uint64_t button, void *arg) {
@@ -1208,6 +1269,10 @@ void hos_oot_menu_tick(Ctx *c, uint64_t screen) {
         int focus = 0;
         if (peek64(peek64(screen + 32) + 96)) each_entry(screen, 400, bench_focus_entry, &focus);
         if (focus) bench_menu(c, screen, vt);
+    } else if (hos_oot_autoload_wants()) {   /* ((Triforce) the Skip title screen row: found and pressed as benchmark mode's) */
+        int focus = 0;
+        if (peek64(peek64(screen + 32) + 96)) each_entry(screen, 400, bench_focus_entry, &focus);
+        if (focus) autoload_menu(screen, vt);
     }
     static int64_t pause_ran_ns;   /* ((Triforce, 11-20) the pause menu's last update: where the Options were chosen from) */
     static int options_from_pause;

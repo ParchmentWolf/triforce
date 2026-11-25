@@ -48,9 +48,9 @@ def main():
     ap.add_argument('--source', type=Path, default=ROOT)
     args = ap.parse_args()
     text = (args.source / 'gpu/vk/vk_replay.cpp').read_text(encoding='utf-8')
-    start = text.find('if (src && framelog_on()) {')
+    start = text.find('if (src && framelog_on() && !log_window) {')
     if start < 0:
-        raise SystemExit('FAIL: FrameLog capture block not found: if (src && framelog_on())')
+        raise SystemExit('FAIL: FrameLog capture block not found: if (src && framelog_on() && !log_window)')
     capture = re.sub(r'/\*.*?\*/|//[^\n]*', '', text[start:], flags=re.S)
     pos, depth = capture.index('{') + 1, 1
     while pos < len(capture) and depth:

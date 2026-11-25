@@ -10,7 +10,12 @@ namespace mkwvk::upscaler_rows {
 /// shader sources: gpu/vk/vk_fsr3.cpp), AMD FSR 4 and its native anti-aliasing (AMD's library, a build with FSR 4:
 /// gpu/vk/vk_fsr4.cpp), and FSR 3.1's own native anti-aliasing (the same passes with the 3D at full size). The saved
 /// values keep their meaning: each came after the ones before, so a saved 1 or 2 is still DLSS or DLAA and a saved 3 FSR 3.1
-enum { GAME = 0, DLSS = 1, DLAA = 2, FSR3 = 3, FSR4 = 4, FSR4_AA = 5, FSR3_AA = 6, kUpscalers = 7 };
+/// ((Triforce) 11-24) OFF: no upscaler at all, the game's own network left out too, its input stretched to the output with a
+/// plain linear filter (vk_draw.cpp taau_stand_in, upscale_off.h: RX_VK_UPSCALE_OFF=1's, now a choice of the row): the fastest,
+/// and the roughest picture. After the others, so every saved value keeps its meaning (6 is FSR 3.1's native AA)
+/// ((Triforce) Intel XeSS Super Resolution and its Native AA (Intel's libxess.dll beside the game, Windows only:
+/// gpu/vk/vk_xess.cpp), after Off, so a saved 7 is still Off)
+enum { GAME = 0, DLSS = 1, DLAA = 2, FSR3 = 3, FSR4 = 4, FSR4_AA = 5, FSR3_AA = 6, OFF = 7, XESS = 8, XESS_AA = 9, kUpscalers = 10 };
 /// One bit per upscaler that can run here (1 << GAME always): what the row steps through
 inline unsigned bit(int upscaler) { return 1u << upscaler; }
 /// The DLSS and DLAA bits, for a caller that knows only whether DLSS runs
@@ -19,15 +24,20 @@ inline unsigned dlss_bits(bool dlss_ok) { return dlss_ok ? bit(DLSS) | bit(DLAA)
 inline unsigned fsr4_bits(bool fsr4_ok) { return fsr4_ok ? bit(FSR4) | bit(FSR4_AA) : 0u; }
 /// FSR 3.1's two (fsr3_ok: vk_fsr3.cpp says its passes run on this GPU): they are the same passes at two sizes
 inline unsigned fsr3_bits(bool fsr3_ok) { return fsr3_ok ? bit(FSR3) | bit(FSR3_AA) : 0u; }
+/// ((Triforce) Intel XeSS's two, the same way (xess_ok: xess_why() == XESS_OK)
+inline unsigned xess_bits(bool xess_ok) { return xess_ok ? bit(XESS) | bit(XESS_AA) : 0u; }
 inline bool is_dlss(int upscaler) { return upscaler == DLSS || upscaler == DLAA; }
 inline bool is_fsr4(int upscaler) { return upscaler == FSR4 || upscaler == FSR4_AA; }
 inline bool is_fsr3(int upscaler) { return upscaler == FSR3 || upscaler == FSR3_AA; }
-/// The 3D drawn at full size, the upscaler anti-aliasing alone (DLAA, FSR 4's native AA, FSR 3.1's): the Render resolution
-/// row does not apply
-inline bool full_scale(int upscaler) { return upscaler == DLAA || upscaler == FSR4_AA || upscaler == FSR3_AA; }
+inline bool is_xess(int upscaler) { return upscaler == XESS || upscaler == XESS_AA; }
+/// The 3D drawn at full size, the upscaler anti-aliasing alone (DLAA, FSR 4's native AA, FSR 3.1's, XeSS's Native AA): the
+/// Render resolution row does not apply
+inline bool full_scale(int upscaler) { return upscaler == DLAA || upscaler == FSR4_AA || upscaler == FSR3_AA || upscaler == XESS_AA; }
 /// FSR 3.1 and FSR 4 scale from a smaller 3D at the shares DLSS's modes use: Quality 1.5x (67%), Balanced 1.7x (58%),
-/// Performance 2x (50%) and Ultra Performance 3x (33%) per axis, AMD's own ratios too
-inline bool scales_by_mode(int upscaler) { return upscaler == DLSS || upscaler == FSR3 || upscaler == FSR4; }
+/// Performance 2x (50%) and Ultra Performance 3x (33%) per axis, AMD's own ratios too. ((Triforce) Intel XeSS takes the
+/// same stops: each runs under the XeSS preset whose range holds it (xess_rules.h preset_for: since XeSS 1.3 its presets
+/// take any size from their ratio, 1.3x to 3x, up to the output))
+inline bool scales_by_mode(int upscaler) { return upscaler == DLSS || upscaler == FSR3 || upscaler == FSR4 || upscaler == XESS; }
 
 /// opts.resolution: 0 Auto (the game's dynamic resolution), else a share of the output in percent. 1 to 4 are the values from
 /// before (100, 75, 67, 50: saved options keep their meaning); 5 and 6 came with DLSS's Balanced and Ultra Performance. Each
@@ -53,6 +63,19 @@ inline const char* dlss_mode_name(int v) {
     case 67: return "Quality";
     case 58: return "Balanced";
     case 50: return "Performance";
+    case 33: return "Ultra Performance";
+    default: return nullptr;
+    }
+}
+
+/// ((Triforce) Intel XeSS's mode for a Render resolution value: the preset whose range of render sizes holds it
+/// (gpu/vk/xess_rules.h preset_for, which tests/test_xess_rules.py checks this against: 67% runs under Ultra Quality (1.5x),
+/// 58% and 50% under Balanced (2x: 7/12 is past Quality's 1.7x), 33% under Ultra Performance (3x), 75% under Ultra Quality
+/// (past Ultra Quality Plus's 1.3x)). nullptr for Auto, or a share no preset names
+inline const char* xess_mode_name(int v) {
+    switch (percent(v)) {
+    case 75: case 67: return "Ultra Quality";
+    case 58: case 50: return "Balanced";
     case 33: return "Ultra Performance";
     default: return nullptr;
     }
@@ -91,7 +114,7 @@ inline int snap(int upscaler, int v) {
 
 /// The order the row shows them in: each engine's native anti-aliasing after it. FSR 3.1's came last (its saved value is
 /// after FSR 4's two) and stands with FSR 3.1
-constexpr int kOrder[kUpscalers] = {GAME, DLSS, DLAA, FSR3, FSR3_AA, FSR4, FSR4_AA};
+constexpr int kOrder[kUpscalers] = {GAME, DLSS, DLAA, FSR3, FSR3_AA, FSR4, FSR4_AA, XESS, XESS_AA, OFF};   // ((Triforce) 11-24: Off last)
 /// The Upscaler row's next value from v (dir +1 / -1), wrapping over the choices there are (available: bit() of each that
 /// runs here), in kOrder. A value that cannot run here steps as the game's own does
 inline int step_upscaler(int v, int dir, unsigned available) {
@@ -114,22 +137,25 @@ inline int step_upscaler(int v, int dir, bool dlss_ok) { return step_upscaler(v,
 // AAs, shown as their engine at Native (100%) ----
 /// The engine of an Upscaler value: DLAA is DLSS's, FSR 4's and FSR 3.1's native AA their own
 inline int engine(int upscaler) {
-    return upscaler == DLAA ? DLSS : upscaler == FSR4_AA ? FSR4 : upscaler == FSR3_AA ? FSR3
+    return upscaler == DLAA ? DLSS : upscaler == FSR4_AA ? FSR4 : upscaler == FSR3_AA ? FSR3 : upscaler == XESS_AA ? XESS
            : upscaler >= GAME && upscaler < kUpscalers ? upscaler : GAME;
 }
 /// An engine's native anti-aliasing (the game's own has none: itself)
 inline int native_of(int engine_value) {
-    return engine_value == DLSS ? DLAA : engine_value == FSR4 ? FSR4_AA : engine_value == FSR3 ? FSR3_AA : engine_value;
+    return engine_value == DLSS ? DLAA : engine_value == FSR4 ? FSR4_AA : engine_value == FSR3 ? FSR3_AA
+           : engine_value == XESS ? XESS_AA : engine_value;
 }
 /// The engines in the order the Upscaler row shows them
-constexpr int kEngines[] = {GAME, DLSS, FSR3, FSR4};
+constexpr int kEngines[] = {GAME, DLSS, FSR3, FSR4, XESS, OFF};   // ((Triforce) 11-24: Off, no upscaler, last)
 constexpr int kEngineCount = sizeof kEngines / sizeof kEngines[0];
 /// What the two rows choose together: the Upscaler's value (opts.dlss) and the Render resolution's (opts.resolution)
 struct Scaling {
     int upscaler, resolution;
 };
 /// The 3D at the output's full size: an engine's native AA, or the game's own at 100%
-inline bool native_size(int upscaler, int resolution) { return full_scale(upscaler) || (upscaler == GAME && percent(resolution) == 100); }
+inline bool native_size(int upscaler, int resolution) {
+    return full_scale(upscaler) || ((upscaler == GAME || upscaler == OFF) && percent(resolution) == 100);
+}
 /// The Upscaler row's next engine from upscaler (dir +1 / -1), wrapping over those that run here (available: bit() of each).
 /// The Render resolution's Native (100%) goes with it: an engine's native AA becomes the next engine's (the game's own at
 /// 100%), and the game's own at 100% the engine's native AA. Otherwise the resolution is the caller's to snap (snap)
@@ -143,7 +169,7 @@ inline Scaling step_engine(int upscaler, int resolution, int dir, unsigned avail
         at = (at + (dir > 0 ? 1 : kEngineCount - 1)) % kEngineCount;
         const int e = kEngines[at];
         if (!(available & bit(e))) continue;
-        if (e == GAME) return {GAME, native ? 1 : resolution};
+        if (e == GAME || e == OFF) return {e, native ? 1 : resolution};   // ((Triforce) 11-24: Off steps as the game's own)
         return {native ? native_of(e) : e, resolution};
     }
     return {GAME, resolution};
@@ -239,11 +265,18 @@ inline bool upscaler_shown(bool built, bool fsr) { return built || fsr; }
 /// full size), the DLSS model while DLSS and DLAA are not drawing
 inline bool upscaler_fixed(bool dlss_ok) { return !dlss_ok; }
 /// The same, from the mask of what can run: fixed when only the game's own can
-inline bool upscaler_fixed(unsigned available) { return (available & ~bit(GAME)) == 0; }
+inline bool upscaler_fixed(unsigned available) { return (available & ~bit(GAME)) == 0; }   // ((Triforce) 11-24: the menu's has Off)
 inline bool resolution_fixed(int upscaler) { return full_scale(upscaler); }
 /// The DLSS model row: shown where the Upscaler is (a build with DLSS), with nothing to choose while the game's own upscales
 inline bool model_shown(bool built) { return built; }
 /// (env_set: RX_VK_DLSS_PRESET names a preset, which wins over the row for this run)
 inline bool model_fixed(int upscaler, bool env_set) { return !is_dlss(upscaler) || env_set; }
+
+/// (Triforce) The FSR 4 model row (opts.fsr4_model): 0 Auto (AMD's own pick for this GPU, as before), 1 Lite (the faster
+/// INT8 network, ffxProvider_FSR4Lite_Int8; vk_fsr4.cpp, fsr4_models.cpp). Shown only where FSR 4 runs on an AMD GPU and the
+/// loaded library is the one whose providers are hooked, while FSR 4 is the Upscaler; fixed with RX_VK_FSR4_MODEL set
+enum { FSR4_MODEL_AUTO = 0, FSR4_MODEL_LITE = 1, kFsr4Models = 2 };
+inline bool fsr4_model_shown(bool fsr4_ok, bool lite_available) { return fsr4_ok && lite_available; }
+inline bool fsr4_model_fixed(int upscaler, bool env_set) { return !is_fsr4(upscaler) || env_set; }
 
 } // namespace mkwvk::upscaler_rows

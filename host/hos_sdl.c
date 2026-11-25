@@ -7,8 +7,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
+#include "audio_output_devices.h"   /* ((Triforce) HOS_OUTPUT_ID_CAP and audio_output_copy_id: the playback devices by name) */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#ifdef _WIN32   /* ((Triforce) a DualSense's own sound card by its device container: hos_sdl_pad_audio_endpoint) */
+#include <setupapi.h>
+#include <devpropdef.h>
+#include <mmdeviceapi.h>
+#include <propsys.h>
+#include <objbase.h>
+#endif
 
 static int version;   /* 3, 2, or 0 none */
 static struct {
@@ -18,6 +27,7 @@ static struct {
         *GetDesktopDisplayMode, *Vulkan_CreateSurface, *PixelSize, *GetKeyboardState, *GetMouseState, *WaitEventTimeout,
         *PollEvent, *GetWindowSize, *LoadPNG, *SetWindowIcon, *DestroySurface, *GetWindowDisplay, *GetCurrentDisplayMode;
     void *GetDisplays, *GetDisplayName;   /* ((Triforce) optional: every display, hos_sdl_displays) */
+    void *ShowSimpleMessageBox;           /* ((Triforce, 11-24) optional: hos_sdl_message_box) */
     /* sound */
     void *OpenAudioDevice, *PauseAudioDevice, *OpenAudioDeviceStream, *ResumeAudioStreamDevice, *PutAudioStreamData;
     /* controllers */
@@ -25,8 +35,11 @@ static struct {
     void *PadType, *PadEffect;   /* (optional: HD rumble, host/pad_sdl.c) */
     void *PadRumbleTriggers;     /* (optional: the motors in an Xbox pad's triggers, host/pad_sdl.c) */
     void *PadHasSensor, *PadSensorEnable, *PadSensorData;   /* (motion: optional, NULL in an SDL without them) */
+    /* ((Triforce) 11-24: Steam's stand-in pads and the Steam Deck's own controls: optional, host/steam_pads.h) */
+    void *PadVendor, *PadProduct, *PadSteamHandle, *SetHintPriority;
     void *GetGamepads, *GetGamepadID, *Free;   /* (SDL3) */
-    void *NumJoysticks, *IsGameController, *DeviceInstanceID, *GetJoystick, *JoystickInstanceID;   /* (SDL2) */
+    void *NumJoysticks, *IsGameController, *DeviceInstanceID, *GetJoystick, *JoystickInstanceID;   /* (SDL2; GetJoystick SDL3's too, for the log) */
+    void *JoystickGUID, *PadMapping;   /* ((Triforce) optional, for the log of a controller's connection: no serial number, no device path) */
     void *JoyTypeOf, *PadNameOf;   /* ((Triforce) 11-20, optional: a controller's type and name before it is opened: pad_kind.h) */
 } f;
 #define CALL(type, fn) ((type)f.fn)
@@ -77,13 +90,24 @@ static int get_all(HMODULE m, int three) {
     *(FARPROC *)&f.PadHasSensor = GetProcAddress(m, three ? "SDL_GamepadHasSensor" : "SDL_GameControllerHasSensor");
     *(FARPROC *)&f.PadSensorEnable = GetProcAddress(m, three ? "SDL_SetGamepadSensorEnabled" : "SDL_GameControllerSetSensorEnabled");
     *(FARPROC *)&f.PadSensorData = GetProcAddress(m, three ? "SDL_GetGamepadSensorData" : "SDL_GameControllerGetSensorData");
+    /* ((Triforce) 11-24: Steam's stand-in pads told apart from the real ones: SDL 2.30 on and SDL3 3.2 on; without them
+       Steam's controller ignore list stays as Steam set it, and no pad is anyone's stand-in) */
+    *(FARPROC *)&f.PadVendor = GetProcAddress(m, three ? "SDL_GetGamepadVendor" : "SDL_GameControllerGetVendor");
+    *(FARPROC *)&f.PadProduct = GetProcAddress(m, three ? "SDL_GetGamepadProduct" : "SDL_GameControllerGetProduct");
+    *(FARPROC *)&f.PadSteamHandle = GetProcAddress(m, three ? "SDL_GetGamepadSteamHandle" : "SDL_GameControllerGetSteamHandle");
+    *(FARPROC *)&f.SetHintPriority = GetProcAddress(m, "SDL_SetHintWithPriority");
     /* ((Triforce) 11-20) a controller's type and name by its place in the list, for the instruments left out (pad_kind.h) */
     *(FARPROC *)&f.JoyTypeOf = GetProcAddress(m, three ? "SDL_GetJoystickTypeForID" : "SDL_JoystickGetDeviceType");
     *(FARPROC *)&f.PadNameOf = GetProcAddress(m, three ? "SDL_GetGamepadNameForID" : "SDL_GameControllerNameForIndex");
     /* ((Triforce) every connected display and its name: SDL3's list of ids, SDL2's count; without them the main one alone) */
     *(FARPROC *)&f.GetDisplays = GetProcAddress(m, three ? "SDL_GetDisplays" : "SDL_GetNumVideoDisplays");
     *(FARPROC *)&f.GetDisplayName = GetProcAddress(m, "SDL_GetDisplayName");
+    *(FARPROC *)&f.ShowSimpleMessageBox = GetProcAddress(m, "SDL_ShowSimpleMessageBox");
+    /* ((Triforce) a controller's hardware GUID and its active mapping, for the log: hos_sdl_pad_log_connection) */
+    *(FARPROC *)&f.JoystickGUID = GetProcAddress(m, three ? "SDL_GetJoystickGUID" : "SDL_JoystickGetGUID");
+    *(FARPROC *)&f.PadMapping = GetProcAddress(m, three ? "SDL_GetGamepadMapping" : "SDL_GameControllerMapping");
     if (three) {
+        *(FARPROC *)&f.GetJoystick = GetProcAddress(m, "SDL_GetGamepadJoystick");   /* (optional: the log's alone) */
         GET(SetWindowPosition, "SDL_SetWindowPosition");
         GET(GetPrimaryDisplay, "SDL_GetPrimaryDisplay");
         GET(OpenAudioDeviceStream, "SDL_OpenAudioDeviceStream");
@@ -98,6 +122,7 @@ static int get_all(HMODULE m, int three) {
         *(FARPROC *)&f.GetWindowDisplay = GetProcAddress(m, "SDL_GetDisplayForWindow");   /* (the refresh: hos_sdl_refresh_mhz) */
         *(FARPROC *)&f.GetCurrentDisplayMode = GetProcAddress(m, "SDL_GetCurrentDisplayMode");
     } else {
+        *(FARPROC *)&f.Free = GetProcAddress(m, "SDL_free");   /* (optional: without it no mapping, which is SDL's to free, is asked for) */
         *(FARPROC *)&f.GetWindowDisplay = GetProcAddress(m, "SDL_GetWindowDisplayIndex");   /* (the refresh: hos_sdl_refresh_mhz) */
         *(FARPROC *)&f.GetCurrentDisplayMode = GetProcAddress(m, "SDL_GetCurrentDisplayMode");
         GET(OpenAudioDevice, "SDL_OpenAudioDevice");
@@ -135,6 +160,13 @@ void hos_sdl_hint(const char *name, const char *value) {
     if (!hos_sdl_load()) return;
     if (version == 3) CALL(_Bool (*)(const char *, const char *), SetHint)(name, value);
     else CALL(int (*)(const char *, const char *), SetHint)(name, value);
+}
+/* ((Triforce) 11-24) a hint over the environment's own (SDL_HINT_OVERRIDE, 2 in both): a variable Steam sets for the
+   games it starts wins over SDL_SetHint. 0 when the SDL has no SDL_SetHintWithPriority */
+int hos_sdl_hint_override(const char *name, const char *value) {
+    if (!hos_sdl_load() || !f.SetHintPriority) return 0;
+    if (version == 3) return CALL(_Bool (*)(const char *, const char *, int), SetHintPriority)(name, value, 2);
+    return CALL(int (*)(const char *, const char *, int), SetHintPriority)(name, value, 2) != 0;
 }
 void hos_sdl_identity(const char *name, const char *app_id) {
     if (!hos_sdl_load()) return;
@@ -251,6 +283,13 @@ void hos_sdl_pixel_size(void *window, int *width, int *height) {
 }
 const uint8_t *hos_sdl_keys(int *count) {   /* (SDL3's bool and SDL2's Uint8: a byte each) */
     return CALL(const uint8_t *(*)(int *), GetKeyboardState)(count);
+}
+/* ((Triforce, 11-24) an error message in a window of its own, over the game's (NULL: none), until the player closes it
+   (SDL_ShowSimpleMessageBox, flag SDL_MESSAGEBOX_ERROR, 0x10 in both SDLs; SDL3 answers a bool, SDL2 0 when shown) */
+int hos_sdl_message_box(void *window, const char *title, const char *text) {
+    if (!f.ShowSimpleMessageBox) return 0;
+    if (version == 3) return CALL(_Bool (*)(uint32_t, const char *, const char *, void *), ShowSimpleMessageBox)(0x10, title, text, window) ? 1 : 0;
+    return CALL(int (*)(uint32_t, const char *, const char *, void *), ShowSimpleMessageBox)(0x10, title, text, window) == 0;
 }
 void hos_sdl_icon(void *window, const char *png) {
     if (version != 3 || !f.LoadPNG || !f.SetWindowIcon || !f.DestroySurface) return;
@@ -378,48 +417,13 @@ static void pull2(void *p, uint8_t *out, int len) {   /* (SDL2: a device callbac
     const Pull *s = (const Pull *)p;
     s->pull(s->user, out, len);
 }
-int hos_sdl_audio_open(int freq, int channels, int s16, void (*pull)(void *user, uint8_t *out, int len), void *user) {
-    if (!hos_sdl_load()) return 0;
-    const uint16_t format = s16 ? 0x8010 /* S16LE */ : 0x8120 /* F32LE */;   /* (both's numbers) */
-    const char *env_samples = getenv("SDL_AUDIO_DEVICE_SAMPLE_FRAMES");
-    if (version == 3 && !env_samples) hos_sdl_hint("SDL_AUDIO_DEVICE_SAMPLE_FRAMES", "480");   /* (SDL2's device buffer below) */
-    if (!hos_sdl_init(HOS_SDL_AUDIO)) return 0;
-    Pull *p = (Pull *)calloc(1, sizeof *p);
-    p->pull = pull, p->user = user, p->frame = channels * (s16 ? 2 : 4);
-    if (version == 3) {
-        const struct { uint32_t format; int channels, freq; } spec = {format, channels, freq};
-        void *stream = CALL(void *(*)(uint32_t, const void *, void (*)(void *, void *, int, int), void *), OpenAudioDeviceStream)(
-            0xFFFFFFFFu /* the default output */, &spec, pull3, p);
-        if (stream && CALL(_Bool (*)(void *), ResumeAudioStreamDevice)(stream)) return 1;
-        free(p);
-        return 0;
-    }
-    struct {
-        int freq;
-        uint16_t format;
-        uint8_t channels, silence;
-        uint16_t samples, padding;
-        uint32_t size;
-        void (*callback)(void *, uint8_t *, int);
-        void *userdata;
-    } want, have;
-    memset(&want, 0, sizeof want);
-    want.freq = freq, want.format = format, want.channels = (uint8_t)channels;
-    want.samples = (uint16_t)(env_samples && atoi(env_samples) > 0 ? atoi(env_samples) : 512);   /* (SDL2 asks for a power of two) */
-    want.callback = pull2, want.userdata = p;
-    /* (no changes allowed: SDL converts to what the device wants) */
-    const uint32_t dev = CALL(uint32_t (*)(const char *, int, const void *, void *, int), OpenAudioDevice)(NULL, 0, &want, &have, 0);
-    if (!dev) {
-        free(p);
-        return 0;
-    }
-    CALL(void (*)(uint32_t, int), PauseAudioDevice)(dev, 0);
-    return 1;
-}
 /* SDL3's format of the default device; SDL2's default audio info (2.24 on: the bundled 2.32 has it). Looked up here,
    not at load: an SDL without it still plays, in stereo. */
+static int playback_chosen_channels(void);
 int hos_sdl_audio_channels(void) {
     if (!hos_sdl_load() || !hos_sdl_init(HOS_SDL_AUDIO)) return 2;
+    const int chosen = playback_chosen_channels();   /* ((Triforce) the Output device row's device, on Linux) */
+    if (chosen > 0) return chosen;
     HMODULE m = load_one(version == 3 ? "SDL3.dll" : "SDL2.dll");   /* (the one loaded: the same handle back) */
     if (!m) return 2;
     int n = 0;
@@ -445,6 +449,274 @@ int hos_sdl_audio_channels(void) {
         if (name && release) ((void (*)(void *))release)(name);
     }
     return n > 0 ? n : 2;
+}
+
+/* ---- (Triforce) the playback devices by name, and a stream on one of them: the game's own sound on Linux (waveOut's SDL
+   stand-in, host/posix/win32_posix.c: the default, or the Output device row's device), and host/rumble_renhdrum.c's (a
+   DualSense's four-channel sound card on its cable, beside the game's own sound). SDL's physical ids and list positions
+   are not lasting: each device is kept by its driver and name ("sdl:<driver>:<name>"), with a token that keeps its
+   meaning for the whole run, even when the list is read again while a stream opens. A device named twice is left out
+   (SDL2 opens a name's first). Listing them opens no stream. A renamed device is one gone ---- */
+typedef struct PlaybackEndpoint {
+    struct PlaybackEndpoint *next;
+    char id[HOS_OUTPUT_ID_CAP], name[HOS_OUTPUT_NAME_CAP];
+    unsigned token;
+    uint32_t physical;
+    int present;
+    int channels;   /* (what the device plays, 0 when SDL cannot say; host/rumble_renhdrum.c looks for four) */
+} PlaybackEndpoint;
+static PlaybackEndpoint *playback_endpoints;
+static unsigned playback_next;
+static int playback_loaded, playback_initialized;
+static SRWLOCK playback_lock = SRWLOCK_INIT;
+static struct {
+    void *Devices, *Name, *Driver, *Free, *Close, *Destroy, *Format, *Status;
+} playback;
+
+static int playback_ready(void) {   /* playback_lock held */
+    if (playback_loaded) return 1;
+    if (!hos_sdl_load()) return 0;
+    if (!playback_initialized) {
+        if (!hos_sdl_init(HOS_SDL_AUDIO)) return 0;
+        playback_initialized = 1;
+    }
+    HMODULE m = load_one(version == 3 ? "SDL3.dll" : "SDL2.dll");   /* (the one loaded: the same handle back) */
+    if (!m) return 0;
+#define PLAY_GET(field, symbol) (*(FARPROC *)&playback.field = GetProcAddress(m, symbol))
+    PLAY_GET(Devices, version == 3 ? "SDL_GetAudioPlaybackDevices" : "SDL_GetNumAudioDevices");
+    PLAY_GET(Name, "SDL_GetAudioDeviceName");
+    PLAY_GET(Driver, "SDL_GetCurrentAudioDriver");
+    PLAY_GET(Free, "SDL_free");
+    PLAY_GET(Close, "SDL_CloseAudioDevice");
+    PLAY_GET(Destroy, "SDL_DestroyAudioStream");
+    PLAY_GET(Format, version == 3 ? "SDL_GetAudioDeviceFormat" : "SDL_GetAudioDeviceSpec");
+    PLAY_GET(Status, "SDL_GetAudioDeviceStatus");
+#undef PLAY_GET
+    playback_loaded = playback.Devices && playback.Name && playback.Driver && playback.Free &&
+                      (version == 3 ? playback.Destroy != NULL : playback.Close != NULL);
+    return playback_loaded;
+}
+static const char *playback_name(uint32_t physical) {
+    return version == 3 ? ((const char *(*)(uint32_t))playback.Name)(physical)
+                        : ((const char *(*)(int, int))playback.Name)((int)physical, 0);
+}
+static int playback_refresh(void) {   /* playback_lock held */
+    for (PlaybackEndpoint *p = playback_endpoints; p; p = p->next) p->present = 0;
+    if (!playback_ready()) return 0;
+    const char *driver = ((const char *(*)(void))playback.Driver)();
+    if (!driver) return 0;
+    int total = 0, count = 0;
+    uint32_t *all = NULL;
+    if (version == 3) all = ((uint32_t *(*)(int *))playback.Devices)(&total);
+    else total = ((int (*)(int))playback.Devices)(0);
+    for (int i = 0; i < total && (version == 2 || all); i++) {
+        const uint32_t physical = version == 3 ? all[i] : (uint32_t)i;
+        const char *name = playback_name(physical);
+        char id[HOS_OUTPUT_ID_CAP], valid[HOS_OUTPUT_ID_CAP];
+        if (!name || !*name || strlen(name) >= HOS_OUTPUT_NAME_CAP) continue;
+        int n = snprintf(id, sizeof id, "sdl:%s:%s", driver, name);
+        if (n < 0 || (size_t)n >= sizeof id || !audio_output_copy_id(valid, sizeof valid, id)) continue;
+        int duplicates = 0;
+        for (int j = 0; j < total; j++) {
+            const char *other = playback_name(version == 3 ? all[j] : (uint32_t)j);
+            if (other && !strcmp(name, other)) duplicates++;
+        }
+        if (duplicates != 1) continue;   /* (opening SDL2 by this name would take the first) */
+        PlaybackEndpoint *p;
+        for (p = playback_endpoints; p && strcmp(p->id, id); p = p->next) {}
+        if (!p) {
+            if (playback_next >= INT_MAX) continue;
+            p = (PlaybackEndpoint *)calloc(1, sizeof *p);
+            if (!p) continue;
+            strcpy(p->id, id), strcpy(p->name, name);
+            p->token = playback_next++;
+            p->next = playback_endpoints, playback_endpoints = p;
+        }
+        p->physical = physical, p->present = 1;
+        p->channels = 0;
+        if (playback.Format) {
+            struct { int a, b, c, d, e, g, h, i; } spec;   /* (SDL3's {format, channels, freq}, SDL2's SDL_AudioSpec) */
+            int frames = 0;
+            memset(&spec, 0, sizeof spec);
+            if (version == 3 && ((_Bool (*)(uint32_t, void *, int *))playback.Format)(physical, &spec, &frames))
+                p->channels = spec.b;
+            else if (version == 2 && ((int (*)(int, int, void *))playback.Format)((int)physical, 0, &spec) == 0)
+                p->channels = ((const uint8_t *)&spec)[6];   /* (int freq, Uint16 format, Uint8 channels) */
+        }
+        count++;
+    }
+    if (all) ((void (*)(void *))playback.Free)(all);
+    return count;
+}
+int hos_sdl_output_count(void) {
+    AcquireSRWLockExclusive(&playback_lock);
+    int count = playback_refresh();
+    ReleaseSRWLockExclusive(&playback_lock);
+    return count;
+}
+int hos_sdl_output_info(int index, char *id, int id_capacity, char *name, int name_capacity) {
+    if (index < 0 || !id || !name || id_capacity <= 0 || name_capacity <= 0) return 0;
+    int ok = 0;
+    AcquireSRWLockShared(&playback_lock);
+    for (PlaybackEndpoint *p = playback_endpoints; p; p = p->next)
+        if (p->present && index-- == 0) {
+            if (strlen(p->name) < (size_t)name_capacity && audio_output_copy_id(id, (size_t)id_capacity, p->id)) {
+                strcpy(name, p->name);
+                ok = 1;
+            }
+            break;
+        }
+    ReleaseSRWLockShared(&playback_lock);
+    return ok;
+}
+int hos_sdl_output_channels(int index) {
+    int channels = 0;
+    AcquireSRWLockShared(&playback_lock);
+    for (PlaybackEndpoint *p = playback_endpoints; p; p = p->next)
+        if (p->present && index-- == 0) {
+            channels = p->channels;
+            break;
+        }
+    ReleaseSRWLockShared(&playback_lock);
+    return channels;
+}
+int hos_sdl_output_resolve(const char *id) {
+    int token = -1;
+    if (!id || !*id) return -1;
+    AcquireSRWLockExclusive(&playback_lock);
+    playback_refresh();
+    for (PlaybackEndpoint *p = playback_endpoints; p; p = p->next)
+        if (p->present && !strcmp(p->id, id)) {
+            token = (int)p->token;
+            break;
+        }
+    ReleaseSRWLockExclusive(&playback_lock);
+    return token;
+}
+typedef struct {
+    Pull base;   /* (first: pull3 and pull2 read it) */
+    void *stream;
+    uint32_t device;
+    unsigned token;
+    uint32_t physical;
+    uint64_t checked;
+    int alive;
+} DevicePull;
+static SRWLOCK audio_open_lock = SRWLOCK_INIT;   /* (one stream opens at a time: the sample frames' hint is the process's) */
+void *hos_sdl_audio_open_device(unsigned device, int freq, int channels, int s16, int frames,
+                                void (*pull)(void *user, uint8_t *out, int len), void *user) {
+    uint32_t physical = 0xFFFFFFFFu;
+    const char *name = NULL;
+    AcquireSRWLockExclusive(&playback_lock);
+    int ready = playback_ready();
+    if (ready && device != UINT_MAX) {
+        playback_refresh();
+        ready = 0;
+        for (PlaybackEndpoint *p = playback_endpoints; p; p = p->next)
+            if (p->token == device && p->present) {
+                physical = p->physical, name = p->name;   /* (kept for the run: the list never frees one) */
+                ready = 1;
+                break;
+            }
+    }
+    ReleaseSRWLockExclusive(&playback_lock);
+    if (!ready) return NULL;
+    const uint16_t format = s16 ? 0x8010 /* S16LE */ : 0x8120 /* F32LE */;   /* (both's numbers) */
+    const char *env_samples = getenv("SDL_AUDIO_DEVICE_SAMPLE_FRAMES");
+    DevicePull *p = (DevicePull *)calloc(1, sizeof *p);
+    if (!p) return NULL;
+    p->base.pull = pull, p->base.user = user, p->base.frame = channels * (s16 ? 2 : 4);
+    p->token = device, p->physical = physical, p->alive = 1;
+    if (version == 3) {
+        const struct { uint32_t format; int channels, freq; } spec = {format, channels, freq};
+        /* (frames: SDL3's device buffer for this stream alone, 0 its default here, 480; SDL_AUDIO_DEVICE_SAMPLE_FRAMES over
+           it. The hint is set for the open and taken away after, so the game's own output keeps what it asked for) */
+        char samples[16];
+        snprintf(samples, sizeof samples, "%d", frames > 0 ? frames : 480);
+        AcquireSRWLockExclusive(&audio_open_lock);
+        if (!env_samples) hos_sdl_hint("SDL_AUDIO_DEVICE_SAMPLE_FRAMES", samples);
+        p->stream = CALL(void *(*)(uint32_t, const void *, void (*)(void *, void *, int, int), void *), OpenAudioDeviceStream)(
+            physical, &spec, pull3, &p->base);
+        if (!env_samples) hos_sdl_hint("SDL_AUDIO_DEVICE_SAMPLE_FRAMES", NULL);
+        ReleaseSRWLockExclusive(&audio_open_lock);
+        if (p->stream && CALL(_Bool (*)(void *), ResumeAudioStreamDevice)(p->stream)) return p;
+        if (p->stream) ((void (*)(void *))playback.Destroy)(p->stream);
+        free(p);
+        return NULL;
+    }
+    struct {
+        int freq;
+        uint16_t format;
+        uint8_t channels, silence;
+        uint16_t samples, padding;
+        uint32_t size;
+        void (*callback)(void *, uint8_t *, int);
+        void *userdata;
+    } want, have;
+    memset(&want, 0, sizeof want);
+    want.freq = freq, want.format = format, want.channels = (uint8_t)channels;
+    want.samples = (uint16_t)(env_samples && atoi(env_samples) > 0 ? atoi(env_samples) : frames > 0 ? frames : 512);   /* (SDL2: a power of two) */
+    want.callback = pull2, want.userdata = &p->base;
+    const uint32_t dev = CALL(uint32_t (*)(const char *, int, const void *, void *, int), OpenAudioDevice)(name, 0, &want, &have, 0);
+    if (!dev) {
+        free(p);
+        return NULL;
+    }
+    CALL(void (*)(uint32_t, int), PauseAudioDevice)(dev, 0);
+    p->device = dev;
+    return p;
+}
+/* ((Triforce) the channels of the Output device row's device (host/audio_output_devices.c) on Linux, where the game's own
+   sound plays on it through waveOut's SDL stand-in (host/posix/win32_posix.c); 0 for the default, an unknown one, one not
+   connected, HOS_AUDIO_DEVICE's run and Windows (there nn_audio.c asks the device itself) */
+static int playback_chosen_channels(void) {
+#ifdef _WIN32
+    return 0;
+#else
+    char wanted[HOS_OUTPUT_ID_CAP] = {0};
+    unsigned generation = 0;
+    const char *forced = getenv("HOS_AUDIO_DEVICE");
+    if (forced && *forced) return 0;
+    hos_audio_output_preference(wanted, sizeof wanted, &generation);
+    if (!*wanted) return 0;
+    int channels = 0;
+    AcquireSRWLockExclusive(&playback_lock);
+    if (playback_ready()) {
+        playback_refresh();
+        for (PlaybackEndpoint *p = playback_endpoints; p; p = p->next)
+            if (p->present && !strcmp(p->id, wanted)) { channels = p->channels; break; }
+    }
+    ReleaseSRWLockExclusive(&playback_lock);
+    return channels;
+#endif
+}
+void hos_sdl_audio_close(void *audio) {
+    DevicePull *p = (DevicePull *)audio;
+    if (!p) return;
+    /* (both wait for a callback under way: never called with a lock that callback takes) */
+    if (p->stream) ((void (*)(void *))playback.Destroy)(p->stream);
+    else ((void (*)(uint32_t))playback.Close)(p->device);
+    free(p);
+}
+int hos_sdl_audio_alive(void *audio) {   /* (looked at once a second at most: the list is read again then) */
+    DevicePull *p = (DevicePull *)audio;
+    if (!p) return 0;
+    const uint64_t now = (uint64_t)GetTickCount64();
+    if (now - p->checked < 1000) return p->alive;
+    p->checked = now;
+    if (p->token != UINT_MAX) {
+        AcquireSRWLockExclusive(&playback_lock);
+        playback_refresh();
+        p->alive = 0;
+        for (PlaybackEndpoint *e = playback_endpoints; e; e = e->next)
+            if (e->token == p->token && e->present && (version == 2 || e->physical == p->physical)) {
+                p->alive = 1;
+                break;
+            }
+        ReleaseSRWLockExclusive(&playback_lock);
+    }
+    if (version == 2 && playback.Status && ((int (*)(uint32_t))playback.Status)(p->device) == 0) p->alive = 0;   /* (SDL_AUDIO_STOPPED) */
+    return p->alive;
 }
 
 /* ---- (hookshot) microphones: SDL3's recording devices, or SDL2's capture devices (the Linux AppImage carries SDL2): a
@@ -651,7 +923,11 @@ int hos_sdl_pads_list(int32_t *ids, int *opens, int max) {   /* (SDL3 opens by i
 void *hos_sdl_pad_open(int what) {
     return version == 3 ? CALL(void *(*)(uint32_t), PadOpen)((uint32_t)what) : CALL(void *(*)(int), PadOpen)(what);
 }
-void hos_sdl_pad_close(void *pad) { CALL(void (*)(void *), PadClose)(pad); }
+static void pad_headphones_forget(void *pad);
+void hos_sdl_pad_close(void *pad) {
+    pad_headphones_forget(pad);   /* ((Triforce) its jack's reader goes with it: SDL may hand the address to the next pad) */
+    CALL(void (*)(void *), PadClose)(pad);
+}
 int hos_sdl_pad_connected(void *pad) {
     return version == 3 ? CALL(_Bool (*)(void *), PadConnected)(pad) : CALL(int (*)(void *), PadConnected)(pad) != 0;
 }
@@ -664,6 +940,49 @@ int16_t hos_sdl_pad_axis(void *pad, int axis) { return CALL(int16_t (*)(void *, 
 const char *hos_sdl_pad_name(void *pad) {
     const char *n = CALL(const char *(*)(void *), PadName)(pad);
     return n ? n : "?";
+}
+/* (Triforce) A controller's connection in the log, with what a bug report about its buttons needs: the hardware GUID SDL
+   has for it (SDL_GUID / SDL_JoystickGUID, the same 16 bytes in SDL2 and SDL3: the maker, the product and the driver, not
+   a serial number) and the mapping in use. The mapping may be SDL's database's, the driver's or the user's own: SDL does
+   not say which, and none is not a sign that it chose a default. Its string is SDL's allocator's */
+typedef struct { uint8_t data[16]; } HosSdlGuid;
+void hos_sdl_pad_log_connection(void *pad, int motion) {
+    char guid[33] = "unavailable";
+    if (f.GetJoystick && f.JoystickGUID) {
+        void *joystick = CALL(void *(*)(void *), GetJoystick)(pad);
+        if (joystick) {
+            const HosSdlGuid id = CALL(HosSdlGuid (*)(void *), JoystickGUID)(joystick);
+            static const char hex[] = "0123456789abcdef";
+            unsigned any = 0;
+            for (int i = 0; i < 16; i++) {
+                guid[2 * i] = hex[id.data[i] >> 4], guid[2 * i + 1] = hex[id.data[i] & 15];
+                any |= id.data[i];
+            }
+            guid[32] = 0;
+            if (!any) strcpy(guid, "unknown");
+        }
+    }
+    const int can_map = f.PadMapping && f.Free;
+    char *mapping = can_map ? CALL(char *(*)(void *), PadMapping)(pad) : NULL;
+    const char *status = !can_map ? "unavailable" : mapping ? "available" : "none";
+    const char *name = mapping ? strchr(mapping, ',') : NULL;
+    int name_len = 1;
+    if (name) {
+        name++;
+        for (name_len = 0; name_len < 128 && name[name_len] && name[name_len] != ','; name_len++) {}
+    } else name = "?";
+    int mapping_len = 0;
+    if (mapping)
+        while (mapping_len < 1024 && mapping[mapping_len]) mapping_len++;
+    hos_log("hid: controller \"%.128s\" connected (SDL)%s; guid=%s; mapping=%s; mapping-name=\"%.*s\"", hos_sdl_pad_name(pad),
+            motion ? ", with a gyroscope" : "", guid, status, name_len, name);
+    /* (a log line holds 1024 bytes: the mapping whole, in parts of 512 with their number) */
+    for (int at = 0; at < mapping_len; at += 512) {
+        const int n = mapping_len - at < 512 ? mapping_len - at : 512;
+        hos_log("hid: guid=%s; mapping-string[%d/%d]=\"%.*s\"%s", guid, at / 512 + 1, (mapping_len + 511) / 512, n, mapping + at,
+                at + n == mapping_len && mapping[mapping_len] ? " (cut)" : "");
+    }
+    if (mapping) CALL(void (*)(void *), Free)(mapping);
 }
 int32_t hos_sdl_pad_id(void *pad) {
     return version == 3 ? (int32_t)CALL(uint32_t (*)(void *), GetGamepadID)(pad)
@@ -701,5 +1020,207 @@ int hos_sdl_pad_sensor(void *pad, int type, float *data, int n) {
     if (!f.PadSensorData) return 0;
     return version == 3 ? CALL(_Bool (*)(void *, int, float *, int), PadSensorData)(pad, type, data, n)
                         : CALL(int (*)(void *, int, float *, int), PadSensorData)(pad, type, data, n) == 0;
+}
+/* ((Triforce) 11-24: Steam's stand-in pads, host/steam_pads.h) whether the SDL tells them apart; a pad's USB vendor and
+   product (0 unknown); its Steam Input handle, not 0 for a Steam stand-in pad */
+int hos_sdl_knows_steam_pads(void) { return f.PadVendor && f.PadSteamHandle && f.SetHintPriority; }
+uint16_t hos_sdl_pad_vendor(void *pad) { return f.PadVendor ? CALL(uint16_t (*)(void *), PadVendor)(pad) : 0; }
+uint16_t hos_sdl_pad_product(void *pad) { return f.PadProduct ? CALL(uint16_t (*)(void *), PadProduct)(pad) : 0; }
+uint64_t hos_sdl_pad_steam_handle(void *pad) {
+    return f.PadSteamHandle ? CALL(uint64_t (*)(void *), PadSteamHandle)(pad) : 0;
+}
+/* ---- (Triforce) vibration (host/pad_sdl.c, host/rumble_renhdrum.c): a pad's transport, its device path and a second
+   handle on its HID device, written beside SDL's own (a DualSense's Bluetooth haptics, a Steam Controller's grips). Looked
+   up on first use, not with the rest at load: an SDL without them still plays, and those pads keep their motors. The
+   path only opens the device; it is never logged ---- */
+static struct {
+    int looked;
+    void *Wireless, *Path, *HidOpenPath, *HidWrite, *HidClose, *HidReadTimeout;
+} vib_calls;
+static void vib_calls_look(void) {
+    if (vib_calls.looked) return;
+    vib_calls.looked = 1;
+    HMODULE m = version ? load_one(version == 3 ? "SDL3.dll" : "SDL2.dll") : NULL;   /* (the one loaded: the same handle) */
+    if (!m) return;
+    /* (a pad's transport: SDL3 3.2 on. SDL2 cannot say, and a DualSense is then placed by its sound card) */
+    if (version == 3) *(FARPROC *)&vib_calls.Wireless = GetProcAddress(m, "SDL_GetJoystickConnectionState");
+    *(FARPROC *)&vib_calls.Path = GetProcAddress(m, version == 3 ? "SDL_GetGamepadPath" : "SDL_GameControllerPath");
+    *(FARPROC *)&vib_calls.HidOpenPath = GetProcAddress(m, "SDL_hid_open_path");   /* (SDL2 2.0.18 on, every SDL3) */
+    *(FARPROC *)&vib_calls.HidWrite = GetProcAddress(m, "SDL_hid_write");
+    *(FARPROC *)&vib_calls.HidClose = GetProcAddress(m, "SDL_hid_close");
+    *(FARPROC *)&vib_calls.HidReadTimeout = GetProcAddress(m, "SDL_hid_read_timeout");   /* (a DualSense's jack, below) */
+}
+/* 1 wireless, 0 a cable, -1 when the SDL cannot say */
+int hos_sdl_pad_wireless(void *pad) {
+    vib_calls_look();
+    if (!vib_calls.Wireless || !f.GetJoystick || !pad) return -1;
+    void *joystick = CALL(void *(*)(void *), GetJoystick)(pad);
+    if (!joystick) return -1;
+    /* SDL_JoystickConnectionState: -1 invalid, 0 unknown, 1 wired, 2 wireless */
+    const int state = ((int (*)(void *))vib_calls.Wireless)(joystick);
+    if (state < 1) return -1;
+    return state == 2 ? 1 : 0;
+}
+const char *hos_sdl_pad_path(void *pad) {
+    vib_calls_look();
+    const char *p = vib_calls.Path && pad ? ((const char *(*)(void *))vib_calls.Path)(pad) : NULL;
+    return p ? p : "";
+}
+int hos_sdl_hid_can(void) {
+    vib_calls_look();
+    return vib_calls.HidOpenPath && vib_calls.HidWrite && vib_calls.HidClose;
+}
+void *hos_sdl_hid_open(const char *path) {
+    if (!hos_sdl_hid_can() || !path || !*path) return NULL;
+    if (version == 3) return ((void *(*)(const char *))vib_calls.HidOpenPath)(path);
+    return ((void *(*)(const char *, int))vib_calls.HidOpenPath)(path, 0);   /* (SDL2's: not exclusive) */
+}
+int hos_sdl_hid_write(void *hid, const void *data, int size) {
+    return hid && vib_calls.HidWrite ? ((int (*)(void *, const unsigned char *, size_t))vib_calls.HidWrite)(
+                                           hid, (const unsigned char *)data, (size_t)size)
+                                     : -1;
+}
+void hos_sdl_hid_close(void *hid) {
+    if (hid && vib_calls.HidClose) ((int (*)(void *))vib_calls.HidClose)(hid);
+}
+/* ((Triforce) the controller speaker, host/pad_speaker.c) A DualSense's own four-channel sound card: the HID interface and
+   the Windows audio endpoint matched by their device container. SDL gives only the endpoint's name, so that name must be
+   the only one of its kind in both lists; never a guess when either is not known. Its token, or -1 (and always -1 off
+   Windows: the speaker then never shares a stream, and the vibration plays as before) */
+int hos_sdl_pad_audio_endpoint(void *pad) {
+#ifdef _WIN32
+    static const DEVPROPKEY container = {{0x8c7ed206, 0x3f8a, 0x4827, {0xb3, 0xab, 0xae, 0x9e, 0x1f, 0xae, 0xfc, 0x6c}}, 2};
+    static const PROPERTYKEY label = {{0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 14};
+    static const GUID clsid = {0xbcde0395, 0xe52f, 0x467c, {0x8e, 0x3d, 0xc4, 0x57, 0x92, 0x91, 0x69, 0x2e}};
+    static const GUID iid = {0xa95664d2, 0x9614, 0x4f35, {0xa7, 0x46, 0xde, 0x8d, 0xb6, 0x36, 0x17, 0xe6}};
+    const char *path = hos_sdl_pad_path(pad);
+    WCHAR wide[1024];
+    if (!*path || !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wide, 1024)) return -1;
+    HDEVINFO set = SetupDiCreateDeviceInfoList(NULL, NULL);
+    if (set == INVALID_HANDLE_VALUE) return -1;
+    SP_DEVICE_INTERFACE_DATA iface = {.cbSize = sizeof iface};
+    SP_DEVINFO_DATA dev = {.cbSize = sizeof dev};
+    GUID pad_container;
+    static const GUID no_container = {0};
+    DEVPROPTYPE type = 0;
+    union { SP_DEVICE_INTERFACE_DETAIL_DATA_W d; WCHAR room[2048]; } detail;
+    detail.d.cbSize = sizeof detail.d;
+    int ok = SetupDiOpenDeviceInterfaceW(set, wide, 0, &iface) &&
+             SetupDiGetDeviceInterfaceDetailW(set, &iface, &detail.d, sizeof detail, NULL, &dev) &&
+             SetupDiGetDevicePropertyW(set, &dev, &container, &type, (BYTE *)&pad_container, sizeof pad_container, NULL, 0) &&
+             type == DEVPROP_TYPE_GUID && memcmp(&pad_container, &no_container, sizeof pad_container);
+    SetupDiDestroyDeviceInfoList(set);
+    if (!ok) return -1;
+    HRESULT com = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    IMMDeviceEnumerator *e = NULL;
+    IMMDeviceCollection *list = NULL;
+    int token = -1, matches = 0;
+    char matched_name[HOS_OUTPUT_NAME_CAP] = "";
+    if (SUCCEEDED(CoCreateInstance(&clsid, NULL, CLSCTX_ALL, &iid, (void **)&e)) && e &&
+        SUCCEEDED(e->lpVtbl->EnumAudioEndpoints(e, eRender, DEVICE_STATE_ACTIVE, &list)) && list) {
+        UINT count = 0;
+        list->lpVtbl->GetCount(list, &count);
+        for (UINT i = 0; i < count; i++) {
+            IMMDevice *d = NULL;
+            IPropertyStore *p = NULL;
+            PROPVARIANT c, n;
+            memset(&c, 0, sizeof c), memset(&n, 0, sizeof n);
+            if (SUCCEEDED(list->lpVtbl->Item(list, i, &d)) && d &&
+                SUCCEEDED(d->lpVtbl->OpenPropertyStore(d, STGM_READ, &p)) && p &&
+                SUCCEEDED(p->lpVtbl->GetValue(p, (const PROPERTYKEY *)&container, &c)) && c.vt == VT_CLSID && c.puuid &&
+                !memcmp(c.puuid, &pad_container, sizeof pad_container) &&
+                SUCCEEDED(p->lpVtbl->GetValue(p, &label, &n)) && n.vt == VT_LPWSTR && n.pwszVal) {
+                char name[HOS_OUTPUT_NAME_CAP];
+                if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, n.pwszVal, -1, name, sizeof name, NULL, NULL)) {
+                    const int total = hos_sdl_output_count();
+                    for (int j = 0; j < total; j++) {
+                        char id[HOS_OUTPUT_ID_CAP], sdl_name[HOS_OUTPUT_NAME_CAP];
+                        if (hos_sdl_output_info(j, id, sizeof id, sdl_name, sizeof sdl_name) &&
+                            !strcmp(name, sdl_name) && hos_sdl_output_channels(j) >= 4) {
+                            token = hos_sdl_output_resolve(id);
+                            if (token >= 0) matches++, strcpy(matched_name, name);
+                        }
+                    }
+                }
+            }
+            PropVariantClear(&c), PropVariantClear(&n);
+            if (p) p->lpVtbl->Release(p);
+            if (d) d->lpVtbl->Release(d);
+        }
+        /* (an SDL name cannot tell two Windows endpoints with the same label apart) */
+        int labels = 0;
+        for (UINT i = 0; matches == 1 && i < count; i++) {
+            IMMDevice *d = NULL;
+            IPropertyStore *p = NULL;
+            PROPVARIANT n;
+            memset(&n, 0, sizeof n);
+            if (SUCCEEDED(list->lpVtbl->Item(list, i, &d)) && d &&
+                SUCCEEDED(d->lpVtbl->OpenPropertyStore(d, STGM_READ, &p)) && p &&
+                SUCCEEDED(p->lpVtbl->GetValue(p, &label, &n)) && n.vt == VT_LPWSTR && n.pwszVal) {
+                char name[HOS_OUTPUT_NAME_CAP];
+                if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, n.pwszVal, -1, name, sizeof name, NULL, NULL) &&
+                    !strcmp(name, matched_name))
+                    labels++;
+            }
+            PropVariantClear(&n);
+            if (p) p->lpVtbl->Release(p);
+            if (d) d->lpVtbl->Release(d);
+        }
+        if (labels != 1) matches = 0;
+    }
+    if (list) list->lpVtbl->Release(list);
+    if (e) e->lpVtbl->Release(e);
+    if (SUCCEEDED(com)) CoUninitialize();
+    return matches == 1 ? token : -1;
+#else
+    (void)pad;
+    return -1;
+#endif
+}
+/* ((Triforce) the controller speaker, once a second) Headphones in a DualSense's jack: 1 in, 0 out, -1 when it cannot be
+   read (an SDL without its HID calls, a pad whose report says nothing). The pad's USB input report (0x01) carries it at
+   byte 54, bit 0 (bit 1: a microphone): read on a second handle to the pad (hos_sdl_hid_open, as the vibration's
+   Bluetooth reports are written), which Windows hands every report as it does SDL's own, emptied of the reports queued
+   since the last second. Its path is never logged */
+static void *hp_dev, *hp_pad;   /* (the reader's second handle, and the pad it reads: for that pad's open life only) */
+static int hp_failed, hp_last = -2;
+static void pad_headphones_forget(void *pad) {   /* (the pad closed: its handle closed, its status and failure forgotten) */
+    if (!pad || pad != hp_pad) return;
+    if (hp_dev) hos_sdl_hid_close(hp_dev);
+    hp_dev = NULL, hp_pad = NULL, hp_failed = 0, hp_last = -2;
+}
+int hos_sdl_pad_headphones(void *pad) {
+    vib_calls_look();
+    if (!vib_calls.HidReadTimeout || !vib_calls.HidOpenPath || !vib_calls.HidClose || !pad) return -1;
+    if (pad != hp_pad) {
+        if (hp_dev) hos_sdl_hid_close(hp_dev);
+        hp_dev = NULL, hp_pad = pad, hp_failed = 0, hp_last = -2;
+    }
+    if (!hp_dev) {
+        if (hp_failed) return -1;
+        hp_dev = hos_sdl_hid_open(hos_sdl_pad_path(pad));
+        if (!hp_dev) {
+            hp_failed = 1;
+            hos_log("sdl: the DualSense's input report could not be read beside SDL's: its headphones are not seen");
+            return -1;
+        }
+    }
+    unsigned char report[80], seen[80];
+    int got = 0;
+    for (int i = 0; i < 256; i++) {   /* (up to a second of reports queued: the newest counts) */
+        const int n = ((int (*)(void *, unsigned char *, size_t, int))vib_calls.HidReadTimeout)(hp_dev, report, sizeof report, 0);
+        if (n < 0) {
+            hos_sdl_hid_close(hp_dev);
+            hp_dev = NULL;
+            return -1;
+        }
+        if (n == 0) break;
+        if (report[0] == 0x01 && n >= 55) memcpy(seen, report, sizeof seen), got = 1;
+    }
+    if (!got) return hp_last >= 0 ? hp_last : -1;
+    const int now = seen[54] & 1;
+    if (now != hp_last) hos_log("sdl: the DualSense's plug status 0x%02x", seen[54]);
+    hp_last = now;
+    return now;
 }
 #undef CALL

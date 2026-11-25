@@ -14,13 +14,19 @@
    is in pages 21 and 22 (0x54 to 0x5b: the character, its variant, the kind of figure, the number high byte first, the
    series, and 2). A dump that a tool has already decrypted keeps the same bytes in other places (amiitool's layout: the
    tag's bytes 8 to 15 first, the serial number's page at 0x1d4, the figure's at 0x1dc). Everything a tag keeps encrypted
-   is left unread. */
+   is left unread. A Flipper Zero's NFC file of the tag (".nfc": text, a "Page N: xx xx xx xx" line per page) is the same
+   bytes written out: amiibo_flipper makes them a dump again.
+
+   A game that keeps data of its own on a figure (its application area: this game's request never opens one) finds it
+   in a file of Triforce's own (host/nn_nfp.c: the amiibo folder's "areas", by the tag's serial number), never in the
+   player's dump, which is only ever read. */
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
 enum { AMIIBO_FILE_MAX = 1024 };   /* (the most of a file that is read: a dump is 532, 540 or 572 bytes) */
+enum { AMIIBO_NFC_MAX = 16384 };   /* ((Triforce) the most of a Flipper .nfc file that is read: about 4 KB for a figure) */
 enum { AMIIBO_OK = 0, AMIIBO_BAD_SIZE, AMIIBO_NOT_A_FIGURE };
 
 typedef struct AmiiboTag {
@@ -57,6 +63,48 @@ static inline int amiibo_parse(const uint8_t *data, size_t n, AmiiboTag *out) {
     return AMIIBO_OK;
 }
 
+/* ((Triforce) A Flipper Zero NFC file's pages (text, n bytes, need not end in a 0) as an NTAG215's 540 bytes in out: each
+   line "Page <number>: <four hex bytes>" puts its bytes at number * 4 (a page past the tag's 135, or a line with an
+   unread byte, "??", is left out). 540 when at least 130 of the tag's pages were there, else 0 (nothing past text[n - 1]
+   is read) */
+static inline int amiibo_hex(char ch) {
+    return ch >= '0' && ch <= '9' ? ch - '0' : ch >= 'a' && ch <= 'f' ? ch - 'a' + 10 : ch >= 'A' && ch <= 'F' ? ch - 'A' + 10 : -1;
+}
+static inline size_t amiibo_flipper(const char *text, size_t n, uint8_t out[540]) {
+    if (!text || n < 9 || memcmp(text, "Filetype:", 9)) return 0;
+    memset(out, 0, 540);
+    int pages = 0;
+    uint8_t seen[135] = {0};
+    for (size_t i = 0; i < n;) {
+        size_t end = i;
+        while (end < n && text[end] != '\n') end++;
+        size_t at = i;
+        if (end - at > 5 && !memcmp(text + at, "Page ", 5)) {
+            at += 5;
+            unsigned page = 0;
+            int digits = 0;
+            while (at < end && text[at] >= '0' && text[at] <= '9' && digits < 4) page = page * 10 + (unsigned)(text[at++] - '0'), digits++;
+            uint8_t b[4];
+            int got = 0;
+            if (digits && at < end && text[at] == ':') {
+                at++;
+                for (; got < 4; got++) {
+                    while (at < end && text[at] == ' ') at++;
+                    if (end - at < 2 || amiibo_hex(text[at]) < 0 || amiibo_hex(text[at + 1]) < 0) break;
+                    b[got] = (uint8_t)(amiibo_hex(text[at]) << 4 | amiibo_hex(text[at + 1]));
+                    at += 2;
+                }
+            }
+            if (got == 4 && page < 135) {
+                memcpy(out + page * 4, b, 4);
+                if (!seen[page]) seen[page] = 1, pages++;
+            }
+        }
+        i = end + 1;
+    }
+    return pages >= 130 ? 540 : 0;
+}
+
 /* nn::nfp::TagInfo (0x58 bytes): the serial number in its first ten bytes, its length at 10, the protocol at 0x20 (1,
    NFC-A) and the tag's type at 0x24 (2, a type 2 tag) */
 enum { NFP_TAG_INFO_SIZE = 0x58, NFP_MODEL_INFO_SIZE = 0x40 };
@@ -91,6 +139,17 @@ enum { NFP_READERS = 2 };
 #define NFP_HOLD_NS 1000000000LL
 /* nn::Result 2115-0073, "the reader is not in the state for that": the game's task ends as for a reader that went away */
 #define NFP_WRONG_STATE 0x9273u
+/* ((Triforce) the application area's: 2115-0128 none made yet, 2115-0152 another game's (its access ID), 2115-0168 one is there */
+#define NFP_AREA_NEEDS_CREATE 0x10073u
+#define NFP_WRONG_ACCESS_ID 0x13073u
+#define NFP_AREA_EXISTS 0x15073u
+enum { NFP_AREA_SIZE = 0xd8, NFP_AREA_FILE = 8 + 0xd8 };   /* (an NTAG215's application area; its file: "TFA1", the ID, the area) */
+typedef struct NfpArea {
+    int there;                  /* a game made one on this figure */
+    int open;                   /* opened (or made) since the figure was put on the reader */
+    uint32_t id;                /* the game's access ID */
+    uint8_t data[NFP_AREA_SIZE];
+} NfpArea;
 /* what the Scan amiibo row is told (HOS_OPT_AMIIBO_SAID) */
 enum { NFP_SAID_NONE = 0, NFP_SAID_WAITING, NFP_SAID_ON_READER, NFP_SAID_READ, NFP_SAID_REFUSED, NFP_SAID_NO_FILE };
 
@@ -102,6 +161,7 @@ typedef struct Nfp {
     int said;                   /* NFP_SAID_* */
     int state[NFP_READERS];
     AmiiboTag tag;
+    NfpArea area;               /* ((Triforce) what a game keeps on the figure chosen: host/nn_nfp.c loads and keeps it) */
 } Nfp;
 
 static inline void nfp_reset(Nfp *n) {
@@ -120,6 +180,7 @@ static inline int nfp_reader(const Nfp *n, uint64_t handle) {
 /* the figure on a reader is lifted off: that reader says so until the game stops or starts detection */
 static inline void nfp_lift(Nfp *n, int said) {
     if (n->holder >= 0) n->state[n->holder] = NFP_DEACTIVE;
+    n->area.open = 0;
     n->holder = -1;
     n->read_at = 0;
     n->said = said;
@@ -130,6 +191,7 @@ static inline int nfp_choose(Nfp *n, const AmiiboTag *tag) {
     const int was = n->listed;
     if (n->holder >= 0) nfp_lift(n, NFP_SAID_NONE);
     n->tag = *tag;
+    memset(&n->area, 0, sizeof n->area);   /* (another figure: its own area, host/nn_nfp.c amiibo_area_parse) */
     n->listed = 1, n->waiting = 1;
     n->said = NFP_SAID_WAITING;
     return !was;
@@ -199,6 +261,75 @@ static inline uint32_t nfp_model_info(Nfp *n, int reader, int64_t now, uint8_t o
     amiibo_model_info(&n->tag, out);
     if (!n->read_at) n->read_at = now ? now : 1;
     return 0;
+}
+
+/* ---- ((Triforce) the application area: a game's own data on the mounted figure. Open by the game's access ID, read and
+   set while open, made (or made again) with its first data, written out by Flush. The calls keep the figure on the reader:
+   it is lifted off NFP_HOLD_NS after the game's last one. A *save of 1: host/nn_nfp.c writes n->area to its file ---- */
+static inline int nfp_area_reader(Nfp *n, int reader, int64_t now) {
+    nfp_step(n, reader, now);
+    if (n->holder != reader || n->state[reader] != NFP_MOUNT) return 0;
+    if (n->read_at) n->read_at = now ? now : 1;
+    return 1;
+}
+static inline uint32_t nfp_area_open(Nfp *n, int reader, int64_t now, uint32_t id) {
+    if (!nfp_area_reader(n, reader, now)) return NFP_WRONG_STATE;
+    if (!n->area.there) return NFP_AREA_NEEDS_CREATE;
+    if (n->area.id != id) return NFP_WRONG_ACCESS_ID;
+    n->area.open = 1;
+    return 0;
+}
+/* GetApplicationArea: at most max bytes into out, the area's size into *size */
+static inline uint32_t nfp_area_get(Nfp *n, int reader, int64_t now, uint8_t *out, uint64_t max, uint64_t *size) {
+    if (!nfp_area_reader(n, reader, now) || !n->area.open) return NFP_WRONG_STATE;
+    memcpy(out, n->area.data, max < NFP_AREA_SIZE ? (size_t)max : NFP_AREA_SIZE);
+    *size = NFP_AREA_SIZE;
+    return 0;
+}
+/* SetApplicationArea: the area becomes data (size bytes, the rest zeros); kept on Flush */
+static inline uint32_t nfp_area_set(Nfp *n, int reader, int64_t now, const uint8_t *data, uint64_t size) {
+    if (!nfp_area_reader(n, reader, now) || !n->area.open) return NFP_WRONG_STATE;
+    memset(n->area.data, 0, NFP_AREA_SIZE);
+    if (data) memcpy(n->area.data, data, size < NFP_AREA_SIZE ? (size_t)size : NFP_AREA_SIZE);
+    return 0;
+}
+/* CreateApplicationArea (again 0) and RecreateApplicationArea (1): the game's area with its first data, open */
+static inline uint32_t nfp_area_create(Nfp *n, int reader, int64_t now, uint32_t id, const uint8_t *data, uint64_t size, int again,
+                                       int *save) {
+    *save = 0;
+    if (!nfp_area_reader(n, reader, now)) return NFP_WRONG_STATE;
+    if (n->area.there && !again) return NFP_AREA_EXISTS;
+    memset(n->area.data, 0, NFP_AREA_SIZE);
+    if (data) memcpy(n->area.data, data, size < NFP_AREA_SIZE ? (size_t)size : NFP_AREA_SIZE);
+    n->area.id = id, n->area.there = 1, n->area.open = 1;
+    *save = 1;
+    return 0;
+}
+/* Flush: what was set is written to the tag (here, to its file) */
+static inline uint32_t nfp_flush(Nfp *n, int reader, int64_t now, int *save) {
+    *save = 0;
+    if (!nfp_area_reader(n, reader, now)) return NFP_WRONG_STATE;
+    *save = n->area.there;
+    return 0;
+}
+/* The area's file: "TFA1", the access ID (4 bytes, this processor's order), the area. 1 when bytes (n of them) are one */
+static inline int amiibo_area_parse(const uint8_t *bytes, size_t n, NfpArea *a) {
+    if (!bytes || n != NFP_AREA_FILE || memcmp(bytes, "TFA1", 4)) return 0;
+    memcpy(&a->id, bytes + 4, 4);
+    memcpy(a->data, bytes + 8, NFP_AREA_SIZE);
+    a->there = 1, a->open = 0;
+    return 1;
+}
+static inline void amiibo_area_bytes(const NfpArea *a, uint8_t out[NFP_AREA_FILE]) {
+    memcpy(out, "TFA1", 4);
+    memcpy(out + 4, &a->id, 4);
+    memcpy(out + 8, a->data, NFP_AREA_SIZE);
+}
+/* The area's file name for a figure: its serial number in hex and ".area" (19 bytes and the end) */
+static inline void amiibo_area_name(const AmiiboTag *t, char out[20]) {
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < 7; i++) out[2 * i] = hex[t->uid[i] >> 4], out[2 * i + 1] = hex[t->uid[i] & 15];
+    memcpy(out + 14, ".area", 6);
 }
 
 /* A dump's file name as the Scan amiibo page sends it: a name of the amiibo folder itself, never a path */

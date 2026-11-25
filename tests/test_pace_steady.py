@@ -536,7 +536,7 @@ def check_source():
     wanted = block(replay, "bool smooth_wanted() {")
     check("smooth_mine && !framegen_on() && !dlssg::active() && ((on && opts.pace != 0) || pace::steady_floor_ns() > 0)" in wanted,
           "the steady frame rate's hold is not for the game's own pictures alone, without frame generation")
-    sp = block(replay, "void smooth_present(std::unique_lock<std::mutex>& qk) {")
+    sp = block(replay, "void smooth_present(std::unique_lock<QueueMutex>& qk) {")
     check("present_smooth_paced_at(&smooth, now, paced)" in sp and "const int64_t paced = pace::steady_floor_ns();" in sp,
           "the present does not hold the pictures to the steady period")
     check(sp.index("smooth_wait_until(at);") < sp.index("if (paced) pace::steady_held(host->now_ns() - now);"),

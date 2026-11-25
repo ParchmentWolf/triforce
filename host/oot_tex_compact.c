@@ -26,6 +26,7 @@
    every frame against never, standing at the Market: 11.0% and 9.8% of frames of 16.7 ms or more against 3.0% and 1.2%. */
 #include "hos.h"
 #include "oot_tex_compact.h"
+#include "input_movie.h"   /* ((Triforce) HosMovieTime: the game clock's time while an input recording is recorded or played) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <windows.h>
@@ -92,6 +93,10 @@ int hos_oot_tex_compact_due(void) {
     static int ms = -2;
     static int64_t last = -1, said;
     static long let, held;
+    /* ((Triforce) the ask's clock: the wall's, or the game clock's while an input recording is recorded or played, so an
+       ask falls on the same frame of a replay as of its recording: host/input_movie.c; under the lock) */
+    int64_t hos_input_movie_time(HosMovieTime *t, int64_t wall_ns);
+    static HosMovieTime ask_time;
     AcquireSRWLockExclusive(&lock);
     if (ms == -2) {
         const char *e = getenv("HOS_OOT_TEX_ASK_MS");
@@ -100,7 +105,7 @@ int hos_oot_tex_compact_due(void) {
         else hos_log("oot: texture compaction: %s (HOS_OOT_TEX_ASK_MS=%s)", ms ? "no ask let through" : "every ask, as shipped", e);
     }
     const int64_t now = hos_now_ns();
-    const int due = hos_oot_tex_ask_due(ms, now, &last);
+    const int due = hos_oot_tex_ask_due(ms, hos_input_movie_time(&ask_time, now), &last);
     if (due) let++;
     else held++;
     if (!said) said = now;

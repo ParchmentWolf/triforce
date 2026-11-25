@@ -27,6 +27,24 @@ int temporal_stood_in();
 /// (vk_fsr3.cpp fsr3_wanted). Where it cannot run, a saved FSR 3.1 stays
 bool temporal_env_chosen();
 bool temporal_wanted();       // (temporal_mode() != GAME)
+/// ((Triforce, 11-23) Evil HD's ambient occlusion, vk_aa.cpp ao_after) The scene's depth as the camera noted it this frame or
+/// the one before, at width x height, and how to read it: view distance = b / (d - a) (d as 1 - d when flip), view x and y =
+/// ndc * distance * inv_p00 and inv_p11. false: none of that size, gone since, or not a plain perspective
+struct TemporalAoCamera {
+    VkImageView depth = VK_NULL_HANDLE;
+    float a = 0.0f, b = 0.0f, inv_p00 = 0.0f, inv_p11 = 0.0f;
+    bool flip = false;
+    float near_z = 0.0f, far_z = 0.0f;   // (for the log)
+    // ((Triforce, 11-24) the light shafts: the scene's view (3 x 4) and projection (4 x 4), row major as the game's block has
+    // them, and the direction towards the sun in the world (temporal_note_cascade; sun_ok false: none seen in the last 30 s)
+    float view[12]{}, proj[16]{}, sun[3]{};
+    bool sun_ok = false;
+};
+bool temporal_ao_camera(uint32_t width, uint32_t height, TemporalAoCamera* out);
+/// ((Triforce, 11-24) Evil HD's light shafts) A draw into the sun's shadow cascades (square, depth only, wider than 768): its
+/// vertex camera block (the vertex stage's slot 0), whose first three rows are the light's view: the third, the light's
+/// backwards axis, points at the sun (TemporalAoCamera sun)
+void temporal_note_cascade(uint64_t camera, uint64_t camera_size, uint32_t width, uint32_t layer);
 /// DLAA or FSR's native anti-aliasing (FSR 4's on this chain, FSR 3.1's with its own passes: vk_fsr3.h fsr3_native): the 3D
 /// drawn at full scale, whatever the Render resolution row says
 bool temporal_full_scale();
@@ -107,6 +125,10 @@ bool temporal_capture_wanted();
 /// FSR 3.1 upscales (vk_fsr3.cpp fsr3_wanted), whose inputs the chain's redraws draw into (temporal_fsr3_motion). The draws
 /// store their positions, and the skinned ones are noted, only then
 bool temporal_motion_wanted();
+/// ((Triforce) 11-24) No engine and no FSR 3.1 upscaling, with AMD FSR 3.1's frame interpolation asked for (the Frame generation
+/// by row): its inputs, made at the gameplay upscale's dispatch, get what moves by itself drawn into their motion too
+/// (vk_fsr3.cpp fsr3_upscale, temporal_fsr3_motion)
+bool temporal_fg_motion();
 
 namespace fsr3_inputs {
 struct Frame;
@@ -121,6 +143,8 @@ int temporal_fsr3_motion(VkCommandBuffer cmd, const fsr3_inputs::Frame* f);
 /// (local, RenoDX port) Whether f is the scene's colour format: the game's B10G11R11, or the RGBA16F the host chose for the
 /// run once an upscale's input was RGBA16F
 bool temporal_scene_format(VkFormat f);
+/// ((Triforce) reshade/fx_runtime.cpp) The scene's depth for a ReShade preset that reads it, a depth-only view, or null
+VkImageView temporal_reshade_depth(uint32_t width, uint32_t height);
 
 /// A gameplay upscale's dispatch (program `key`; vk_draw.cpp's temporal_stand_in finds them: the 4/3 network fd029a317a9a4b94
 /// at the game's usual 3/4, the same-size pass 9dc98871eb7fc101 at full size, and one network of its own for each other
@@ -189,6 +213,8 @@ int temporal_status(char* b, size_t n);
 /// 0 when there is to be none (no engine drawing, or RX_VK_DLSS_JITTER=0). Axis 2: the jitter sequence's length for the
 /// engine's scale (dlss_jitter_phases, HOS_OPT_DLSS_JITTER_PHASES)
 uint32_t temporal_jitter_size(int axis);
+/// ((Triforce) the same, one whole sample (temporal_jitter.h): all zero while there is to be none
+MkwVkJitter temporal_jitter_sample();
 
 // ---- what an engine is given and does ----
 

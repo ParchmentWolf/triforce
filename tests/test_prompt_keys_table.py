@@ -118,8 +118,13 @@ def main():
     table = re.search(r"key_default\[HOS_KEY_N\]\[2\] = \{(.*?)\};", hid, re.S)
     check(table is not None, "host/nn_hid.c has no key_default")
     rows = [[code(t) for t in row.split(",") if t.strip()] for row in re.findall(r"\{([^{}]*)\}", table.group(1))]
-    check([r[0] for r in rows] == K.DEFAULT, "DEFAULT is not key_default's first keys: %s" % [r[0] for r in rows])
-    check(all(k in K.KEYS for r in rows for k in r), "a key of key_default has no icon")
+    # ((Triforce) 11-24: after the controls with a key out of the box come the ocarina's five note rows, with none: they
+    # are no button's, and have no icon; then Toggle HUD, with none too)
+    firsts = [r[0] for r in rows]
+    check(firsts[:len(K.DEFAULT)] == K.DEFAULT, "DEFAULT is not key_default's first keys: %s" % firsts)
+    check(firsts[len(K.DEFAULT):] == [0] * 6 and all(len(r) == 1 for r in rows[len(K.DEFAULT):]),
+          "the rows after DEFAULT's are not the five note rows and Toggle HUD, unset: %s" % rows[len(K.DEFAULT):])
+    check(all(k in K.KEYS for r in rows[:len(K.DEFAULT)] for k in r), "a key of key_default has no icon")
 
     # the controls' numbers
     def enum(first):
@@ -127,6 +132,12 @@ def main():
         check(m is not None, "gpu/vk/vk_api.h has no enum starting %s" % first)
         return [re.sub(r"\s*=.*", "", e.strip()) for e in m.group(1).split(",") if e.strip()]
     sw, key = enum("HOS_SW_A"), enum("HOS_KEY_MOVE_UP")
+    # ((Triforce) 11-24: the ocarina's five note rows end the keys' enum, before HOS_KEY_N: they are no button's, have no
+    # key out of the box and no icon, so the icons' table stops before them)
+    notes = [n for n in key if n.startswith("HOS_KEY_OC_NOTE_")]
+    check(len(notes) == 5 and key[-7:-2] == notes and key[-2] == "HOS_KEY_TOGGLE_HUD",
+          "the note rows and Toggle HUD are not the six last controls: %s" % key)
+    key = key[:-7] + key[-1:]
     check(len(sw) - 1 == len(prompt_assets.SWITCH) and len(sw) - 1 + len(key) - 1 == len(K.DEFAULT),
           "the controls are not %d buttons and %d keys' places" % (len(prompt_assets.SWITCH), len(K.DEFAULT) - len(sw) + 1))
     number = {n: i for i, n in enumerate(sw[:-1] + key[:-1])}
@@ -180,8 +191,11 @@ def main():
     harness = "\n".join([
         "#include <ctype.h>", "#include <stdint.h>", "#include <stdio.h>", "#include <stdlib.h>", "#include <string.h>",
         '#include "gpu/vk/vk_api.h"',
+        '#include "host/hd_rumble.h"',
         block(prompts, "static int contains("),
         block(prompts, "static int auto_face("),
+        block(prompts, "static int face_of_type("),
+        block(prompts, "static int typed_face("),
         block(prompts, "static int device_face("),
         re.search(r"typedef struct \{ int held, recorded; int64_t held_ns; int active; \} Follow;", prompts).group(0),
         re.search(r"#define KEYS_ACTIVE \d+", prompts).group(0),
@@ -191,6 +205,8 @@ def main():
         "int main(int argc, char **argv) {",
         '    if (!strcmp(argv[1], "auto")) printf("%d\\n", auto_face(argv[2], atoi(argv[3]), atoi(argv[4])));',
         '    else if (!strcmp(argv[1], "device")) printf("%d\\n", device_face(atoi(argv[2]), argv[3]));',
+        '    else if (!strcmp(argv[1], "typed"))   /* (a named controller with its SDL type: SDL 3 or 2, the type) */',
+        '        printf("%d\\n", typed_face(auto_face(argv[2], 0, -1), argv[2], atoi(argv[3]), atoi(argv[4])));',
         '    else if (!strcmp(argv[1], "due"))',
         '        printf("%d\\n", pad_font_due(atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), atoll(argv[5]) * 1000000LL,',
         '                                     (unsigned)atoi(argv[6])));',
@@ -250,6 +266,18 @@ def main():
         for device, name, face in devices:
             got = int(run("device", device, name))
             check(got == face, "device %d (%r) is face %d, not %d" % (device, name, got, face))
+        # ((Triforce) a name that names no maker's buttons asks SDL's type; one that does wins over the type; a type that
+        # names no face keeps the Xbox's. SDL3's and SDL2's numbers)
+        typed = [("HORIPAD S", 3, 7, "SWITCH"), ("HORIPAD S", 2, 5, "SWITCH"), ("Wireless Controller", 3, 6, "PS5"),
+                 ("Wireless Controller", 3, 5, "PS4"), ("Wireless Controller", 2, 7, "PS5"), ("Wireless Controller", 2, 4, "PS4"),
+                 ("Wireless Controller", 2, 3, "PS4"), ("8BitDo Pro 2", 3, 3, "XBOX"), ("8BitDo Pro 2", 3, 0, "XBOX"),
+                 ("8BitDo Pro 2", 3, 1, "XBOX"), ("8BitDo Pro 2", 0, 6, "XBOX"), ("Controller", 2, 11, "SWITCH"),
+                 ("DualSense Wireless Controller", 3, 3, "PS5"), ("Steam Deck", 3, 3, "STEAMDECK"),
+                 ("Nintendo Switch Pro Controller", 3, 6, "SWITCH"), ("Xbox Series X Controller", 3, 6, "XBOX"),
+                 ("", 3, 6, "KEYBOARD")]
+        for name, sdl, kind, face in typed:
+            got = int(run("typed", name, sdl, kind))
+            check(faces[got] == "HOS_PROMPT_" + face, "controller %r of SDL%d type %d: %s, not %s" % (name, sdl, kind, faces[got], face))
         for seq, writes in follows:
             got = run("follow", *seq).split("\n")[:-1]
             check(got == writes, "following %s writes %s, not %s" % (seq, got, writes))
@@ -258,6 +286,8 @@ def main():
             check(got == due, "the overlay's font for served %d, face %d, shown %d, held %d ms, failed %d: %d, not %d"
                   % (args + (got, due)))
     choose = block(prompts, "static int choose_face(")
+    check("typed_face(auto_face(name, xinput, remembered), name, sdl, type)" in choose, "choose_face does not ask the first controller's SDL type")
+    check("typed_face(device_face(device, name), name, sdl, type)" in prompts, "the device used last is not asked its SDL type")
     check("auto_face(name, xinput, remembered)" in choose and "!name[0] && hos_xinput_connected()" in choose and
           "name[0] || xinput ? -1 : remembered_face(dir)" in choose,
           "choose_face does not ask auto_face, asks XInput while SDL names a controller, or the last run's device before both")
@@ -266,7 +296,9 @@ def main():
     check("int hos_xinput_connected(void) {" in hid, "host/nn_hid.c has no hos_xinput_connected")
     # (the device used last: a controller where its presses count, the keys and the mouse where theirs do; stored only)
     reader = block(hid, "static void read_input(")
-    check("player_used(), device_used(2);" in reader and "if (bound_down(i, 0)) *buttons |= 1ULL << i, player_used(), device_used(1);"
+    # (the player's input, which hides the game menus' cursor, is stamped when a button or a key goes down; the device is told
+    # at every read it is held, as before)
+    check("if (pb || pushed) device_used(2);" in reader and "if (bound_down(i, 0)) *buttons |= 1ULL << i, down |= 1ULL << i, device_used(1);"
           in reader and "if (bound_down(i, 1)) *buttons |= 1ULL << i, device_used(1);" in reader and
           "if (mouse[2] > 4096 || mouse[2] < -4096 || mouse[3] > 4096 || mouse[3] < -4096) device_used(1);" in reader and "if (keys[0] || keys[1] || cx || cy) device_used(1);" in reader,
           "host/nn_hid.c read_input does not say which device was used last")
@@ -294,13 +326,14 @@ def main():
           and "auto_path(path, sizeof path);" in block(prompts, "static int remembered_face(") and "auto_path(path, sizeof path);" in follow
           and "prompts/auto.txt" not in follow, "Auto's device used last is kept in prompts/, which Setup makes again at an update")
     check(re.search(r"int \(\*prompt_pad_face\)\(void\);", api) is not None and
-          "#define MKWVK_API_VERSION 19" in api, "gpu/vk/vk_api.h has no prompt_pad_face, at version 19 (15 had it; 16-18 ultrawide's "
+          int(re.search(r"#define MKWVK_API_VERSION (\d+)", api).group(1)) >= 19,
+          "gpu/vk/vk_api.h has no prompt_pad_face, at version 19 or later (15 had it; 16-18 ultrawide's "
           "screens and wide_backdrop, 19 the renderer's screen_point, N64 Classic's)")
-    check("hos_bench_state, hos_prompts_pad_face, host_screens, host_wide_backdrop,\n};" in (ROOT / "host/rx_backend.c").read_text(encoding="utf-8"),
+    check("hos_bench_state, hos_prompts_pad_face, host_screens, host_wide_backdrop," in (ROOT / "host/rx_backend.c").read_text(encoding="utf-8"),
           "host/rx_backend.c does not give the back end hos_prompts_pad_face")
     imgui = (ROOT / "gpu/vk/vk_imgui.cpp").read_text(encoding="utf-8")
     check('"prompts/External.pad." + std::to_string(pad) + ".bfotf.zs"' in imgui and
-          "glyphs_follow();\n    ImGui_ImplVulkan_NewFrame();" in imgui and "std::thread(read_glyphs).detach()" in block(imgui, "void glyphs_follow("),
+          "glyphs_follow();\n    language_fonts();" in imgui and "std::thread(read_glyphs).detach()" in block(imgui, "void glyphs_follow("),
           "the overlay does not read the controller used last's icons, or not again on its own thread")
     gf = block(imgui, "void glyphs_follow(")
     check("fonts_.glyph = pad_glyphs[pad], glyph_pad.store(pad, std::memory_order_relaxed);" in gf and

@@ -27,8 +27,9 @@ namespace mkwvk::start_screen {
 
 // ---- the tokens: colour ----
 constexpr ImU32 hex(unsigned rgb, int a = 255) { return IM_COL32(rgb >> 16 & 255, rgb >> 8 & 255, rgb & 255, a); }
-constexpr unsigned kInk900 = 0x0A0908, kInk600 = 0x262017, kLine = 0x2C2518, kTextHi = 0xF3EAD5, kText = 0xCDC2A8, kTextDim = 0x948A70,
-                   kTextFaint = 0x5F5744, kGold100 = 0xFFF4CC, kGold300 = 0xF7DC8C, kGold500 = 0xE0B23E, kTopLight = 0xFFECAA;
+// (Triforce) the warm dark and gold: the game's look
+inline unsigned kInk900 = 0x0A0908, kInk600 = 0x262017, kLine = 0x2C2518, kTextHi = 0xF3EAD5, kText = 0xCDC2A8, kTextDim = 0x948A70,
+                kTextFaint = 0x5F5744, kGold100 = 0xFFF4CC, kGold300 = 0xF7DC8C, kGold500 = 0xE0B23E, kTopLight = 0xFFECAA;
 // (the stones in the order they count: emerald, sapphire, ruby)
 constexpr unsigned kStoneGlow[3] = {0x7CFF9A, 0x8FC0FF, 0xFF7A84};
 constexpr float kStoneAt[3][2] = {{0.53f, 0.32f}, {0.71f, 0.68f}, {0.30f, 0.64f}};   // (their centres in the crest's box)
@@ -556,7 +557,7 @@ inline void draw(ui::Ctx& c, const StartupView& v, float fade, double now) {
         }
         {   // (the line)
             const float y = y_line + rise[2], aa = a[2], th = std::max(2.0f, std::floor(2 * u + 0.5f));
-            d->AddRectFilled(ImVec2(x0, y), ImVec2(x1, y + th), ink(kInk600, aa));
+            d->AddRectFilled(ImVec2(x0, y), ImVec2(x1, y + th), ink(kInk600, aa), 0);
             if (v.fraction >= 0) {
                 const float target = (float)std::min(v.fraction, 1.0);
                 m.fill += (target - m.fill) * (1 - std::exp(-dt / 0.10f));   // (never a jump: there in 300 ms)

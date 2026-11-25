@@ -183,7 +183,7 @@ def checks(t):
           "the 10-bit passes are not the patched shaders")
     check("if (!present_native_pq.load(std::memory_order_relaxed) || fg.hdr_failed) return VK_FORMAT_R8G8B8A8_UNORM;" in
           function(fg, "VkFormat frames_format() {"), "the frames' format does not follow HDR Native")
-    check("if (fg.format != VK_FORMAT_R8G8B8A8_UNORM) return 0;" in function(fg, "int fsr3fi_frame("),
+    check("if (fg.format != VK_FORMAT_R8G8B8A8_UNORM) return 0;" in function(fg, "int fsr3fi_frames("),
           "FSR 3.1's interpolation is given HDR Native's 10-bit frames")
     check(replay.count("retyped_view ? retyped_view : texture_view(tex, t, nullptr, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Sample)") == 2,
           "frame generation reads the window texture's own view where the present retyped it")

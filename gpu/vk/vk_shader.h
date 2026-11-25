@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <cstddef>
+#include <cstdio>
 #include <functional>
 #include <memory>
 #include <string>
@@ -15,7 +16,9 @@
 
 #include "spv_store.h"
 #include "compute_pin.h"   // ((Triforce, 11-22, PIPE-52) which compute programs are held to 32 lanes: compute_pin_mode)
-#include "fallback_size_policy.h"   // ((Triforce, 11-22, PIPE-56) the mesh fallback's stages too big for two Mesa drivers)
+#include "compute_gate.h"   // ((Triforce) the compute compiles' memory gate: compute_gate_radv)
+#include "fallback_size_policy.h"
+#include "fallback_lanes.h"   // ((Triforce) the lanes a mesh fallback stage with no subgroup instruction runs at)   // ((Triforce, 11-22, PIPE-56) the mesh fallback's stages too big for two Mesa drivers)
 #include "vk_internal.h"
 #include "vk_state.h"
 
@@ -39,6 +42,10 @@ struct Stage {
 /// A texture handle the stage reads from a storage buffer: its handle program (Shader::Info::handle_programs, Eden's
 /// recompiler) run over the stage's constant banks and storage buffers as the draw has them
 uint32_t stage_handle(const NvnState& s, const Stage& st, uint32_t program, uint32_t element = 0);
+/// (Triforce) How many of such a table's count elements are the game's own this draw: the elements at and behind it name no
+/// texture (handle 0), and are not computed. count itself for anything that is not a table with the game's count in its
+/// header (vk_shader.cpp handle_table_live). key: the program's, for the log line that names which programs a count cuts
+uint32_t stage_handle_table_live(const NvnState& s, const Stage& st, uint32_t program, uint32_t count, uint64_t key = 0);
 
 /// (Triforce, texture detail) Whether the module reads the texture at that binding by texel position or asks its size
 /// (spv_exact.h); false on a card whose textures are whole anyway. Any thread of the replay.
@@ -78,6 +85,16 @@ bool compute_lanes_free(VkShaderModule m);
 /// OpFunctionCall counts as make_module took them (0 and 0 for a stage nobody counted). Any thread
 fallback_size::Driver fallback_size_driver();
 fallback_size::Size stage_size(const Stage& st);
+/// ((Triforce) where the counts above are taken: on those two drivers, and on RADV with an integrated GPU on a PC with under 13 GB
+/// of RAM (compute_gate_radv), whose compute compiles the memory gate weighs by their phis (vk_draw.cpp ComputeTurn)
+bool stage_sizes_counted();
+/// ((Triforce) vk_draw.cpp) A shader module made inside the driver fault guard: -77 for a fault there, or a program the driver faulted
+/// on before where the quarantine is on (driver_faults.h); program 0: none known
+VkResult extern_guarded_shader_module(const VkShaderModuleCreateInfo* ci, VkShaderModule* m, uint64_t program);
+/// ((Triforce) vk_draw.cpp) A graphics pipeline of the renderer's own made inside the driver fault guard (guarded_graphics):
+/// the ReShade preset's passes (reshade/fx_runtime.cpp)
+VkResult extern_guarded_graphics(VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* ci, VkPipeline* pl);
+bool compute_gate_radv();
 /// (Triforce) A program stage's module let go (vkDestroyShaderModule), and forgotten by the memory line's count (mem_parts.h):
 /// every place that lets a program's module go does it through this
 void stage_module_destroy(VkShaderModule m);
@@ -188,6 +205,7 @@ SeedVariants seed_compute(size_t i, size_t cap, const std::function<void(Program
 /// (hookshot, the prediction: vk_predict.cpp) a kept graphics program variant as triforce_programs.bin has it: each stage's SPIR-V
 struct KeptProgram {
     uint64_t key = 0, variant = 0;
+    int64_t at = 0;   // ((Triforce, 11-24) the record's place in the file: program_cache_each calls in no order)
     bool mesh = false;
     std::vector<std::pair<VkShaderStageFlagBits, std::vector<uint32_t>>> stages;
 };
@@ -196,24 +214,89 @@ void program_cache_borrow(uint64_t key, const std::function<void(Program&)>& fn)
 /// (hookshot) Every kept graphics and mesh program's key, in the file's order, no record read; *loaded: the variants in memory already
 std::vector<uint64_t> program_cache_keys(std::vector<Program*>* loaded);
 const Program* program_find(uint64_t key, uint64_t variant);
+/// (hookshot) The pipeline state list's variants, the same on every GPU: the answers with their stages numbered without the mesh
+/// fallback's generated vertex stage, and their hash (a graphics or native mesh program's: its own); a loaded variant by that hash
+std::vector<Program::Answer> answers_portable(const Program& p);
+std::vector<Program::Answer> answers_here(const Program& p, std::vector<Program::Answer> portable);   // (the inverse)
+uint64_t answers_hash_of(const std::vector<Program::Answer>& answers);   // (a variant's: Program::variant)
+uint64_t portable_variant(const Program& p);
+const Program* program_find_portable(uint64_t key, uint64_t variant);
 /// (hookshot) The pipeline state list (vk_draw.cpp): a program by its stages' code keys (graphics: vertex, fragment; mesh: mesh,
 /// fragment, task) and the vertex inputs and colour output types it was drawn with, from the seed (seed_open first): translated
 /// and kept unless kept already (null then, or when it does not translate). *key_out: its key, 0 when a stage is not in the seed
 std::unique_ptr<Program> seed_program_of(const uint64_t code[3], bool mesh, const uint32_t attributes[16], const uint8_t color_types[8],
                                          uint64_t* key_out);
 /// (hookshot) The same for a program variant made by other textures' answers: translated with the answers given in the order asked
-/// (Program::questions) and taking those answers (Program::answers); kept in memory for the precompile, and in the program cache.
+/// (Program::questions) and taking those answers (Program::answers, numbered as answers_portable has them); kept in memory for the
+/// precompile, and in the program cache.
 /// Null when a stage is not in the seed or it does not translate
 const Program* seed_variant_of(const uint64_t code[3], bool mesh, const uint32_t attributes[16], const uint8_t color_types[8],
                                const std::vector<uint8_t>& questions, const std::vector<Program::Answer>& answers);
+/// (hookshot) The variant nothing bound makes (each texture as its instruction declares it), kept the same way: what a state list
+/// record with variant 0 and no answers or questions stands for (one converted from records that hold no texture answers)
+const Program* seed_plain_of(const uint64_t code[3], bool mesh, const uint32_t attributes[16], const uint8_t color_types[8]);
+/// (hookshot) That variant if it is loaded and ready: every slot answering the type its instruction declares. Its own variant is
+/// the hash of those answers, not 0, so program_find_portable(key, 0) does not find it (state_list_prepare looks here first)
+const Program* program_find_plain(uint64_t key);
 /// The NVN stages of the bound program, for logs (stage field of each control section)
 void log_program_stages(const NvnState& s, const char* why);
 Shader::AttributeType attribute_type_of(uint32_t vattr);
 Shader::TextureType handle_texture_type(uint32_t handle);
 void shader_stats(int64_t* translated, int64_t* failed);
+/// (Triforce) After the preparation's "N failed": a line for each "not translated" line's programs, all of them (those lines stop at 30)
+void shader_fail_lines();
 double shader_translate_ms();
 void program_released(const nvn_prog* p);
 /// ((Triforce) program_released, once no program pick has the shaders' lock let go for a read: program_read_once.h)
 void program_released_after_reads(const nvn_prog* p);
+
+// ---- ((Triforce) RX_VK_LOAD=create: the load of a program's kept variants when the game makes it, vk_programs.cpp) ----
+/// A guest program as the game makes it (nvnProgramSetShaders), before any draw: its stages' code keys as Program::codes has
+/// them (vertex or mesh, fragment, task, the header-only stage; a compute program's stage in codes[0]), read from the game's
+/// memory now and hashed, nothing lowered. ok: it has a stage a draw or dispatch can use
+struct CreatedProgram {
+    uint64_t codes[4]{};
+    bool ok = false, compute = false, mesh = false;
+    int stages = 0;
+};
+CreatedProgram program_created_read(const nvn_prog& prog);   // (the game's thread; kept by the program's serial)
+/// The key a pick makes for that program drawn with these vertex input formats and colour output types (a compute program's:
+/// its stage's key); 0: no such serial was read
+uint64_t program_created_key(uint64_t serial, const uint32_t vattr[16], const uint8_t color_types[8]);
+void program_created_forget(uint64_t serial);
+int64_t shader_translated();   // (programs translated so far, by any thread)
+/// Where a kept record is in the program cache's file (its DiskRecord, as the load at a create call takes it)
+struct CacheRecord {
+    int64_t at = 0;
+    size_t size = 0;
+    uint32_t kind = 0;
+};
+/// Every kept program key not read in yet (the index's own copy: a create call on the game's thread then takes no lock a disk
+/// read holds), and the kept compute programs' keys (the first start's warm builds their pipelines into the caches)
+std::unordered_set<uint64_t> program_cache_kept_keys();
+std::vector<uint64_t> program_cache_compute_keys();
+/// The records of key not read in yet, as the list has them (none: no such key, or all read in)
+std::vector<CacheRecord> program_cache_records(uint64_t key);
+/// A record's variant (the hash of its answers) from its head alone, read by position through the caller's own handle. False:
+/// the head does not read that way
+bool program_cache_variant(FILE* in, uint64_t key, const CacheRecord& d, uint64_t* variant);
+/// Those of want still not read in become read in (as program_cache_load takes them): the ones taken
+std::vector<CacheRecord> program_cache_take(uint64_t key, const std::vector<CacheRecord>& want);
+/// The kept variants of key in those records read through the caller's own handle and made ready, to out
+void program_cache_read_records(FILE* in, uint64_t key, const std::vector<CacheRecord>& recs, std::vector<std::unique_ptr<Program>>& out);
+/// A kept compute record's program without its code (its head and descriptors, by position around the SPIR-V): what a pick
+/// needs. program_cache_complete reads the code and makes the module. Null: not a record to read this way
+std::unique_ptr<Program> program_cache_read_light(FILE* in, uint64_t key, const CacheRecord& d);
+/// A compute program read without its code (RX_VK_LOAD=create, program_cache_load): its SPIR-V read and its module made here,
+/// before the first use of the module (vk_draw.cpp dispatch). True: it is whole (or was). False: its code did not read or
+/// made no module; it is marked failed
+bool program_cache_complete(Program& p);
+bool program_cache_complete_unshared(Program& p, FILE* in);   // (the same for a program no other thread has yet, on the caller's handle)
+/// The words of SPIR-V such a program has still to read (0: it has its module, or never lacked it). Where its code is, is kept by
+/// the program's address in vk_shader.cpp, not in Program: Program's size is in the program cache's stamp
+uint64_t program_cache_code_words(const Program& p);
+/// (shader_mu held: programs_load_wait) a program a load made, into key's list; one whose variant is there already is let go
+void program_cache_publish_locked(uint64_t key, std::unique_ptr<Program> p);
+std::string program_cache_path();   // (the cache's file, for a thread's own handle on it; empty: no cache)
 
 } // namespace mkwvk

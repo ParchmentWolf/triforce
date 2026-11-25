@@ -24,7 +24,9 @@
    - The parts of vk_bank.cpp so marked: code no translation can reach (sampler_bias_changed, which only vk_draw.cpp's
      sampler_for reads by). What a translation calls there, what those read and what writes that (texture_of's registrations:
      register_texture, texture_released) stay in the stamp; tests/test_program_carry.py bank_check holds it.
-   - Comments, blank lines and the spaces at the ends of lines, in the C and C++ files.
+   - Comments, blank lines and the spaces at the ends of lines, in the C and C++ files; and ((Triforce, 11-24) nx2/build.py
+     strip_comments collapse) each run of blanks between their tokens taken as one space, none at a line's start: an
+     indentation edit keeps the stamp (a file with a raw string literal is taken as before).
    The run-time part of the stamp is as before (disk_stamp: the depth mode, the GPU's mesh shaders and warps, the per-GPU
    translation settings, the C++ library's layouts, the RX_VK_ and EDEN_ switches that change a translation). So a record is
    never used by a build that would have made it otherwise, as far as the stamp of the whole translator could ever tell (what

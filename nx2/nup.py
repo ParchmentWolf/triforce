@@ -35,6 +35,55 @@ ZSTD = b"\x28\xb5\x2f\xfd"
 WINDOWS_DEVICES = {"CON", "CONIN$", "CONOUT$", "PRN", "AUX", "NUL"} | {p + n for p in ("COM", "LPT") for n in "123456789¹²³"}
 
 
+# ((Triforce, 11-24, after Source A's) (Windows) a read refused because another program holds part of the file:
+# ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+LOCKED = {32, 33}
+# (Windows) a drive that cannot give back what it holds
+DRIVE_ERRORS = {21: "the drive is not ready (unplugged, or asleep)", 23: "a read failed its data check",
+                27: "the drive could not find a sector", 30: "the drive could not read", 31: "the drive stopped responding",
+                1117: "the drive reported an I/O error", 1392: "the file is corrupted and unreadable"}
+# (Windows) the C runtime's _get_doserrno, found now: importing ctypes after a failed read runs file calls of its own, which
+# replace the error it holds
+_get_doserrno = None
+if os.name == "nt":
+    try:
+        import ctypes
+        _get_doserrno = ctypes.CDLL("ucrtbase")._get_doserrno
+    except (ImportError, OSError, AttributeError):
+        pass
+
+
+def windows_error(error):
+    """The Windows error behind an OSError, or None. A file object's read goes through the C runtime, which turns every
+    Windows error from 19 to 36 (a lock, a sharing violation, a bad sector, a drive gone) into errno 13 and keeps the error
+    itself apart (its _doserrno): read straight after the failure, before anything else can fail and replace it"""
+    code = getattr(error, "winerror", None)
+    if code is None and _get_doserrno is not None and error.errno == errno.EACCES:
+        value = ctypes.c_ulong()
+        if _get_doserrno(ctypes.byref(value)) == 0 and value.value:
+            code = value.value
+    return code
+
+
+def unreadable(path, at, size, error, code=None):
+    """What to say when the .nup could not be read at byte at, in plain words with what to do. code: the Windows error
+    (windows_error), else read from error"""
+    code = code if code is not None else windows_error(error)
+    name = os.path.basename(path)
+    where = "%s at %d of %d MB" % (name, at >> 20, size >> 20) if size else "%s at %d MB" % (name, at >> 20)
+    said = " (Windows error %d)" % code if code is not None else " (%s)" % (error.strerror or error)
+    if code in LOCKED:
+        return ("Windows would not let the build read %s: another program has that part of the file locked%s. A backup "
+                "or sync program, or a virus scan, can do this. Close it and build again, or copy the .nup to another "
+                "folder and build from the copy." % (where, said))
+    if code in DRIVE_ERRORS or code is None and error.errno == errno.EIO:
+        return ("Your drive could not read %s: %s%s. Copy the .nup to another drive and build from the copy. If Windows "
+                "cannot copy it either, that part of the drive is damaged: check the drive for errors, or dump the game "
+                "again onto another drive." % (where, DRIVE_ERRORS.get(code, "the drive reported an I/O error"), said))
+    return ("The build could not read %s%s. Close any program that may be using the file and build again, or copy the "
+            ".nup to another drive and build from the copy." % (where, said))
+
+
 def frame_content_size(head):
     """The content size a zstd frame header states, None when it states none"""
     if head[:4] != ZSTD or len(head) < 18:
@@ -209,12 +258,27 @@ class Nup:
                 r = self.files[k - self.nd]
                 yield prefix + self.name(r[0], r[1]), r
 
+    def _data(self, n):
+        """((Triforce, 11-24, after Source A's) Up to n bytes of the package from where it stands. A read the system refuses
+        partway through the file (another program's lock on that part of it, a drive that cannot read it back) stops with what
+        that means and what to do, not as a bare "PermissionError: [Errno 13] Permission denied"."""
+        at = self.f.tell()
+        try:
+            return self.f.read(n)
+        except OSError as error:
+            code = windows_error(error)   # (first: a later call that fails would replace the error it reads)
+            try:
+                size = os.fstat(self.f.fileno()).st_size
+            except OSError:
+                size = None
+            raise SystemExit(unreadable(self.path, at, size, error, code)) from error
+
     def inner_is_zstd(self, r):
         """Whether what this frame holds is itself a zstd frame"""
         import zstandard
         self.f.seek(r[3])
         try:
-            return zstandard.ZstdDecompressor().decompressobj().decompress(self.f.read(min(r[2], 1 << 20)))[:4] == ZSTD
+            return zstandard.ZstdDecompressor().decompressobj().decompress(self._data(min(r[2], 1 << 20)))[:4] == ZSTD
         except zstandard.ZstdError:   # (made with one of the game's dictionaries: the game's own file)
             return False
 
@@ -227,7 +291,7 @@ class Nup:
         if not name:
             name = self.name(r[0], r[1])
         self.f.seek(r[3])
-        head = self.f.read(18)
+        head = self._data(18)
         if head[:4] != ZSTD:
             return False
         size = frame_content_size(head)
@@ -242,7 +306,7 @@ class Nup:
         left = r[2]
         try:
             while left and got <= r[2] and not d.eof:
-                b = self.f.read(min(left, 1 << 20))
+                b = self._data(min(left, 1 << 20))
                 if not b:
                     break
                 left -= len(b)
@@ -264,7 +328,7 @@ class Nup:
             d = zstandard.ZstdDecompressor().decompressobj()
             got = 0
             while left and not getattr(d, "eof", False):
-                b = self.f.read(min(left, 8 << 20))
+                b = self._data(min(left, 8 << 20))
                 if not b:
                     break
                 left -= len(b)
@@ -284,7 +348,7 @@ class Nup:
                 raise SystemExit("a compressed file came out as %d bytes, %d expected" % (got, r[2]))
             return
         while left:
-            b = self.f.read(min(left, 8 << 20))
+            b = self._data(min(left, 8 << 20))
             if not b:
                 raise SystemExit("the .nup file ends early (short read at %d of %d MB): it is incomplete. Download or copy it again"
                                  % (self.f.tell() >> 20, os.fstat(self.f.fileno()).st_size >> 20))
@@ -692,6 +756,21 @@ def zstd_start(head):
     return head == ZSTD or (len(head) == 4 and head[1:] == b"\x2a\x4d\x18" and head[0] & 0xf0 == 0x50)
 
 
+def still_in_nup_frame(f, head):
+    """((Triforce, 11-24, after Source A's) Whether a .zs file that starts as zstd (head: its first 18 bytes) is the .nup's own
+    frame round a damaged file, as older builders wrote them: a frame whose content is as large as the file, and that starts
+    with zeros or does not decompress. Only those are decompressed, and only their start: a game .zs file's content is larger
+    than the file, and most of them need the game's dictionary to decompress at all"""
+    if frame_content_size(head) != os.fstat(f.fileno()).st_size:
+        return False
+    import zstandard
+    f.seek(0)
+    try:
+        return not any(zstandard.ZstdDecompressor().stream_reader(f, read_size=1 << 14).read(16))
+    except zstandard.ZstdError:
+        return True
+
+
 def damaged_game_files(romfs, progress=None):
     """The romfs .zs files that do not start as zstd: in the 23.3 GB dumps three of them begin with zeros (the complete
     dump is about 23.8 GB), and the game then leaves out every model that uses one: the Water Temple's walls and floors,
@@ -707,48 +786,70 @@ def damaged_game_files(romfs, progress=None):
     found = []
     for i, (path, given) in enumerate(paths):
         with open(path, "rb") as f:
-            if not zstd_start(f.read(4)):
+            head = f.read(18)
+            if not zstd_start(head[:4]) or still_in_nup_frame(f, head):   # ((Triforce, 11-24) or still in the .nup's frame
                 found.append(given)
         if progress:
             progress(i + 1, len(paths))
     return found
 
 
-def stand_in_for(path, damaged=()):
+def folder_listing(folder):
+    """(name, size) of each file in folder, in the listing's order: one listing, whose entries carry the sizes on Windows"""
+    with os.scandir(long_path(folder)) as entries:
+        return [(entry.name, entry.stat().st_size) for entry in entries if entry.is_file()]
+
+
+def stand_in_for(path, damaged=(), listings=None):
     """A whole file of the same kind beside a damaged one, to load in its place: the same last part of the name
     (_Nrm.bntx.zs: a normal map for a normal map), the longest common start of the name, then the nearest size. Never
-    one of the damaged files, even one already given a stand-in"""
+    one of the damaged files, even one already given a stand-in. ((Triforce, 11-24, after Source A's) The files of its kind
+    are ranked by name and size first, then opened in that order until a whole one: one or two opens, not one for each file
+    of its kind (PreComputedCulling/RuntimeId holds about 35,000 .bcul.zs, each opened for each damaged file). listings:
+    folder -> folder_listing, kept across one pass's calls so that a folder is listed once)"""
     folder, name = os.path.split(path)
     suffix = re.search(r"(_[A-Za-z]+\d*)?(\.[^_]*)$", name).group(0)
     size = os.path.getsize(long_path(path))
-    best = None
-    for other in os.listdir(long_path(folder)):
-        if other == name or not other.endswith(suffix):
-            continue
+    listing = None if listings is None else listings.get(folder)
+    if listing is None:
+        listing = folder_listing(folder)
+        if listings is not None:
+            listings[folder] = listing
+    # (ties go to the first in the listing, as when each was opened in turn)
+    ranked = sorted((-len(os.path.commonprefix((name, other))), abs(other_size - size), i, other)
+                    for i, (other, other_size) in enumerate(listing)
+                    if other != name and other.endswith(suffix) and os.path.join(folder, other) not in damaged)
+    for *_, other in ranked:
         candidate = os.path.join(folder, other)
-        if candidate in damaged:
-            continue
         with open(long_path(candidate), "rb") as f:
-            if not zstd_start(f.read(4)):
-                continue
-        score = (len(os.path.commonprefix((name, other))), -abs(os.path.getsize(long_path(candidate)) - size))
-        if best is None or score > best[0]:
-            best = (score, candidate)
-    return best and best[1]
+            if zstd_start(f.read(4)):
+                return candidate
+    return None
+
+
+# ((Triforce, 11-24, after Source A's) An incomplete dump has a few damaged files (three textures in the 23.3 GB dumps). Past
+# this many the dump is damaged throughout: no stand-in is looked for, and the build stops at once (one with 1,896 sat
+# overnight looking first)
+MOST_STAND_INS = 100
 
 
 def stand_in_damaged(romfs, progress=None, known=None):
     """Each damaged .zs file in an unpacked romfs replaced by a copy of its stand-in: (damaged, stand-in or None) each.
     Only for a romfs this tool unpacked: the player's own folder is never written to. progress: damaged_game_files'.
     known: the damaged files as the unpack itself found them (extract's zs, paths under romfs with "/"): they are taken
-    as they are and no file is opened to look for them"""
+    as they are and no file is opened to look for them. More than MOST_STAND_INS damaged: none is given a stand-in (each is
+    None) and nothing is written"""
     done = []
     if known is None:
         damaged = damaged_game_files(romfs, progress)
     else:
         damaged = [os.path.normpath(os.path.join(romfs, *rel.split("/"))) for rel in known]
+    if len(damaged) > MOST_STAND_INS:
+        return [(path, None) for path in damaged]
+    excluded = set(damaged)
+    listings = {}
     for path in damaged:
-        other = stand_in_for(path, set(damaged))
+        other = stand_in_for(path, excluded, listings)
         if other:
             shutil.copyfile(long_path(other), long_path(path + ".part"))
             os.replace(long_path(path + ".part"), long_path(path))

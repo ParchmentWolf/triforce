@@ -806,7 +806,7 @@ def source_checks():
                  "fg.src_w = sw, fg.src_h = sh, fg.source = source;"):
         need(record, what, "framegen_record")
     # ((Triforce) the renderer's own vectors are make_vectors')
-    if not record.index("fsr4_frame(") < record.index("fsr3fi_frame(") < record.index("make_vectors(cmd", record.index("fsr4_frame(")):
+    if not record.index("fsr4_frame(") < record.rindex("fsr3fi_frames(") < record.index("make_vectors(cmd", record.index("fsr4_frame(")):
         raise SystemExit("framegen_record: AMD FSR 4 is not asked before the renderer's own interpolation")
     frame = function(framegen, "framegen_rows::Made fsr4_frame(")
     for what in ("if (!fsr4fg::frames_wanted()) {", "framegen_rows::why_name(", "fsr3_inputs::take(f)", "in.reset = f.reset || !blend;",

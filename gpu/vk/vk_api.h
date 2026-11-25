@@ -16,8 +16,13 @@ extern "C" {
 #endif
 
 /* ((Triforce, 11-22) 16: MkwVkRenderer's screen_point, N64 Classic's TV's curve for the game's own menus' mouse. 11-23: 19, as
-   ultrawide's screens and wide_backdrop (16, 17, 18 on its own line) came first on next/update) */
-#define MKWVK_API_VERSION 19
+   ultrawide's screens and wide_backdrop (16, 17, 18 on its own line) came first on next/update. 11-24: 20 to 23, batches of
+   the same day: MkwVkHost's playback devices (audio_output_*) and the microphone's test (mic_test); MkwVkRenderer's control
+   bridge functions, frame_info to setting_set; MkwVkHost's prompts_live, reset_binding, rebind_control and binding_is_default
+   at its end (the live button prompts, the Controls page's per-control reset and confirmed rebinds); MkwVkRenderer's
+   jitter_sample, the camera jitter's one whole sample; MkwVkRenderer's nvn_program_created at its end, the load of a
+   program at its create call (RX_VK_LOAD=create). 25: all of them together */
+#define MKWVK_API_VERSION 25
 enum { HOS_OPT_CHEAT_HEARTS = 32, HOS_OPT_CHEAT_FLIGHT, HOS_OPT_CHEAT_ACTION, HOS_OPT_CHEAT_CAMERA };
 /* (hookshot) the Motion page's rows (host/pad_sdl.c reads them, vk_replay.cpp's option answers them): Motion controls on
    or off, the horizontal's and the vertical's sensitivity in percent, each turned around, and the deadzone (0 to 2) */
@@ -94,14 +99,52 @@ enum { HOS_PAD_SOUTH, HOS_PAD_EAST, HOS_PAD_WEST, HOS_PAD_NORTH, HOS_PAD_BACK, H
    the overlay's lists move by the stick as by the D-pad. Past HOS_PAD_N, so no binding takes them */
 enum { HOS_PAD_LS_UP = 20, HOS_PAD_LS_DOWN, HOS_PAD_LS_LEFT, HOS_PAD_LS_RIGHT,
        HOS_PAD_RS_UP, HOS_PAD_RS_DOWN };   /* (and the right stick up or down: the Mods screen's description scrolls by it) */
+/* ((Triforce) 11-24) the rear paddles (a Steam Controller's, an Xbox Elite's, a DualSense Edge's: SDL's paddle buttons, R4
+   L4 R5 L5), inputs a binding can take: past the sticks' menu bits, 20 to 25, as HOS_PAD_N stays the inputs with an icon of
+   their own (host/prompts.c: a paddle shows its Switch button's default icon). hos_pad_bindable: an input a binding takes;
+   HOS_PAD_BIND_MASK their bits */
+enum { HOS_PAD_RPADDLE1 = 26, HOS_PAD_LPADDLE1, HOS_PAD_RPADDLE2, HOS_PAD_LPADDLE2 };
+#define hos_pad_bindable(hos_pad_input_) (((hos_pad_input_) >= 0 && (hos_pad_input_) < HOS_PAD_N) || ((hos_pad_input_) >= HOS_PAD_RPADDLE1 && (hos_pad_input_) <= HOS_PAD_LPADDLE2))
+enum { HOS_PAD_BIND_MASK = ((1 << HOS_PAD_N) - 1) | (15 << HOS_PAD_RPADDLE1) };
+/* a DualShock 4's or DualSense's touchpad click, which opens the Insert menu as F1 does with the Menu shortcut row's touchpad
+   choices (host/pad_sdl.c, gpu/vk/vk_menu.cpp): a menu bit of its own past HOS_PAD_N and the sticks' bits, so no binding
+   takes it */
+enum { HOS_PAD_TOUCHPAD = 30 };
 enum { HOS_BIND_PAD, HOS_BIND_KEY };
+/* ((Triforce) 11-24) The Audio tab's Output device row (host/audio_output_devices.h): an endpoint id's and a device name's room,
+   with their ends, and what the sound's thread has open (MkwVkHost audio_output_state): HOS_OUTPUT_FALLBACK the default
+   stands in for the device chosen (not there now, or it took no sound), HOS_OUTPUT_OVERRIDE HOS_AUDIO_DEVICE chose it for
+   this run, HOS_OUTPUT_UNAVAILABLE none could be opened */
+#define HOS_OUTPUT_ID_CAP 200
+#define HOS_OUTPUT_NAME_CAP 256
+enum { HOS_OUTPUT_FALLBACK = 1, HOS_OUTPUT_OVERRIDE = 2, HOS_OUTPUT_UNAVAILABLE = 4 };
+/* ((Triforce) 11-24) The Test microphone row's state (MkwVkHost mic_test): testing, the microphone open, the default standing
+   in for the chosen one, samples within the last 250 ms, clipped within the last second, the Microphone row Off */
+enum { HOS_MIC_TEST_ON = 1, HOS_MIC_TEST_OPEN = 2, HOS_MIC_TEST_STANDIN = 4, HOS_MIC_TEST_FRESH = 8, HOS_MIC_TEST_CLIP = 16,
+       HOS_MIC_TEST_OFF = 32 };
 /* (hookshot) the controller faces of the button prompts (host/prompts.c): the Switch, then nx2/prompt_faces.py FACES' order;
    the Button prompts row's value is one more (0 Auto). (Triforce) HOS_PROMPT_KEYBOARD: the keyboard and mouse, no
    controller's: each button's icon is the key or the mouse button bound to it (nx2/prompt_keys.py) */
 enum { HOS_PROMPT_SWITCH, HOS_PROMPT_XBOX, HOS_PROMPT_PS4, HOS_PROMPT_PS5, HOS_PROMPT_STEAMDECK, HOS_PROMPT_KEYBOARD, HOS_PROMPT_N };
-/* keys only (HOS_BIND_KEY), after the Switch's buttons: the left stick's and the camera's directions */
+/* ((Triforce) 23) what of the button prompts follows a new face or new controls at once (MkwVkHost.prompts_live, a bit
+   each): the textures (the ocarina's notes, the Talk ring's letters, the System page's controller), the layouts (the Talk
+   ring's places, the ocarina hint's spacing), the icons in texts; the rest at the next start. HOS_OPT_PROMPTS: the Button
+   prompts row as it is now (host/prompts.c live_face: 0 Auto, else HOS_PROMPT_* + 1) */
+enum { HOS_PROMPTS_LIVE_TEXTURES = 1, HOS_PROMPTS_LIVE_LAYOUTS = 2, HOS_PROMPTS_LIVE_TEXTS = 4, HOS_PROMPTS_LIVE_ALL = 7 };
+enum { HOS_OPT_PROMPTS = 326 };
+/* keys only (HOS_BIND_KEY), after the Switch's buttons: the left stick's and the camera's directions; then
+   ((Triforce) 11-24) the ocarina's five note controls, which take a gamepad input too (HOS_BIND_PAD, slot 0) and
+   share their inputs: a note's key or gamepad input can be some other control's at once (host/nn_hid.c oc_notes).
+   No new function and no change to an old one's arguments, so MKWVK_API_VERSION stays: a host without the rows
+   answers -1 and 0 for them */
 enum { HOS_KEY_MOVE_UP = HOS_SW_N, HOS_KEY_MOVE_DOWN, HOS_KEY_MOVE_LEFT, HOS_KEY_MOVE_RIGHT, HOS_KEY_CAM_UP,
-       HOS_KEY_CAM_DOWN, HOS_KEY_CAM_LEFT, HOS_KEY_CAM_RIGHT, HOS_KEY_N };
+       HOS_KEY_CAM_DOWN, HOS_KEY_CAM_LEFT, HOS_KEY_CAM_RIGHT, HOS_KEY_OC_NOTE_L, HOS_KEY_OC_NOTE_R,
+       HOS_KEY_OC_NOTE_A, HOS_KEY_OC_NOTE_Y, HOS_KEY_OC_NOTE_X,
+       HOS_KEY_TOGGLE_HUD,
+       HOS_KEY_N };
+/* ((Triforce) HOS_KEY_TOGGLE_HUD, the Controls page's Toggle HUD row: hides or shows the HUD in play at a press
+   (host/hos_wide_ui.c hos_gameplay_hud_toggle), unbound out of the box; a gamepad input and two keys, which are its alone
+   while it has them (host/nn_hid.c hud_shortcut) */
 /* (Triforce) more of the Controls tab's rows, after NX2navi's (host/pad_sdl.c and host/nn_hid.c read them, vk_replay.cpp's
    option answers them; 50 to 59 are theirs). HOS_OPT_RUMBLE_CURVE: the Vibration curve, the power on the motors' rumble
    in hundredths, 20 to 150, 100 none. HOS_OPT_RUMBLE_TRIGGERS: Trigger vibration, 1 the rumble in an Xbox pad's triggers
@@ -111,6 +154,29 @@ enum { HOS_KEY_MOVE_UP = HOS_SW_N, HOS_KEY_MOVE_DOWN, HOS_KEY_MOVE_LEFT, HOS_KEY
    movement keys push the left stick while it is held, in hundredths, 20 to 90 */
 enum { HOS_OPT_RUMBLE_CURVE = 50, HOS_OPT_RUMBLE_TRIGGERS, HOS_OPT_LSTICK_ZONE, HOS_OPT_RSTICK_ZONE, HOS_OPT_WALK_KEY,
        HOS_OPT_WALK_SCALE };
+/* ((Triforce) 11-24, the controller batch) the Controls tab's Vibration (host/vibration.h, host/pad_sdl.c reads them by
+   number each poll; the existing option callback: no new member). HOS_OPT_VIBRATION: 0 Auto (the best each controller can
+   do: with RenHDrum beside the game a DualSense's voice coils, an Xbox pad's four motors, a Switch pad's HD rumble made by
+   RenHDrum; without it a Switch pad's own HD rumble, every other pad's motors, as before), 1 Basic (every pad's motors), 2
+   Off. HOS_OPT_DS_HD_HAPTICS: 1 (the default) a DualSense that RenHDrum plays taps its speaker and kicks back its held
+   L2/R2 from the game's vibration too; 0 its voice coils only. HOS_OPT_VIBRATION_STATUS: what plays the controller used
+   last, written back by the host each poll (host/vibration.h: its kind times 16, plus VIB_SAY_*); the Vibration row's help
+   line reads it */
+enum { HOS_OPT_VIBRATION = 320 };
+enum { HOS_OPT_DS_HD_HAPTICS = 321 };
+enum { HOS_OPT_VIBRATION_STATUS = 322 };
+/* ((Triforce) 11-24, the controller batch) the Audio tab's Controller speaker rows (host/pad_speaker.c reads them once a
+   second by number; the existing option callback: no new member), three numbers for its sixteen rows.
+   HOS_OPT_PAD_SPEAKER_CLASSES: where each kind of sound plays, two bits each, host/audio_source.h's classes from Navi's voice
+   (bits 0-1) on: 0 Off (the game's output alone, the default for all), 1 the controller only, 2 the controller and the TV.
+   HOS_OPT_PAD_SPEAKER_LEVELS: the speaker's volume in percent (0 to 200, bits 0-7), the Controller sync plus 100 (-100 to
+   150 ms, bits 8-15: above 0 the pad waits, below 0 the TV's copy of the Controller + TV sounds does) and the headphones'
+   volume in percent (0 to 100, bits 16-23). HOS_OPT_PAD_SPEAKER_HEADPHONES: Headphones on the controller, 0 Off (the
+   default), 1 the controller's sounds there, 2 all sound there (the TV silent) */
+enum { HOS_OPT_PAD_SPEAKER_CLASSES = 323 };
+enum { HOS_OPT_PAD_SPEAKER_LEVELS = 324, HOS_PAD_SPEAKER_LEVELS_DEFAULT = 100 | (100 << 8) | (80 << 16) };
+enum { HOS_OPT_PAD_SPEAKER_HEADPHONES = 325 };
+enum { HOS_PAD_SPEAKER_CLASS_ROWS = 12 };
 /* (Triforce) The System tab's rows for the cheats of the mods' cheat files (host/mod_cheats.c runs them, gpu/vk/vk_menu.cpp
    and gpu/vk/mod_cheat_rows.h show them; 130 to 134 are theirs, 134 not used). At the first frame the host names its
    cheats, in the rows' order: HOS_OPT_MODCHEAT_TEXT, option_set: the next byte of a cheat's name, UTF-8, then a line feed
@@ -199,7 +265,78 @@ enum { HOS_OPT_HELPERS_FORCE = 170 };
    this start follows a choice (the game restarted for it). HOS_OPT_FILES_SAID, option_set: what became of the file asked
    for: 1 it is the next start's (the menu restarts the game), 2 it could not be kept (nothing changes) */
 enum { HOS_OPT_FILES_TEXT = 180, HOS_OPT_FILES_ADD, HOS_OPT_FILES_COUNT, HOS_OPT_FILES_ASK, HOS_OPT_FILES_SAID };
+/* ((Triforce) 11-24: input rows of the Controls tab, 190 to 199 theirs. HOS_OPT_MOUSE_INVERT_X, option: its Invert mouse
+   horizontal row, 1 on: the mouse's left and right swapped, as option 8, Invert mouse vertical, swaps its up and down.
+   host/mouse_native.c (the camera's yaw) and host/nn_hid.c (the mouse as the right stick) read it. The existing option
+   callback: no new member) */
+enum { HOS_OPT_MOUSE_INVERT_X = 190 };
+/* (HOS_OPT_HOLD_TOGGLE, option: the Controls tab's Hold to toggle rows as a mask, 1 << HOS_SW_* for each of the Switch's
+   buttons A to ZR whose row is on, 0 by default: a press of such a button holds it and the next lets it go (host/nn_hid.c
+   npad_states, host/hold_toggle.h). The rows are saved one by one, toggle_<button>; the existing option callback) */
+enum { HOS_OPT_HOLD_TOGGLE = 191 };
 enum { HOS_FILE_SAVED = 1, HOS_FILE_CURRENT = 2, HOS_FILES_CHOSEN = 256 };
+/* ((Triforce) 11-24: the Graphics and Display tabs' feature rows, 240 to 279 theirs. HOS_OPT_SHADOW_RES, option: the
+   Graphics tab's Shadow resolution row, the size the sun's shadow cascades are drawn at: 0 the game's own (1600), 1 2200,
+   2 3072 (host/oot_shadow.c, read each frame; host/oot_shadow_fit.c keeps the nearest cascade steady at 3072) */
+enum { HOS_OPT_SHADOW_RES = 240 };
+/* (HOS_OPT_FULLSCREEN_SCREEN, option: the Display tab's Fullscreen screen, 0 the screen the window is on (the default), n the
+   n-th of MkwVkHost.screens' list (host/display.c, Windows; read at each switch to fullscreen) */
+enum { HOS_OPT_FULLSCREEN_SCREEN = 241 };
+/* ((Triforce) 11-24: the menu, display and HUD rows of the third batch, 340 to 379 theirs. HOS_OPT_HUD_POSITION, option: the
+   Display tab's HUD position row as it is now (0 Middle, 1 Screen edges), host/hos_wide_ui.c reads it at each present: the
+   HUD's layouts planned for a wider screen, live. HOS_OPT_MENU_SIDES: its Menu sides row (0 Full width, 1 Centred, blurred
+   sides, 2 Centred, black bars, HOS_MENU_SIDES_EXTENDED the menus at their 16:9 size with their side panes at the screen's
+   edges, planned by host/hos_wide_ui.c too). HOS_HUD_DEFAULT_PLACEMENT: a HUD group's placement left as the game makes it
+   (x and y biased by 16 in percent of the picture, the scale in percent above them) */
+enum { HOS_OPT_HUD_POSITION = 340 };
+enum { HOS_OPT_MENU_SIDES = 341 };
+enum { HOS_MENU_SIDES_EXTENDED = 3 };
+/* (HOS_OPT_FPS_CAP_ROW, option: the Graphics tab's Frame rate cap row as it is now, frame_rate_cap='s values; host/nn_vi.c
+   reads it once a present and takes a change in play, HOS_FPS_MAX over it) */
+enum { HOS_OPT_FPS_CAP_ROW = 342 };
+/* (HOS_OPT_HUD_PLACEMENT, option: the Display tab's HUD placement row, 0 the game's, 1 Custom; HOS_OPT_HUD_HEALTH,
+   HOS_OPT_HUD_BUTTONS, HOS_OPT_HUD_MINIMAP: Custom's three groups, each packed as HOS_HUD_DEFAULT_PLACEMENT is (the hearts and
+   magic; the action and item buttons; the minimap). host/hos_wide_ui.c reads them at each present) */
+enum { HOS_OPT_HUD_PLACEMENT = 343, HOS_OPT_HUD_HEALTH, HOS_OPT_HUD_BUTTONS, HOS_OPT_HUD_MINIMAP };
+enum { HOS_HUD_DEFAULT_PLACEMENT = 16 | (16 << 6) | (100 << 12) };
+/* ((Triforce) 380 to 389: Threaded rendering's. HOS_OPT_RENDER_THREAD, option: 1 when the replay runs on a thread of its own
+   this run (gpu/vk/vk_replay.cpp async_on: RX_VK_ASYNC when set, else the Debug tab's Threaded rendering row or RX_VK_THREADED,
+   gpu/vk/threaded_rendering.h), resolved once; 0 otherwise, as by default. host/rx_backend.c rx_async_replay asks it once the
+   renderer runs. The existing option callback: no new member) */
+enum { HOS_OPT_RENDER_THREAD = 380 };
+/* ((Triforce) 410 to 419: the simulated turf's. The host says the area Link is in for the Graphics tab's Simulated turf page
+   (gpu/vk/sim_turf_settings.h: each area's own turf values), through option_set: HOS_OPT_SIM_TURF_AREA_TEXT the map's name
+   (Sequence_CurrentBanc), a byte a call, then HOS_OPT_SIM_TURF_AREA 1 (the name is whole) or 0 (no map: no save loaded).
+   host/hos_main.c oot_inventory_refresh says it when it changes */
+enum { HOS_OPT_SIM_TURF_AREA_TEXT = 410, HOS_OPT_SIM_TURF_AREA };
+/* ((Triforce, 11-25) Evil HD's render distance: HOS_OPT_EVIL_HD, option: 1 while Evil HD is on (evil_hd_now: the row, F2,
+   RX_VK_EVIL_FLIP), read each frame by host/evil_hd.c; HOS_EVIL_HD over it. 420: 410 and 411 are the Simulated turf's */
+enum { HOS_OPT_EVIL_HD = 420 };
+/* (Triforce) More rows of how the game plays (gpu/vk/vk_menu.cpp; 200 to 239 are theirs), each an option: what the row is
+   set to, the game's own at its default. HOS_OPT_FOV: the System tab's Field of view row, percent of the game's own vertical
+   angle in play, 50 to 150, 100 the game's own (host/oot_fov.c). HOS_OPT_TEXT_SIZE: its Text size row, 0 the game's own
+   size, 1 to 4 for 110%, 125%, 150% and 175% (host/oot_text_size.c). HOS_OPT_CAMERA_CENTERING: the Controls tab's Camera
+   centering row, 1 the game's own (the camera turns by itself the way Link moves), 0 it does not (host/mouse_native.c
+   hos_disable_camera_centering). HOS_OPT_DAMAGE_TAKEN: the System tab's Damage taken row, 0 Half, 1 Normal (the game's
+   own), 2 Double, 3 Quadruple (host/oot_damage.c). HOS_OPT_SKIP_OPENING: its Skip opening row, 1 a new game starts without
+   the story movie and Navi waking Link (host/oot_opening.c). HOS_OPT_SKIP_TITLE: its Skip title screen row, 1 the game's
+   start is pressed through to the newest save (host/oot_autoload.c: read once, at the title). HOS_OPT_AUTOSAVE: its Autosave
+   row, 1 the game's own, 0 the autosaves of going from one area to another are skipped (host/oot_autosave.c).
+   HOS_OPT_CHEAT_SPEED: the Debug tab's Movement speed tool, percent of Link's own speed, 100 to 300; 100 while the Debug
+   tools are off (host/hos_main.c hos_oot_cct_speed). HOS_OPT_AUDIO_OUTPUT: the Audio tab's Audio output row as it is now,
+   0 Auto, 1 Stereo, 2 5.1, 3 Mono: the layout is read from the file at the start (host/nn_audio.c au_menu_output), only
+   Mono is asked for here, at each block mixed (audio_mono). HOS_OPT_MUTE_BACKGROUND: its Mute in background row, 1 no
+   sound while another window has the focus (host/nn_audio.c master_volume). HOS_OPT_MIC_GAIN: its Microphone gain row,
+   percent of what the microphone gives, 25 to 400, 100 its own (host/nn_audio_in.c pump, host/mic_gain.h) */
+enum { HOS_OPT_FOV = 200, HOS_OPT_TEXT_SIZE, HOS_OPT_CAMERA_CENTERING, HOS_OPT_DAMAGE_TAKEN, HOS_OPT_SKIP_OPENING,
+       HOS_OPT_SKIP_TITLE, HOS_OPT_AUTOSAVE, HOS_OPT_CHEAT_SPEED, HOS_OPT_AUDIO_OUTPUT, HOS_OPT_MUTE_BACKGROUND,
+       HOS_OPT_MIC_GAIN };
+/* ((Triforce) 11-24) A bug capture's settings changed from the defaults (host/bug_capture.c, capture.txt; 286 to 289 the bug
+   capture's). HOS_OPT_BUG_SETTINGS, option_set 1: the menu writes down its rows that are not at their defaults, as it shows
+   them, "Name: value (default: value)" a line each, or one line that says none is; option: the next byte of that text,
+   UTF-8, 0 at its end (and a renderer without the text: the capture says the changes are not known). No new function, so
+   MKWVK_API_VERSION stays */
+enum { HOS_OPT_BUG_SETTINGS = 286 };
 
 /* (hookshot) the mouse over the window while it is free (not captured): the Insert menu's (host/display.c,
    host/posix/display_sdl.c). x and y: the cursor in the window's pixels, of a window width x height pixels (the
@@ -236,6 +373,14 @@ typedef struct MkwVkScreen {
     int32_t opens;
     char name[64];
 } MkwVkScreen;
+
+/* ((Triforce) one of the Options screen's settings, for the control bridge (MkwVkRenderer setting, host/control.c): key is its
+   line in triforce_options.ini, name the row's, text how the menu shows the value) */
+typedef struct MkwVkSetting {
+    char key[32], name[48], text[64], tab[16];
+    int value, lo, hi, step;
+    int restart, fixed;   /* the change applies at the next start; nothing to choose on this PC (the menu shows it greyed) */
+} MkwVkSetting;
 
 typedef struct MkwVkHost {
     uint32_t version;   /* MKWVK_API_VERSION */
@@ -283,7 +428,8 @@ typedef struct MkwVkHost {
     /* (hookshot) the controls, for the Insert menu's Controls page. button: the Switch's, HOS_SW_*; set HOS_BIND_PAD:
        the gamepad input that presses it (a HOS_PAD_* position, -1 none; slot 0 only); set HOS_BIND_KEY: the keys that
        do (Windows key codes, 0 none; slots 0 and 1; a mouse button's too, and HOS_KEY_* past the Switch's buttons).
-       bind with button -1: all back to their defaults */
+       bind with button -1: all back to their defaults. ((Triforce) 11-24: HOS_BIND_PAD takes the ocarina's note rows
+       too, HOS_KEY_OC_NOTE_*, which start unset and take no mouse button) */
     int (*binding)(int set, int button, int slot);
     void (*bind)(int set, int button, int slot, int code);
     /// Display aspect of the presented picture, after crop: the camera aspect applied at startup.
@@ -329,7 +475,36 @@ typedef struct MkwVkHost {
        itself). The blur of the last picture that the renderer sees drawn is then that backdrop, to be given sides, and not
        the item wheel's background, which keeps the whole picture (gpu/vk/wide_sides_rule.h) */
     int (*wide_backdrop)(void);
+    /* ((Triforce) 20) the playback devices, for the Audio tab's Output device row (host/audio_output_devices.c): listed again,
+       how many; one's endpoint id and name (UTF-8), 1 when there is one at index; the row's choice by its id ("" the
+       default), which the sound's thread opens at its next block; what it has open, HOS_OUTPUT_* bits */
+    int (*audio_output_count)(void);
+    int (*audio_output_info)(int index, char *id, int id_capacity, char *name, int name_capacity);
+    void (*audio_output_select)(const char *id);
+    int (*audio_output_state)(void);
+    /* ((Triforce) 20) the Audio tab's Test microphone row (host/nn_audio_in.c hos_mic_test), once a menu tick while it may run:
+       enabled 1 reads the Microphone row's microphone through the Microphone gain row (nothing played, nothing written), 0
+       lets it go. levels[0], levels[1]: the loudest sample before and after the gain over the last 150 ms, thousandths of
+       full scale. The answer: HOS_MIC_TEST_* bits */
+    int (*mic_test)(int enabled, int *levels);
+    /* ((Triforce) 23) what of the button prompts a change of face or controls reaches at once (host/prompts.c
+       hos_prompts_live_parts): HOS_PROMPTS_LIVE_* bits; 0 none (a mod's files, a font built before, the keys' face, or not
+       loaded yet): the Button prompts row asks for a restart then */
+    int (*prompts_live)(void);
+    /* ((Triforce) 23) the Controls page's per-control reset and its confirmed rebinds (host/nn_hid.c): a control's (HOS_SW_* or
+       HOS_KEY_*) default bindings back, 0 (nothing changed) when another control has one of them; hos_bind's change made only
+       when the controls it takes the input from (a bit each: conflicts) are those approved, 0 and nothing changed otherwise;
+       whether a control's bindings are its defaults */
+    int (*reset_binding)(int button);
+    int (*rebind_control)(int set, int button, int slot, int code, uint64_t approved, uint64_t *conflicts);
+    int (*binding_is_default)(int button);
 } MkwVkHost;
+
+/* ((Triforce, version 22) one completed temporal upscale's camera jitter sample: the scene's width and height and the jitter
+   sequence's length, together; all zero while no upscaler jitters (host/rx_backend.c hos_dlss_jitter_clip) */
+typedef struct MkwVkJitter {
+    uint32_t width, height, phases;
+} MkwVkJitter;
 
 /* what the back end gives the executable: the rx_* functions (gpu/render/rx_nvn.h, rx_core) */
 typedef struct MkwVkRenderer {
@@ -366,7 +541,7 @@ typedef struct MkwVkRenderer {
     void (*nvn_texture_created)(const nvn_tex *t);
     /* the CPU set an event's value: in order with the submits (the GPU's waits on it) */
     void (*nvn_event_signal)(uint64_t gpu, uint32_t value);
-    int (*option)(int id);   /* (hookshot, the Insert menu) 0: game time follows the clock, 1: the menu is open, 2: dynamic resolution, 3: its fixed scale in percent, 4: the controllers count behind other windows, 5: text speed (0 normal to 3 instant), 6: native mouse look (host/mouse_native.c),
+    int (*option)(int id);   /* (hookshot, the Insert menu) 0: game time follows the clock, 1: the menu is open, 2: dynamic resolution, 3: its fixed scale in percent, 4: the controllers count behind other windows, 5: text speed (0 normal to 3 instant), 6: Mouse camera (1 native mouse look, host/mouse_native.c; (Triforce) 2 off: the mouse is never captured, host/display.c),
                                 7: the mouse's sensitivity in percent, 8: its up and down swapped (host/nn_hid.c),
                                 18 to 23: the Motion page (HOS_OPT_GYRO*: motion controls from a pad's gyroscope, host/pad_sdl.c;
                                 the horizontal and vertical sensitivity in percent, each turned around, the deadzone) */
@@ -383,6 +558,27 @@ typedef struct MkwVkRenderer {
        N64 Classic's TV showed there at the last present, through its screen's curve: where the game's own menus drew what the
        cursor is over (host/oot_menu.c). As it is when the TV did not draw (gpu/vk/vk_n64.h n64_screen_point) */
     void (*screen_point)(int *x, int *y, int w, int h);
+    /* ((Triforce, version 20) the control bridge (host/control.c, HOS_CONTROL; nothing calls these without it): the presents
+       replayed so far, the draws recorded since the start, and the picture's size (the window's swapchain) */
+    void (*frame_info)(int64_t *presents, int64_t *draws, int *width, int *height);
+    /* a PNG of the first present replayed after present `after` (-1: the next one), RX_VK_SHOTS' size, written to path on a
+       thread of its own, which then calls done(ctx, the present, 1 when the file was written). 0: not taken (too many
+       waiting) */
+    int (*shot)(const char *path, int64_t after, void (*done)(void *ctx, int64_t present, int ok), void *ctx);
+    /* the Options screen's settings rows (shown on this PC; not the headings or the debug tools): the index-th, to list them
+       (0: past the last; an index is no name, rows come and go), and the one whose triforce_options.ini key is key set to
+       value as the menu's Left and Right set it, kept in the options file, out the row after it (1 set, 0 no such row, -1
+       nothing to choose on this PC, -2 none of a list row's steps reaches value here: left as it was) */
+    int (*setting)(int index, MkwVkSetting *out);
+    int (*setting_set)(const char *key, int value, MkwVkSetting *out);
+    /* ((Triforce, version 22) the camera jitter's sample (MkwVkJitter), whole: HOS_OPT_DLSS_JITTER_W, _H and _PHASES asked one
+       at a time were three answers a resize or a scale change could fall between. Kept the last of the struct */
+    void (*jitter_sample)(MkwVkJitter *out);
+    /* ((Triforce, version 20) the game gave a program its shaders (nvnProgramSetShaders, nvnProgramInitializeFromBuilder), on the
+       game's thread, before any draw uses it: what the back end kept ready for it can be loaded now (gpu/vk/vk_programs.cpp,
+       RX_VK_LOAD=create; without it, only RX_VK_LOG_PROGRAM_LIFE's log). Its stages' code and control sections are in the
+       game's memory at this call */
+    void (*nvn_program_created)(const nvn_prog *p);
 } MkwVkRenderer;
 
 /* (Triforce VR) what the game's side asks of VR (gpu/vk/vk_xr.h has what each does). Every function answers "no" (0) while

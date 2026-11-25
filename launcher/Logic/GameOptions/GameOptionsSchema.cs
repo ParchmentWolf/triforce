@@ -17,7 +17,11 @@ public static class GameOptionsSchema
 {
     /// <summary>The file the game reads at its start and writes at every change in its menu, in the game folder.</summary>
     public const string FileName = "triforce_options.ini";
-    /// <summary>The options_version the game writes (vk_menu.cpp save): the file's format, which menu_init's rules read.</summary>
+    /// <summary>The options_version the launcher brings a file up to: the format menu_init's rules read, and
+    /// output_sizes.h's OUTPUT_OPTIONS_VERSION. The game itself writes 10 since 11-24 (vk_menu.cpp save): 10 changed the
+    /// keys alone (Plus is Tab, no longer Enter too: host/nn_hid.c binds_load moves a file's old default pair, and only
+    /// while the file's version is below 10). The launcher has no key rows and no rule for 10, so it stops at 9: a file it
+    /// brings up to date still has the game's own key migration ahead of it, and a 10 is left as it is.</summary>
     public const int CurrentVersion = 9;
 
     public const string OutputResKey = "output_res";
@@ -108,6 +112,18 @@ public static class GameOptionsSchema
         "Blowout" => "renodx_blowout", "Flare" => "renodx_flare", "Hue correction" => "renodx_hue_correction",
         "Color grading" => "renodx_color_grading", "Highlights" => "renodx_highlights", "Shadows" => "renodx_shadows",
         "Contrast" => "renodx_contrast", "Saturation" => "renodx_saturation", "Bloom" => "renodx_bloom",
+        // ((Triforce) 11-24/25: HUD placement's Custom rows, Auto (this PC), the Controller speaker rows: ini_key's table)
+        "Hearts and magic across" => "hud_health_x", "Hearts and magic up" => "hud_health_y", "Hearts and magic size" => "hud_health_scale",
+        "Buttons across" => "hud_buttons_x", "Buttons up" => "hud_buttons_y", "Buttons size" => "hud_buttons_scale",
+        "Minimap across" => "hud_minimap_x", "Minimap up" => "hud_minimap_y", "Minimap size" => "hud_minimap_scale",
+        "Auto (this PC)" => "auto_pc",
+        "Speaker volume" => "pad_speaker_volume", "Controller sync" => "pad_speaker_sync",
+        "Headphones on the controller" => "pad_speaker_headphones", "Headphone volume" => "pad_speaker_headphone_volume",
+        "Navi's voice" => "pad_speaker_navi_voice", "Navi's flight sounds" => "pad_speaker_navi_sound",
+        "Z-targeting" => "pad_speaker_target", "Ocarina" => "pad_speaker_ocarina", "Pick-ups" => "pad_speaker_pickup",
+        "Items" => "pad_speaker_item", "Fairies" => "pad_speaker_fairy", "Interface sounds" => "pad_speaker_ui",
+        "Stone of Agony" => "pad_speaker_agony", "Low health alarm" => "pad_speaker_low_health",
+        "Fishing" => "pad_speaker_fishing", "Bottles" => "pad_speaker_bottle",
         _ => Cut(new string(name.Select(c => c == ' ' ? '_' : c is >= 'A' and <= 'Z' ? (char)(c + 32) : c).ToArray()), 31),
     };
     static string Cut(string s, int n) => s.Length > n ? s[..n] : s;
@@ -120,7 +136,8 @@ public static class GameOptionsSchema
     static string Pct(int v) => v.ToString(CultureInfo.InvariantCulture) + "%";
 
     static string TxOnoff(int v, IGameOptionValues? o) => v != 0 ? "On" : "Off";
-    static string TxMenuShortcut(int v, IGameOptionValues? o) => v != 0 ? "F1 only" : "Insert or F1";
+    static string TxVibration(int v, IGameOptionValues? o) => v == 2 ? "Off" : v == 1 ? "Basic" : "Auto";   // ((Triforce) 11-24)
+    static string TxMenuShortcut(int v, IGameOptionValues? o) => v == 4 ? "Insert, F1, Esc or touchpad" : v == 3 ? "Insert, F1 or touchpad" : v == 2 ? "Insert, F1 or Esc" : v != 0 ? "F1 only" : "Insert or F1";
     static string TxHdr(int v) => v == 1 ? "Expanded" : v == 2 ? "Native" : "Off";
     /// <summary>tx_hdr_mode: the HDR row, opts.hdr with RenoDX HDR as its fourth value.</summary>
     static string TxHdrMode(int v, IGameOptionValues? o) => v == HdrRenodx ? "Native + RenoDX" : TxHdr(Math.Clamp(v, 0, 2));
@@ -129,6 +146,7 @@ public static class GameOptionsSchema
     static string TxFpsCap(int v, IGameOptionValues? o)
     {
         if (v < 0) return v == -1 ? "45" : v == -2 ? "40" : "30";
+        if (v >= 7) return "Uncapped";
         if (v >= 6) return "Monitor's rate";
         return new[] { "60 (the console's)", "90", "120", "144", "165", "240" }[v];
     }
@@ -137,20 +155,28 @@ public static class GameOptionsSchema
     static string TxPacing(int v, IGameOptionValues? o) => Pick(new[] { "Off", "Even", "Steady, any rate", "Steady, refresh steps" }, v);
     /// <summary>tx_gyro without a controller's answer (the game adds "(gyro found)" and the like).</summary>
     static string TxGyro(int v, IGameOptionValues? o) => v != 0 ? "On" : "Off";
-    static string TxMousecam(int v, IGameOptionValues? o) => v != 0 ? "Native" : "As the stick";
+    static string TxMousecam(int v, IGameOptionValues? o) => v == 2 ? "Off" : v != 0 ? "Native" : "As the stick";
     static string TxSens(int v, IGameOptionValues? o) =>
         (v < 0 ? "-" : "") + (Math.Abs(v) / 100).ToString(CultureInfo.InvariantCulture) + "." + (Math.Abs(v) % 100).ToString("00", CultureInfo.InvariantCulture);
     static readonly string[] LatencyNames = { "Off", "On", "On + Boost" };
     /// <summary>tx_latency: the Low latency row by the card's maker (with DLSS frame generation the game shows Reflex's Off as
     /// On: Streamline's Reflex is always on).</summary>
     static string TxLatency(int v, IGameOptionValues? o) => LatencyNames[Math.Clamp(v, 0, LatencyHi(LatencyNow()))];
-    static readonly string[] Engines = { "Game", "NVIDIA DLSS", "NVIDIA DLSS", "AMD FSR 3.1", "AMD FSR 4", "AMD FSR 4", "AMD FSR 3.1" };
+    static readonly string[] Engines = { "Game", "NVIDIA DLSS", "NVIDIA DLSS", "AMD FSR 3.1", "AMD FSR 4", "AMD FSR 4", "AMD FSR 3.1", "Off", "Intel XeSS", "Intel XeSS" };
     /// <summary>tx_upscaler: the engine alone (options_version 8: DLAA and the native AAs are the Render resolution's Native
     /// (100%)); the game names FSR 4 by the version AMD's library runs once it has asked ("AMD FSR 4.1").</summary>
     static string TxUpscaler(int v, IGameOptionValues? o) => Engines[Engine(v)];
     /// <summary>tx_dlss_model without RX_VK_DLSS_PRESET.</summary>
     static string TxDlssModel(int v, IGameOptionValues? o) => Pick(new[] { "Transformer (K)", "Transformer 2 (M)", "Transformer 2 (L)", "NVIDIA default" }, v);
     static string TxAniso(int v, IGameOptionValues? o) => OrFirst(new[] { "Game", "2x", "4x", "8x", "16x" }, v);
+    /// <summary>((Triforce) 11-24) the Fullscreen screen row: the game names each screen by the monitor's name and size, which
+    /// the launcher does not know; here they are counted in the game's order (the game also keeps fullscreen_screen_name).</summary>
+    static string TxFsScreen(int v, IGameOptionValues? o) => v <= 0 ? "Automatic" : "Screen " + v.ToString(CultureInfo.InvariantCulture);
+    static string TxVsync(int v, IGameOptionValues? o) => v == 2 ? "Every refresh" : v != 0 ? "On" : "Off";
+    static string TxFgBy(int v, IGameOptionValues? o) => OrFirst(new[] { "Triforce", "AMD FSR 3.1" }, v);
+    static string TxColourVision(int v, IGameOptionValues? o) => OrFirst(new[] { "Off", "Protan (red-green)", "Deutan (red-green)", "Tritan (blue-yellow)" }, v);
+    static string TxGrassDistance(int v, IGameOptionValues? o) => OrFirst(new[] { "Game's", "2x", "3x", "4x" }, v);
+    static string TxShadowRes(int v, IGameOptionValues? o) => OrFirst(new[] { "Game's", "High", "Highest" }, v);
     /// <summary>tx_tex_detail: the game adds the level Automatic gives ("Automatic (Full)") once its first texture is made.</summary>
     static string TxTexDetail(int v, IGameOptionValues? o) => OrFirst(new[] { "Automatic", "Full", "Reduced", "Low" }, v);
     static string TxPercent(int v, IGameOptionValues? o) => Pct(v);
@@ -161,7 +187,11 @@ public static class GameOptionsSchema
     static string TxRdxGrade(int v, IGameOptionValues? o) => v.ToString(CultureInfo.InvariantCulture);
     static string TxSpeed(int v, IGameOptionValues? o) => v != 0 ? "Real time" : "Per frame";
     static string TxTextSpeed(int v, IGameOptionValues? o) => OrFirst(new[] { "Normal", "2x", "4x", "Instant" }, v);
-    static readonly string[] Shapes = { "16:9", "16:10", "21:9", "32:9" };
+    static string TxTextSize(int v, IGameOptionValues? o) => OrFirst(new[] { "Normal", "110%", "125%", "150%", "175%" }, v);
+    static string TxDamageTaken(int v, IGameOptionValues? o) => new[] { "Half", "Normal", "Double", "Quadruple" }[v is >= 0 and < 4 ? v : 1];
+    /// <summary>tx_fov: percent of the game's own angle.</summary>
+    static string TxFov(int v, IGameOptionValues? o) => v == 100 ? "100% (the game's)" : Pct(v);
+    static readonly string[] Shapes = { "16:9", "16:10", "21:9", "32:9", "4:3" };   // ((Triforce, N64 Classic) 4:3, the row's last)
     /// <summary>tx_shape: the row's choice, or the shape of an Output resolution that has its own (the row then has nothing
     /// to choose) with its size. (The game shows HOS_ASPECT's there while it is set.)</summary>
     static string TxUltrawide(int v, IGameOptionValues? o)
@@ -179,7 +209,7 @@ public static class GameOptionsSchema
     }
     static string TxPixels(int v, IGameOptionValues? o) => v.ToString(CultureInfo.InvariantCulture);
     static string TxWideHud(int v, IGameOptionValues? o) => v != 0 ? "Screen edges" : "Middle";
-    static string TxWideMenus(int v, IGameOptionValues? o) => Pick(new[] { "Full width", "Centred, blurred sides", "Centred, black bars" }, v);
+    static string TxWideMenus(int v, IGameOptionValues? o) => Pick(new[] { "Full width", "Centred, blurred sides", "Centred, black bars", "Extended" }, v);
     static string TxPrompts(int v, IGameOptionValues? o) =>
         Pick(new[] { "Auto", "Switch", "Xbox", "PlayStation 4", "PlayStation 5", "Steam Deck", "Keyboard & mouse" }, v);
     static string TxRumble(int v, IGameOptionValues? o) => v != 0 ? Pct(v) : "Off";
@@ -190,10 +220,37 @@ public static class GameOptionsSchema
     /// <summary>tx_own_dead_zone: -1 is XInput's own (~24%), the Default (options_version 8: the shared Stick dead zone is gone).</summary>
     static string TxOwnDeadZone(int v, IGameOptionValues? o) => v < 0 ? "Default (24%)" : Pct(v);
     static string TxWalkKey(int v, IGameOptionValues? o) => OrFirst(new[] { "Off", "Caps Lock", "Shift", "Ctrl", "Tab" }, v);
-    static string TxAudioOutput(int v, IGameOptionValues? o) => OrFirst(new[] { "Auto", "Stereo", "5.1" }, v);
+    static string TxAudioOutput(int v, IGameOptionValues? o) => OrFirst(new[] { "Auto", "Stereo", "5.1", "Mono" }, v);
     static string TxDeadzone(int v, IGameOptionValues? o) => Pick(new[] { "Low", "Standard", "High" }, v);
     static string TxMesh(int v, IGameOptionValues? o) => v == 1 ? "Compute fallback" : "Auto";
-    static string TxPerf(int v, IGameOptionValues? o) => v == 1 ? "On" : v >= 2 ? "Full" : "Off";
+    // ((Triforce) 11-24/25: the rows the game added since: tx_hud_placement, tx_fsr4_model, n64_rules.h name,
+    // reshade_menu.h preset_choices (reshade/fx_builtin.h's numbers, the Clarity looks last), tx_menu_lang (menu_i18n.h kLangs),
+    // and the Controller speaker's tx_pad_*)
+    static string TxHudPlacement(int v, IGameOptionValues? o) => v != 0 ? "Custom" : "Game's";
+    static string TxFsr4Model(int v, IGameOptionValues? o) => v != 0 ? "Lite (INT8)" : "Auto (AMD's)";
+    static string TxN64(int v, IGameOptionValues? o) => v == 1 ? "Faithful" : v == 2 ? "Remembered" : "Off";
+    static readonly string[] ReshadePresets =
+    {
+        "Off", "Warm", "Cool", "User", "HDR Vibrance", "Depth View", "Depth Haze",
+        "Serfrost (Recommended)", "Serfrost (Dim Display)", "Serfrost (Bright Display)", "Bruz", "t3nka Neutral+", "Jamie",
+        "Contrasty", "The Complaining Gamer", "Filmic", "CellHunter", "ViskClarity", "Survival of the Wild (Warmer)",
+        "Survival of the Wild (Colder)", "Godot's Mexican", "Hexaae's Clear", "MaranBr (Little More Intense)",
+        "YeMaoWuXin (Bright Colors)", "YeMaoWuXin (Vivid and Clear)", "Cobalt (Saturated & Bright)", "Clarity Base",
+    };
+    static string TxReshade(int v, IGameOptionValues? o) => Pick(ReshadePresets, v);
+    static readonly string[] MenuLanguages =
+    {
+        "English", "Português (Brasil)", "Español (Latinoamérica)", "Español (España)", "Français", "Deutsch", "Italiano",
+        "Nederlands", "Polski", "Русский", "日本語", "한국어", "简体中文", "繁體中文",
+    };
+    static string TxMenuLang(int v, IGameOptionValues? o) => v <= 0 ? "Auto (game's language)" : Pick(MenuLanguages, v - 1);
+    static string TxPadSpeaker(int v, IGameOptionValues? o) => v == 1 ? "Controller only" : v == 2 ? "Controller + TV" : "Off";
+    static string TxPadHeadphones(int v, IGameOptionValues? o) => v == 1 ? "Controller sounds" : v == 2 ? "All sound" : "Off";
+    static string TxPadSync(int v, IGameOptionValues? o) =>
+        v < 0 ? "TV waits " + (-v).ToString(CultureInfo.InvariantCulture) + " ms"
+        : v > 0 ? "Controller waits " + v.ToString(CultureInfo.InvariantCulture) + " ms" : "0 ms";
+    // ((Triforce) and the levels between On and Full, saved after Full's 2: gpu/vk/fps_levels.h)
+    static string TxPerf(int v, IGameOptionValues? o) => v switch { 1 => "On", 2 => "Full", 3 => "Frame time", 4 => "Graph", 5 => "Breakdown", 6 => "Dev", _ => "Off" };
     static string TxDlssg(int v) => v == 1 ? "2x" : v == 2 ? "3x" : v == 3 ? "4x" : "Off";
     /// <summary>tx_framegen where AMD's library can make the frames, before it has said its version (the game then shows
     /// "AMD FSR (4.0.2)" and the like; elsewhere a saved 9 as 2x).</summary>
@@ -253,14 +310,14 @@ public static class GameOptionsSchema
 
     // (gpu/vk/output_sizes.h, as plain code)
     const int OutputMinW = 640, OutputMinH = 360, OutputMaxW = 7680, OutputMaxH = 2880;
-    const double OutputMaxPixels = 5120.0 * 2880.0, OutputRowPixels = 3840.0 * 2160.0, ShapeMin = 5.0 / 4.0, ShapeMax = 32.0 / 9.0;
+    const double OutputMaxPixels = 5120.0 * 2880.0, OutputRowPixels = 3840.0 * 2160.0, ShapeMin = 5.0 / 4.0, ShapeMax = 48.0 / 9.0;
     static int OutputFrameWidth(int height) => (height * 16 + 36) / 72 * 8;
     static bool ShapeIsGame(double shape) => !(shape > 16.0 / 9.0 * 1.01 || shape < 16.0 / 9.0 * 0.99);
     static bool SizeShaped((int W, int H) s) => s.W > 0 && s.H > 0 && !ShapeIsGame((double)s.W / s.H);
     /// <summary>ultrawide_row_ratio: the Ultrawide row's shape, 0 for the game's own 16:9.</summary>
-    static double UltrawideRatio(int row) => row <= 0 ? 0 : row == 1 ? 1.6f : row == 2 ? (float)(64.0 / 27.0) : (float)(32.0 / 9.0);
+    static double UltrawideRatio(int row) => row <= 0 ? 0 : row == 1 ? 1.6f : row >= 4 ? (float)(4.0 / 3.0) : row == 2 ? (float)(64.0 / 27.0) : (float)(32.0 / 9.0);
     /// <summary>output_width_range: the widths, whole multiples of 8, a picture of height h can have on one side of 16:9:
-    /// within 5:4 to 32:9 and outside the 1% beside 16:9, within the width's ends and the pixels. Lo above Hi: none.</summary>
+    /// within 5:4 to 48:9 and outside the 1% beside 16:9, within the width's ends and the pixels. Lo above Hi: none.</summary>
     static (int Lo, int Hi) OutputWidthRange(int h, bool wide)
     {
         const double game = 16.0 / 9.0;
@@ -273,7 +330,7 @@ public static class GameOptionsSchema
         return ((int)least, most < 0 ? 0 : (int)most);
     }
     /// <summary>output_size_used: a size from outside (the screen's, Custom's) as the game takes it, null for none. Its
-    /// shape first (5:4 to 32:9), then into the limits in that shape: 7680x4320 is 5120x2880. The width is the multiple of
+    /// shape first (5:4 to 48:9), then into the limits in that shape: 7680x4320 is 5120x2880. The width is the multiple of
     /// 8 nearest the shape's among those OutputWidthRange allows, so what comes out is taken as itself when given again.</summary>
     internal static (int W, int H)? OutputSizeUsed(long w, long h)
     {
@@ -362,7 +419,7 @@ public static class GameOptionsSchema
         var size = OutputSizeOf(v, o);
         var frameH = v == 0 ? Outputs[1].H : size.H;
         var sized = SizeShaped(size);
-        var want = sized ? (double)size.W / size.H : UltrawideRatio(Math.Clamp(V(o, UltrawideKey, 0), 0, 3));
+        var want = sized ? (double)size.W / size.H : UltrawideRatio(Math.Clamp(V(o, UltrawideKey, 0), 0, 4));
         if (OutputPicture(frameH, want, sized) is not { } p) return v == 0 ? Outputs[0] : size;
         return v == 0 ? (p.W * 4 / 5, p.H * 4 / 5) : p;
     }
@@ -380,22 +437,25 @@ public static class GameOptionsSchema
     }
 
     // (upscaler_rows.h)
-    const int Game = 0, Dlss = 1, Dlaa = 2, Fsr3 = 3, Fsr4 = 4, Fsr4Aa = 5, Fsr3Aa = 6;
+    const int Game = 0, Dlss = 1, Dlaa = 2, Fsr3 = 3, Fsr4 = 4, Fsr4Aa = 5, Fsr3Aa = 6, UpscalerOff = 7;   // ((Triforce) 11-24: Off, no upscaler)
+    // ((Triforce) Intel XeSS and its Native AA, after Off: the game offers them with Intel's libxess.dll beside it. Not in
+    // UpscalerOrder, as Off is not: a saved one keeps its value and its name here)
+    const int Xess = 8, XessAa = 9;
     /// <summary>The engines in the order the Upscaler row shows them (kEngines): an engine's native anti-aliasing (DLAA, FSR's
     /// Native AA) is the Render resolution's Native (100%) from options_version 8, its saved value as before.</summary>
     public static readonly IReadOnlyList<int> UpscalerOrder = new[] { Game, Dlss, Fsr3, Fsr4 };
     /// <summary>upscaler_rows.h engine: DLAA is DLSS's, FSR 4's and FSR 3.1's native AA their own.</summary>
-    public static int Engine(int up) => up == Dlaa ? Dlss : up == Fsr4Aa ? Fsr4 : up == Fsr3Aa ? Fsr3 : up is >= Game and <= Fsr3Aa ? up : Game;
+    public static int Engine(int up) => up == Dlaa ? Dlss : up == Fsr4Aa ? Fsr4 : up == Fsr3Aa ? Fsr3 : up == XessAa ? Xess : up is >= Game and <= Xess ? up : Game;
     /// <summary>upscaler_rows.h native_of: an engine's native anti-aliasing (the game's own has none: itself).</summary>
-    public static int NativeOf(int engine) => engine == Dlss ? Dlaa : engine == Fsr4 ? Fsr4Aa : engine == Fsr3 ? Fsr3Aa : engine;
+    public static int NativeOf(int engine) => engine == Dlss ? Dlaa : engine == Fsr4 ? Fsr4Aa : engine == Fsr3 ? Fsr3Aa : engine == Xess ? XessAa : engine;
     /// <summary>The Render resolution row's Native (100%) with DLSS or FSR (upscaler_rows.h kNativeStep): its value here while
     /// the Upscaler is an engine's native AA (GameOptionsFile.Get). Chosen, the Upscaler becomes that native AA and the
     /// saved resolution stays as it is.</summary>
     public const int NativeStep = -1;
     static readonly int[] Percents = { 0, 100, 75, 67, 50, 58, 33 };
     static int Percent(int v) => v > 0 && v < Percents.Length ? Percents[v] : 0;
-    public static bool FullScale(int up) => up == Dlaa || up == Fsr4Aa || up == Fsr3Aa;
-    static bool ScalesByMode(int up) => up == Dlss || up == Fsr3 || up == Fsr4;
+    public static bool FullScale(int up) => up == Dlaa || up == Fsr4Aa || up == Fsr3Aa || up == XessAa;
+    static bool ScalesByMode(int up) => up == Dlss || up == Fsr3 || up == Fsr4 || up == Xess;
     /// <summary>upscaler_rows.h native_size: the 3D at the output's full size (an engine's native AA, or the game's own at 100%).</summary>
     public static bool NativeSize(int up, int resolution) => FullScale(up) || (up == Game && Percent(resolution) == 100);
     static readonly int[] GameSteps = { 0, 1, 2, 3, 4 }, DlssSteps = { 0, 3, 5, 4, 6 }, TemporalSteps = { 0, NativeStep, 3, 5, 4, 6 };
@@ -508,6 +568,11 @@ public static class GameOptionsSchema
         };
     }
 
+    /// <summary>((Triforce) 11-24) A Controller speaker row for one kind of sound: where it plays (tx_pad_speaker).</summary>
+    static GameOptionRow PadSound(string name) => Row(GameOptionTab.Audio, "Controller speaker", name, 0, 2, 1, 0, GameOptionKind.Choice,
+        TxPadSpeaker, false, true,
+        "Where this kind of sound plays with a DualSense on a USB cable. Off: with the rest of the game's sound. Controller only: on the controller's speaker, and no longer on the TV. Controller + TV: on both.");
+
     /// <summary>A merged row (merged_rows.h): a Choice row with no line of its own, a view of its parts. Low latency's choices
     /// follow the card's maker (LatencyVendorOf).</summary>
     static GameOptionRow Merged(GameOptionTab tab, string section, string name, int lo, int hi, int step,
@@ -531,20 +596,43 @@ public static class GameOptionsSchema
     {
         Row(GameOptionTab.Display, "Screen", "Fullscreen", 0, 1, 1, 0, GameOptionKind.Choice, TxOnoff, false, true,
             "The game fills the whole screen, without the window's border. F10 and Alt+Enter do the same."),
+        Row(GameOptionTab.Display, "Screen", "Fullscreen screen", 0, 15, 1, 0, GameOptionKind.Choice, TxFsScreen, false, true,
+            "Which screen Fullscreen fills: Automatic, the one the window is on, or one of the connected screens. Changes at once."),
         Row(GameOptionTab.Display, "Screen", "Output resolution", 0, 9, 1, 0, GameOptionKind.Choice, TxOutputRes, true, false,
             "The picture's size, before it is scaled to the window: the fixed sizes, and the size of each connected screen by its name. A size that is not 16:9 is a wider or narrower picture: the HUD, menus and story movies keep their 16:9 shape at its height. Docked only. Applies after a restart."),
         Row(GameOptionTab.Display, "Screen", "Output width", 640, 7680, 8, 2560, GameOptionKind.Slider, TxPixels, true, false,
-            "The output resolution's width in pixels, where it is a screen's size or Custom; hold Left or Right to move faster. Output resolution shows the size the game takes: 5:4 to 32:9 in shape, at most the pixels of 5120x2880. Applies after a restart."),
+            "The output resolution's width in pixels, where it is a screen's size or Custom; hold Left or Right to move faster, or type a number and press Enter. Output resolution shows the size the game takes: 5:4 to 48:9 in shape, at most the pixels of 5120x2880. Applies after a restart."),
         Row(GameOptionTab.Display, "Screen", "Output height", 360, 2880, 8, 1440, GameOptionKind.Slider, TxPixels, true, false,
-            "The output resolution's height in pixels, where it is a screen's size or Custom; hold Left or Right to move faster. Output resolution shows the size the game takes: 5:4 to 32:9 in shape, at most the pixels of 5120x2880. Applies after a restart."),
+            "The output resolution's height in pixels, where it is a screen's size or Custom; hold Left or Right to move faster, or type a number and press Enter. Output resolution shows the size the game takes: 5:4 to 48:9 in shape, at most the pixels of 5120x2880. Applies after a restart."),
         Row(GameOptionTab.Display, "Screen", "GPU device", 0, 8, 1, 0, GameOptionKind.Choice, TxGpu, true, true,
             "Which graphics card the game runs on. Applies after a restart."),
-        Row(GameOptionTab.Display, "Ultrawide", "Aspect ratio", 0, 3, 1, 0, GameOptionKind.Choice, TxUltrawide, true, false,
-            "The picture's shape for a 16:9 Output resolution: the game's own 16:9, or a fixed 16:10, 21:9 or 32:9 at the same height, for a screen or a window of that shape. A screen of another shape shows the picture between black bars. An Output resolution that is not 16:9 has its own shape, shown here. Applies after a restart."),
-        Row(GameOptionTab.Display, "Ultrawide", "HUD position", 0, 1, 1, 0, GameOptionKind.Choice, TxWideHud, true, true,
-            "With a picture wider than 16:9: where corner HUD elements, tips and notices sit. Middle: in the middle 16:9, as on a normal screen. Screen edges: out in the screen's corners. Applies after a restart."),
-        Row(GameOptionTab.Display, "Ultrawide", "Menu sides", 0, 2, 1, 1, GameOptionKind.Choice, TxWideMenus, false, false,
+        Row(GameOptionTab.Display, "Ultrawide", "Aspect ratio", 0, 4, 1, 0, GameOptionKind.Choice, TxUltrawide, true, false,
+            "The picture's shape for a 16:9 Output resolution: the game's own 16:9, or a fixed 16:10, 21:9 or 32:9 at the same height, for a screen or a window of that shape, or 4:3, a TV's of 1998. A screen of another shape shows the picture between black bars. An Output resolution that is not 16:9 has its own shape, shown here. Applies after a restart."),
+        Row(GameOptionTab.Display, "Ultrawide", "HUD position", 0, 1, 1, 0, GameOptionKind.Choice, TxWideHud, false, true,
+            "With a picture wider than 16:9: where corner HUD elements, tips and notices sit. Middle: in the middle 16:9, as on a normal screen. Screen edges: out in the screen's corners. Changes at once."),
+        Row(GameOptionTab.Display, "Ultrawide", "Menu sides", 0, 3, 1, 1, GameOptionKind.Choice, TxWideMenus, false, false,
             "With a picture wider than 16:9: the pause, item and map menus, and what shows beside them. Loading screens and story movies, which draw no world either, get the same sides (the title's movie fills the picture up to 12:5); a fade always covers the whole screen. Changes at once."),
+        // ((Triforce) 11-24/25) the HUD's three groups moved and sized (host/hos_wide_ui.c): Custom's rows by their own keys
+        Row(GameOptionTab.Display, "HUD", "HUD placement", 0, 1, 1, 0, GameOptionKind.Choice, TxHudPlacement, false, true,
+            "Where the hearts, the buttons and the minimap sit in play. Custom moves and resizes each group. Changes at once."),
+        Row(GameOptionTab.Display, "HUD", "Hearts and magic across", -15, 15, 1, 0, GameOptionKind.Slider, TxPercent, false, true,
+            "Moves the hearts and magic left or right, as a share of the picture's width."),
+        Row(GameOptionTab.Display, "HUD", "Hearts and magic up", -15, 15, 1, 0, GameOptionKind.Slider, TxPercent, false, true,
+            "Moves the hearts and magic down or up, as a share of the picture's height."),
+        Row(GameOptionTab.Display, "HUD", "Hearts and magic size", 75, 125, 1, 100, GameOptionKind.Slider, TxPercent, false, true,
+            "Resizes the hearts and magic together."),
+        Row(GameOptionTab.Display, "HUD", "Buttons across", -15, 15, 1, 0, GameOptionKind.Slider, TxPercent, false, true,
+            "Moves the action prompts and the item buttons left or right, as a share of the picture's width."),
+        Row(GameOptionTab.Display, "HUD", "Buttons up", -15, 15, 1, 0, GameOptionKind.Slider, TxPercent, false, true,
+            "Moves the action prompts and the item buttons down or up, as a share of the picture's height."),
+        Row(GameOptionTab.Display, "HUD", "Buttons size", 75, 125, 1, 100, GameOptionKind.Slider, TxPercent, false, true,
+            "Resizes the action prompts and the item buttons together."),
+        Row(GameOptionTab.Display, "HUD", "Minimap across", -15, 15, 1, 0, GameOptionKind.Slider, TxPercent, false, true,
+            "Moves the minimap left or right, as a share of the picture's width."),
+        Row(GameOptionTab.Display, "HUD", "Minimap up", -15, 15, 1, 0, GameOptionKind.Slider, TxPercent, false, true,
+            "Moves the minimap down or up, as a share of the picture's height."),
+        Row(GameOptionTab.Display, "HUD", "Minimap size", 75, 125, 1, 100, GameOptionKind.Slider, TxPercent, false, true,
+            "Resizes the minimap."),
         Merged(GameOptionTab.Display, "HDR", "HDR", 0, 3, 1, MergeHdr, TxHdrMode, true, true,
             "HDR10 on an HDR display (Windows: Use HDR on in the display settings). Native + RenoDX applies after a restart."),
         Row(GameOptionTab.Display, "HDR", "Paper white", 80, 400, 10, 200, GameOptionKind.Slider, TxNits, false, true,
@@ -589,12 +677,22 @@ public static class GameOptionsSchema
             "The scene's color. 50 is neutral."),
         Row(GameOptionTab.Display, "RenoDX", "Bloom", 0, 100, 5, 50, GameOptionKind.Slider, TxRdxGrade, false, true,
             "The glow around bright things. 50 is the game's. RenoDX is by Carlos Lopez (clshortfuse), under the MIT license."),
-        Row(GameOptionTab.Display, "Overlay", "FPS counter", 0, 2, 1, 0, GameOptionKind.Choice, TxPerf, false, true,
+        Row(GameOptionTab.Display, "Accessibility", "Color vision correction", 0, 3, 1, 0, GameOptionKind.Choice, TxColourVision, false, true,
+            "Recolors the finished picture for red-green or blue-yellow color vision deficiency, keeping its brightness. Not with HDR Native. Changes at once."),
+        Row(GameOptionTab.Display, "Overlay", "FPS counter", 0, 6, 1, 0, GameOptionKind.Choice, TxPerf, false, true,
             "Frames per second in the top right corner. Full: a performance panel in its place: the GPU's and the CPU's load, temperatures and memory, the frame rate and its lows, the frame times and their graph, the waits per frame and the picture's settings."),
-        Row(GameOptionTab.Graphics, "Upscaling", "Upscaler", 0, 6, 1, 0, GameOptionKind.Choice, TxUpscaler, false, false,
+        // ((Triforce, 11-23) Evil HD, the game's first Graphics row: gpu/vk/evil_hd.h, saved as evil_hd)
+        Row(GameOptionTab.Graphics, "Evil HD", "Evil HD", 0, 1, 1, 0, GameOptionKind.Choice, TxOnoff, false, true,
+            "The fullest picture the game can give, for a powerful PC: SMAA Ultra edges, 16x texture filtering, every texture whole, the shadows of distant grass and leaves as the game draws them, and soft shadows in corners and creases (ambient occlusion), and the grass, plants, flowers and stones drawn 4 times as far (in the areas you enter after it is turned on). Your own choices in those rows come back when it is off. F2 turns it on and off."),
+        // ((Triforce) Auto (this PC): auto_settings.h; its state is auto_tune and auto_for, kept keys)
+        Row(GameOptionTab.Graphics, "This PC", "Auto (this PC)", 0, 1, 1, 0, GameOptionKind.Choice, TxOnoff, false, true,
+            "On: the Upscaler, Render resolution, Texture detail, Shadow resolution and Grass distance are set for this PC's graphics card, memory and processor, and adjusted in the first minutes of play to hold the Frame rate cap. Changing one of those rows yourself turns it Off. The Render resolution and Upscaler apply after a restart."),
+        Row(GameOptionTab.Graphics, "Upscaling", "Upscaler", 0, 9, 1, 0, GameOptionKind.Choice, TxUpscaler, false, false,
             "What draws the 3D up to the Output resolution."),
         Row(GameOptionTab.Graphics, "Upscaling", "DLSS model", 0, 3, 1, 0, GameOptionKind.Choice, TxDlssModel, false, true,
             "Which of NVIDIA's DLSS networks draws the picture."),
+        Row(GameOptionTab.Graphics, "Upscaling", "FSR 4 model", 0, 1, 1, 0, GameOptionKind.Choice, TxFsr4Model, false, true,
+            "The FSR 4 network: Auto lets AMD pick for this GPU, Lite is the faster INT8 network."),
         Row(GameOptionTab.Graphics, "Upscaling", "Render resolution", 0, 6, 1, 0, GameOptionKind.Choice, TxResolution, true, false,
             "The size the 3D is drawn at; the upscaler fills in the rest. Applies after a restart."),
         Row(GameOptionTab.Graphics, "Upscaling", "Upscale before bloom", 0, 1, 1, 0, GameOptionKind.Choice, TxOnoff, true, true,
@@ -603,12 +701,17 @@ public static class GameOptionsSchema
             "With DLSS, DLAA or AMD FSR as the Upscaler, the 3D before the HUD (FSR's own sharpening; AMD's RCAS for DLSS); with the game's own upscaler, the picture at the window. 0 is off. Too much shows halos around edges."),
         Row(GameOptionTab.Graphics, "Anti-aliasing", "Anti-aliasing", 0, 3, 1, 0, GameOptionKind.Choice, TxAa, false, true,
             "How the 3D's edges are smoothed: the game's own SMAA, none, FXAA, or SMAA at its Ultra preset. Changes at once."),
+        // ((Triforce, N64 Classic) the row; its Remembered page's rows (n64_rem_*) are kept keys, set in the game)
+        Row(GameOptionTab.Graphics, "N64 Classic", "N64 Classic", 0, 2, 1, 0, GameOptionKind.Choice, TxN64, false, true,
+            "The game as the 1998 cartridge on a TV of then. F7 turns it on and off. Changes at once."),
         Merged(GameOptionTab.Graphics, "Frame generation", "Frame generation", 0, 12, 1, MergeFramegen, TxFramegenRow, true, true,
             "Makes frames between the game's own, for smoother motion, at a little input delay. Fast motion and camera cuts can show artifacts. NVIDIA DLSS applies after a restart."),
-        Row(GameOptionTab.Graphics, "Frame rate & latency", "Frame rate cap", -3, 6, 1, 0, GameOptionKind.Choice, TxFpsCap, true, true,
-            "The most frames the game renders a second; made frames come on top. 60 is the safe choice: past it some cutscenes and bosses can misbehave. 30, 40 and 45 are for a PC that holds one of them where 60 swings. Monitor's rate: the refresh rate of the screen the game starts on. Applies after a restart."),
-        Row(GameOptionTab.Graphics, "Frame rate & latency", "VSync", 0, 1, 1, 1, GameOptionKind.Choice, TxOnoff, false, true,
-            "Whether a finished frame waits for the screen's next refresh. Off: a little less delay, and the picture can tear. Changes at once."),
+        Row(GameOptionTab.Graphics, "Frame generation", "Frame generation by", 0, 1, 1, 0, GameOptionKind.Choice, TxFgBy, false, true,
+            "Who makes the frames at Auto and 2x to 8x."),
+        Row(GameOptionTab.Graphics, "Frame rate & latency", "Frame rate cap", -3, 7, 1, 0, GameOptionKind.Choice, TxFpsCap, false, true,
+            "The most frames the game renders a second; made frames come on top. 60 is the safe choice: past it some cutscenes and bosses can misbehave. 30, 40 and 45 are for a PC that holds one of them where 60 swings. Monitor's rate: the refresh rate of the screen the game starts on. Uncapped: as fast as the PC can, still at real time; with VSync on, the screen's refresh rate is the limit. Changes at once."),
+        Row(GameOptionTab.Graphics, "Frame rate & latency", "VSync", 0, 2, 1, 1, GameOptionKind.Choice, TxVsync, false, true,
+            "Whether a finished frame waits for the screen's next refresh. Off: a little less delay, and the picture can tear. Every refresh: always the screen's own pacing (FIFO), for a display that tears or stutters otherwise. Changes at once."),
         Merged(GameOptionTab.Graphics, "Frame rate & latency", "Frame pacing", 0, 3, 1, MergePacing, TxPacing, true, false,
             "When each frame is shown. Steady paces the game to a rate this PC holds where you are: steadier, at some frame rate."),
         Merged(GameOptionTab.Graphics, "Frame rate & latency", "Low latency", 0, 2, 1, MergeLatency, TxLatency, false, false,
@@ -617,56 +720,107 @@ public static class GameOptionsSchema
             "Keeps ground, paths and walls sharp where they slope away from the camera. Game: what the game asks for; 16x is the sharpest, at a small cost."),
         Row(GameOptionTab.Graphics, "Textures", "Texture detail", 0, 3, 1, 0, GameOptionKind.Choice, TxTexDetail, true, false,
             "How large the game's textures are kept in video memory. Automatic suits the graphics card. Applies after a restart."),
+        // ((Triforce) 11-24) the ReShade presets (reshade/fx_builtin.h); the User preset file is the game's to list
+        Row(GameOptionTab.Graphics, "Post-processing", "ReShade preset", 0, 26, 1, 0, GameOptionKind.Choice, TxReshade, false, true,
+            "Native HDR supports built-in and LinearHDR presets. Use Expanded HDR for imported SDR presets."),
+        Row(GameOptionTab.Graphics, "Detail", "Grass distance", 0, 3, 1, 0, GameOptionKind.Choice, TxGrassDistance, false, false,
+            "How far away short grass blades reach, such as Kokiri Forest's tufts and the moss on its stones. The game stops them at about 20 m. Higher extends their reach for some GPU time. Changes at once."),
+        Row(GameOptionTab.Graphics, "Detail", "Shadow resolution", 0, 2, 1, 0, GameOptionKind.Choice, TxShadowRes, false, false,
+            "The size of the sun's shadow maps: higher keeps the shadows of thin things near you, such as chains, fences and leaves, smooth instead of stair-stepped, for more video memory and a little GPU time. Highest also makes them shimmer less while the camera moves. Changes at once."),
         Row(GameOptionTab.Graphics, "Advanced", "Mesh shaders", 0, 1, 1, 0, GameOptionKind.Choice, TxMesh, true, false,
             "How the game's mesh-shader draws run. Try Compute fallback on an AMD card that shows glowing walls or loses the GPU. Applies after a restart."),
+        // ((Triforce) 11-23) the System tab's Achievements group (host/achievements.c)
+        Row(GameOptionTab.System, "Achievements", "Achievements", 0, 1, 1, 1, GameOptionKind.Choice, TxOnoff, false, true,
+            "Whether things you do in the game are marked as earned. Off: nothing is checked or earned, and what you have earned is kept."),
+        Row(GameOptionTab.System, "Achievements", "Achievement notices", 0, 1, 1, 1, GameOptionKind.Choice, TxOnoff, false, true,
+            "Whether a notice and a sound tell you when you earn one. Off: they are still earned, and listed under View achievements."),
+        Row(GameOptionTab.System, "Game", "Menu language", 0, 14, 1, 1, GameOptionKind.Choice, TxMenuLang, false, true,
+            "The language of this menu."),
         Row(GameOptionTab.System, "Game", "Text speed", 0, 3, 1, 0, GameOptionKind.Choice, TxTextSpeed, false, false,
             "How fast the letters of dialogue and other messages appear."),
+        Row(GameOptionTab.System, "Game", "Text size", 0, 4, 1, 0, GameOptionKind.Choice, TxTextSize, false, true,
+            "How large the text of dialogue, Navi and signs is drawn."),
         Row(GameOptionTab.System, "Game", "Game speed", 0, 1, 1, 1, GameOptionKind.Choice, TxSpeed, false, false,
             "How the game keeps time when it runs below 60 fps."),
+        Row(GameOptionTab.System, "Game", "Field of view", 50, 150, 5, 100, GameOptionKind.Slider, TxFov, false, true,
+            "How much of the world the camera shows while you play: higher is wider. Cutscenes keep their own view."),
+        Row(GameOptionTab.System, "Game", "Damage taken", 0, 3, 1, 1, GameOptionKind.Choice, TxDamageTaken, false, true,
+            "How much of his hearts Link loses from a hit. Half rounds up to the next quarter heart. Healing stays as it is."),
+        Row(GameOptionTab.System, "Game", "Skip title screen", 0, 1, 1, 0, GameOptionKind.Choice, TxOnoff, false, true,
+            "Starts the game straight on your newest save: Continue and Load are pressed for you, unless you press something first. From the game's next start."),
+        Row(GameOptionTab.System, "Game", "Skip opening", 0, 1, 1, 0, GameOptionKind.Choice, TxOnoff, false, true,
+            "A new game starts without its opening, the story movie and Navi waking Link. Every later cutscene plays as it does."),
         Row(GameOptionTab.Audio, "Sound", "Master volume", 0, 100, 5, 100, GameOptionKind.Slider, TxVolume, false, true,
             "How loud the game is, in percent of its own volume."),
         Row(GameOptionTab.Audio, "Sound", "Menu sounds", 0, 100, 5, 80, GameOptionKind.Slider, TxMenuSounds, false, true,
             "How loud these options' own sounds are, the game's interface sounds from your game files."),
-        Row(GameOptionTab.Audio, "Sound", "Audio output", 0, 2, 1, 0, GameOptionKind.Choice, TxAudioOutput, true, true,
-            "The speakers the game mixes its sound for. Applies after a restart."),
+        Row(GameOptionTab.Audio, "Sound", "Mute in background", 0, 1, 1, 0, GameOptionKind.Choice, TxOnoff, false, true,
+            "No sound while another window has the focus."),
+        Row(GameOptionTab.Audio, "Sound", "Audio output", 0, 3, 1, 0, GameOptionKind.Choice, TxAudioOutput, true, true,
+            "The speakers the game mixes its sound for. Applies after a restart; Stereo and Mono change at once."),
         Row(GameOptionTab.Audio, "Microphone", "Microphone", 0, 18, 1, 1, GameOptionKind.Choice, TxMic, false, true,
             "What the ocarina hears when the game's microphone option is on (playing an instrument, or humming)."),
+        Row(GameOptionTab.Audio, "Microphone", "Microphone gain", 25, 400, 25, 100, GameOptionKind.Slider, TxPercent, false, true,
+            "How loud the microphone is for the ocarina, in percent of what it gives. Raise it if your notes are not heard."),
+        // ((Triforce) 11-24) a DualSense's own speaker and headphones (host/pad_speaker.c)
+        Row(GameOptionTab.Audio, "Controller speaker", "Speaker volume", 0, 200, 10, 100, GameOptionKind.Slider, TxPercent, false, true,
+            "How loud a DualSense's own speaker plays the sounds sent to it below (the controller on a USB cable). A short tone plays on it when you change this."),
+        Row(GameOptionTab.Audio, "Controller speaker", "Controller sync", -100, 150, 10, 0, GameOptionKind.Slider, TxPadSync, false, true,
+            "Lines up the sounds set to Controller + TV. If the controller plays later than the TV, go below 0: the TV waits. If the TV plays later, go above 0: the controller waits."),
+        Row(GameOptionTab.Audio, "Controller speaker", "Headphones on the controller", 0, 2, 1, 0, GameOptionKind.Choice, TxPadHeadphones, false, true,
+            "With headphones in a DualSense's jack (on a USB cable). All sound: the whole game plays on them and the TV is silent, as on the console. Controller sounds: only the sounds set to play on the controller go to them. Off: they are left out."),
+        Row(GameOptionTab.Audio, "Controller speaker", "Headphone volume", 0, 100, 10, 80, GameOptionKind.Slider, TxPercent, false, true,
+            "How loud the headphones in the controller's jack play."),
+        PadSound("Navi's voice"), PadSound("Navi's flight sounds"), PadSound("Z-targeting"), PadSound("Ocarina"), PadSound("Pick-ups"),
+        PadSound("Items"), PadSound("Fairies"), PadSound("Interface sounds"), PadSound("Stone of Agony"), PadSound("Low health alarm"),
+        PadSound("Fishing"), PadSound("Bottles"),
+        Row(GameOptionTab.System, "Saves & reports", "Autosave", 0, 1, 1, 1, GameOptionKind.Choice, TxOnoff, false, true,
+            "Whether the game saves by itself as you go from one area to another. Off skips those saves; saving from the pause menu still works."),
         Row(GameOptionTab.System, "Online", "Discord status", 0, 1, 1, 1, GameOptionKind.Choice, TxOnoff, false, true,
             "Shows \"Playing Triforce\" and the time played in your Discord status, while Discord runs on this PC."),
         Row(GameOptionTab.Controls, "Controller", "Controller in background", 0, 1, 1, 0, GameOptionKind.Choice, TxOnoff, false, false,
             "Whether the controller plays the game while another window has the focus."),
         Row(GameOptionTab.Controls, "Controller", "Left stick dead zone", -1, 50, 1, -1, GameOptionKind.Slider, TxOwnDeadZone, false, true,
-            "How far the left stick moves before the game sees it, in percent of its travel on each axis: lower for a precise stick, higher for one that drifts. The game's own dead zone still follows."),
+            "How far the left stick moves from its centre before the game sees it, in percent of its travel: lower for a precise stick, higher for one that drifts. The game's own dead zone still follows."),
         Row(GameOptionTab.Controls, "Controller", "Right stick dead zone", -1, 50, 1, -1, GameOptionKind.Slider, TxOwnDeadZone, false, true,
-            "How far the right stick moves before the game sees it, in percent of its travel on each axis: lower for a precise stick, higher for one that drifts. The game's own dead zone still follows."),
+            "How far the right stick moves from its centre before the game sees it, in percent of its travel: lower for a precise stick, higher for one that drifts. The game's own dead zone still follows."),
         Row(GameOptionTab.Controls, "Controller", "Camera speed", 25, 300, 5, 100, GameOptionKind.Slider, TxSens, true, true,
             "How fast the right stick turns the camera, times the game's own speed. Applies after a restart."),
         Row(GameOptionTab.Controls, "Controller", "Invert camera X", 0, 1, 1, 0, GameOptionKind.Choice, TxOnoff, false, true,
             "Swaps left and right for the right stick's camera."),
         Row(GameOptionTab.Controls, "Controller", "Invert camera Y", 0, 1, 1, 0, GameOptionKind.Choice, TxOnoff, false, true,
             "Swaps up and down for the right stick's camera."),
-        Row(GameOptionTab.Controls, "Mouse & keyboard", "Mouse camera", 0, 1, 1, 0, GameOptionKind.Choice, TxMousecam, false, true,
+        Row(GameOptionTab.Controls, "Mouse & keyboard", "Mouse camera", 0, 2, 1, 0, GameOptionKind.Choice, TxMousecam, false, true,
             "How the captured mouse turns the camera."),
         Row(GameOptionTab.Controls, "Mouse & keyboard", "Mouse sensitivity", 10, 500, 10, 100, GameOptionKind.Slider, TxSens, false, true,
             "How far the camera turns for a mouse movement. The - and = keys change it in game too."),
         Row(GameOptionTab.Controls, "Mouse & keyboard", "Invert mouse vertical", 0, 1, 1, 0, GameOptionKind.Choice, TxOnoff, false, true,
             "Swaps up and down for the mouse."),
+        Row(GameOptionTab.Controls, "Mouse & keyboard", "Invert mouse horizontal", 0, 1, 1, 0, GameOptionKind.Choice, TxOnoff, false, true,
+            "Swaps left and right for the mouse."),
         Row(GameOptionTab.Controls, "Mouse & keyboard", "Walk key", 0, 4, 1, 0, GameOptionKind.Choice, TxWalkKey, false, true,
             "A key that makes Link walk: held with the movement keys, they push the stick only as far as Walk scale. While it is chosen the key presses nothing else."),
         Row(GameOptionTab.Controls, "Mouse & keyboard", "Walk scale", 20, 90, 1, 51, GameOptionKind.Slider, TxSens, false, true,
             "How far the movement keys push the stick while the Walk key is held: 1.00 would be all the way."),
-        Row(GameOptionTab.Controls, "Mouse & keyboard", "Menu shortcut", 0, 1, 1, 0, GameOptionKind.Choice, TxMenuShortcut, false, true,
-            "Which keys open and close these options from anywhere. F1 always does; F1 only leaves Insert free for an overlay."),
+        Row(GameOptionTab.Controls, "Mouse & keyboard", "Menu shortcut", 0, 4, 1, 0, GameOptionKind.Choice, TxMenuShortcut, false, true,
+            "Which keys open and close these options from anywhere. F1 always does; F1 only leaves Insert free for an overlay. With Esc, Esc opens them too, as a PC game's pause menu (open, Esc still goes back a page or closes them). With touchpad, a DualShock 4's or DualSense's touchpad click opens and closes them as F1 does."),
         Row(GameOptionTab.Controls, "Rumble", "Rumble strength", 0, 300, 25, 100, GameOptionKind.Slider, TxRumble, false, true,
             "How strongly the controller rumbles, in percent of the game's rumble. Off turns it off."),
         Row(GameOptionTab.Controls, "Rumble", "Vibration curve", 20, 150, 5, 100, GameOptionKind.Slider, TxSens, false, true,
             "Shapes the rumble: 1.00 is the game's. Lower makes the many weak rumbles easier to feel; higher quiets them. A Switch controller's HD rumble is not changed."),
         Row(GameOptionTab.Controls, "Rumble", "Trigger vibration", 0, 1, 1, 0, GameOptionKind.Choice, TxOnoff, false, true,
             "Xbox One and Series controllers: the motors in the triggers rumble too."),
+        // ((Triforce) 11-24) the Insert menu's Vibration and DualSense HD Haptics (host/vibration.h, host/rumble_renhdrum.c)
+        Row(GameOptionTab.Controls, "Rumble", "Vibration", 0, 2, 1, 0, GameOptionKind.Choice, TxVibration, false, true,
+            "How the controller vibrates. Auto plays the best it can: with RenHDrum beside the game a DualSense its voice coils, a Switch controller and an Xbox controller RenHDrum's HD rumble, a Steam Controller (2026) its grips; without it a Switch controller its own HD rumble and every other controller its motors. Basic plays the motors on every controller. Off stops it. The line below says what plays the controller used last."),
+        Row(GameOptionTab.Controls, "Rumble", "DualSense HD Haptics", 0, 1, 1, 1, GameOptionKind.Choice, TxOnoff, false, true,
+            "A DualSense that RenHDrum plays also taps its speaker and kicks back on L2 and R2 while you hold them, from the game's vibration, with deeper heavy hits. Off: its fine haptics alone."),
         Row(GameOptionTab.Controls, "Gameplay", "Sprint button", 0, 2, 1, 0, GameOptionKind.Choice, TxSprint, false, true,
             "Link sprints from a button press, without rolling first. Left stick click: the game has no other use for it. B: sprints while Link moves (with the game's Swap Jump Controls B is the jump: use the stick's click)."),
         Row(GameOptionTab.Controls, "Gameplay", "Sprint mode", 0, 1, 1, 0, GameOptionKind.Choice, TxSprintMode, false, true,
             "Toggle: a press starts the sprint, the next press or stopping ends it. Hold: Link sprints while the button is held."),
+        Row(GameOptionTab.Controls, "Gameplay", "Camera centering", 0, 1, 1, 1, GameOptionKind.Choice, TxOnoff, false, true,
+            "Whether the camera turns by itself the way Link moves. Off: it stays where you put it, which suits the mouse; the game's own recentring still works."),
         Row(GameOptionTab.Controls, "Motion", "Motion controls", 0, 1, 1, 1, GameOptionKind.Choice, TxGyro, false, true,
             "Aims and looks with the controller's gyroscope where the game uses motion, as on the Switch: Switch Pro controllers and pads in Switch mode, DualSense and DualShock 4."),
         Row(GameOptionTab.Controls, "Motion", "Motion sensitivity X", 10, 600, 10, 100, GameOptionKind.Slider, TxPercent, false, true,
@@ -679,6 +833,26 @@ public static class GameOptionsSchema
             "Swaps the motion aim's up and down."),
         Row(GameOptionTab.Controls, "Motion", "Motion deadzone", 0, 2, 1, 1, GameOptionKind.Choice, TxDeadzone, false, true,
             "How slow a turn counts as none, the console's three settings: Standard is its own. High steadies a pad that jitters; Low keeps the smallest movements."),
+        Row(GameOptionTab.Controls, "Hold to toggle", "Toggle ZL", 0, 1, 1, 0, GameOptionKind.Choice, TxOnoff, false, true,
+            "One press of ZL holds it, the next lets it go, with whatever is bound to it. Opening a menu or pressing Plus or Minus lets it go too."),
+        Row(GameOptionTab.Controls, "Hold to toggle", "Toggle ZR", 0, 1, 1, 0, GameOptionKind.Choice, TxOnoff, false, true,
+            "One press of ZR holds it, the next lets it go, with whatever is bound to it. Opening a menu or pressing Plus or Minus lets it go too."),
+        Row(GameOptionTab.Controls, "Hold to toggle", "Toggle L", 0, 1, 1, 0, GameOptionKind.Choice, TxOnoff, false, true,
+            "One press of L holds it, the next lets it go, with whatever is bound to it. Opening a menu or pressing Plus or Minus lets it go too."),
+        Row(GameOptionTab.Controls, "Hold to toggle", "Toggle R", 0, 1, 1, 0, GameOptionKind.Choice, TxOnoff, false, true,
+            "One press of R holds it, the next lets it go, with whatever is bound to it. Opening a menu or pressing Plus or Minus lets it go too."),
+        Row(GameOptionTab.Controls, "Hold to toggle", "Toggle A", 0, 1, 1, 0, GameOptionKind.Choice, TxOnoff, false, true,
+            "One press of A holds it, the next lets it go, with whatever is bound to it. Opening a menu or pressing Plus or Minus lets it go too."),
+        Row(GameOptionTab.Controls, "Hold to toggle", "Toggle B", 0, 1, 1, 0, GameOptionKind.Choice, TxOnoff, false, true,
+            "One press of B holds it, the next lets it go, with whatever is bound to it. Opening a menu or pressing Plus or Minus lets it go too."),
+        Row(GameOptionTab.Controls, "Hold to toggle", "Toggle X", 0, 1, 1, 0, GameOptionKind.Choice, TxOnoff, false, true,
+            "One press of X holds it, the next lets it go, with whatever is bound to it. Opening a menu or pressing Plus or Minus lets it go too."),
+        Row(GameOptionTab.Controls, "Hold to toggle", "Toggle Y", 0, 1, 1, 0, GameOptionKind.Choice, TxOnoff, false, true,
+            "One press of Y holds it, the next lets it go, with whatever is bound to it. Opening a menu or pressing Plus or Minus lets it go too."),
+        Row(GameOptionTab.Controls, "Hold to toggle", "Toggle LS", 0, 1, 1, 0, GameOptionKind.Choice, TxOnoff, false, true,
+            "One press of the left stick's click holds it, the next lets it go, with whatever is bound to it. Opening a menu or pressing Plus or Minus lets it go too."),
+        Row(GameOptionTab.Controls, "Hold to toggle", "Toggle RS", 0, 1, 1, 0, GameOptionKind.Choice, TxOnoff, false, true,
+            "One press of the right stick's click holds it, the next lets it go, with whatever is bound to it. Opening a menu or pressing Plus or Minus lets it go too."),
         Row(GameOptionTab.Controls, "Controls", "Button prompts", 0, 6, 1, 0, GameOptionKind.Choice, TxPrompts, true, true,
             "The button icons the game shows in its texts and menus: those of this controller, or the keyboard's and the mouse's."),
     };
@@ -714,7 +888,8 @@ public static class GameOptionsSchema
         [MicDeviceKey] = "the Microphone row's device, by its name: the game's to choose from the devices it lists",
         [GpuNameKey] = "the GPU device row's card by its name (11-20): Save writes it with the row; the game finds the card by it first",
         [CustomSizeKey] = "the Custom size entered before a screen's size was chosen in the game's Output resolution row: the game's to keep; GameOptionsFile empties it when it writes another Custom size, and takes it back into the rows when the Output resolution is changed",
-        ["layout_preset"] = "the Controls page's Layout preset: choosing one in the game rebinds the pad_ lines, which a changed value alone would not do",
+        ["fullscreen_screen_name"] = "the Fullscreen screen row's screen by its name and size (11-24): the game finds the screen by it first, so a choice of the row here holds where the file has no such line",
+        ["layout_preset"] ="the Controls page's Layout preset: choosing one in the game rebinds the pad_ lines, which a changed value alone would not do",
         ["debug_tools"] = "the Debug tab (not ported)",
         ["descriptor_reuse"] = "the Debug tab's Developer rows (not ported)",
         ["fast_pipeline_link"] = "the Debug tab's Developer rows (not ported)",
@@ -734,6 +909,38 @@ public static class GameOptionsSchema
         ["debug_tab"] = "an old line (Alt+G's Debug tab): the game drops it at its next save",
         ["rivatuner_limit"] = "an old test builds' line: the game drops it at its next save",
         ["discord_app_id"] = "the Discord status's application, for a test application (host/discord_rpc.c): no row",
+        ["discord_text"] = "the Discord status's text, the player's template (host/discord_activity.c): no row",
+        ["discord_image"] = "the Discord status's picture, an art asset's key or an https:// link (host/discord_activity.c): no row",
+        ["discord_image_text"] = "the Discord status's picture's hover text, a template (host/discord_activity.c): no row",
+        // ((Triforce) 11-24/25: the game's own state and its pages' rows, set in the game)
+        ["auto_tune"] = "Auto (this PC)'s tuning state (auto_settings.h): the game's own",
+        ["auto_for"] = "the hardware Auto (this PC) chose for (auto_settings.h): the game's own",
+        ["n64_classic_last"] = "the preset F7 turns N64 Classic on to (n64_rules.h Toggle): the game's own",
+        ["n64_rem_fps"] = "N64 Classic's Remembered page (n64_rules.h kSpec): set in the game",
+        ["n64_rem_lines"] = "N64 Classic's Remembered page (n64_rules.h kSpec): set in the game",
+        ["n64_rem_colour"] = "N64 Classic's Remembered page (n64_rules.h kSpec): set in the game",
+        ["n64_rem_dither"] = "N64 Classic's Remembered page (n64_rules.h kSpec): set in the game",
+        ["n64_rem_blur"] = "N64 Classic's Remembered page (n64_rules.h kSpec): set in the game",
+        ["n64_rem_tv"] = "N64 Classic's Remembered page (n64_rules.h kSpec): set in the game",
+        ["n64_rem_scanlines"] = "N64 Classic's Remembered page (n64_rules.h kSpec): set in the game",
+        ["n64_rem_mask"] = "N64 Classic's Remembered page (n64_rules.h kSpec): set in the game",
+        ["n64_rem_mask_strength"] = "N64 Classic's Remembered page (n64_rules.h kSpec): set in the game",
+        ["n64_rem_bleed"] = "N64 Classic's Remembered page (n64_rules.h kSpec): set in the game",
+        ["n64_rem_glow"] = "N64 Classic's Remembered page (n64_rules.h kSpec): set in the game",
+        ["n64_rem_curvature"] = "N64 Classic's Remembered page (n64_rules.h kSpec): set in the game",
+        ["n64_rem_saturation"] = "N64 Classic's Remembered page (n64_rules.h kSpec): set in the game",
+        ["use_global_multipliers"] = "the Simulated turf page's (sim_turf_settings.h; its own file now): an older build's line",
+        ["fade_start_multiplier"] = "the Simulated turf page's (sim_turf_settings.h; its own file now): an older build's line",
+        ["turf_density_multiplier"] = "the Simulated turf page's (sim_turf_settings.h; its own file now): an older build's line",
+        ["minimum_blades_multiplier"] = "the Simulated turf page's (sim_turf_settings.h; its own file now): an older build's line",
+        ["far_power_multiplier"] = "the Simulated turf page's (sim_turf_settings.h; its own file now): an older build's line",
+        ["fade_start"] = "the Simulated turf page's (sim_turf_settings.h; its own file now): an older build's line",
+        ["turf_density"] = "the Simulated turf page's (sim_turf_settings.h; its own file now): an older build's line",
+        ["minimum_blades"] = "the Simulated turf page's (sim_turf_settings.h; its own file now): an older build's line",
+        ["far_power"] = "the Simulated turf page's (sim_turf_settings.h; its own file now): an older build's line",
+        ["user_preset_file"] = "the ReShade User preset file row: the game's list of the files in its reshade folder (reshade/selected.txt)",
+        ["compile_shaders"] = "the Debug tab's Developer rows (not ported)",
+        ["threaded_rendering"] = "the Debug tab's Developer rows (not ported)",
     };
     /// <summary>The binding lines of the Controls page's grid: pad_&lt;button&gt;=&lt;input&gt; and key_&lt;button&gt;=&lt;key&gt;,&lt;key&gt;.</summary>
     public static readonly IReadOnlyList<string> KeptPrefixes = new[] { "pad_", "key_" };

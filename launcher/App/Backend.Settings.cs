@@ -40,6 +40,7 @@ public sealed partial class Backend
         state["settings"] = SettingsRows();
         state["bench"] = BenchState();
         state["gameopts"] = GameOptsState();
+        state["texpack"] = PackState();   // ((Triforce, 11-25) the Play screen's Remastered textures row)
     }
 
     /// <summary>The list again. color: the kept color too, as at start (only when the page asks for the list, which it does each time

@@ -152,6 +152,14 @@ struct { int language = 0, other = 5; } opts;
 struct Row { int* value; int hi; };
 Row rows[] = {{&opts.other, 9}, {&opts.language, 0}, {nullptr, 0}};
 bool is_merged(const int*) { return false; }   /* ((Triforce, options_version 7) no merged row here */
+/* ((Triforce) the menu's languages, vk_menu_i18n.cpp: each game language by its own name; the language the game runs in) */
+namespace mkwvk::i18n {
+const char* game_lang_name(int i) { return mkwvk::game_language::kOwnNames[i]; }
+int started = -1;
+void set_game_started(int i) { started = i; }
+}
+namespace i18n = mkwvk::i18n;
+int output_pick;   /* ((Triforce) the Output device row: saved by its device's id, not here) */
 @STATE@
 @TEXT@
 @HINT@
@@ -177,10 +185,11 @@ int main(int argc, char** argv) {
     const std::string start = slurp();   /* (the test's file: Setup's text with de chosen) */
     CHECK(!start.empty());
     lang_load();
+    CHECK(i18n::started == 4);   /* (the language the game runs in, for the Menu language row's Auto: the file's de) */
     /* the row: the file's 16 languages in the game's order, on the file's choice; not a line of the options file */
     CHECK(lang_count == 16 && rows[1].hi == 15 && rows[0].hi == 9 && opts.language == 4 && lang_saved == 4);
-    CHECK(!std::strcmp(tx_language(4), "German") && !std::strcmp(tx_language(0), "English (US)") && !std::strcmp(tx_language(15), "Chinese (Traditional)"));
-    CHECK(!std::strcmp(tx_language(-3), "English (US)") && !std::strcmp(tx_language(99), "Chinese (Traditional)"));
+    CHECK(!std::strcmp(tx_language(4), "Deutsch") && !std::strcmp(tx_language(0), "English (US)") && !std::strcmp(tx_language(15), "繁體中文"));
+    CHECK(!std::strcmp(tx_language(-3), "English (US)") && !std::strcmp(tx_language(99), "繁體中文"));
     CHECK(!ini_row(rows[1]) && ini_row(rows[0]) && !ini_row(rows[2]));
     CHECK(!hn_language(0, -1) && hn_language(0, 0) && hn_language(0, 1) && !hn_language(0, 2));
     /* nothing chosen anew: nothing written */
@@ -215,7 +224,7 @@ int main(int argc, char** argv) {
     CHECK(slurp() == "# only these now\n\nfr\n\n# en-US    English (US)\n# fr       French (France)\n" && lang_saved == 2 && !lang_failed);
     /* read anew, as the next start does: two entries, on fr */
     lang_load();
-    CHECK(lang_count == 2 && rows[1].hi == 1 && opts.language == 1 && !std::strcmp(tx_language(1), "French (France)"));
+    CHECK(lang_count == 2 && rows[1].hi == 1 && opts.language == 1 && !std::strcmp(tx_language(1), "Français (France)"));
     /* the file gone: the choice cannot be kept, the row stays */
     remove(lang_path().c_str());
     opts.language = 0;
@@ -230,7 +239,7 @@ int main(int argc, char** argv) {
     /* a choice with no list: one entry, nothing to choose (not shown either) */
     put("it\n");
     lang_load();
-    CHECK(lang_count == 1 && opts.language == 0 && !std::strcmp(tx_language(0), "Italian"));
+    CHECK(lang_count == 1 && opts.language == 0 && !std::strcmp(tx_language(0), "Italiano"));
     /* a file far too large is not language.txt */
     put(std::string(70000, '#') + "\nde\n# de German\n# fr French\n");
     lang_load();

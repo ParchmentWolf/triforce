@@ -128,7 +128,8 @@ def check_source():
                              ("VmaPool textures_pool() {", "pi.priority = prio(PrioKind::Texture);", "the textures' pool"),
                              ("bool vma_piece_alloc(", "pi.priority = prio(PrioKind::Other);", "the mirrors' pieces' pool"),
                              ("bool vma_init(PFN_vkGetInstanceProcAddr gipa) {", "ai.priority = prio(PrioKind::Held);", "the lab's ballast"),
-                             ("bool create_image_inner_(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated, bool target, bool textures) {",
+                             ("bool create_image_inner_(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated, bool target, bool textures,\n"
+                              "                         ImageNeed* need) {",
                               "ai.priority = prio(target ? PrioKind::Target : textures ? PrioKind::Texture : PrioKind::Other);", "an image")):
         check(tier in block(vma, head), "vk_vma.cpp: %s does not name its tier" % what)
     init = block(vma, "bool vma_init(PFN_vkGetInstanceProcAddr gipa) {")

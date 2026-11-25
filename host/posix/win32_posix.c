@@ -85,20 +85,24 @@ static struct timespec rel_ms(DWORD ms) {
     struct timespec ts = {(time_t)(ms / 1000), (long)(ms % 1000) * 1000000L};
     return ts;
 }
-void WakeConditionVariable(CONDITION_VARIABLE *cv) {
+/* ((Triforce) a wake with no sleeper makes no system call: a sleeper counts itself in (waiters) under its lock, before it
+   reads seq and lets the lock go, so a waker that changed what the sleeper waits for under that lock sees it counted, and one
+   that finds none has nobody to wake. Most of the game's wakes have no sleeper: each was a futex call for nothing) */
+static void cv_wake(CONDITION_VARIABLE *cv, int count) {
+    if (!__atomic_load_n(&cv->waiters, __ATOMIC_SEQ_CST)) return;
     __atomic_add_fetch(&cv->seq, 1, __ATOMIC_SEQ_CST);
-    futex(&cv->seq, FUTEX_WAKE_PRIVATE, 1, NULL);
+    futex(&cv->seq, FUTEX_WAKE_PRIVATE, count, NULL);
 }
-void WakeAllConditionVariable(CONDITION_VARIABLE *cv) {
-    __atomic_add_fetch(&cv->seq, 1, __ATOMIC_SEQ_CST);
-    futex(&cv->seq, FUTEX_WAKE_PRIVATE, INT_MAX, NULL);
-}
+void WakeConditionVariable(CONDITION_VARIABLE *cv) { cv_wake(cv, 1); }
+void WakeAllConditionVariable(CONDITION_VARIABLE *cv) { cv_wake(cv, INT_MAX); }
 static BOOL cv_wait(CONDITION_VARIABLE *cv, DWORD ms, void (*unlock)(void *), void (*relock)(void *, ULONG), void *l, ULONG flags) {
+    __atomic_add_fetch(&cv->waiters, 1, __ATOMIC_SEQ_CST);
     const uint32_t seq = __atomic_load_n(&cv->seq, __ATOMIC_SEQ_CST);
     unlock(l);
     struct timespec ts = rel_ms(ms);
     const long r = futex(&cv->seq, FUTEX_WAIT_PRIVATE, seq, ms == INFINITE ? NULL : &ts);
     const int timed_out = r == -1 && errno == ETIMEDOUT;
+    __atomic_sub_fetch(&cv->waiters, 1, __ATOMIC_SEQ_CST);
     relock(l, flags);
     if (timed_out) { last_error = ERROR_TIMEOUT; return FALSE; }
     return TRUE;
@@ -171,6 +175,7 @@ typedef struct {
     pthread_mutex_t mu;
     pthread_cond_t cv;
     int done, priority;
+    int pinned;   /* (SetThreadAffinityMask set its affinity: thread_entry leaves it; under mu) */
     DWORD code;
     volatile int refs;
     LPTHREAD_START_ROUTINE fn;
@@ -191,6 +196,30 @@ static HThread *thread_new(void) {
     monitor_init(&t->mu, &t->cv);
     return t;
 }
+/* The process's affinity as the process started: Windows keeps a process mask apart from its threads' masks, Linux has
+   only the threads'. Read from the asking thread each time, it was that thread's own mask, which shrank once hos_thread_pin
+   pinned it off the reserved core: the Presentation Thread's pin, asked for from a game thread kept off that core, then
+   saw no reserved core in the "process" mask and kept the Presentation Thread off it too, against render_thread_on_reserved
+   (host/hos_thread.c; Ryzen 9 9950X3D, 2026-11-09). Taken once, before main, when no thread is pinned yet.
+   Also applied when a thread first registers here (CreateThread's thread_entry, or a std::thread in thread_self on its
+   first GetCurrentThread call in SetThreadDescription / SetThreadPriority), so a thread made inside a pinned replay
+   (ReplayPin in gpu/vk/vk_replay.cpp) starts with the process's affinity as on Windows rather than inheriting the pin.
+   (A thread that never registers here, a std::thread that calls none of these or a library's, keeps what it inherited) */
+static DWORD_PTR process_affinity;
+__attribute__((constructor)) static void init_process_affinity(void) {
+    cpu_set_t s;
+    CPU_ZERO(&s);
+    if (sched_getaffinity(0, sizeof s, &s) == 0)
+        for (int i = 0; i < 64; i++) if (CPU_ISSET(i, &s)) process_affinity |= (DWORD_PTR)1 << i;
+}
+static void apply_process_affinity(pthread_t th) {
+    if (!process_affinity) init_process_affinity();
+    if (!process_affinity) return;
+    cpu_set_t want;
+    CPU_ZERO(&want);
+    for (int i = 0; i < 64; i++) if (process_affinity >> i & 1) CPU_SET(i, &want);
+    pthread_setaffinity_np(th, sizeof want, &want);
+}
 static HThread *thread_self(void) {
     if (!self_thread) {   /* (a thread this file did not start: the main thread, a library's) */
         HThread *t = thread_new();
@@ -198,6 +227,7 @@ static HThread *thread_self(void) {
         t->tid = (pid_t)syscall(SYS_gettid);
         t->refs = 1;   /* (kept for the thread's life) */
         self_thread = t;
+        apply_process_affinity(t->th);
     }
     return self_thread;
 }
@@ -220,6 +250,11 @@ static void *thread_entry(void *p) {
     HThread *t = (HThread *)p;
     self_thread = t;
     t->tid = (pid_t)syscall(SYS_gettid);
+    /* (Triforce: unless its maker has pinned it by its handle already, hos_thread_start's hos_thread_pin right after
+       CreateThread: the reset coming second would have put a game thread back on the reserved core) */
+    pthread_mutex_lock(&t->mu);
+    if (!t->pinned) apply_process_affinity(t->th);
+    pthread_mutex_unlock(&t->mu);
     thread_finish(t->fn(t->arg));
     return NULL;
 }
@@ -274,7 +309,10 @@ BOOL SetThreadPriority(HANDLE h, int p) {
     if (!t) { last_error = ERROR_INVALID_HANDLE; return FALSE; }
     t->priority = p;
     const int nice = p <= THREAD_PRIORITY_IDLE ? 19 : p <= THREAD_PRIORITY_LOWEST ? 10 : p == THREAD_PRIORITY_BELOW_NORMAL ? 5 : 0;
-    if (nice && t->tid) setpriority(PRIO_PROCESS, (id_t)t->tid, nice);
+    if (!nice) return TRUE;
+    /* (a thread just made has no id until it runs: hos_thread_start lowers it right after CreateThread) */
+    while (!t->tid && !t->done) sched_yield();
+    if (t->tid) setpriority(PRIO_PROCESS, (id_t)t->tid, nice);
     return TRUE;
 }
 int GetThreadPriority(HANDLE h) {
@@ -289,22 +327,14 @@ DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask) {
     pthread_getaffinity_np(t->th, sizeof old, &old);
     CPU_ZERO(&want);
     for (int i = 0; i < 64; i++) if (mask >> i & 1) CPU_SET(i, &want);
-    if (pthread_setaffinity_np(t->th, sizeof want, &want)) { last_error = ERROR_INVALID_PARAMETER; return 0; }
+    pthread_mutex_lock(&t->mu);   /* (with thread_entry's reset to the process's affinity: whichever comes first, this one stays) */
+    const int failed = pthread_setaffinity_np(t->th, sizeof want, &want);
+    if (!failed) t->pinned = 1;
+    pthread_mutex_unlock(&t->mu);
+    if (failed) { last_error = ERROR_INVALID_PARAMETER; return 0; }
     DWORD_PTR r = 0;
     for (int i = 0; i < 64; i++) if (CPU_ISSET(i, &old)) r |= (DWORD_PTR)1 << i;
     return r ? r : 1;
-}
-/* The process's affinity as the process started: Windows keeps a process mask apart from its threads' masks, Linux has
-   only the threads'. Read from the asking thread each time, it was that thread's own mask, which shrank once hos_thread_pin
-   pinned it off the reserved core: the Presentation Thread's pin, asked for from a game thread kept off that core, then
-   saw no reserved core in the "process" mask and kept the Presentation Thread off it too, against render_thread_on_reserved
-   (host/hos_thread.c; Ryzen 9 9950X3D, 2026-11-09). Taken once, before main, when no thread is pinned yet. */
-static DWORD_PTR process_affinity;
-__attribute__((constructor)) static void init_process_affinity(void) {
-    cpu_set_t s;
-    CPU_ZERO(&s);
-    if (sched_getaffinity(0, sizeof s, &s) == 0)
-        for (int i = 0; i < 64; i++) if (CPU_ISSET(i, &s)) process_affinity |= (DWORD_PTR)1 << i;
 }
 BOOL GetProcessAffinityMask(HANDLE p, DWORD_PTR *proc, DWORD_PTR *sys) {
     (void)p;
@@ -756,7 +786,9 @@ static const char *linux_name(const char *base) {
         if (!strcasecmp(base, map[i][0])) return map[i][1];
     return NULL;
 }
+static __thread char load_error[512];   /* ((Triforce) dlerror()'s text for this thread's last failure: hos_load_error) */
 HMODULE LoadLibraryA(LPCSTR name) {
+    load_error[0] = 0;
     if (!name) return NULL;
     char path[PATH_MAX];
     snprintf(path, sizeof path, "%s", name);
@@ -774,9 +806,14 @@ HMODULE LoadLibraryA(LPCSTR name) {
         }
     }
     HMODULE m = dlopen(path, RTLD_NOW | RTLD_LOCAL);
-    if (!m) last_error = ERROR_FILE_NOT_FOUND;
+    if (!m) {
+        last_error = ERROR_FILE_NOT_FOUND;
+        const char *why = dlerror();
+        snprintf(load_error, sizeof load_error, "%s", why ? why : "");
+    }
     return m;
 }
+const char *hos_load_error(void) { return load_error; }
 BOOL FreeLibrary(HMODULE m) { return m && dlclose(m) == 0; }
 FARPROC GetProcAddress(HMODULE m, LPCSTR name) { return m ? (FARPROC)dlsym(m, name) : NULL; }
 HMODULE GetModuleHandleA(LPCSTR name) {
@@ -1133,6 +1170,10 @@ static void on_signal(int sig, siginfo_t *si, void *uctx) {
             context_to(uc, &ctx);
             return;
         }
+    /* ((Triforce) the signal and its code for the local crash record (host/mkw_glue.c record_exception), in the record's
+       unused tail: NumberParameters, which the CRASH lines read, is unchanged) */
+    rec.ExceptionInformation[13] = (ULONG_PTR)sig;
+    rec.ExceptionInformation[14] = (ULONG_PTR)(intptr_t)si->si_code;
     if (unhandled && unhandled(&ep) == EXCEPTION_CONTINUE_EXECUTION) {
         context_to(uc, &ctx);
         return;
@@ -1148,12 +1189,16 @@ static void on_signal(int sig, siginfo_t *si, void *uctx) {
         return;
     }
     signal(sig, SIG_DFL);
+    /* ((Triforce) a signal sent (abort, kill) does not come again by returning: raised again, so it still ends the process
+       as it would have; a real fault comes again on return, with its own information) */
+    if (si->si_code <= 0) raise(sig);
 }
 static void install_signals(void) {
     static int done;
     if (done) return;
     done = 1;
-    const int sigs[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE};
+    /* ((Triforce) SIGABRT too: an abort is reported (the CRASH lines, the local crash record) before it ends the game */
+    const int sigs[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT};
     for (size_t i = 0; i < sizeof sigs / sizeof sigs[0]; i++) {
         struct sigaction sa;
         memset(&sa, 0, sizeof sa);
@@ -1256,13 +1301,19 @@ int MessageBoxA(HWND w, LPCSTR text, LPCSTR caption, UINT type) {
 
 /* ---- waveOut on SDL's audio (host/hos_sdl.c): a callback takes the written blocks in order and marks them done ---- */
 /* (the executable's: this file is in the Vulkan back end too, which plays no sound and has no hos_sdl.c) */
-int hos_sdl_audio_open(int freq, int channels, int s16, void (*pull)(void *user, uint8_t *out, int len), void *user)
-    __attribute__((weak));
+/* ((Triforce) the device: WAVE_MAPPER the default, else the Output device row's token (host/audio_output_devices.c
+   resolves its id). A device gone is told at the next write (MMSYSERR_NODRIVER: host/nn_audio.c's au_device_gone opens
+   the default meanwhile and tries the chosen one again); the stream is closed with the handle, its callbacks stopped first) */
+void *hos_sdl_audio_open_device(unsigned device, int freq, int channels, int s16, int frames,
+                                void (*pull)(void *user, uint8_t *out, int len), void *user) __attribute__((weak));
+void hos_sdl_audio_close(void *audio) __attribute__((weak));
+int hos_sdl_audio_alive(void *audio) __attribute__((weak));
 typedef struct {
     pthread_mutex_t mu;
     WAVEHDR *q[64];
     int head, count;
     DWORD pos;
+    void *audio;   /* (hos_sdl.c's stream) */
 } WaveOut;
 static void wave_pull(void *user, uint8_t *out, int len) {
     WaveOut *w = (WaveOut *)user;
@@ -1282,12 +1333,15 @@ static void wave_pull(void *user, uint8_t *out, int len) {
     if (len > 0) memset(out, 0, (size_t)len);   /* (behind: silence) */
 }
 MMRESULT waveOutOpen(HWAVEOUT *out, UINT device, const WAVEFORMATEX *f, DWORD_PTR cb, DWORD_PTR inst, DWORD flags) {
-    (void)device, (void)cb, (void)inst, (void)flags;
+    (void)cb, (void)inst, (void)flags;
     /* (the same SDL as the window's and the controllers', beside the executable first: hos_sdl.c) */
-    if (!hos_sdl_audio_open) return MMSYSERR_ERROR;
+    if (!hos_sdl_audio_open_device || !hos_sdl_audio_close || !hos_sdl_audio_alive || !out || !f) return MMSYSERR_ERROR;
     WaveOut *w = (WaveOut *)calloc(1, sizeof *w);
-    pthread_mutex_init(&w->mu, NULL);
-    if (!hos_sdl_audio_open((int)f->nSamplesPerSec, (int)f->nChannels, f->wBitsPerSample == 16, wave_pull, w)) {
+    if (!w) return MMSYSERR_ERROR;
+    if (pthread_mutex_init(&w->mu, NULL)) { free(w); return MMSYSERR_ERROR; }
+    w->audio = hos_sdl_audio_open_device(device, (int)f->nSamplesPerSec, (int)f->nChannels, f->wBitsPerSample == 16, 0,
+                                         wave_pull, w);
+    if (!w->audio) {
         pthread_mutex_destroy(&w->mu);
         free(w);
         return MMSYSERR_ERROR;
@@ -1300,8 +1354,15 @@ MMRESULT waveOutUnprepareHeader(HWAVEOUT w, WAVEHDR *h, UINT size) { (void)w, (v
 MMRESULT waveOutWrite(HWAVEOUT hw, WAVEHDR *h, UINT size) {
     (void)size;
     WaveOut *w = (WaveOut *)hw;
+    if (!hos_sdl_audio_alive(w->audio)) return MMSYSERR_NODRIVER;   /* ((Triforce) its device is gone) */
     pthread_mutex_lock(&w->mu);
-    if (w->count == 64) { pthread_mutex_unlock(&w->mu); return MMSYSERR_ERROR; }
+    if (w->count >= 60) {
+        WAVEHDR *old = w->q[w->head];
+        __atomic_store_n(&old->dwFlags, (old->dwFlags & ~(DWORD)WHDR_INQUEUE) | WHDR_DONE, __ATOMIC_RELEASE);
+        w->head = (w->head + 1) % 64;
+        w->count--;
+        w->pos = 0;
+    }
     h->dwFlags = (h->dwFlags & ~(DWORD)WHDR_DONE) | WHDR_INQUEUE;
     w->q[(w->head + w->count) % 64] = h;
     w->count++;
@@ -1319,4 +1380,13 @@ MMRESULT waveOutReset(HWAVEOUT hw) {
     pthread_mutex_unlock(&w->mu);
     return 0;
 }
-MMRESULT waveOutClose(HWAVEOUT hw) { waveOutReset(hw); return 0; }
+/* ((Triforce) the stream closed with it: it was left playing silence before, one more each time the output reopened) */
+MMRESULT waveOutClose(HWAVEOUT hw) {
+    WaveOut *w = (WaveOut *)hw;
+    if (!w) return MMSYSERR_ERROR;
+    hos_sdl_audio_close(w->audio);   /* (waits for a callback under way, which takes mu: never called holding it) */
+    waveOutReset(hw);
+    pthread_mutex_destroy(&w->mu);
+    free(w);
+    return MMSYSERR_NOERROR;
+}

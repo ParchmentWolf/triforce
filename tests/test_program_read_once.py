@@ -62,7 +62,7 @@ MUTATIONS = [
     ("the read under the lock", "read", "functions", "draw_once.unlocked(read, &st_once_relock_ns);", "read();"),
     ("no claim: the second draw reads the program again", "second", "functions",
      "if (once && !draw_once.claim(key, &st_once_wait_ns)) {", "if (false) {"),
-    ("the records taken off the list at the read's start", "read", "functions", "if (keep || once) {", "if (keep) {"),
+    ("the records taken off the list at the read's start", "read", "functions", "} else if (once) {", "} else if (false) {"),
     ("the wait for the worker under the lock", "worker", "functions", "if (read_unlocked() && draw_once.may_let_go()) {",
      "if (false) {"),
     ("the read-ahead chooses a program a draw is reading", "choose", "functions", " || draw_once.reading(k)) return false;",

@@ -48,7 +48,7 @@ def main():
         raise SystemExit("vk_replay.cpp's HDR Native picture is no longer dev.hdr && opts.hdr == 2: menu_note_present_sizes's test")
     # AMD FSR 1, which the sizes now choose, sharpens only with Sharpness above 0: at 0, EASU alone into the image shown
     # (fsr1_rcas.hlsl's 0% is 2 stops below its strongest, not off)
-    scale = block((ROOT / "gpu" / "vk" / "vk_framegen.cpp").read_text(encoding="utf-8"), "VkImage framegen_scale(")
+    scale = block((ROOT / "gpu" / "vk" / "vk_framegen.cpp").read_text(encoding="utf-8"), "VkImage scale_picture(")   # ((Triforce) 11-24: framegen_scale is scale_picture, then the colour vision pass
     # ((Triforce, S1, S3) the window's Sharpness is sharpen_rules.h window_sharpness's: 0 at the row's 0, and 0 while the
     # upscaler sharpened the 3D before the HUD; EASU then writes the image shown, and RCAS runs only under if (sharp))
     if "const int sharp = sharpen_rules::window_sharpness(opts.sharpness, temporal_sharpens_3d());" not in scale:

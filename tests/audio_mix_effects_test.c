@@ -28,7 +28,9 @@ static void au_unlock(void) { CHECK(--lock_depth == 0); }
 /* the voice's source: one authored sample a frame (render_voice's resampler at 1.0 hands them through a frame late) */
 static float tone[4096];
 static int tone_pos;
+static int silent_voice = -1;   /* (this voice plays silence) */
 static int next_source_frame(Voice *v) {
+    if (v - voices == silent_voice) { v->cur[0] = 0; return 1; }
     v->cur[0] = tone[tone_pos++ % 4096];
     return 1;
 }
@@ -274,11 +276,57 @@ static float splitter_level(int filter_on) {
     }
     return level;
 }
+/* Two voices through one splitter destination with its low pass on: the filter's history is each voice's own. The
+   first plays a steady 1.0, the second silence: with one history in the splitter the second voice's samples came out of
+   the first one's filter state, and the first one's level was taken down by the second's zeros */
+static void splitter_voices(void) {
+    reset();
+    Splitter *s = &splitters[0];
+    s->used = 1; s->channels = 1; s->dests = 1; s->dest_mix[0] = 1;
+    s->vol[0][0][0] = s->ramp[0][0][0] = 1.0f;
+    put_handle(SPLIT, K_SPLITTER, 0);
+    float_packet(1, (const float[]){0.1f, 0, 0, 0.9f, 0});
+    Ctx c = call(SPLIT, 0, MIX1, 0, PACKET, 0, 0);
+    imp__ZN2nn5audio32SetSplitterBiquadFilterParameterEPNS0_12SplitterTypeEiPNS0_10SubMixTypeEiRKNS0_22TBiquadFilterParameterIfEE(&c);
+    commit();
+    for (int k = 0; k < 2; k++) {
+        Voice *v = &voices[k];
+        v->used = 1; v->channels = 1; v->rate = RATE; v->pitch = 1; v->volume = v->ramp_volume = 1;
+        v->state = PLAY_STARTED; v->dest_kind = DEST_SPLITTER; v->dest = 0;
+    }
+    for (int i = 0; i < 4096; i++) tone[i] = 1.0f;
+    tone_pos = 0;
+    silent_voice = 1;
+    float first = 0;
+    for (int frame = 0; frame < 10; frame++) {
+        memset(mixes[1].buf, 0, sizeof mixes[1].buf);
+        render_voice(&voices[0]);
+        first = mixes[1].buf[0][FRAME - 1];
+        memset(mixes[1].buf, 0, sizeof mixes[1].buf);
+        render_voice(&voices[1]);
+        for (int i = 0; i < FRAME; i++) CHECK(mixes[1].buf[0][i] == 0.0f);   /* (silence in, silence out) */
+    }
+    silent_voice = -1;
+    CHECK(fabsf(first - 1.0f) < 0.001f);   /* (a steady 1.0 through y = 0.1 x + 0.9 y' settles at 1.0, filtered or not) */
+    /* the filter turned off and on again starts over in the voices: nothing of the level it had settled at */
+    float_packet(0, (const float[]){0.1f, 0, 0, 0.9f, 0});
+    c = call(SPLIT, 0, MIX1, 0, PACKET, 0, 0);
+    imp__ZN2nn5audio32SetSplitterBiquadFilterParameterEPNS0_12SplitterTypeEiPNS0_10SubMixTypeEiRKNS0_22TBiquadFilterParameterIfEE(&c);
+    float_packet(1, (const float[]){0.1f, 0, 0, 0.9f, 0});
+    c = call(SPLIT, 0, MIX1, 0, PACKET, 0, 0);
+    imp__ZN2nn5audio32SetSplitterBiquadFilterParameterEPNS0_12SplitterTypeEiPNS0_10SubMixTypeEiRKNS0_22TBiquadFilterParameterIfEE(&c);
+    commit();
+    memset(mixes[1].buf, 0, sizeof mixes[1].buf);
+    render_voice(&voices[0]);
+    if (effects) CHECK(fabsf(mixes[1].buf[0][0] - 0.1f) < 0.001f);
+    else CHECK(fabsf(mixes[1].buf[0][0] - 1.0f) < 0.001f);
+}
 static void splitter(void) {
     const float plain = splitter_level(0), filtered = splitter_level(1);
     CHECK(fabsf(plain - 1.0f) < 0.0001f);
     if (!effects) CHECK(filtered == plain);
     else CHECK(fabsf(filtered - 0.1f / 1.9f) < 0.001f);
+    splitter_voices();
 }
 
 int main(void) {

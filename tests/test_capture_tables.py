@@ -174,7 +174,7 @@ def main():
         "const bool old_ok = history && s.captured_frame && s.captured_frame == to.last;",
         "if (c.k.depth == cam.depth) s.captured_before.put(c.key, c);",
         "if (caps.empty() || !make_capture_pipeline()) return 0;",
-        "const State::Captured* const was = old_ok ? s.captured_before.before(c.key) : nullptr;",
+        "const State::Captured* const was = old_ok && has[i] ? s.captured_before.before(look[i]) : nullptr;",
         "const State::Captured& o = *was;")]
     check(at == sorted(at), "capture_motion does not turn the table, fill it with this frame's draws and then look up the frame before's")
     check("old.find(" not in motion and "std::unordered_map<uint64_t, State::Captured> old" not in motion,

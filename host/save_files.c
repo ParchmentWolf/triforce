@@ -25,6 +25,7 @@
 #include <time.h>
 #include "../gpu/vk/vk_api.h"
 #include "save_files.h"
+#include "oot_autoload.h"   /* (the Skip title screen row's rule for the newest save: hos_save_files_newest_here) */
 
 int rx_option(int id, int otherwise);
 void rx_option_set(int id, int value);
@@ -155,6 +156,46 @@ static int last_saved(int file, char *when, size_t when_cap, char *picture, size
     } while (FindNextFileA(h, &fd));
     FindClose(h);
     return saved;
+}
+/* When a folder of the game's (a file's, or the game's own with the save files off) was last saved in: the newest write time
+   of its slots' caption.sav (the game writes a slot's caption and its save one after the other), as the folder's list has it
+   (a FILETIME's number), 0 when it has no save. Nothing is opened */
+static int64_t folder_saved(const char *dir) {
+    char pat[FILES_PATH + 96];
+    WIN32_FIND_DATAA fd, found;
+    int64_t newest = 0;
+    snprintf(pat, sizeof pat, "%s\\save\\*", dir);
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (fd.cFileName[0] == '.' || strlen(fd.cFileName) > 40) continue;
+        for (int slot = 0; slot < 12; slot++) {   /* (the game looks for slot_00 to slot_11) */
+            snprintf(pat, sizeof pat, "%s\\save\\%s\\slot_%02d\\caption.sav", dir, fd.cFileName, slot);
+            HANDLE s = FindFirstFileA(pat, &found);
+            if (s == INVALID_HANDLE_VALUE) continue;
+            FindClose(s);
+            const int64_t t = (int64_t)((uint64_t)found.ftLastWriteTime.dwHighDateTime << 32 | found.ftLastWriteTime.dwLowDateTime);
+            if (t > newest) newest = t;
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    return newest;
+}
+/* host/oot_autoload.c (the Skip title screen row): 1 when the file this run plays holds the newest save of all the files
+   the file select shows (host/oot_autoload.h oot_autoload_newest_here); 0 when another file was saved in later, or this
+   one has no save yet. With the save files off there is one folder, the game's own (own_dir: hos_user_dir): whether it has
+   a save */
+int hos_save_files_newest_here(const char *own_dir) {
+    int64_t times[SAVE_FILES] = {0};
+    if (!started) {
+        times[0] = own_dir && own_dir[0] ? folder_saved(own_dir) : 0;
+        return oot_autoload_newest_here(times, 1, 0);
+    }
+    for (int i = 0; i < SAVE_FILES; i++) {
+        char dir[FILES_PATH];
+        times[i] = save_files_folder(base_dir, i, dir, sizeof dir) ? folder_saved(dir) : 0;
+    }
+    return oot_autoload_newest_here(times, SAVE_FILES, files.current);
 }
 /* ---- a file's card: host/save_files.h SaveCard ---- */
 #define CARD_FILE "triforce_card.txt"

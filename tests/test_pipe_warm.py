@@ -594,13 +594,13 @@ def check_source(draw, shader):
     for need in ('pipe_warm::opt_in(getenv("RX_VK_COMPUTE_WARM"))', "dev.vk13.pipelineCreationCacheControl", "taau_key(p.key)",
                  "!warm_computes.count(p.key) || !warm_computes_made.first(mix(p.key, p.variant))", "VkComputePipelineCreateInfo ci = compute_create_info(p);",
                  "ci.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;",
-                 "guarded_compute(pcache_use().cache, &ci, &made)", "p.compute_pipeline = made;",
+                 "guarded_compute(pcache_use().cache, &ci, &made)", "std::atomic_ref<VkPipeline>(p.compute_pipeline).store(made, std::memory_order_release);",
                  "p.compute_state.store(2, std::memory_order_release);"):
         if need not in comp:
             raise SystemExit("vk_draw.cpp warm_compute lacks: " + need)
     disp = between(draw, "void dispatch(VkCommandBuffer cmd, NvnState& s,", "\n}\n")
     if "const auto info = [](const Program& q) { return compute_create_info(q); };" not in disp or \
-            disp.index("if (!compute_wait && !p.compute_pipeline") > disp.index("compute_create_info("):
+            disp.index("if (!compute_wait && !cpipe()") > disp.index("compute_create_info("):
         raise SystemExit("vk_draw.cpp dispatch does not make its compute pipeline as the warm does, or makes one it has")
     if 'if (pipe_warm::opt_in(getenv("RX_VK_COMPUTE_WARM"))) warm_computes.insert(computes.begin(), computes.end());' not in index:
         raise SystemExit("vk_draw.cpp warm_index_set does not keep the compute programs play dispatched")

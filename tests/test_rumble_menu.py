@@ -75,6 +75,8 @@ bool is_merged(const int*) { return false; }
 int merged_step(const int*, int v, int) { return v; }
 void merged_store(const int*) {}
 void merged_sync() {}
+namespace fps_levels { inline int step(int v, int) { return v; } }   /* ((Triforce) the FPS counter's levels and Auto (this PC): set_row's, not reached here */
+void auto_row_set(const int*) {}
 namespace mr { constexpr int kMax = 8; }
 void restart_values(int*) {}
 struct { void note(const int*) {} } restart_state;
@@ -87,6 +89,15 @@ bool can_mic() { return false; }
 /* (the Upscaler row's choices, which set_row steps through: the game's own only, here) */
 unsigned upscalers_available() { return 1; }
 void mic_chosen() {}
+int output_pick;   // (the Output device row: its device is told to the host, not run here)
+bool output_forced() { return false; }
+void output_chosen() {}
+void prompts_at_once(const Row&) {}
+namespace reshade_menu {   // ((Triforce) the ReShade preset rows: the renderer's, not run here
+int user_pick;
+void preset_chosen() {}
+void user_picked() {}
+}
 // (set_row steps the Output row through vk_menu.cpp's output_step, its choices (#1144): not what this checks)
 struct { unsigned w, h; } remembered_custom{};
 bool output_step(int, bool) { return false; }

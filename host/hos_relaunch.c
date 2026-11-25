@@ -62,6 +62,15 @@ static void relaunch(void) {
 
 extern char **environ;
 
+static int start_err_given = 1;   /* ((Triforce) whether the game was started with a stderr: hos_relaunch_keep_env) */
+
+void hos_relaunch_keep_env(void) {
+    /* ((Triforce, 11-24, after Source A's) kept before hos_main.c opens triforce_log.txt as stderr for a game given none, by
+       the same test as hos_main.c's: whether it was given one */
+    const HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
+    start_err_given = err && err != INVALID_HANDLE_VALUE && GetFileType(err) != FILE_TYPE_UNKNOWN;
+}
+
 static void relaunch(void) {
     HosRelaunch r;
     if (!hos_relaunch_command("/proc/self/cmdline", "/proc/self/environ", &r)) {
@@ -80,9 +89,19 @@ static void relaunch(void) {
         closedir(d);
     }
     fflush(NULL);
+    /* ((Triforce, 11-24) a game given no stderr has its own log there, which execve would keep: the new run would take it for
+       a stderr it was given, and neither move it to .1 nor start a log of its own. It is given none again; its log back if
+       the exec fails) */
+    int log_err = -1;
+    if (!start_err_given) {
+        const int none = open("/dev/null", O_WRONLY | O_CLOEXEC);
+        if (none >= 0 && (log_err = fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 0)) >= 0) dup2(none, STDERR_FILENO);
+        if (none >= 0) close(none);
+    }
     execve("/proc/self/exe", r.argv, r.envp);
     environ = r.envp;   /* (execvp searches the PATH of the environment it is given: the one the game started with) */
     execvp(r.argv[0], r.argv);
+    if (log_err >= 0) dup2(log_err, STDERR_FILENO), close(log_err);
     hos_log("restart: the game could not be started again: it only exits");
     hos_log_flush();
 }
@@ -93,12 +112,17 @@ static void relaunch(void) {
 void hos_window_closed_exit(void) {
     const int again = relaunch_asked != 0;
     { void hos_bench_closing(void); hos_bench_closing(); }   /* ((Triforce) benchmark mode: a run not finished writes that it stopped) */
+    /* ((Triforce) host/input_movie.c: an input recording's last run written, and a playback's count; ExitProcess runs no
+       atexit handler here) */
+    { void hos_input_movie_close(void); hos_input_movie_close(); }
     hos_log(again ? "display: window closed for a restart (the Insert menu's Restart now)" : "display: window closed, exiting");
     hos_log_flush();
     { void hos_fs_save_finish(void); hos_fs_save_finish(); }   /* (host/nn_fs.c: a save still being committed is finished first) */
+    { void hos_pad_speaker_shutdown(void); hos_pad_speaker_shutdown(); }   /* ((Triforce) host/pad_speaker.c: a DualSense's sound back to its jack) */
     /* (Triforce) the renderer is told: NVIDIA's Streamline is shut down in order, where leaving it to the DLLs' unloading
        crashed inside nvngx_dlssg.dll at every exit with DLSS frame generation on */
     { void rx_option_set(int id, int value); rx_option_set(HOS_OPT_EXITING, 1); }
+    { void hos_crash_clean_end(void); hos_crash_clean_end(); }   /* ((Triforce) a clean end: host/hos_crash_record.c */
     if (again) relaunch();
     ExitProcess(0);
 }

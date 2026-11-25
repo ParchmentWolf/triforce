@@ -177,14 +177,14 @@ def check_sources(menu, header, api, replay, readme):
     check(at < heading < table.index("MOD_CHEAT_ROWS8(0)") < table.index("// ---- Controls ("), "the cheats' rows do not stand after Bug capture (F8) on the System tab")
     check('constexpr char kModCheatHeading[] = "Mod cheats";' in menu, "the heading's name in the table is not the one row_shown tells it by")
     check(re.search(r"static_assert\(mod_cheat_rows::kSlots == %d," % slots, menu), "nothing holds the table to the list's slots")
-    check('bool ini_row(const Row& r) { return r.value && r.value != &opts.language && !is_merged(r.value); }' in menu, "a row without a value may be a row of the options file now")
+    check('bool ini_row(const Row& r) { return r.value && r.value != &opts.language && !is_merged(r.value) && r.value != &output_pick; }' in menu, "a row without a value may be a row of the options file now")
     # shown only once named
     shown = block(menu, "bool row_shown(int i) {")
     check("(!rows[i].heading || strcmp(rows[i].name, kModCheatHeading) || mod_cheats.shown() > 0)" in shown
           and "(mod_cheat_slot(rows[i].name) < 0 || mod_cheat_slot(rows[i].name) < mod_cheats.shown())" in shown,
           "the cheats' rows and their heading are shown before the host named them")
     # drawn and pressed as cheats before anything that goes by a row's name
-    draw = block(menu, "void draw_options(ui::Ctx& c) {")
+    draw = block(menu, "void draw_options(ui::Ctx& c) {") + block(menu, "float row_value_cell(")   # ((Triforce) its value cells
     cell = draw.index("if (const int cheat = mod_cheat_slot(r.name); cheat >= 0) {")
     check(cell < draw.index("} else if (!r.value) {") and 'halves_cell(c, va, vb, "On", "Off", !mod_cheats.is_on(cheat), selected, false);' in draw
           and "choice_cell(c, va, vb, mod_cheats.fixed_text(cheat), selected, false, false, true);" in draw,

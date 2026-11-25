@@ -41,7 +41,7 @@ def checks(t):
     temporal, fsr3, inputs, inputs_h, draw, menu = (t["temporal"], t["fsr3"], t["inputs"], t["inputs_h"], t["draw"],
                                                     t["menu"])
     # the gates: FSR 3.1 too
-    check("bool temporal_motion_wanted() { return temporal_wanted() || fsr3_wanted(); }" in temporal,
+    check("bool temporal_motion_wanted() { return temporal_wanted() || fsr3_wanted() || temporal_fg_motion(); }" in temporal,
           "temporal_motion_wanted does not include AMD FSR 3.1")
     check("bool temporal_capture_wanted() { return motion_mode() == kMotionCapture && temporal_motion_wanted(); }" in temporal,
           "the draws store their positions only for the chain's own engines")
@@ -99,7 +99,7 @@ def checks(t):
     check(up.index("fsr3_inputs::prepare(cmd, in, in_view, f, hdr)") < up.index("temporal_fsr3_motion(cmd, &f)") <
           up.index("std::lock_guard lk(o.mu);") < up.index("fsr3::upscale(cmd, ai)"),
           "fsr3_upscale's own motion is not drawn after its inputs, outside its lock and before its passes")
-    check("if (upscaling) (void)temporal_fsr3_motion(cmd, nullptr);" in up, "the frame's draws are kept when FSR 3.1's inputs were not made")
+    check("if (upscaling || fg_own) (void)temporal_fsr3_motion(cmd, nullptr);" in up, "the frame's draws are kept when FSR 3.1's inputs were not made")
     stand = function(draw, "bool fsr3_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {")
     check("last_pipeline = VK_NULL_HANDLE;" in stand and "vertex_set.on = false" in stand,
           "fsr3_stand_in does not set the draw state again after the redraws")

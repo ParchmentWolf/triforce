@@ -93,7 +93,7 @@ def check_source():
     need("vk_draw.cpp graphics_pipeline (libraries first)", first,
          ["gpl_build_cold(q, job->s, job->at, job->topo, i + 1, k);", "gpl_rules::linked(*job->e, l);",
           "jobs_push([job] { gpl_retire(gpl_rules::built(*job->e, build_graphics(*job->p, job->s, job->at, job->topo))); });",
-          "gpl_retire(gpl_rules::built(*job->e, build_graphics(q, job->s, job->at, job->topo)));", "}, false, &e->ready);"])
+          "gpl_retire(gpl_rules::built(*job->e, build_graphics(q, job->s, job->at, job->topo)));", "}, false, &e->ready, [job]() noexcept {"])
     need("vk_draw.cpp graphics_pipeline (when)", gp,
          ["if (!e->ready.load(std::memory_order_relaxed) && pipe_fast_workers() && (link_later || cold[0] || cold[1])) {"])
     tail = gp[gp.index("pipe_wait::libs_first<VkPipeline>("):]

@@ -9,7 +9,7 @@ maps or binaries (on Linux, the game folder).
 
 Prints the functions by inclusive share (in the stack at all) and by self share (the leaf), and the leaf modules.
 """
-import bisect, collections, itertools, os, re, stat, subprocess, sys
+import bisect, collections, itertools, os, re, shutil, stat, subprocess, sys
 from contextlib import ExitStack
 from tempfile import TemporaryFile
 
@@ -25,12 +25,63 @@ def load_map(path, base):
             if m:
                 syms.append((int(m.group(2), 16) - base, m.group(1)))
     syms.sort()
-    return [a for a, _ in syms], [n for _, n in syms]
+    return [a for a, _ in syms], demangle_all([n for _, n in syms])
+
+
+def demangler():
+    """((Triforce, 11-24, after Source A's) A C++ demangler for the Itanium names of a Windows build's maps (llvm-mingw's, as on
+    Linux): llvm-cxxfilt or c++filt on the PATH, else HOOKSHOT_MINGW's. None: there is none"""
+    for name in ("llvm-cxxfilt", "c++filt"):
+        p = shutil.which(name)
+        if p:
+            return p
+    d = os.environ.get("HOOKSHOT_MINGW", "")
+    for exe in ("llvm-cxxfilt.exe", "llvm-cxxfilt"):
+        p = os.path.join(d, "bin", exe) if d else ""
+        if p and os.path.isfile(p):
+            return p
+    return None
+
+
+def demangle_all(names):
+    """((Triforce, 11-24, after Source A's) names with their Itanium C++ names (_Z...) demangled and their parameter lists left
+    out, as load_elf's nm -C gives them; any other name (C, MSVC's) as it is. Without a demangler (demangler()), all as they
+    are"""
+    idx = [i for i, n in enumerate(names) if n.startswith("_Z")]
+    tool = demangler() if idx else None
+    if not tool:
+        return names
+    try:
+        r = subprocess.run([tool], input="\n".join(names[i] for i in idx) + "\n", capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return names
+    out = r.stdout.splitlines()
+    if r.returncode or len(out) != len(idx):
+        return names
+    names = list(names)
+    for i, n in zip(idx, out):
+        names[i] = bare(n)
+    return names
+
+
+def bare(name):
+    """a demangled name without its parameter list (and const, noexcept after it): "ns::f(int) const" -> "ns::f"; one with
+    none as it is ("(anonymous namespace)" inside a name stays)"""
+    n = re.sub(r"(\s+(const|volatile|noexcept|&&|&))+$", "", name)
+    if not n.endswith(")"):
+        return name
+    depth = 0
+    for i in range(len(n) - 1, -1, -1):
+        depth += {")": 1, "(": -1}.get(n[i], 0)
+        if depth == 0:
+            return n[:i] if i else name
+    return name
 
 
 # The modules whose frames are Hookshot's own code (the game and the runtime, the renderer): Windows, then Linux
-GAME_MODS = ("Triforce.exe", "hookshot.exe", "hookshot")   # (Triforce's names first; upstream's kept for its samples)
-VK_MODS = ("triforce_vk.dll", "hookshot_vk.dll", "hookshot_vk.so")
+GAME_MODS = ("Triforce.exe", "triforce", "hookshot.exe", "hookshot")   # (Triforce's names first; the older names kept for their samples)
+VK_MODS = ("triforce_vk.dll", "triforce_vk.so", "hookshot_vk.dll", "hookshot_vk.so")
 RUN_MODS = GAME_MODS + VK_MODS
 
 
@@ -57,7 +108,7 @@ def load_symbols(folder=None):
         mp = os.path.join(folder, mod[:-4] + ".map")
         if os.path.exists(mp):
             maps[mod] = load_map(mp, 0x180000000 if mod.endswith(".dll") else 0x140000000)
-    for mod in ("hookshot_vk.so", "hookshot"):
+    for mod in ("triforce_vk.so", "triforce", "hookshot_vk.so", "hookshot"):   # ((Triforce, 11-24) its Linux names first
         b = os.path.join(folder, mod)
         if os.path.isfile(b):
             try:

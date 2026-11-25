@@ -77,6 +77,7 @@ int64_t st_prefetch_dropped = 0;
 uint64_t mem_rec_value = 7;
 int freed = 0;
 void vkDestroyBuffer(void*, VkBuffer, void*) {}
+void destroy_import_buffer(VkBuffer) {}   // (vk_memory.cpp's: an import's texel buffer views, then vkDestroyBuffer)
 void vkFreeMemory(void*, VkDeviceMemory, void*) { freed++; }
 void logf(const char*, ...) {}
 void guest_pages_set(uint64_t, uint64_t, uint64_t) {}

@@ -146,7 +146,8 @@ def main():
     ui = (ROOT / "gpu/vk/vk_ui.h").read_text(encoding="utf-8")
     check("draw_debug_rows" not in menu and not (ROOT / "gpu/vk/debug_tab_layout.h").exists(),
           "the Debug tab still has a layout of its own")
-    draw = function(menu, "void draw_options(ui::Ctx& c) {")
+    # ((Triforce) the rows' value cells are row_value_cell's, which the options' list and the tuning bar share)
+    draw = function(menu, "void draw_options(ui::Ctx& c) {") + function(menu, "float row_value_cell(")
     # one list, one loop, for every tab: the Debug tab's entries are debug_list's
     check("if (cur_tab == TAB_DEBUG) listed = debug_list(list);" in draw and "return;" not in draw[:draw.index("PushClipRect")],
           "the Debug tab is not drawn by the tabs' own loop")

@@ -1,5 +1,6 @@
 #include "../gpu/vk/dlss_math.h"
 
+#include <limits>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -98,6 +99,25 @@ int main() {
     for (int i = 0; i < 16; i++) CHECK("reprojection * current = previous", near(back[i], prev[i], 1e-3f));
     const float singular[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
     CHECK("a singular camera", !dm::reprojection(singular, prev, r));
+    // (a camera that is not finite on either side, or a result no float holds: no reprojection, so the chain starts a new history)
+    for (const float bad : {std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(),
+                            -std::numeric_limits<float>::infinity()})
+        for (int i = 0; i < 16; i++) {
+            float c2[16], p2[16];
+            std::memcpy(c2, cur, sizeof c2), std::memcpy(p2, prev, sizeof p2);
+            c2[i] = bad;
+            CHECK("a current camera that is not finite", !dm::reprojection(c2, prev, r));
+            p2[i] = bad;
+            CHECK("a previous camera that is not finite", !dm::reprojection(cur, p2, r));
+        }
+    {
+        float c2[16], p2[16];
+        for (int i = 0; i < 16; i++) c2[i] = p2[i] = i % 5 == 0 ? 1.0f : 0.0f;
+        c2[0] = 1e-10f, p2[0] = std::numeric_limits<float>::max();
+        CHECK("a result past what a float holds", !dm::reprojection(c2, p2, r));
+        c2[0] = 1.0f;
+        CHECK("the largest float itself", dm::reprojection(c2, p2, r) && r[0] == p2[0]);
+    }
 
     // the jitter taken off: a jittered camera unjittered is the camera
     const float jit[2] = {0.0013f, -0.0021f};

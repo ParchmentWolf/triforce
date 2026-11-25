@@ -69,6 +69,7 @@ static int row, ini_reads, renderer_up, display, asked;
 int hos_ini_option(const char *key, int otherwise) { ini_reads++; return strcmp(key, "frame_rate_cap") ? otherwise : row; }
 int rx_option(int id, int otherwise) { asked++; return renderer_up && id == HOS_OPT_DISPLAY_CAP ? display : otherwise; }
 static volatile long long presents;
+static volatile int fps_row_asked = -100;   /* (host/nn_vi.c: the row as the renderer has it now, once a present) */
 @HOST@
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "";
@@ -77,7 +78,9 @@ int main(int argc, char **argv) {
         static const int caps[] = {60, 90, 120, 144, 165, 240};
         for (int i = 0; i < 6; i++) CHECK(fps_cap_of(i, NULL, 0) == caps[i] && fps_cap_of(i, NULL, -1) == caps[i] && fps_cap_of(i, NULL, 144) == caps[i]);
         CHECK(fps_cap_of(-1, NULL, 0) == 45 && fps_cap_of(-2, NULL, 0) == 40 && fps_cap_of(-3, NULL, 0) == 30);
-        CHECK(fps_cap_of(-4, NULL, 0) == 60 && fps_cap_of(7, NULL, 144) == 60 && fps_cap_of(99, NULL, 144) == 60);   /* (past the row: 60) */
+        CHECK(fps_cap_of(-4, NULL, 0) == 60 && fps_cap_of(8, NULL, 144) == 60 && fps_cap_of(99, NULL, 144) == 60);   /* (past the row: 60) */
+        /* Uncapped (7): a cap of 1000, the pacing's 1 ms, whatever the display */
+        CHECK(fps_cap_of(7, NULL, 144) == 1000 && fps_cap_of(7, NULL, -1) == 1000 && fps_cap_of(7, NULL, 0) == 1000);
         /* Monitor's rate: what the renderer says of the display, 30 to 240 whatever it says; not known: 60; no renderer yet: unsettled */
         CHECK(fps_cap_of(6, NULL, 144) == 144 && fps_cap_of(6, NULL, 60) == 60 && fps_cap_of(6, NULL, 75) == 75 && fps_cap_of(6, NULL, 240) == 240);
         CHECK(fps_cap_of(6, NULL, 50) == 50 && fps_cap_of(6, NULL, 30) == 30);
@@ -86,10 +89,10 @@ int main(int argc, char **argv) {
         CHECK(fps_cap_of(6, NULL, -1) == 0);
         /* HOS_FPS_MAX over the row, Monitor's rate too, in its own range as before (20 to 240; under 20, 60) */
         CHECK(fps_cap_of(6, "120", -1) == 120 && fps_cap_of(6, "120", 144) == 120 && fps_cap_of(0, "90", 0) == 90);
-        CHECK(fps_cap_of(6, "1000", 144) == 240 && fps_cap_of(6, "25", 144) == 25 && fps_cap_of(2, "10", 0) == 60 && fps_cap_of(6, "60", 144) == 60);
-        /* no value of the row gives more than 240: "unlimited" is not one of them */
+        CHECK(fps_cap_of(6, "1000", 144) == 1000 && fps_cap_of(6, "5000", 144) == 1000 && fps_cap_of(0, "300", 0) == 300 && fps_cap_of(6, "25", 144) == 25 && fps_cap_of(2, "10", 0) == 60 && fps_cap_of(6, "60", 144) == 60);
+        /* no value of the row but Uncapped gives more than 240 */
         for (int r = -8; r <= 16; r++)
-            for (int d = -1; d <= 1000; d += 7) CHECK(fps_cap_of(r, NULL, d) <= 240 && (fps_cap_of(r, NULL, d) >= 30 || (r == 6 && d < 0)));
+            for (int d = -1; d <= 1000; d += 7) CHECK((r == 7 || fps_cap_of(r, NULL, d) <= 240) && (fps_cap_of(r, NULL, d) >= 30 || (r == 6 && d < 0)));
     } else if (!strcmp(mode, "late")) {
         /* Monitor's rate while the renderer starts: 60, asked again each time, the options file read once; then the display's, kept */
         row = 6;
@@ -123,9 +126,25 @@ int main(int argc, char **argv) {
         row = 2;
         CHECK(fps_max() == 120 && asked == 0 && ini_reads == 1);
         CHECK(fps_max() == 120 && ini_reads == 1);
+    } else if (!strcmp(mode, "inplay")) {
+        /* ((Triforce) the row changed in play: its cap from the next call, Monitor's rate asked of the renderer then */
+        row = 2;
+        CHECK(fps_max() == 120 && asked == 0);
+        fps_row_asked = 2;
+        CHECK(fps_max() == 120 && asked == 0);   /* (the same row: nothing made again) */
+        fps_row_asked = 0;
+        CHECK(fps_max() == 60);
+        fps_row_asked = 7;
+        CHECK(fps_max() == 1000);
+        renderer_up = 1, display = 144, fps_row_asked = 6;
+        CHECK(fps_max() == 144 && asked == 1);
+        fps_row_asked = -3;
+        CHECK(fps_max() == 30 && ini_reads == 1);
     } else if (!strcmp(mode, "env")) {
-        /* HOS_FPS_MAX (set by the test) over Monitor's rate: the renderer is not asked */
+        /* HOS_FPS_MAX (set by the test) over Monitor's rate: the renderer is not asked, nor the row in play */
         row = 6, renderer_up = 1, display = 144;
+        CHECK(fps_max() == 90 && asked == 0);
+        fps_row_asked = 0;
         CHECK(fps_max() == 90 && asked == 0);
     } else {
         return 2;
@@ -150,12 +169,12 @@ def main():
           "the renderer does not answer HOS_OPT_DISPLAY_CAP with fps_cap.h's rule for the window's display")
     menu = (ROOT / "gpu/vk/vk_menu.cpp").read_text(encoding="utf-8")
     # ((Triforce, options_version 7) the Graphics tab's Frame rate & latency group: Frame rate cap)
-    check(re.search(r'\{TAB_GRAPHICS, "Frame rate cap", &opts\.fps_cap, -3, 6, 1, tx_fps_cap,', menu),
-          "the Frame rate cap row does not go from 30 (-3) to Monitor's rate (6)")
+    check(re.search(r'\{TAB_GRAPHICS, "Frame rate cap", &opts\.fps_cap, -3, 7, 1, tx_fps_cap,', menu),
+          "the Frame rate cap row does not go from 30 (-3) to Monitor's rate (6) and Uncapped (7)")
     label = block(menu, "const char* tx_fps_cap(int v) {")
     check("fps_cap::of_display(display_refresh_mhz())" in label and '"Monitor\'s rate (%d)"' in label,
           "the row does not say what Monitor's rate gives on this display")
-    check("Unlimited" not in label and "unlimited" not in label.lower(), "the row offers Unlimited: the game's time step stops at 240")
+    check('"Uncapped"' in label and "fps_cap::kUncapped" in label, "the row does not name Uncapped (7)")
     vi = (ROOT / "host/nn_vi.c").read_text(encoding="utf-8")
     # the vsync event and the pacing follow a cap that settles late
     vsync = block(vi, "static DWORD WINAPI vsync_main(void *p) {")
@@ -171,7 +190,7 @@ def main():
     check("| Frame rate cap | 30, 40, 45, 60, 90, 120, 144, 165, 240, Monitor's rate" in readme,
           "readme.md's settings table has no Frame rate cap row with Monitor's rate")
     guide = (ROOT / "docs/development.md").read_text(encoding="utf-8")
-    check("| `frame_rate_cap` | 0 60, 1 90, 2 120, 3 144, 4 165, 5 240, 6 the monitor's refresh rate; -1 45, -2 40, -3 30 |" in guide,
+    check("| `frame_rate_cap` | 0 60, 1 90, 2 120, 3 144, 4 165, 5 240, 6 the monitor's refresh rate, 7 uncapped; -1 45, -2 40, -3 30 |" in guide,
           "docs/development.md's options table has no frame_rate_cap")
 
     host = "\n".join(block(vi, m) for m in ("static int fps_cap_of(int row, const char *env, int display) {", "static int fps_max(void) {"))
@@ -185,7 +204,7 @@ def main():
         src.write_text(HOST.replace("@ID@", ident.group(1)).replace("@HOST@", host), encoding="utf-8")
         subprocess.run([a.cc, "-std=c11", "-Wall", "-Wextra", "-Werror", str(src), "-o", str(exe)], check=True)
         plain = {k: v for k, v in os.environ.items() if not k.startswith("HOS_")}
-        for mode in ("rule", "late", "unknown", "no answer", "fifty", "fixed"):
+        for mode in ("rule", "late", "unknown", "no answer", "fifty", "fixed", "inplay"):
             subprocess.run([str(exe), mode], env=plain, check=True)
         subprocess.run([str(exe), "env"], env=dict(plain, HOS_FPS_MAX="90"), check=True)
 

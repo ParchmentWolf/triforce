@@ -8,13 +8,17 @@
 //
 // tests/test_aa_passes.py compiles this file whole against stand-ins for the rest of the renderer: what the dispatches are
 // told, in the suite, and with --gpu the passes themselves on the PC's own graphics card, from authored pictures.
+#include <algorithm>
 #include <atomic>
+#include <cmath>
+#include <cstdio>    // ((Triforce) sscanf: RX_VK_EVIL_AO)
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <vector>
 
 #include "aa_rows.h"
+#include "evil_hd.h"   // ((Triforce, 11-23) Evil HD: SMAA Ultra over the row while on)
 #include "upscaler_rows.h"
 #include "vk_aa.h"
 #include "vk_fsr3.h"       // (fsr3_wanted: AMD FSR 3.1 upscales, with its own anti-aliasing)
@@ -26,6 +30,9 @@
 #include "../../third_party/smaa/AreaTex.h"     // (SMAA's lookup textures, MIT: third_party/smaa/PROVENANCE.md)
 #include "../../third_party/smaa/SearchTex.h"
 #include "shaders/aa_post_comp_spv.h"
+#include "shaders/evil_ao_apply_comp_spv.h"   // ((Triforce, 11-23) Evil HD's ambient occlusion: ao_after)
+#include "shaders/evil_ao_comp_spv.h"
+#include "shaders/evil_shafts_comp_spv.h"   // ((Triforce, 11-24) Evil HD's light shafts: shafts_after)
 #include "shaders/smaa_blend_comp_spv.h"
 #include "shaders/smaa_edge_comp_spv.h"
 #include "shaders/smaa_luma_comp_spv.h"
@@ -59,7 +66,7 @@ bool keep_passes() {
 /// upscale (n64_rules.h anti_aliasing): the grid's averaging smooths the edges, so the game's edge and weight passes go
 /// too. RX_VK_AA still goes over it, for an A/B
 int choice_now() {
-    const int choice = ar::chosen(opts.aa, env_choice());
+    const int choice = ar::chosen(evil_hd::aa(evil_hd_now(), opts.aa), env_choice());   // ((Triforce) Evil HD: SMAA Ultra)
     return env_choice() >= 0 ? choice : n64_rules::anti_aliasing(n64_in_front(), choice);
 }
 /// What upscales now, as the menu's Upscaler row shows it (vk_menu.cpp upscaler)
@@ -89,8 +96,8 @@ std::atomic<bool> engaged{false};          // (something of this file is at work
 std::atomic<bool> last_replaced{false};    // (the last composition seen was replaced: the passes before the next may go)
 std::atomic<int> state_now{ar::QUIET};
 
-enum { P_POST, P_LUMA, P_EDGE, P_WEIGHT, P_BLEND, P_N };
-constexpr int kPostFirst = P_POST, kPostEnd = P_LUMA, kSmaaFirst = P_LUMA, kSmaaEnd = P_N;
+enum { P_POST, P_LUMA, P_EDGE, P_WEIGHT, P_BLEND, P_AO, P_AO_APPLY, P_SHAFTS, P_N };
+constexpr int kPostFirst = P_POST, kPostEnd = P_LUMA, kSmaaFirst = P_LUMA, kSmaaEnd = P_AO, kAoFirst = P_AO, kAoEnd = P_N;
 constexpr VkDescriptorType S = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, I = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
 struct PassInfo {
     const uint32_t* code;
@@ -105,6 +112,9 @@ const PassInfo kPasses[P_N] = {
     {SMAA_EDGE_COMP_SPV, sizeof SMAA_EDGE_COMP_SPV, 2, {S, I}, "smaa_edge"},
     {SMAA_WEIGHT_COMP_SPV, sizeof SMAA_WEIGHT_COMP_SPV, 4, {S, S, S, I}, "smaa_weight"},
     {SMAA_BLEND_COMP_SPV, sizeof SMAA_BLEND_COMP_SPV, 3, {S, S, I}, "smaa_blend"},
+    {EVIL_AO_COMP_SPV, sizeof EVIL_AO_COMP_SPV, 3, {S, S, I}, "evil_ao"},
+    {EVIL_AO_APPLY_COMP_SPV, sizeof EVIL_AO_APPLY_COMP_SPV, 3, {S, S, I}, "evil_ao_apply"},
+    {EVIL_SHAFTS_COMP_SPV, sizeof EVIL_SHAFTS_COMP_SPV, 3, {S, S, I}, "evil_shafts"},
 };
 
 struct Image {
@@ -123,7 +133,11 @@ constexpr uint64_t kDeadFrames = 120;
 struct State {
     std::mutex mu;
     // (the pipelines: 0 not tried, 1 made, -1 could not be)
-    int post = 0, smaa = 0;
+    int post = 0, smaa = 0, ao = 0;
+    // ((Triforce, 11-23) Evil HD's ambient occlusion: its estimate at the picture's size; what was said of it)
+    Image ao_image;
+    uint32_t ao_w = 0, ao_h = 0;
+    bool told_ao = false, told_ao_off = false;
     VkDescriptorSetLayout set[P_N]{};
     VkPipelineLayout layout[P_N]{};
     VkPipeline pipe[P_N]{};
@@ -224,7 +238,7 @@ bool make_pipelines(State& s, int first, int end) {
         VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
         li.bindingCount = (uint32_t)k.n, li.pBindings = b;
-        const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
+        const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 64};   // ((Triforce) 64: the AO passes push 48 bytes)
         VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         pi.setLayoutCount = 1, pi.pSetLayouts = &s.set[p], pi.pushConstantRangeCount = 1, pi.pPushConstantRanges = &pr;
         VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -357,6 +371,162 @@ void pass(State& s, VkCommandBuffer cmd, int p, const VkImageView* views, const 
     compute_after(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT);
 }
 
+/// ((Triforce, 11-23) Evil HD, evil_hd.h) RX_VK_EVIL_AO: unset, the defaults; 0, no ambient occlusion with Evil HD; else
+/// "radius,strength,far,bounce" (world units, 0 to 4, world units, 0 to 4) for the lab's A/Bs. RX_VK_EVIL_SHAFTS: the light
+/// shafts' strength (0 none; 0 to 4). RX_VK_EVIL_AO_SHOW: 1 the occlusion alone, 2 the shafts alone and the sun's place
+struct AoTune {
+    bool on = true;
+    int show = 0;
+    float radius = 1.0f, strength = 3.0f, fade = 80.0f, bounce = 1.5f;   // (the lab's choice, 11-23/24)
+    float shafts = 0.8f;
+    bool flip_sun_y = false;   // (RX_VK_EVIL_SUN_FLIPY=1: the sun's place upside down, for the lab)
+};
+const AoTune& ao_tune() {
+    static const AoTune t = [] {
+        AoTune k;
+        if (const char* v = getenv("RX_VK_EVIL_AO_SHOW")) k.show = atoi(v);
+        if (const char* v = getenv("RX_VK_EVIL_SUN_FLIPY")) k.flip_sun_y = atoi(v) != 0;
+        if (const char* v = getenv("RX_VK_EVIL_SHAFTS"); v && *v) {
+            const float x = (float)atof(v);
+            if (x >= 0.0f && x <= 4.0f) k.shafts = x;
+        }
+        const char* e = getenv("RX_VK_EVIL_AO");
+        if (e && !strcmp(e, "0")) k.on = false;
+        else if (e && *e) {
+            float r = k.radius, s = k.strength, f = k.fade, b = k.bounce;
+            if (sscanf(e, "%f,%f,%f,%f", &r, &s, &f, &b) >= 1) {
+                if (r > 0.0f) k.radius = r;
+                if (s >= 0.0f && s <= 4.0f) k.strength = s;
+                if (f > 0.0f) k.fade = f;
+                if (b >= 0.0f && b <= 4.0f) k.bounce = b;
+            }
+        }
+        if (e || getenv("RX_VK_EVIL_SHAFTS"))
+            logf("vk: Evil HD: ambient occlusion %s (radius %.2f, strength %.2f, gone by %.0f, bounce %.2f), light shafts %.2f",
+                 k.on ? "on" : "off", (double)k.radius, (double)k.strength, (double)k.fade, (double)k.bounce, (double)k.shafts);
+        return k;
+    }();
+    return t;
+}
+
+/// ((Triforce, 11-24) Evil HD's light shafts) The sun's place on the screen: its direction from the shadow cascades
+/// (cam.sun) turned into the view and projected as a point at infinity (clip = P * (view rotation * sun, 0)); 0 to 1 each way,
+/// y down. *facing: how far it is in front of the camera (the cosine with the view's forward axis, 0 behind). false: none
+bool sun_on_screen(const TemporalAoCamera& cam, bool flip_y, float uv[2], float* facing) {
+    if (!cam.sun_ok) return false;
+    float dv[3];
+    for (int i = 0; i < 3; i++) dv[i] = cam.view[i * 4] * cam.sun[0] + cam.view[i * 4 + 1] * cam.sun[1] + cam.view[i * 4 + 2] * cam.sun[2];
+    const float len = std::sqrt(dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2]);
+    if (!(len > 1e-6f)) return false;
+    const float cw = cam.proj[12] * dv[0] + cam.proj[13] * dv[1] + cam.proj[14] * dv[2];   // (= -view z)
+    *facing = cw / len;
+    if (*facing <= 0.02f) return false;
+    const float cx = cam.proj[0] * dv[0] + cam.proj[1] * dv[1] + cam.proj[2] * dv[2];
+    const float cy = cam.proj[4] * dv[0] + cam.proj[5] * dv[1] + cam.proj[6] * dv[2];
+    const float nx = cx / cw, ny = cy / cw;
+    uv[0] = std::clamp(nx * 0.5f + 0.5f, -2.0f, 3.0f);
+    uv[1] = std::clamp(flip_y ? ny * 0.5f + 0.5f : 0.5f - ny * 0.5f, -2.0f, 3.0f);
+    return true;
+}
+void shafts_after(State& s, VkCommandBuffer cmd, const AoTune& tune, const TemporalAoCamera& cam, VkImageView src,
+                  VkImageView dst, uint32_t w, uint32_t h) {
+    if (tune.shafts <= 0.0f) return;
+    // (RX_VK_EVIL_LOG=1, the lab's: why the shafts ran or not, counted over 600 calls)
+    static const bool verbose = getenv("RX_VK_EVIL_LOG") != nullptr;
+    static int calls = 0, no_sun = 0, behind = 0, low = 0, ran = 0;
+    const auto count = [&](int& which) {
+        which++;
+        if (verbose && ++calls >= 600) {
+            logf("vk: Evil HD light shafts, the last 600 frames: ran %d, no sun seen %d, the sun behind %d, faded out %d", ran, no_sun,
+                 behind, low);
+            calls = no_sun = behind = low = ran = 0;
+        }
+    };
+    float uv[2], facing = 0.0f;
+    if (!cam.sun_ok) return count(no_sun);
+    if (!sun_on_screen(cam, tune.flip_sun_y, uv, &facing)) return count(behind);
+    // (in front of the camera, and the sun above the horizon (y up): the moon's light is left alone)
+    const auto smooth = [](float a, float b, float x) {
+        const float k = std::clamp((x - a) / (b - a), 0.0f, 1.0f);
+        return k * k * (3.0f - 2.0f * k);
+    };
+    const float fade = smooth(0.05f, 0.35f, facing) * smooth(0.0f, 0.15f, cam.sun[1]);
+    if (fade <= 0.0f && tune.show != 2) return count(low);
+    count(ran);
+    static int told = 0;
+    if (told < (verbose ? 600 : 4) && (told == 0 || texture_frame_no() % (verbose ? 120 : 1800) == 0))
+        told++, logf("vk: Evil HD light shafts: the sun at (%.2f, %.2f) on the screen, %.0f%% in front, %.0f%% of their strength",
+                     (double)uv[0], (double)uv[1], (double)(facing * 100.0f), (double)(fade * 100.0f));
+    struct {
+        float inv[2];
+        int32_t size[2];
+        float cam[4];
+        float sun[4];
+    } pc = {{1.0f / (float)w, 1.0f / (float)h}, {(int32_t)w, (int32_t)h},
+            {cam.a, cam.b, (float)((cam.flip ? 1 : 0) | (tune.show == 2 ? 2 : 0)), 0.9f * cam.far_z},
+            {uv[0], uv[1], tune.shafts, fade}};
+    static_assert(sizeof pc == 48);
+    const VkImageView v[3] = {src, cam.depth, dst};
+    const VkSampler sm[3] = {s.linear, s.nearest, VK_NULL_HANDLE};
+    pass(s, cmd, P_SHAFTS, v, sm, &pc, sizeof pc, w, h);
+}
+
+/// ((Triforce, 11-23) Evil HD's ambient occlusion) Over the picture the passes above just stored into dst (its RGB9E5 words,
+/// the R32_UINT view): the occlusion from the scene's depth (evil_ao.comp), then the picture darkened by it, blurred
+/// (evil_ao_apply.comp). The depth is the camera's (vk_temporal.cpp temporal_ao_camera), at the picture's size; anything
+/// missing leaves the picture as it is. The point is the game's SMAA composition: after the tone mapping, before the gameplay
+/// upscale and the HUD, as the game's own SMAA (or the row's stand-in) leaves it
+void ao_after(State& s, VkCommandBuffer cmd, VkImageView src, VkImageView dst, uint32_t w, uint32_t h) {
+    const AoTune& tune = ao_tune();
+    if (!tune.on && tune.shafts <= 0.0f) return;
+    TemporalAoCamera cam;
+    if (!temporal_ao_camera(w, h, &cam)) {
+        static int told = 0;
+        if (told++ < 3) logf("vk: Evil HD ambient occlusion: no scene depth of %ux%u this frame (frame %llu)", w, h,
+                             (unsigned long long)texture_frame_no());
+        return;
+    }
+    if (!s.ao)
+        s.ao = storage_and_linear(VK_FORMAT_R16G16B16A16_SFLOAT) && make_pipelines(s, kAoFirst, kAoEnd) ? 1 : -1;
+    if (s.ao < 0) {
+        if (!s.told_ao_off) logf("vk: Evil HD ambient occlusion cannot run here (its pipelines or an RGBA16F storage image)");
+        s.told_ao_off = true;
+        return;
+    }
+    if (!s.ao_image.image || s.ao_w != w || s.ao_h != h) {
+        drop(s, s.ao_image);
+        s.ao_w = s.ao_h = 0;
+        if (!make_image(cmd, s.ao_image, VK_FORMAT_R16G16B16A16_SFLOAT, w, h, VK_IMAGE_USAGE_STORAGE_BIT)) return;
+        s.ao_w = w, s.ao_h = h;
+    }
+    if (!s.told_ao)
+        logf("vk: Evil HD ambient occlusion on the %ux%u picture (the camera's near %.3f, far %.0f; radius %.2f, strength %.2f, "
+             "gone by %.0f)", w, h, (double)cam.near_z, (double)cam.far_z, (double)tune.radius, (double)tune.strength,
+             (double)tune.fade);
+    s.told_ao = true;
+    // (the depth was last written as the scene's depth target)
+    compute_after(cmd, VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                  VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+    if (tune.on) {
+        struct {
+            float inv[2];
+            int32_t size[2];
+            float cam[4];
+            float k[4];
+            float bounce, pad[3];
+        } pc = {{1.0f / (float)w, 1.0f / (float)h}, {(int32_t)w, (int32_t)h}, {cam.a, cam.b, cam.inv_p00, cam.inv_p11},
+                {tune.radius, tune.strength, tune.fade, (float)((cam.flip ? 1 : 0) | (tune.show == 1 ? 2 : 0))}, tune.bounce, {}};
+        static_assert(sizeof pc == 64);
+        const VkImageView est[3] = {cam.depth, src, s.ao_image.view};
+        const VkSampler est_samplers[3] = {s.nearest, s.nearest, VK_NULL_HANDLE};
+        pass(s, cmd, P_AO, est, est_samplers, &pc, sizeof pc, w, h);
+        const VkImageView put[3] = {s.ao_image.view, cam.depth, dst};
+        const VkSampler put_samplers[3] = {s.nearest, s.nearest, VK_NULL_HANDLE};
+        pass(s, cmd, P_AO_APPLY, put, put_samplers, &pc, sizeof pc, w, h);
+    }
+    shafts_after(s, cmd, tune, cam, src, dst, w, h);
+}
+
 } // namespace
 
 int aa_mode() {
@@ -412,6 +582,7 @@ bool aa_record(VkCommandBuffer cmd, int mode, VkImageView src, VkImageView dst, 
         const VkImageView views[2] = {src, dst};
         const VkSampler samplers[2] = {s.linear, VK_NULL_HANDLE};
         pass(s, cmd, P_POST, views, samplers, &pc, sizeof pc, w, h);
+        if (evil_hd_now()) ao_after(s, cmd, src, dst, w, h);   // ((Triforce, 11-23) Evil HD's ambient occlusion)
         return true;
     }
     s.smaa_frame = texture_frame_no();
@@ -426,6 +597,7 @@ bool aa_record(VkCommandBuffer cmd, int mode, VkImageView src, VkImageView dst, 
     pass(s, cmd, P_EDGE, edge, linear, metrics, sizeof metrics, w, h);
     pass(s, cmd, P_WEIGHT, weight, weight_samplers, metrics, sizeof metrics, w, h);
     pass(s, cmd, P_BLEND, blend, linear, metrics, sizeof metrics, w, h);
+    if (evil_hd_now()) ao_after(s, cmd, src, dst, w, h);   // ((Triforce, 11-23) Evil HD's ambient occlusion)
     return true;
 }
 

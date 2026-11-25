@@ -137,7 +137,7 @@ def check_source(draw):
     ordered(push, ["if ((want && !done) || dispatch_diag_old()) {", "snprintf(hex, sizeof hex,",
                    "if (want && !done && !strncmp(hex, want, strlen(want))) {", "done = true;"],
             "dispatch formats RX_VK_LOG_PUSH's key without its switch")
-    ordered(disp, ["struct PipeClock {", "const bool pipe_timed = !p.compute_pipeline || !p.layout;",
+    ordered(disp, ["struct PipeClock {", "const bool pipe_timed = !cpipe() || !p.layout;",
                    "PipeClock pipe_clock{pipe_timed || dispatch_diag_old() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{},",
                    "pipe_timed};", "ensure_layout(p);", "pipe_clock.stop();"],
             "dispatch reads PipeClock's clock when it times nothing")
@@ -146,7 +146,7 @@ def check_source(draw):
     slow = block(shader, "const Program* program_pick(const NvnState& s, ProgramKind kind, const uint8_t color_types[8]) {")
     need(slow.split("\n")[1].strip().startswith("PROF_EXACT();"), "program_pick is no longer timed by PROF_EXACT: the pick's time stood on it")
     internal = (ROOT / "gpu/vk/vk_internal.h").read_text(encoding="utf-8")
-    need("prof_t.exact = x0 + dt;" in internal and "inline thread_local ProfThread prof_t;" in internal,
+    need("prof_t.exact = x0 + dt;" in internal and "inline constinit thread_local ProfThread prof_t{};" in internal,
          "PROF_EXACT no longer adds its time to the thread's prof_t.exact")
     tex = (ROOT / "gpu/vk/vk_texture.cpp").read_text(encoding="utf-8")
     frame = block(tex, "void texture_frame(uint64_t completed) {")

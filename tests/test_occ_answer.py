@@ -100,7 +100,7 @@ def check_source(src):
              read, ["VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT", "occ::complete(sl.reps, v.data(), sl.used,",
                     "occ_writers,", "occ_write(addr, expect, count)", "sl.reps.clear();",
                     "if (occ_host_reset && sl.used) vkResetQueryPool(dev.device, occ_pool, (uint32_t)i * kOccPerSlot, sl.used), sl.used = 0;",
-                    "sl.sealed = false;"])
+                    "sl.sealed = false, sl.copied = false;"])
     in_order("vk_replay.cpp occ_write (a compare-and-write of the count word over the replay's value, then as the replay "
              "writes a report: the page marked written, shadows told, kept out of write-backs)",
              block(replay, "bool occ_write(uint64_t addr, uint64_t expect, uint64_t count) {"),
@@ -120,7 +120,7 @@ def check_source(src):
     before = block(replay, "void occ_before_begin(Recording& r) {")
     in_order("vk_replay.cpp occ_before_begin (read if sealed, else dropped; reset either way; then the done ones)", before,
              ["std::lock_guard lk(occ_mu);", "if (sl.sealed) {", "occ_read_slot(r.slot, occ::Stats::kAtReuse);",
-              "occ::dropped(sl.reps, occ_writers, occ_st);", "vkResetQueryPool(", "sl.armed = false, sl.sealed = false, sl.seq = 0;",
+              "occ::dropped(sl.reps, occ_writers, occ_st);", "vkResetQueryPool(", "sl.armed = false, sl.sealed = false, sl.seq = 0, sl.copied = false;",
               "occ_harvest_done(occ::Stats::kAtBegin);"])
     in_order("vk_replay.cpp occ_seal (sealed once, by its timeline number; counted pending if it has reports)",
              block(replay, "void occ_seal(Recording& r, uint64_t seq) {"),

@@ -111,7 +111,8 @@ def main():
     check('#include "framegen_idle.h"' in fg, "vk_framegen.cpp does not use the rule")
     idle = block(fg, "void framegen_idle(bool recorded) {")
     check("const bool on = framegen_on();" in idle and
-          "framegen_idle::step(counts, {on, recorded, fsr4fg::frames_wanted(), fg.w != 0, have_hudless}, keep);" in idle,
+          "framegen_idle::Present p{on, recorded, fsr4fg::frames_wanted(), fg.w != 0, have_hudless};" in idle and
+          "const framegen_idle::Release go = framegen_idle::step(counts, p, keep);" in idle,
           "framegen_idle does not ask the rule with the row read again, what this present recorded and what there is")
     check('getenv("RX_VK_FG_KEEP") && atoi(getenv("RX_VK_FG_KEEP")) != 0' in idle, "the switch is not RX_VK_FG_KEEP")
     at = [idle.index(part) for part in (

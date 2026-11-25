@@ -134,7 +134,7 @@ Then come your settings, and **Start game**.
 *Choose your path.* Settings live in the game's own **Options** screen (title screen or pause menu): the tabs Display,
 Graphics, Audio, Controls and System sit beside the game's own list, and **L** / **R** switch between them. Each tab's
 settings come in groups under the game's own separator: Display has Screen, Ultrawide, HDR, RenoDX and Overlay; Graphics
-has Upscaling, Anti-aliasing, N64 Classic, Frame generation, Frame rate & latency and Textures. A setting that does nothing with the
+has Evil HD, Upscaling, Anti-aliasing, N64 Classic, Frame generation, Frame rate & latency and Textures. A setting that does nothing with the
 others as they are is not shown (Paper white with HDR off, the DLSS model without DLSS). A few apply at the next start;
 the game asks. They're saved in `triforce_options.ini` beside the game.
 
@@ -147,12 +147,13 @@ the game asks. They're saved in `triforce_options.ini` beside the game.
 | VSync | On, Off: Off shows each frame at once, with a little less delay and possible tearing; the frame rate stays the cap's |
 | Frame pacing | Off, Even, Steady (any rate), Steady (refresh steps). Even (the default): each frame is shown at an even interval, for less stutter at up to one frame of delay. Steady applies at the next start: the game is paced to a frame rate your PC holds where you are, never above the cap, and each frame is shown a period after the last: the frames come evenly, for some frame rate given up (on the lab's recorded Market frame times about 74 to 81 fps where it ran at 93 to 95, with the frame-to-frame jitter halved). The rate is measured by letting about 30 frames run unpaced every 12 s or so (and right away where frames run late), and it goes down within a second of a heavier scene and back up within one such probe of a lighter one; loads and single hitches do not move it. Any rate suits a screen with variable refresh (G-SYNC, FreeSync) or VSync off; refresh steps keeps to whole divisions of the refresh rate (at 240 Hz: 240, 120, 80, 60, 48, 40, 30) for VSync without variable refresh. The overlay's Full view shows the rate it holds. Where RivaTuner or Reflex limits the game, the cap holds as before. `HOS_FPS_STEADY=0`, `1` or `2` in `triforce_env.txt` over the row |
 | Low latency | Off, On, On + Boost: NVIDIA Reflex on an NVIDIA card (Boost keeps the card's clocks up), AMD Anti-Lag 2 on an AMD one (Off, On); not shown where neither runs. With DLSS frame generation Reflex is always on, and it holds the frame rate cap where each frame starts in place of the game's own wait, so a frame waits once (where RivaTuner limits the game, RivaTuner does) |
-| Frame rate cap | 30, 40, 45, 60, 90, 120, 144, 165, 240, Monitor's rate (your screen's refresh rate, up to 240). Past 60 is experimental; applies at the next start. Where RivaTuner Statistics Server is installed and running (Windows), the game puts this cap into RivaTuner's profile for `Triforce.exe` and RivaTuner limits the game instead of the game's own wait, once it is seen holding the game to it; with frame generation 2x to 8x or AMD FSR 4 the limit is the cap times the frames shown for each. Closing the game puts the profile back as it was, and after a crash the next start does (`triforce_rtss_profile.txt` beside the game keeps what it held). The game never starts RivaTuner. Changing that profile needs the game run as administrator (RivaTuner keeps its profiles under Program Files); without it a limit you set in RivaTuner yourself, at or under the cap, holds the game alone. With frame generation on Auto or DLSS frame generation, while the window is minimised and during movies (when the limit is the game's) the game limits itself. The overlay's Full view says who limits and why. `HOS_RTSS=0` in `triforce_env.txt` leaves RivaTuner out entirely |
-| Upscaler | Game, NVIDIA DLSS, AMD FSR 3.1, AMD FSR 4 (named by the version AMD's library runs, such as AMD FSR 4.1): those your card and build can run |
+| Frame rate cap | 30, 40, 45, 60, 90, 120, 144, 165, 240, Monitor's rate (your screen's refresh rate, up to 240), Uncapped (as fast as the PC can, the game still at real time; with VSync on, the screen's refresh rate is the limit). Past 60 is experimental; changes at once. Where RivaTuner Statistics Server is installed and running (Windows), the game puts this cap into RivaTuner's profile for `Triforce.exe` and RivaTuner limits the game instead of the game's own wait, once it is seen holding the game to it; with frame generation 2x to 8x or AMD FSR 4 the limit is the cap times the frames shown for each. Closing the game puts the profile back as it was, and after a crash the next start does (`triforce_rtss_profile.txt` beside the game keeps what it held). The game never starts RivaTuner. Changing that profile needs the game run as administrator (RivaTuner keeps its profiles under Program Files); without it a limit you set in RivaTuner yourself, at or under the cap, holds the game alone. With frame generation on Auto or DLSS frame generation, while the window is minimised and during movies (when the limit is the game's) the game limits itself. The overlay's Full view says who limits and why. `HOS_RTSS=0` in `triforce_env.txt` leaves RivaTuner out entirely |
+| Upscaler | Game, NVIDIA DLSS, AMD FSR 3.1, AMD FSR 4 (named by the version AMD's library runs, such as AMD FSR 4.1), Intel XeSS (Windows: put `libxess.dll` from Intel's XeSS SDK beside the game yourself; Triforce never ships or downloads it), Off: those your card and build can run |
 | Render resolution | Auto (the game's dynamic resolution), 100%, 75%, 67%, 50% with the game's own upscaler; with DLSS and FSR Auto, Native (100%: DLAA, or FSR's native anti-aliasing), Quality, Balanced, Performance, Ultra Performance. Applies at the next start |
 | Anti-aliasing | Game SMAA, Off, FXAA, SMAA Ultra: how the 3D's edges are smoothed with the game's own upscaler. DLSS and FSR smooth them themselves, from frames the game's SMAA has not been over, and the row is then not shown |
 | Sharpness | 0–100% (0, off, by default; around 50% suits DLSS and FSR): with DLSS or AMD FSR as the Upscaler the 3D before the HUD, with the game's own upscaler the picture at the window |
 | N64 Classic | Off, Faithful, Remembered; changes at once, and **F7** turns it on and off (to the last one chosen). The game as the 1998 cartridge on a TV of then: the 3D drawn on a grid of 240 lines in place of the game's upscaler, its textures blurred, and a CRT TV over the picture (scanlines, the phosphor mask, colour bleed, glow, a curved screen). Faithful is always the same, at 20 frames a second; Remembered is set on its own page, **Remembered settings**: Frame rate (Frame rate cap, 60, 30, 20, 17: never above the cap, and movies keep the cap's), 3D resolution (240 to 720 lines), Colour (15-bit, 18-bit, Full), Dither, Texture blur, CRT TV, Scanlines, Mask (Auto, Off, Aperture grille, Slot mask, Shadow mask), Mask strength, Colour bleed, Glow, Curvature, Colour saturation, and Copy Faithful and Reset to defaults. Turning it on or off, or changing it, the TV switches off and on in half a second, as an old one did. While it is on, the Upscaler and the Anti-aliasing say N64 Classic, and these options are shown on the TV too, with the game's own screens (the mouse finds them under the curve; with HDR on they stay flat over it); the FPS counter stays flat over it. The TV is left out with HDR Native and with DLSS frame generation. `RX_VK_N64=0`, `1` or `2` in `triforce_env.txt` over the row |
+| Evil HD | Off, On (Off unless you choose it; F2 in game): the fullest picture for a powerful PC: SMAA Ultra edges, 16x texture filtering, every texture whole, soft shadows in corners and creases, and the grass, plants, flowers and stones drawn 4 times as far (grass to 160 and 240 m instead of 40 and 60 m), so open fields such as Hyrule Field keep their grass into the distance (about 1 ms a frame there). Changes at once; the farther foliage reaches the areas entered after it is turned on. `HOS_EVIL_HD=0` or `1` in `triforce_env.txt` over the row for the foliage, `HOS_EVIL_HD_DIST=<1..4>` for how far (4 when not set) |
 | Texture filtering | Game, 2x, 4x, 8x, 16x anisotropic |
 | Texture detail | Automatic, Full, Reduced, Low: how large the game's textures are kept in video memory. Automatic goes by your card; applies at the next start |
 | Fast pipeline link | Off, On (the Debug tab; on by default): new pipelines are first linked from prepared shader libraries, so fewer draws wait for the graphics driver. The first start with it compiles those libraries once; applies at the next start |
@@ -160,13 +161,17 @@ the game asks. They're saved in `triforce_options.ini` beside the game.
 | Lazy write-back | Off, On (the Debug tab; on by default, Windows only): what the GPU writes into memory the game shares with it is copied back only when something reads it there, not after every submission. Stays off with an AMD card's driver unless `RX_VK_LAZY_WB=1` is set; applies at the next start |
 | Start next frame early | Off, On (the Debug tab; on by default; experimental): the game starts its next frame while the graphics card still draws the end of this one (the upscaling and the interface), where that end holds nothing the game reads back; other frames run as before. Applies at the next start (`RX_VK_TAIL_EARLY=1` or `=0` in `triforce_env.txt` over it) |
 | Opaque textures as BC1 | Off, On (the Debug tab): the game's large textures that have no transparency kept in half the video memory, with the same picture. On by default; applies at the next start |
-| Game language | The game's 16 languages, as `language.txt` beside the game lists them; applies at the next start |
+| Game language | The game's 16 languages, each by its own name (Deutsch, Русский, 日本語), as `language.txt` beside the game lists them; applies at the next start |
+| Menu language | English (the default), Auto (the language the game runs in), Português (Brasil), Español (Latinoamérica), Español (España), Français, Deutsch, Italiano, Nederlands, Polski, Русский, 日本語, 한국어, 简体中文, 繁體中文: the language of this menu alone, at once. Machine-made translations; a text a language's table lacks stays English. Japanese, Korean and Chinese need a font of their letters: the game's own where its files have it, else the system's (Windows' own fonts, Noto Sans CJK on Linux) |
 | Game speed | Real time (keeps normal pace), Per frame (slows down below 60 fps) |
 | Output resolution | Connected monitors by name, Custom with editable width and height, Use current window size, and 1536x864 (handheld: the game's handheld profile, as if the console were undocked), 1920x1080, 2048x1152 (the game's own), 2560x1440, 3840x2160, 5120x1440, 5120x2160, 5120x2880; applies at the next start. The finished picture is scaled to the window by AMD FSR 1 when it is enlarged (sharpened only by the Sharpness row) and by the plain copy otherwise, and always by the plain copy with HDR Native, which keeps its 10 bits (`RX_VK_UPSCALE=<0..3>` in `triforce_env.txt` fixes the filter) |
-| Aspect ratio | 16:9 (the game's own), 16:10, 21:9, 32:9, 4:3: the fixed shapes are for a screen or a window of that shape (a screen of another shape shows black bars); 4:3 is a TV's of 1998, for N64 Classic; applies at the next start. Wider than 16:9, HUD position and Menu sides show too |
+| Aspect ratio | 16:9 (the game's own), 16:10, 21:9, 32:9, 4:3: the fixed shapes are for a screen or a window of that shape (a screen of another shape shows black bars); 4:3 is a TV's of 1998, for N64 Classic; applies at the next start. Wider than 16:9, HUD position (Middle, or Screen edges: the HUD's sides at the screen's edges; changes at once) and Menu sides (Full width, Centred with blurred sides or black bars, or Extended: the menus at their 16:9 size, their sides at the screen's edges) show too |
+| HUD placement | Game's (the default) or Custom: the hearts and magic, the action and item buttons and the minimap each moved (up to 15% of the picture either way) and sized (75% to 125%); changes at once. On a 16:9 or wider picture |
 | Output shape | 16:9 (the game's own), 16:10, 21:9, 32:9: the picture's shape for a 16:9 Output resolution, at the same height. The fixed shapes are for a screen or a window of that shape (a screen of another shape shows black bars). An Output resolution that is not 16:9 (5120x1440, 5120x2160, or a screen's or Custom size of another shape) has its own shape: the row shows it and has nothing to choose. Applies at the next start |
 | FPS counter | Off, On, Full: On is the frame rate in the top right corner; Full shows NX2navi's performance overlay there in its place (under the options while they are open), in the options' look and see-through: the build, the GPU's and the CPU's load and temperature, video memory and memory, the frame rate with its 1% and 0.1% lows, the frame times and their graph, the GPU's and the replay's time and waits per frame, the picture's settings and the GPU's and CPU's names (a "-" where the PC does not say: temperature and power need an NVIDIA or AMD card). It measures only while shown |
 | Menu sounds | Off, 5% to 100% (80% unless you change it): the game's own interface sounds as you move through these settings, the tabs and the rows, read from your game files (a mod's when a mod replaces them). Under Master volume on the Audio tab; changes at once |
+| Microphone gain | 25% to 400%: how loud the ocarina's microphone is (Audio tab, with a microphone chosen) |
+| Mute in background | Off, On: no sound while another window has the focus (Audio tab) |
 | Controller in background | Off, On: the pad keeps playing while another window has focus |
 | Left stick dead zone, Right stick dead zone | Default (24%), or 0% to 50%: how far that stick moves before the game sees it |
 | Rumble strength | Off, 25% to 300% of the game's rumble |
@@ -174,19 +179,47 @@ the game asks. They're saved in `triforce_options.ini` beside the game.
 | Trigger vibration | Off, On: an Xbox One or Series controller's triggers rumble too |
 | Walk key | Off, Caps Lock, Shift, Ctrl, Tab: hold it with the movement keys and Link walks instead of running |
 | Walk scale | 0.20 to 0.90: how far the movement keys push the stick while the Walk key is held |
+| Invert mouse horizontal | Off, On: swaps left and right for the mouse, with either Mouse camera |
+| Hold to toggle (Toggle ZL, ZR, L, R, A, B, X, Y, LS, RS) | Off, On, a row for each button: one press holds it and the next lets it go, for whatever is bound to it. Opening a menu or pressing Plus or Minus lets it go too |
+| Camera centering | On, Off: Off stops the camera turning by itself the way Link moves (Controls tab) |
+| Ocarina note (L), (R), (A), (Y), (X) (Controls page) | A gamepad button and up to two keys for each of the ocarina's five notes, none to begin with: the game's own buttons play until you bind one. A bound note answers only its own input while the ocarina waits for a note, and that input does its other job the rest of the time |
 | Button prompts | Auto, Switch, Xbox, PlayStation 4, PlayStation 5, Steam Deck, Keyboard & mouse: the button icons the game shows (Controls page). Auto takes the controller connected when the game starts, or with none the device you used last in the game before (the keyboard and mouse the first time); Keyboard & mouse shows the key or mouse button each control is bound to. Applies at the next start |
 | Text speed | Normal, 2x, 4x, Instant |
+| Text size | Normal, 110%, 125%, 150%, 175%: the text of dialogue, Navi and signs |
+| Damage taken | Half, Normal, Double, Quadruple: how much of his hearts Link loses from a hit (System tab) |
+| Skip title screen | Off, On: the game starts straight on your newest save, Continue and Load pressed for you (System tab) |
+| Skip opening | Off, On: a new game starts without the story movie and Navi waking Link (System tab) |
+| Field of view | 50% to 150% of the game's own (System tab): how much of the world the camera shows while you play. Cutscenes keep their own view |
+| Autosave | On, Off: Off skips the game's autosaves as you go from one area to another (System tab) |
 | Export save | Your save as a zip in your Downloads folder (System tab; see *Export and import a save* below) |
 | Export save for a bug report | The same zip with the logs and settings a problem report needs |
 | Import a save | A save export of Triforce or NX2navi becomes your save at the next start |
 | Bug capture (F8) | One folder with what a problem report needs (System tab; see *Bug capture* below) |
-| Scan amiibo | A dump of one of your own figures from a folder `amiibo` beside the game (`.bin`, as the figure's tag has it: 532, 540 or 572 bytes), put on the reader when the game looks for a figure. Only the figure's serial number and which figure it is are read from the file: no key is needed. On the Debug tab (with Debug tools On) |
+| Scan amiibo | A dump of one of your own figures from a folder `amiibo` beside the game (`.bin`, as the figure's tag has it: 532, 540 or 572 bytes, or a Flipper Zero `.nfc` file of it), put on the reader when the game looks for a figure. Only the figure's serial number and which figure it is are read from the file: no key is needed. Your dump is never written: data a game keeps on a figure goes to `amiibo/areas`. On the Debug tab (with Debug tools On) |
+| Movement speed | 1x, 1.25x, 1.5x, 2x, 3x: how fast Link walks, runs and swims, a testing tool (Debug tab, with Debug tools on) |
 | Game flags | The game's story and world flags by name, read from your game files: see which are set in your save, and set or clear one (Debug tab) |
 | Cutscenes | The game's events by name, read from your game files: start one (Debug tab) |
+| No-clip flight | With the row on, double-tap Jump to take off and land: X (Space), or B with the game's Swap Jump Controls; hold Jump or R to climb, L to descend (Debug tab) |
+| Inventory | Unlock or relock items and change amounts, given to Link as the game gives them: a sword is equipped, the bracelet and the gauntlets are worn (Debug tab) |
 | Mod cheats | Off, On for each cheat of a mod's cheat file, under its own name (System tab, only with such a mod; see *Mods* below) |
 
 In game, **F10** or **Alt+Enter** switches between a window and fullscreen. **F1** opens the same options from anywhere.
 **F8** takes a bug capture.
+
+**Discord status.** With Discord open on your PC (and the menu's Discord status row on), your status says "Triforce" and
+the version. You can write your own in `triforce_options.ini`, beside the game:
+
+| Line | What it is |
+| --- | --- |
+| `discord_text=` | The status's text. `{break}` starts its second line. `{location}` where Link is, `{age}` Child or Adult, `{hearts}`, `{max_hearts}`, `{rupees}`, `{skulltulas}`, `{heart_pieces}`, `{version}`, `{release}`. `{location\|text}` shows text only while Link is somewhere, `{!location\|text}` only while he is not (the title screen) |
+| `discord_image=` | The picture: an image key of the Discord application, or an `https://` link |
+| `discord_image_text=` | The picture's text when you point at it |
+
+For example, the place and Link's stats over the version on the title screen:
+`discord_text={location|{location} - {age}{break}{hearts|❤️ {hearts}/{max_hearts} · }{skulltulas|🕷️ {skulltulas} · }{heart_pieces|💗 {heart_pieces}}}{!location|{version} {build}}`
+
+Only that text goes to the Discord app on your PC; the game reads where Link is and his stats only while your text asks
+for them.
 
 <p align="center"><img src="assets/readme/divider.svg" alt="" width="100%"></p>
 
@@ -244,13 +277,14 @@ game goes on; a moment later a line at the foot of the screen names the folder t
 | File | What |
 |---|---|
 | `frame.png` | The frame shown after the press, without the options or the FPS counter over it (an HDR picture brought to sRGB). Uncompressed: zip the folder to send it |
-| `capture.txt` | The Triforce version, the graphics card and driver as the log names them, the frame rate before the press, and the map and Link's position while he is in play |
+| `capture.txt` | The Triforce version, your CPU, RAM and system, the graphics card and driver as the log names them, the frame rate before the press, the map and Link's position while he is in play, the first sign of trouble in this run's log and the last run's, the options you changed from their defaults, and the switches set (a switch's value only when it is a number or on/off) |
 | `log-tail.txt` | The last 400 lines of `triforce_log.txt` |
+| `triforce_log.1.txt` | The last run's log, when there is one (after a crash and a start again, the crashed run's): whole up to 10 MB |
 | `triforce_options.ini` | Your settings |
 | `Triforce-save-<date>-<time>.zip` | Your save, as **Export save** writes it |
 
 Send the folder with your report and say what you saw. Nothing leaves your PC by itself, and **no game file is in a
-capture**; delete old ones whenever you like. A press while a capture is still being written is skipped. If you bound
+capture**; the logs' copies leave out your home folder and user name. Delete old ones whenever you like. A press while a capture is still being written is skipped. If you bound
 F8 to one of the controls yourself, the key stays the game's and the row takes the capture.
 
 <p align="center"><img src="assets/readme/divider.svg" alt="" width="100%"></p>

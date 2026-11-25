@@ -62,7 +62,9 @@
 #include "vk_dlss.h"
 #include "vk_fsr3.h"      // (the Upscaler row: whether AMD FSR 3.1 runs on this GPU)
 #include "vk_fsr3fi.h"    // (the Frame generation row: whether FSR 3.1 makes the frame)
+#include "vk_framegen.h"   // ((Triforce) 11-24: framegen_maker, who made the last frames: perf_framegen_text)
 #include "vk_fsr4.h"
+#include "vk_xess.h"   // ((Triforce) the Upscaler row: whether Intel XeSS runs here)
 #include "vk_temporal.h"
 #include "vk_fsr3_inputs.h"   // (Triforce: the render size while AMD FSR 3.1 draws, for the performance overlay)
 #include "perf_stats.h"       // (Triforce: the performance overlay's frame times)
@@ -71,6 +73,12 @@
 #include "vk_reflex.h"
 #include "vk_antilag.h"
 #include "upscaler_rows.h"
+#include "output_modes.h"   // ((Triforce) the Output resolution's display modes and common sizes: mode_sizes
+#include "fps_levels.h"   // ((Triforce) the FPS counter row's levels between On and Full: draw_fps, fps_detail_sample
+#include "auto_settings.h"   // ((Triforce) the Graphics tab's Auto (this PC) row: auto_apply, menu_auto_tune
+#ifndef _WIN32
+#include <unistd.h>   // ((Triforce) sysconf: the RAM, Auto (this PC)'s auto_hardware)
+#endif
 #include "first_start.h"   // ((Triforce, 11-22, PRESENT-46) the Render resolution of a first start on a weak card: menu_first_start)
 #include "vk_present_rect.h"   // ((Triforce, options_version 7) where the picture goes in the window: the filter it takes)
 #include "text_spread.h"   // ((Triforce, 11-19) the title entry's shadow and glow as the game's entries'
@@ -79,6 +87,7 @@
 #include "aa_rows.h"        // (Triforce, the Anti-aliasing row: its choices, and when it does not apply)
 #include "vk_aa.h"          // (...RX_VK_AA over it, and whether the game's pass was there to replace)
 #include "vk_n64.h"         // ((Triforce, N64 Classic, step 4) its TV in the window filter's place)
+#include "evil_hd.h"         // ((Triforce, 11-23) the Evil HD row: what it puts over the rows below it)
 #include "tex_detail.h"     // (the Texture detail row: the levels' names, RX_VK_TEX_DETAIL)
 #include "fps_cap.h"        // (the Game frame rate cap row's Monitor's rate)
 #include "ultrawide_rows.h" // ((Triforce) the Ultrawide row's shapes, and its old Monitor's shape read before options_version 6)
@@ -86,6 +95,7 @@
 #include "present_mode.h"   // (the VSync row: what its choice comes to on this driver)
 #include "game_language.h"  // (the Game language row: what language.txt chooses and offers)
 #include "vk_xr.h"          // ((Triforce VR) vk_xr_cfg)
+#include "vk_menu_i18n.h"   // ((Triforce) the menu's languages: the Menu language row, the texts looked up (vk_ui.h))
 #include "menu_restart.h"
 #include "mod_cheat_rows.h"   // (Triforce: the System tab's rows for the cheats of the mods' cheat files)
 #include "achievement_rows.h"   // (Triforce: the achievements the host names, their notice and their page)
@@ -99,6 +109,8 @@
 #include "imgui_internal.h"   // (RegisterUserTexture: the mods' pictures)
 #include "ini_merge.h"   // ((Triforce, handoff §9) the options file's lines merged by key with a change made outside the game)
 #include "file_whole.h"  // (and the file written whole: file_writers::write_whole)
+#include "reshade_menu.h"   // ((Triforce) 11-24: the Graphics tab's Post-processing group, the ReShade preset's rows and comparison)
+#include "sim_turf.h"   // ((Triforce) the Simulated turf page: its rows' values, the area, its file)
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 #ifndef HOOKSHOT_VERSION   // (nx2/build.py gives it to this file: nx2/version.py)
 #define HOOKSHOT_VERSION "unknown"
@@ -139,7 +151,10 @@ enum MenuTab {
     TAB_PAGE = TAB_VRSET + 1,   // (hookshot: the Controls page's rows, above its grid; no tab shows them)
     TAB_N64 = TAB_PAGE + 1,      // ((Triforce, 11-22, N64 Classic, step 5) the Remembered page that the Graphics tab's
                                  // Remembered settings row opens: no tab shows it)
-    TAB_HIDDEN = TAB_N64 + 1    // ((Triforce, options_version 7) saved values a merged row stands for: never shown, merged_rows.h)
+    TAB_SIM_TURF = TAB_N64 + 1,   // ((Triforce, 11-24) the Simulated turf page that the Graphics tab's Simulated turf row opens:
+                                  // no tab shows it. Its values are each area's, in sim_turf_settings.ini, read after the options
+                                  // file: the options file's lines of its rows are the last ones shown, read by nothing)
+    TAB_HIDDEN = TAB_SIM_TURF + 1    // ((Triforce, options_version 7) saved values a merged row stands for: never shown, merged_rows.h)
 };
 
 struct Row {
@@ -224,18 +239,40 @@ const char* hn_dlssg(int v, int variant) {
     return mkwvk::dlssg::asked() ? mkwvk::dlssg::status() : "Starts with the next start of the game.";
 }
 const char* tx_menu_shortcut(int v) {
-    static const char* const names[] = {"Insert or F1", "F1 only"};   // (F1 is never turned off: the menu is always one key away)
-    return names[v ? 1 : 0];
+    // (F1 is never turned off: the menu is always one key away. Esc as well, as a PC game's pause menu)
+    // (and a DualShock 4's or DualSense's touchpad click, as F1)
+    static const char* const names[] = {"Insert or F1", "F1 only", "Insert, F1 or Esc", "Insert, F1 or touchpad",
+                                        "Insert, F1, Esc or touchpad"};
+    return names[std::clamp(v, 0, 4)];
 }
 const char* tx_hdr(int v) { return v == 1 ? "Expanded" : v == 2 ? "Native" : "Off"; }   // ((Triforce, 11-16) "Native", the owner's word)
 namespace mr7 = merged_rows;
 /// ((Triforce, options_version 7) the HDR row: opts.hdr with RenoDX HDR as its fourth value, merged_rows.h)
 const char* tx_hdr_mode(int v) { return v == mr7::HDR_RENODX ? "Native + RenoDX" : tx_hdr(v); }
-MENU_HINTS(hn_hdr_mode, 0, "The usual SDR picture.",
-           "The game's SDR picture shown on an HDR display: its white at Paper white, its highlights up to Peak brightness.",
-           "The game's own HDR, told your display's Paper white and Peak brightness.",
-           "The game's own HDR with RenoDX's tone mapping, eye adaptation and color grading in place of the game's (the RenoDX "
-           "rows below). RenoDX is by Carlos Lopez (clshortfuse), under the MIT license.")
+/// The row's value in words; and with HDR on while the swapchain stayed SDR, why instead (dev.hdr_sdr_why, vk_main.cpp
+/// create_swapchain): the player is told what to change, not sent to a setting that is already right. Variants: the
+/// value's own line, then each reason
+const char* hn_hdr_mode(int v, int variant) {
+    static const char* const t[] = {
+        "The usual SDR picture.",
+        "The game's SDR picture shown on an HDR display: its white at Paper white, its highlights up to Peak brightness.",
+        "The game's own HDR, told your display's Paper white and Peak brightness.",
+        ("The game's own HDR with RenoDX's tone mapping, eye adaptation and color grading in place of the game's (the RenoDX "
+         "rows below). RenoDX is by Carlos Lopez (clshortfuse), under the MIT license.")};
+    static const char* const why[] = {
+        "The picture stays SDR: the graphics driver offers no HDR output (no VK_EXT_swapchain_colorspace).",
+        "The picture stays SDR: HDR is off for this display in Windows' display settings.",
+        ("The picture stays SDR: Windows has HDR on, but the graphics driver offers the game no HDR output. Reinstall the "
+         "driver with a clean install, then restart the PC."),
+        "The picture stays SDR: the display offers no HDR output. Is HDR on in the display settings?"};
+    const int reasons = hdr_sdr_count - 1;   // (every HdrSdrWhy but hdr_sdr_none)
+    static_assert(sizeof why / sizeof *why == hdr_sdr_count - 1, "hn_hdr_mode: a line for each HdrSdrWhy but hdr_sdr_none");
+    if (v < 0 || v >= (int)(sizeof t / sizeof *t)) return nullptr;
+    if (variant < 0)   // (the one to show now. The swapchain is made again when the row changes, so the reason is this value's)
+        return v && opts.hdr && !dev.hdr && dev.hdr_sdr_why != hdr_sdr_none ? why[std::clamp((int)dev.hdr_sdr_why, 1, reasons) - 1] : t[v];
+    if (variant == 0) return t[v];
+    return v && variant <= reasons ? why[variant - 1] : nullptr;
+}
 const char* tx_nits(int v) {
     static char b[24];
     snprintf(b, sizeof b, "%d nits", v);
@@ -245,6 +282,7 @@ static_assert(fps_cap::kMonitor == 6, "the Game frame rate cap row's last value 
 const char* tx_fps_cap(int v) {
     static const char* const t[] = {"60 (the console's)", "90", "120", "144", "165", "240"};
     if (v < 0) return v == -1 ? "45" : v == -2 ? "40" : "30";   // (Triforce: the limits under 60, host/nn_vi.c fps_max)
+    if (v >= fps_cap::kUncapped) return "Uncapped";   // ((Triforce) as fast as the PC can, at real time: host/nn_vi.c fps_cap_of)
     if (v >= fps_cap::kMonitor) {   // (Triforce: Monitor's rate, with what this display gives now: fps_cap.h, as the host asks it)
         static char b[32];
         const int cap = fps_cap::of_display(display_refresh_mhz());
@@ -269,6 +307,8 @@ MENU_HINTS(hn_pacing, 0, "Each frame as soon as it is ready.", "Frames at an eve
 // (Triforce) The VSync row (opts.vsync; present_mode.h has what On and Off ask for): the line under its help says what the
 // choice came to on this driver, by the present mode of the swapchain there is, or which switch decides for the run.
 // Variants (every one): each mode the value can come to, then the two switches
+/// ((Triforce) 11-24) its third value, Every refresh: FIFO, as RX_VK_FIFO (vk_main.cpp create_swapchain)
+const char* tx_vsync(int v) { return v == 2 ? "Every refresh" : tx_onoff(v); }
 const char* hn_vsync(int v, int variant) {
     static const char* const on[] = {
         "Each frame waits for the screen's next refresh: no tearing.",
@@ -282,15 +322,18 @@ const char* hn_vsync(int v, int variant) {
     };
     static const char* const fifo_env = "Set for this run by RX_VK_FIFO: each frame waits for the screen's next refresh.";
     static const char* const immediate_env = "RX_VK_IMMEDIATE asks for frames shown at once in this run, whatever is chosen here.";
+    static const char* const every = "Each frame waits for the screen's next refresh (FIFO): no tearing, at most the screen's rate, "
+                                     "and a frame late for one refresh waits for the next.";
     if (variant < 0) {
         static const bool fifo = getenv("RX_VK_FIFO") != nullptr, immediate = getenv("RX_VK_IMMEDIATE") != nullptr;
         if (fifo || immediate) return fifo ? fifo_env : immediate_env;
+        if (v == 2) return every;
         const int mode = swapchain_present_mode();
         if (mode < present_mode::kFifo || mode > present_mode::kImmediate) return nullptr;   // (no swapchain: nothing to say)
         return (v ? on : off)[mode];
     }
     if (variant <= present_mode::kImmediate) return (v ? on : off)[variant];
-    return variant == 3 ? fifo_env : variant == 4 ? immediate_env : nullptr;
+    return variant == 3 ? fifo_env : variant == 4 ? immediate_env : variant == 5 ? every : nullptr;
 }
 // (hookshot) Motion controls: the choice, and whether a connected controller has a gyroscope (host/pad_sdl.c). Either can be
 // chosen whatever is connected: a pad plugged in later is read when it comes
@@ -301,7 +344,7 @@ const char* tx_gyro(int v) {
     if (status == 0) return v ? "On (no controller)" : "Off (no controller)";
     return v ? "On" : "Off";
 }
-const char* tx_mousecam(int v) { return v ? "Native" : "As the stick"; }
+const char* tx_mousecam(int v) { return v == 2 ? "Off" : v ? "Native" : "As the stick"; }   // ((Triforce) 2: Off)
 const char* tx_sens(int v) {
     static char b[12];
     snprintf(b, sizeof b, "%.2f", v / 100.0);
@@ -343,17 +386,22 @@ const char* hn_latency(int v, int variant) {
 namespace ur = upscaler_rows;
 /// One bit per upscaler that runs here (upscaler_rows.h bit). Each backend caches its own answer, so this costs nothing
 unsigned upscalers_available() {
-    return ur::bit(ur::GAME) | ur::dlss_bits(dlss_why() == DLSS_OK) | ur::fsr3_bits(fsr3::supported()) |
-           ur::fsr4_bits(fsr4_why() == FSR_OK);
+    // ((Triforce) 11-24: Off, no upscaler, everywhere)
+    return ur::bit(ur::GAME) | ur::bit(ur::OFF) | ur::dlss_bits(dlss_why() == DLSS_OK) | ur::fsr3_bits(fsr3::supported()) |
+           ur::fsr4_bits(fsr4_why() == FSR_OK) | ur::xess_bits(xess_why() == XESS_OK);   // ((Triforce) Intel XeSS where it runs)
 }
 /// (FSR 3.1 has inputs of its own, at the Render resolution's mode or as its Native AA; DLSS and FSR 4 run on the frame
 /// chain they share, temporal_mode)
-int upscaler() { return fsr3_wanted() ? (int)(fsr3_native() ? ur::FSR3_AA : ur::FSR3) : temporal_mode(); }
+int upscaler() {
+    if (fsr3_wanted()) return fsr3_native() ? ur::FSR3_AA : ur::FSR3;
+    const int t = temporal_mode();
+    return t == ur::GAME && opts.dlss == ur::OFF ? (int)ur::OFF : t;   // ((Triforce) 11-24: Off, no engine: upscale_off_wanted)
+}
 /// ((Triforce, options_version 7) the engine alone: an engine's native AA is the Render resolution row's Native (100%))
 const char* tx_upscaler(int) {
     if (n64_in_front() != n64_rules::OFF) return "N64 Classic";   // ((Triforce, N64 Classic) its 3D pass draws in their place)
     static const char* t[ur::kUpscalers] = {"Game", "NVIDIA DLSS", "NVIDIA DLSS", "AMD FSR 3.1", "AMD FSR 4", "AMD FSR 4",
-                                            "AMD FSR 3.1"};
+                                            "AMD FSR 3.1", "Off", "Intel XeSS", "Intel XeSS"};
     // ((Triforce, FSR4-7) FSR 4 by the version AMD's library runs here, "AMD FSR 4.1", once it has been asked. up is the
     // engine (ur::engine), so FSR 4's Native AA reads as its engine too, "AMD FSR 4.1": the Render resolution says Native)
     const int up = ur::engine(std::clamp(upscaler(), 0, ur::kUpscalers - 1));
@@ -375,6 +423,13 @@ const char* hn_upscaler(int v, int variant) {
         "AMD's machine-learned upscaler, with AMD's files beside the game. Things that move by themselves can trail for now.",
         nullptr,
         nullptr,
+        // ((Triforce) 11-24)
+        "No upscaler, not even the game's network: the 3D stretched to the output with a plain filter. The fastest, and the "
+        "roughest picture: softer below 100%.",
+        // ((Triforce) Intel XeSS, its Native AA the Render resolution's Native (100%) as the others')
+        "Intel's machine-learned upscaler, with Intel's libxess.dll beside the game. Sharpness sharpens its 3D before the HUD, "
+        "with AMD's RCAS. Things that move by themselves can trail for now.",
+        nullptr,
     };
     static const char* const dlss_no[DLSS_WHY_COUNT] = {
         nullptr,
@@ -394,26 +449,44 @@ const char* hn_upscaler(int v, int variant) {
         "AMD FSR 4: AMD's files have no FSR 4 for this GPU and driver: it needs a Radeon RX 6000, 7000 or 9000 and AMD's "
         "driver 26.10.1 or newer.",
     };
+    // ((Triforce) why Intel XeSS is not offered (vk_xess.h XessWhy). Its library missing is said on an Intel GPU alone: on
+    // another, the line would be on every PC without Intel's file)
+    static const char* const xess_no[XESS_WHY_COUNT] = {
+        nullptr,
+        "Intel XeSS: Windows only (Intel makes no XeSS library for Linux).",
+        "Intel XeSS: off for this run (RX_VK_XESS=0).",
+        "Intel XeSS: Intel's libxess.dll was not found beside the game (see the readme).",
+        "Intel XeSS: the GPU or its Vulkan driver lacks what XeSS needs (the log says what).",
+        "Intel XeSS: Intel's library does not run on this GPU or driver.",
+    };
     // ((Triforce, FSR4-1) the engine chosen, off after failing again and again: the game's own stands in for it. FSR 4 by the
     // version AMD's library ran, as the Upscaler row names it (fsr4_name: "AMD FSR 4.1"; "AMD FSR 4" until it was asked).
     // (The reasons above are for an FSR 4 that does not run here, whose version no library has given: its plain name)
     static char fsr4_stood_in[160];
     snprintf(fsr4_stood_in, sizeof fsr4_stood_in, "The game's own stands in: %s failed four times in a row (the log says "
              "why). Set the Upscaler again to try it anew.", fsr4_name(false));
-    const char* const stood_in[2] = {
+    const char* const stood_in[3] = {
         "The game's own stands in: NVIDIA DLSS failed four times in a row (the log says why). Set the Upscaler again to try "
         "it anew.",
         fsr4_stood_in,
+        "The game's own stands in: Intel XeSS failed four times in a row (the log says why). Set the Upscaler again to try "
+        "it anew.",
     };
-    // (now: the value shown and what runs here, with both engines' reasons; every one: as said above)
-    int d = 0, f = 0;
+    // (now: the value shown and what runs here, with every engine's reasons; every one: as said above, then ((Triforce)
+    // XeSS's reasons and its stand-in line after them)
+    int d = 0, f = 0, x = 0;
+    constexpr int kXessAt = DLSS_WHY_COUNT + FSR_WHY_COUNT + 1;   // (the first of XeSS's variants)
     if (variant < 0) {
-        v = std::clamp(upscaler(), 0, ur::kUpscalers - 1), d = (int)dlss_why(), f = (int)fsr4_why();
-        if (const int in = temporal_stood_in(); v == ur::GAME && in != ur::GAME) return stood_in[ur::is_fsr4(in) ? 1 : 0];
+        v = std::clamp(upscaler(), 0, ur::kUpscalers - 1), d = (int)dlss_why(), f = (int)fsr4_why(), x = (int)xess_why();
+        if (x == XESS_NO_LIBRARY && dev.props.vendorID != 0x8086) x = 0;   // (Intel's file named on Intel's GPUs alone)
+        if (const int in = temporal_stood_in(); v == ur::GAME && in != ur::GAME)
+            return stood_in[ur::is_xess(in) ? 2 : ur::is_fsr4(in) ? 1 : 0];
     } else if (v == ur::GAME) {
         if (variant < DLSS_WHY_COUNT) d = variant;
         else if (variant < DLSS_WHY_COUNT + FSR_WHY_COUNT - 1) f = variant - DLSS_WHY_COUNT + 1;
         else if (variant < DLSS_WHY_COUNT + FSR_WHY_COUNT + 1) return stood_in[variant - (DLSS_WHY_COUNT + FSR_WHY_COUNT - 1)];
+        else if (variant < kXessAt + XESS_WHY_COUNT - 1) x = variant - kXessAt + 1;
+        else if (variant == kXessAt + XESS_WHY_COUNT - 1) return stood_in[2];
         else return nullptr;
     } else if (variant > 0) {
         return nullptr;
@@ -422,10 +495,12 @@ const char* hn_upscaler(int v, int variant) {
     // (the reasons are said only where the engine is in the build: one without FSR does not tell an NVIDIA user why)
     const char* dn = dlss_built() || variant >= 0 ? dlss_no[d] : nullptr;
     const char* fn = fsr4_built() || variant >= 0 ? fsr_no[f] : nullptr;
-    if (v != ur::GAME || (!dn && !fn)) return t[v];
-    static char b[DLSS_WHY_COUNT][FSR_WHY_COUNT][320];
-    snprintf(b[d][f], sizeof b[d][f], "%s%s%s%s%s", t[0], dn ? " " : "", dn ? dn : "", fn ? " " : "", fn ? fn : "");
-    return b[d][f];
+    const char* xn = xess_built() || variant >= 0 ? xess_no[x] : nullptr;   // ((Triforce) a Linux build says nothing of XeSS)
+    if (v != ur::GAME || (!dn && !fn && !xn)) return t[v];
+    static char b[DLSS_WHY_COUNT][FSR_WHY_COUNT][XESS_WHY_COUNT][400];
+    snprintf(b[d][f][x], sizeof b[d][f][x], "%s%s%s%s%s%s%s", t[0], dn ? " " : "", dn ? dn : "", fn ? " " : "", fn ? fn : "",
+             xn ? " " : "", xn ? xn : "");
+    return b[d][f][x];
 }
 /// The DLSS model row (opts.dlss_model): NVIDIA's network by its preset, or RX_VK_DLSS_PRESET's for this run
 const char* dlss_preset_env() {
@@ -463,6 +538,20 @@ const char* hn_dlss_model(int v, int variant) {
     if (variant == 2) return v == ur::MODEL_K ? cnn : nullptr;
     return variant == 0 ? t[std::clamp(v, 0, ur::kModels - 1)] : nullptr;
 }
+/// ((Triforce) The FSR 4 model row (opts.fsr4_model): AMD's own pick for this GPU, or the smaller INT8 Lite network
+const char* tx_fsr4_model(int v) { return v ? "Lite (INT8)" : "Auto (AMD's)"; }
+/// The FSR 4 model: the value chosen; variant 1: set for this run by RX_VK_FSR4_MODEL
+const char* hn_fsr4_model(int v, int variant) {
+    static const char* const t[] = {
+        "AMD's own choice for this GPU: FP8 on RDNA 4, full INT8 on RDNA 3 and Strix Halo, the Navi 2 INT8 model on RX 6000, "
+        "Lite on Strix Point and Van Gogh.",
+        "AMD's smaller FSR 4 network. On a GPU AMD already runs Lite on, this setting does nothing.",
+    };
+    static const char* const env = "Set for this run by RX_VK_FSR4_MODEL.";
+    if (variant < 0) variant = fsr4_model_env() >= 0 ? 1 : 0;
+    if (variant == 1) return env;
+    return variant == 0 ? t[std::clamp(v, 0, ur::kFsr4Models - 1)] : nullptr;
+}
 const char* tx_aniso(int v) {   // (Triforce: the Texture filtering row)
     static const char* t[] = {"Game", "2x", "4x", "8x", "16x"};   // ((Triforce, 11-16) "Game", the owner's word)
     if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
@@ -481,7 +570,19 @@ const char* tx_tex_detail(int v) {
     const int here = texture_detail_auto();
     return v == 0 && here >= 0 && here <= 2 ? picked[here] : t[v];
 }
-/// The Texture detail: the value chosen; variant 1: set for this run by RX_VK_TEX_DETAIL
+/// ((Triforce, 11-23) the Evil HD row, evil_hd.h: what each value does here
+MENU_HINTS(hn_evil_hd, 0,
+           "Off: the picture as the rows below are set.",
+           "On: SMAA Ultra, 16x filtering and ambient occlusion now; every texture whole from the next start. A little more GPU "
+           "time and video memory: a card with less than 12 GB can run out. With DLSS or FSR it is their own edges, and no "
+           "ambient occlusion.")
+/// ((Triforce, 11-23) the Texture filtering row: nothing for its value; while Evil HD is on, that it is 16x whatever is chosen
+const char* hn_aniso(int, int variant) {
+    static const char* const evil = "Evil HD is on: 16x, whatever is chosen here.";
+    if (variant < 0) return opts.evil_hd ? evil : nullptr;
+    return variant == 0 ? evil : nullptr;
+}
+/// The Texture detail: the value chosen; variant 1: set for this run by RX_VK_TEX_DETAIL; ((Triforce) 4: Evil HD on)
 const char* hn_tex_detail(int v, int variant) {
     static const char* const t[] = {
         "By this graphics card's video memory: Full from 12 GB (never on integrated graphics), Reduced on 8 and 10 GB cards, "
@@ -495,10 +596,38 @@ const char* hn_tex_detail(int v, int variant) {
     static const char* const env[] = {"Full for this run (RX_VK_TEX_DETAIL=full), whatever is chosen here.",
                                       "Reduced for this run (RX_VK_TEX_DETAIL=reduced), whatever is chosen here.",
                                       "Low for this run (RX_VK_TEX_DETAIL=low), whatever is chosen here."};
-    if (variant < 0) variant = tex_detail_env() >= 0 ? 1 + tex_detail_env() : 0;
+    static const char* const evil = "Evil HD is on: Full from the next start, whatever is chosen here.";
+    if (variant < 0) variant = tex_detail_env() >= 0 ? 1 + tex_detail_env() : opts.evil_hd ? 4 : 0;
     if (variant == 0) return t[(unsigned)v < sizeof t / sizeof t[0] ? v : 0];
-    return variant <= 3 ? env[variant - 1] : nullptr;
+    return variant <= 3 ? env[variant - 1] : variant == 4 ? evil : nullptr;
 }
+// ((Triforce) 11-24) The Detail rows. Shadow resolution (opts.shadow_res): the sun's cascades at the game's own sizes
+// (host/oot_shadow.c; on Highest the nearest one kept steady, host/oot_shadow_fit.c). Game's is the default: as shipped
+const char* tx_shadow_res(int v) {
+    static const char* const t[] = {"Game's", "High", "Highest"};
+    return t[(unsigned)v < 3 ? v : 0];
+}
+MENU_HINTS(hn_shadow_res, 0, "1600 pixels a side, the console's. About 31 MB of video memory.",
+           "2200 pixels a side. About 58 MB of video memory.",
+           "3072 pixels a side, the game's own highest, and the shadows near you shimmer less while the camera moves. About "
+           "113 MB of video memory.")
+// ((Triforce) 11-24) Colour vision correction (opts.colour_vision; colour_vision.h): the finished picture's colours moved onto
+// an axis the player sees. Off is the default: the picture as the game makes it
+const char* tx_colour_vision(int v) {
+    static const char* const t[] = {"Off", "Protan (red-green)", "Deutan (red-green)", "Tritan (blue-yellow)"};
+    return t[(unsigned)v < 4 ? v : 0];
+}
+MENU_HINTS(hn_colour_vision, 0, "The picture's colors as the game makes them.",
+           "For protanopia and protanomaly: reds told apart from greens, the difference moved towards blue and yellow.",
+           "For deuteranopia and deuteranomaly: greens told apart from reds, the difference moved towards blue and yellow.",
+           "For tritanopia and tritanomaly: blues told apart from yellows, the difference moved towards red and green.")
+// (Grass distance (opts.grass_distance): the short grass blades' reach, vk_draw.cpp grass_reach. Game's is the default)
+const char* tx_grass_distance(int v) {
+    static const char* const t[] = {"Game's", "2x", "3x", "4x"};
+    return t[(unsigned)v < 4 ? v : 0];
+}
+MENU_HINTS(hn_auto_pc, 0, "The rows are as you set them.",
+           "Set for this PC: the log says what was chosen and why. A new graphics card chooses again.")
 /// (Triforce) Opaque textures as BC1 (opts.tex_bc1, tex_bc1.h): nothing about the value itself; variants 0 and 1:
 /// RX_VK_TEX_BC1 decides for this run, off or on
 const char* hn_tex_bc1(int, int variant) {
@@ -509,6 +638,28 @@ const char* hn_tex_bc1(int, int variant) {
         return !e || !*e ? nullptr : t[atoi(e) != 0];
     }
     return variant < 2 ? t[variant] : nullptr;
+}
+// ((Triforce) 11-24) The Audio tab's Test microphone row: while on, the chosen microphone's level before and after the
+// Microphone gain row (host->mic_test, host/nn_audio_in.c), in the row's own cell as a meter; what goes on in the line under
+// its help. For this run only: never saved, and off as the Audio tab is left, the options close, the window loses the focus
+// or the Microphone row is Off (mic_test_tick)
+constexpr const char* kTestMic = "Test microphone";
+// ((Triforce) 11-24) The System tab's NFC group: the Scan amiibo page (host/nn_nfp.c, the game folder's amiibo folder) for every
+// player, not only with the Debug tab's tools on. The same page as the Debug tab's row, which stays (names_open)
+constexpr const char* kNfcTag = "NFC tag";
+bool mic_testing = false;
+int mic_levels[2] = {}, mic_test_state = 0;
+/// The Test microphone row's line under its help: what the meter shows, and what is wrong when something is
+const char* mic_test_line() {
+    if (!(mic_test_state & HOS_MIC_TEST_ON))
+        return "Start the test, then play a note or hum: the bar shows how loud the microphone is after the gain.";
+    static std::string line;
+    line = !(mic_test_state & HOS_MIC_TEST_OPEN) ? "The microphone could not be opened."
+         : !(mic_test_state & HOS_MIC_TEST_FRESH) ? "Waiting for the microphone's sound."
+         : (mic_test_state & HOS_MIC_TEST_CLIP) ? "Too loud: the sound is clipped. Lower the Microphone gain."
+                                                 : "The first figure is the microphone's level, the second after the gain.";
+    if (mic_test_state & HOS_MIC_TEST_STANDIN) line += " The default microphone stands in for the one chosen.";
+    return line.c_str();
 }
 const char* tx_percent(int v) {
     static char b[8];
@@ -678,6 +829,9 @@ Out output_picture_of(int v, int ultrawide_row) {
     if (!output_picture(frame.h, want, sized, &w, &h)) return v ? frame : kOutputs[0];
     return v ? Out{w, h} : Out{w * 4 / 5, h * 4 / 5};
 }
+/// ((Triforce) the sizes of the screen the game's window is on, its display modes and the common sizes of each shape up to its
+/// size, as the game takes them (output_modes.h; read_mode_sizes, as the menu opens): none until then
+std::vector<Out> mode_list;
 // The row's choices: the fixed sizes, each connected screen's size that is not one of those (once for screens of one size), and
 // Custom where its size is not a screen's. Smallest to largest, by width and then height; of one size a fixed one first; one
 // with no size at the end. A choice is saved as its value: a fixed size's number, or OUTPUT_CUSTOM with the size in the Output
@@ -703,6 +857,9 @@ std::vector<OutEntry> output_entries() {
     // (HOS_OUTPUT_SIZE is Custom's size for the run: a screen's size cannot be chosen then)
     for (const Screen& s : screens)
         if (!custom_env() && !fixed(s.used) && !has(OUTPUT_CUSTOM, s.used)) e.push_back(OutEntry{OUTPUT_CUSTOM, s.used, s.native});
+    // ((Triforce) the screen's display modes and the common sizes of each shape: chosen, Custom with that size, as a screen's)
+    for (const Out& m : mode_list)
+        if (!custom_env() && !fixed(m) && !has(OUTPUT_CUSTOM, m)) e.push_back(OutEntry{OUTPUT_CUSTOM, m, m});
     // (the old Screen value, only while it is still what is chosen: menu_init makes it the screen's size, output_adopt_screen)
     if (output_choice(opts.output_res) == OUTPUT_SCREEN) e.push_back(OutEntry{OUTPUT_SCREEN, row_size(OUTPUT_SCREEN), Out{0, 0}});
     // A fixed choice can have a remembered Custom in an edited file. Only the remembered pair is restored.
@@ -781,8 +938,10 @@ const char* tx_resolution(int v) {
     static char b[48];
     const int up = upscaler();
     if (ur::full_scale(up)) return "Native (100%)";   // ((Triforce, options_version 7) DLAA, FSR 4's and FSR 3.1's native AA)
+    v = ur::snap(up, v);   // ((Triforce) 11-24: the Upscaler's own step for the saved scale, which stays the player's: set_row)
     if (!ur::percent(v)) return "Auto (dynamic)";
-    if (const char* mode = ur::scales_by_mode(up) ? ur::dlss_mode_name(v) : nullptr) {
+    // ((Triforce) Intel XeSS: the preset whose range holds the share, upscaler_rows.h xess_mode_name)
+    if (const char* mode = up == ur::XESS ? ur::xess_mode_name(v) : ur::scales_by_mode(up) ? ur::dlss_mode_name(v) : nullptr) {
         snprintf(b, sizeof b, "%s (%d%%)", mode, ur::percent(v));
         return b;
     }
@@ -799,7 +958,7 @@ const char* hn_resolution(int v, int variant) {
         // ((Triforce, FSR4-2) chosen in play, the engine scales the smaller 3D up to the output until the next start)
         return "The 3D at the output's full size, its edges smoothed by the upscaler: the sharpest, and the slowest. The 3D "
                "takes its full size at the next start.";
-    const int p = ur::percent(v);
+    const int p = ur::percent(ur::snap(up, v));   // ((Triforce) 11-24: as tx_resolution shows it)
     if (up == ur::DLSS) {
         switch (p) {
         case 0: return "The game lowers it when the GPU is busy, and DLSS follows.";
@@ -820,6 +979,16 @@ const char* hn_resolution(int v, int variant) {
         default: return nullptr;   // (not one of FSR's steps: the row moves to one)
         }
     }
+    if (up == ur::XESS) {   // ((Triforce) each step under the XeSS preset whose range holds it: xess_rules.h)
+        switch (p) {
+        case 0: return "The game lowers it when the GPU is busy, and XeSS follows.";
+        case 67: return "XeSS's Ultra Quality mode, 1.5x: its sharpest from a smaller 3D.";
+        case 58: return "Between XeSS's Quality and Balanced, under its Balanced mode, 2x.";
+        case 50: return "XeSS's Balanced mode, 2x: faster, and softer.";
+        case 33: return "XeSS's Ultra Performance mode, 3x: its fastest, and its softest.";
+        default: return nullptr;   // (not one of its steps: the row moves to one)
+        }
+    }
     if (!p) return "The game lowers it when the GPU is busy.";
     if (p == 100) return "The 3D at the output's full size: the sharpest, and the slowest.";
     return "A steady size: lower is faster, and softer.";
@@ -830,11 +999,13 @@ const char* tx_aa(int v) {
     if (n64_in_front() != n64_rules::OFF) return "N64 Classic";   // ((Triforce, N64 Classic) its grid smooths the edges)
     const int up = upscaler();
     if (ur::is_dlss(up)) return "DLSS's own";
+    if (ur::is_xess(up)) return "XeSS's own";   // ((Triforce) Intel XeSS)
     if (aa_rows::upscaler_own(up)) return "FSR's own";
     return aa_rows::name(aa_rows::chosen(v, aa_env_choice()));
 }
 /// The Anti-aliasing: the value chosen (variant 0); that it does not apply while NVIDIA DLSS or DLAA (1) or AMD FSR (2)
-/// draws; that RX_VK_AA set it for this run (3); that the game's pass was not there to replace (4)
+/// draws; that RX_VK_AA set it for this run (3); that the game's pass was not there to replace (4); ((Triforce) that it does
+/// not apply while Intel XeSS draws (6)
 const char* hn_aa(int v, int variant) {
     static const char* const t[aa_rows::kValues] = {
         "The game's own SMAA, as on the console.",
@@ -855,9 +1026,9 @@ const char* hn_aa(int v, int variant) {
         "kept for when it is off.";
     if (variant < 0) {
         const int up = upscaler();
-        const bool asked = aa_rows::chosen(v, aa_env_choice()) != aa_rows::GAME;
-        variant = n64_in_front() != n64_rules::OFF ? 5 : ur::is_dlss(up) ? 1 : aa_rows::upscaler_own(up) ? 2
-                  : asked && aa_state() == aa_rows::MISSING ? 4 : aa_env_choice() >= 0 ? 3 : 0;
+        const bool asked = aa_rows::chosen(evil_hd::aa(opts.evil_hd, v), aa_env_choice()) != aa_rows::GAME;
+        variant = n64_in_front() != n64_rules::OFF ? 5 : ur::is_dlss(up) ? 1 : ur::is_xess(up) ? 6 : aa_rows::upscaler_own(up) ? 2
+                  : asked && aa_state() == aa_rows::MISSING ? 4 : aa_env_choice() >= 0 ? 3 : opts.evil_hd ? 7 : 0;
     }
     switch (variant) {
     case 0: return t[v >= 0 && v < aa_rows::kValues ? v : 0];
@@ -866,6 +1037,10 @@ const char* hn_aa(int v, int variant) {
     case 3: return env;
     case 4: return missing;
     case 5: return n64;
+    case 6:   // ((Triforce) Intel XeSS)
+        return "Intel XeSS smooths the 3D's edges itself, from frames the game's SMAA has not been over: nothing to set here. "
+               "The choice is kept for the game's own upscaler.";
+    case 7: return "Evil HD is on: SMAA Ultra, whatever is chosen here.";   // ((Triforce, 11-23) evil_hd.h)
     default: return nullptr;
     }
 }
@@ -927,6 +1102,24 @@ int n64_rem_row(const int* value) {
 }
 /// The Graphics tab's row that opens the Remembered page (the TAB_N64 rows), as the Motion row opens the Motion page
 bool is_n64_page_row(const Row& r) { return r.tab == TAB_GRAPHICS && !r.value && !strcmp(r.name, "Remembered settings"); }
+/// ((Triforce, 11-24) the Graphics tab's row that opens the Simulated turf page (the TAB_SIM_TURF rows), and the page's action
+bool is_sim_turf_page_row(const Row& r) { return r.tab == TAB_GRAPHICS && !r.value && !strcmp(r.name, "Simulated turf"); }
+bool is_sim_turf_reset_row(const Row& r) { return r.tab == TAB_SIM_TURF && !r.value && !strcmp(r.name, "Reset current area"); }
+/// (the page's rows by Use global multipliers: on, the four multipliers of every area's own values; off, this area's own four
+/// values and its Reset)
+bool sim_turf_row_shown(const Row& r) {
+    namespace sts = sim_turf_settings;
+    if (r.tab != TAB_SIM_TURF || r.value == &sts::global) return true;
+    for (int& m : sts::multipliers)
+        if (r.value == &m) return sts::global != 0;
+    return sts::global == 0;
+}
+const char* hn_sim_turf_area(int, int variant) { return variant <= 0 ? sim_turf_area_note() : nullptr; }
+const char* hn_sim_turf_reset(int, int variant) {
+    if (variant > 0) return nullptr;
+    if (variant == 0) return "This area already has the game's own values.";
+    return !sim_turf_ready() ? "Go to an area first." : sim_turf_can_reset() ? nullptr : "This area already has the game's own values.";
+}
 /// The Remembered page's two actions: 1 Copy Faithful, 2 Reset to defaults; 0 another row
 int n64_action(const Row& r) {
     if (r.tab != TAB_N64 || r.value) return 0;
@@ -950,6 +1143,7 @@ bool row_fixed(const int* value) {
     return (value == &opts.aa && aa_rows::fixed(upscaler(), aa_env_choice() >= 0)) ||
            (value == &opts.dlss && ur::upscaler_fixed(upscalers_available())) ||
            (value == &opts.dlss_model && ur::model_fixed(upscaler(), dlss_preset_env() != nullptr)) ||
+           (value == &opts.fsr4_model && ur::fsr4_model_fixed(upscaler(), fsr4_model_env() >= 0)) ||   // ((Triforce))
            // ((Triforce, 11-22, N64 Classic) the Upscaler and the Anti-aliasing while its 3D pass draws in their place; its own
            // row with RX_VK_N64 set for the run; a Remembered row with nothing to do (n64_rules.h row_fixed)
            ((value == &opts.dlss || value == &opts.aa) && n64_in_front() != n64_rules::OFF) ||
@@ -987,6 +1181,23 @@ const char* tx_text_speed(int v) {
     if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
     return t[v];
 }
+// (Triforce) The Text size row (host/oot_text_size.c, host/oot_play.h oot_text_size_scale has the scales)
+const char* tx_text_size(int v) {
+    static const char* t[] = {"Normal", "110%", "125%", "150%", "175%"};
+    if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
+    return t[v];
+}
+// (Triforce) The Damage taken row (host/oot_damage.c, host/oot_play.h OOT_DAMAGE_*)
+const char* tx_damage_taken(int v) {
+    static const char* const t[] = {"Half", "Normal", "Double", "Quadruple"};
+    return t[v >= 0 && v < 4 ? v : 1];
+}
+// (Triforce) The Field of view row (host/oot_fov.c): percent of the game's own angle
+const char* tx_fov(int v) {
+    static char b[24];
+    snprintf(b, sizeof b, v == 100 ? "100%% (the game's)" : "%d%%", v);
+    return b;
+}
 const char* tx_ultrawide(int v) {   // (Triforce: 1 to 4, the fixed shapes, ultrawide_rows.h; host/hos_main.c ultrawide_ratio)
     static const char* const t[] = {"16:9", "16:10", "21:9", "32:9", "4:3"};
     return t[std::min(std::max(v, 0), 4)];
@@ -1023,10 +1234,30 @@ const char* tx_shape(int v) {
     return b;
 }
 const char* tx_wide_hud(int v) { return v ? "Screen edges" : "Middle"; }
+// ((Triforce) The HUD placement row and Custom's rows (host/hos_wide_ui.c places the three groups at each present)
+const char* tx_hud_placement(int v) { return v ? "Custom" : "Game's"; }
+MENU_HINTS(hn_hud_placement, 0, "The hearts, buttons and minimap where the game puts them.",
+           "Move and resize the hearts, the buttons and the minimap from their usual places.")
+bool hud_custom_row(const int* v) {
+    return v == &opts.hud_health_x || v == &opts.hud_health_y || v == &opts.hud_health_scale || v == &opts.hud_buttons_x ||
+           v == &opts.hud_buttons_y || v == &opts.hud_buttons_scale || v == &opts.hud_minimap_x || v == &opts.hud_minimap_y ||
+           v == &opts.hud_minimap_scale;
+}
+int pack_placement(int x, int y, int scale) { return (x + 16) | ((y + 16) << 6) | (scale << 12); }
 const char* tx_prompts(int v) {
     static const char* t[HOS_PROMPT_N + 1] = {"Auto", "Switch", "Xbox", "PlayStation 4", "PlayStation 5", "Steam Deck",
                                               "Keyboard & mouse"};
     return t[std::min(std::max(v, 0), (int)HOS_PROMPT_N)];
+}
+// ((Triforce) 11-24) The Fullscreen screen row (opts.fs_screen): Automatic, the screen the window is on, or each connected
+// screen as the host listed them at the start, by its name and size (fs_screen_labels). The choice is kept by that label too
+// (fullscreen_screen_name), so the same screen is found when the list's order changes; one that is gone is Automatic.
+// host/display.c moves the window there (HOS_OPT_FULLSCREEN_SCREEN). Windows only: the row is not shown elsewhere
+std::vector<std::string> fs_screen_labels;
+std::string fs_screen_want;   // (the label the options file had, until menu_init has found it)
+const char* tx_fs_screen(int v) {
+    if (v <= 0 || v > (int)fs_screen_labels.size()) return "Automatic";
+    return fs_screen_labels[(size_t)v - 1].c_str();
 }
 const char* tx_gpu(int v) {
     static char buf[300];
@@ -1044,7 +1275,7 @@ const char* tx_pad_layout(int v);
 // host lets the default stand in and opens it again once it is back, and the name stays in the ini. In the ini the name is
 // cut to kMicNameKept bytes (at a character's start), so the line fits the 80-byte readers of the file (host/nn_hid.c,
 // nn_applet.c, hos_main.c), and a name is matched by that much of it
-constexpr int kMaxMics = 16;
+constexpr int kMaxMics = 64;
 constexpr size_t kMicNameKept = 60;
 std::string mic_want;      // (the chosen microphone's name, cut to kMicNameKept; empty: Off or the default chosen)
 // ((Triforce) 11-20) the GPU device row's card by its name (triforce_options.ini gpu_device_name, written beside the number by
@@ -1063,6 +1294,14 @@ std::string mic_key(const char* name) {
         if ((unsigned char)c < 0x20 || c == 0x7f) c = ' ';
     if (k.size() > kMicNameKept) k = k.substr(0, text_char_start(k, kMicNameKept));
     // (and no spaces at the end: a saved line's end, made one above, and those an older build saved with the name)
+    while (!k.empty() && k.back() == ' ') k.pop_back();
+    return k;
+}
+/// ((Triforce) 11-24) The Fullscreen screen row's label as the options file keeps it: mic_key's, cut so that its line fits the
+/// file's 80-byte readers
+std::string fs_key(const std::string& label) {
+    std::string k = mic_key(label.c_str());
+    if (k.size() > 54) k = k.substr(0, text_char_start(k, 54));
     while (!k.empty() && k.back() == ' ') k.pop_back();
     return k;
 }
@@ -1091,6 +1330,55 @@ const char* tx_mic(int v) {
     utf8_whole(buf);
     return buf;
 }
+// ((Triforce) 11-24) The Audio tab's Output device row: the default, or one of the host's playback devices
+// (host/audio_output_devices.c), told to the host by its endpoint id (host->audio_output_select), which the sound's thread
+// opens at its next block. The choice is kept by that id, output_want, never by the device's place or its name (two devices
+// can share one); also while it is unplugged: the row then has one more entry for it, "<name> (not connected)", the default
+// stands in and the host tries it again. The options file's audio_output_device_id= and audio_output_device_name= (the name
+// for that entry); the row's own number is not saved (ini_row). HOS_AUDIO_DEVICE over it for a run
+struct OutputChoice { std::string id, name; };
+std::vector<OutputChoice> output_devices;   // (as the host last listed them)
+int output_pick = 0;                        // (the row: 0 the default, n the nth device, one past them the unplugged one)
+std::string output_want, output_saved_name;
+bool output_missing = false;
+bool can_outputs() {
+    return host && host->audio_output_count && host->audio_output_info && host->audio_output_select && host->audio_output_state;
+}
+bool output_forced() { const char* e = getenv("HOS_AUDIO_DEVICE"); return e && *e; }
+/// An endpoint id as the file has it, or "" when it cannot be one: too long, or a control character in it
+std::string output_id_key(const char* text) {
+    std::string s(text ? text : "");
+    while (!s.empty() && (s.back() == '\r' || s.back() == '\n')) s.pop_back();
+    if (s.size() >= HOS_OUTPUT_ID_CAP) return std::string();
+    for (const char c : s)
+        if ((unsigned char)c < 0x20 || c == 0x7f) return std::string();
+    return s;
+}
+const char* tx_output_device(int v) {
+    static std::string text;
+    if (output_forced()) return "Set by HOS_AUDIO_DEVICE";
+    if (v <= 0) return "Default";
+    if (output_missing && v == (int)output_devices.size() + 1) {
+        text = (output_saved_name.empty() ? std::string("The chosen device") : output_saved_name) + " (not connected)";
+        return text.c_str();
+    }
+    if ((size_t)(v - 1) >= output_devices.size()) return "Default";
+    text = output_devices[(size_t)v - 1].name;
+    int same = 0;   // (two devices of one name: their places as well)
+    for (const auto& d : output_devices) same += d.name == text;
+    if (same > 1) text += " [" + std::to_string(v) + "]";
+    return text.c_str();
+}
+const char* hn_output_device(int, int variant) {
+    if (variant > 0) return nullptr;
+    if (variant < 0) return "Where the game plays its sound. A change restarts only the sound, at once.";
+    if (output_forced()) return "HOS_AUDIO_DEVICE chooses the device for this run. The row's choice is kept.";
+    const int state = can_outputs() ? host->audio_output_state() : 0;
+    if (state & HOS_OUTPUT_UNAVAILABLE) return "No device could be opened. The game keeps trying.";
+    if (output_missing || (state & HOS_OUTPUT_FALLBACK))
+        return "The default plays for now. The chosen device is kept and tried again while the game runs.";
+    return output_pick ? "This device, whatever the system's default is." : "The system's default playback device, as it changes.";
+}
 /// The Microphone row: Off, the default, a microphone of the list, or the chosen one while it is unplugged (variant 1)
 const char* hn_mic(int v, int variant) {
     if (v <= 0) return variant <= 0 ? "The game hears silence." : nullptr;
@@ -1112,8 +1400,8 @@ int lang_entries[gl::kCount];   // (the row's entries: places in gl::kLanguages,
 int lang_count = 0;
 int lang_saved = -1;            // (the entry language.txt chooses now: as read at the start, or as last written)
 bool lang_failed = false;       // (the last choice could not be written: the row is back on the file's)
-const char* tx_language(int v) {
-    return lang_count > 0 ? gl::kLanguages[lang_entries[std::min(std::max(v, 0), lang_count - 1)]].name : "";
+const char* tx_language(int v) {   // ((Triforce) each by its own name: Deutsch, Русский, 日本語, in any menu language)
+    return lang_count > 0 ? i18n::game_lang_name(lang_entries[std::min(std::max(v, 0), lang_count - 1)]) : "";
 }
 /// The Game language: nothing about the value itself; variant 0: HOS_LANGUAGE decides for this run; variant 1: the choice
 /// could not be written
@@ -1126,7 +1414,57 @@ const char* hn_language(int, int variant) {
     }
     return variant == 0 ? env : variant == 1 ? failed : nullptr;
 }
+// ((Triforce) The Menu language row (opts.menu_lang): Auto, then each language by its own name (vk_menu_i18n.h). Not the
+// game's: the menu's texts alone, at once)
+const char* tx_menu_lang(int v) {
+    if (v <= 0) return "Auto (game's language)";
+    return i18n::lang_name(v - 1);
+}
+const char* hn_menu_lang(int v, int variant) {   // (a language of its own: the help says it all)
+    return v <= 0 && variant <= 0 ? "Follows the game's language (language.txt in the game folder)." : nullptr;
+}
 const char* tx_rumble(int v) { return v ? tx_percent(v) : "Off"; }
+// ((Triforce) 11-24) Vibration (host/vibration.h): what plays each controller. Auto plays the best a controller can do, Basic
+// its motors, Off nothing; Rumble strength stays every backend's strength. The host writes back what plays the controller
+// used last (HOS_OPT_VIBRATION_STATUS: its kind times 16, plus what it says), which the row's help line says.
+const char* tx_vibration(int v) {
+    static const char* t[] = {"Auto", "Basic", "Off"};
+    return (unsigned)v < 3 ? t[v] : t[0];
+}
+std::atomic<int> vibration_status_cache{0};   // (no controller until the host reports)
+int vibration_says() { return vibration_status_cache.load(std::memory_order_relaxed) % 16; }
+const char* vibration_why(int s) {
+    static const char* t[] = {
+        "No controller is connected.", "Vibration is Off.", "Its two motors play the game's vibration.",
+        "Its own HD rumble plays the game's vibration as it is.",
+        "Its voice coils play the game's fine vibration, through its USB cable.",
+        "Its voice coils play the game's fine vibration over Bluetooth.",
+        "All four of its motors play, the triggers' too.",
+        "RenHDrum makes its HD rumble.",
+        "Its fine haptics play through the sound card it has on a USB cable, which was not found: its motors play "
+        "meanwhile.",
+        "Its fine haptics need RenHDrum beside the game (renhdrum.dll, or renhdrum.so on Linux), which is not there: its "
+        "motors play.",
+        "Its Bluetooth connection can't be written to here, so its motors play; on a USB cable, its voice coils play the "
+        "game's fine vibration.",
+        "Its grips play the game's fine vibration. Experimental: made from one person's measurements of the controller."};
+    return (unsigned)s < sizeof t / sizeof t[0] ? t[s] : nullptr;
+}
+// ((Triforce) 11-24) the Controller speaker rows (host/pad_speaker.c): where each kind of sound plays, the sync, the headphones
+const char* tx_pad_speaker(int v) { return v == 1 ? "Controller only" : v == 2 ? "Controller + TV" : "Off"; }
+const char* tx_pad_headphones(int v) { return v == 1 ? "Controller sounds" : v == 2 ? "All sound" : "Off"; }
+const char* tx_pad_sync(int v) {   // (above 0 the controller waits, below 0 the TV's copy of its sounds does)
+    static char b[48];
+    if (v < 0) snprintf(b, sizeof b, "TV waits %d ms", -v);
+    else if (v > 0) snprintf(b, sizeof b, "Controller waits %d ms", v);
+    else snprintf(b, sizeof b, "%d ms", 0);
+    return b;
+}
+// (under the Vibration row's help: what plays the controller used last now; every one, for the help's height)
+const char* hn_vibration(int v, int variant) {
+    (void)v;
+    return vibration_why(variant < 0 ? vibration_says() : variant);
+}
 const char* tx_volume(int v) { return v ? tx_percent(v) : "Muted"; }
 const char* tx_menu_sounds(int v) { return v ? tx_percent(v) : "Off"; }   // (Triforce: the Menu sounds row)
 const char* tx_sprint(int v) { return v == 1 ? "Left stick click" : v == 2 ? "B" : "Off"; }
@@ -1155,8 +1493,8 @@ const char* tx_walk_key(int v) {
 }
 // (hookshot) Audio output: the speakers the game mixes for, read once at its start (host/nn_audio.c au_menu_output)
 const char* tx_audio_output(int v) {
-    static const char* t[] = {"Auto", "Stereo", "5.1"};
-    return (unsigned)v < 3 ? t[v] : t[0];
+    static const char* t[] = {"Auto", "Stereo", "5.1", "Mono"};   // ((Triforce) Mono: stereo's layout, averaged as it is mixed)
+    return (unsigned)v < 4 ? t[v] : t[0];
 }
 // (hookshot) the motion's deadzone: the console's three zero-drift modes, the rate under which the pad counts as still
 const char* tx_deadzone(int v) {
@@ -1167,6 +1505,14 @@ const char* tx_robust(int v) {
     static const char* t[] = {"Auto", "Off", "On"};
     return (unsigned)v < 3 ? t[v] : t[0];
 }
+// ((Triforce, 11-24) the Debug tab's Compile shaders row (opts.compile_shaders; gpu/vk/compile_level.h)
+const char* tx_compile_shaders(int v) { return v == 1 ? "Most" : "All"; }
+MENU_HINTS(hn_compile_shaders, 0,
+           "The shader preparation builds every pipeline it can before the title, as before: the longest preparation, the "
+           "fewest compiles in play.",
+           "The preparation leaves out the predicted pipelines (built behind the game while a menu or the title is shown) "
+           "and the compute pipelines no list names: a shorter first preparation, and a short hitch where play first needs "
+           "one of those.")
 const char* tx_mesh(int v) { return v == 1 ? "Compute fallback" : "Auto"; }   // ((Triforce, 11-18) opts.mesh_mode, vk_main.cpp)
 // (Triforce) The Debug tab's Replay helper threads row (opts.replay_threads; vk_replay.cpp par_threads_max): Off, or the
 // parallel replay tried on 2 to 8 threads as RX_VK_PARALLEL_AUTO=<n> does. The switches go over the row for a run
@@ -1229,9 +1575,16 @@ const char* hn_framegen_fsr4(int variant) {
 /// Frame generation: how many frames are made for each of the game's
 const char* hn_framegen(int v, int variant) {
     if (v == framegen_rows::FSR4) return hn_framegen_fsr4(variant);   // (Triforce: AMD's library makes the frame)
-    // (2x: by AMD FSR 3.1 where it runs, from the scene's depth and motion: vk_framegen.cpp. Variant 1 is that text)
-    if (v == 2 && (variant < 0 ? fsr3fi::frames_wanted() != 0 : variant == 1))
-        return "One made frame between each two of the game's, by AMD FSR 3.1 from the scene's depth and motion.";
+    // ((Triforce) 11-24: by AMD FSR 3.1 where the Frame generation by row has it make them and it runs, from the scene's depth and
+    // motion: vk_framegen.cpp. Variant 1 is the longest such text, for the menu's height)
+    if (v >= 2 && v <= 8 && (variant < 0 ? fsr3fi::frames_wanted() != 0 : variant == 1)) {
+        static char f[9][112];
+        const int k = variant == 1 ? 8 : v;
+        snprintf(f[k], sizeof f[k], "%s between each two of the game's, by AMD FSR 3.1 from the scene's depth and motion.",
+                 k == 2 ? "One made frame" : k == 3 ? "Two made frames" : k == 4 ? "Three made frames" : k == 5 ? "Four made frames"
+                 : k == 6 ? "Five made frames" : k == 7 ? "Six made frames" : "Seven made frames");
+        return f[k];
+    }
     if (variant > 0) return nullptr;
     if (v <= 0) return "Only the game's own frames: no added delay.";
     if (v == 1) return "A frame for each of the display's refreshes: none made when the game keeps up. Frame pacing does not apply.";
@@ -1239,6 +1592,20 @@ const char* hn_framegen(int v, int variant) {
     snprintf(b[v], sizeof b[v], "%s between each two of the game's.", v == 2 ? "One made frame" : v == 3 ? "Two made frames" : v == 4 ? "Three made frames"
              : v == 5 ? "Four made frames" : v == 6 ? "Five made frames" : v == 7 ? "Six made frames" : "Seven made frames");
     return b[std::clamp(v, 2, 8)];
+}
+/// ((Triforce) 11-24) The Frame generation by row (opts.fg_by, framegen_rows.h BY_*): who makes the frames at Auto and 2x to 8x
+const char* tx_fg_by(int v) { return v == framegen_rows::BY_FSR3 ? "AMD FSR 3.1" : "Triforce"; }
+/// Its line: what makes them, and for AMD FSR 3.1 where it cannot run here, why (variants: every line it can show)
+const char* hn_fg_by(int v, int variant) {
+    static const char* const own = "Triforce's own interpolation, from the picture alone: the lightest on the GPU.";
+    static const char* const fsr = "AMD FSR 3.1's frame interpolation, from the scene's depth and motion, the HUD kept still: "
+                                   "less ghosting, more GPU time. Any GPU.";
+    static const char* const cannot = "This GPU lacks what AMD FSR 3.1's passes need: Triforce's own makes the frames.";
+    static const char* const native = "Paused with HDR Native: Triforce's own makes the frames, in their 10 bits.";
+    if (variant >= 0) return variant == 0 ? own : variant == 1 ? fsr : variant == 2 ? cannot : variant == 3 ? native : nullptr;
+    if (v != framegen_rows::BY_FSR3) return own;
+    if (opts.hdr == 2) return native;   // (the picture is HDR Native's where the display has HDR: vk_fsr3fi.cpp frames_wanted)
+    return !dev.device || fsr3fi::capable() ? fsr : cannot;
 }
 /// ((Triforce, options_version 7) The Frame generation row: the renderer's own and AMD FSR 4's (opts.framegen), then NVIDIA
 /// DLSS 2x to 4x (opts.dlssg), which was a row of its own: merged_rows.h)
@@ -1300,12 +1667,14 @@ const char* hn_shape(int v, int variant) {
     }
 }
 const char* tx_wide_menus(int v) {
-    static const char* t[] = {"Full width", "Centred, blurred sides", "Centred, black bars"};
-    return t[std::min(std::max(v, 0), 2)];
+    static const char* t[] = {"Full width", "Centred, blurred sides", "Centred, black bars", "Extended"};
+    return t[std::min(std::max(v, 0), 3)];
 }
 MENU_HINTS(hn_wide_menus, 0, "The menus stretched over the whole screen, as before.",
            "The menus in the middle 16:9; beside them, what the game draws there, out of focus.",
-           "The menus in the middle 16:9; black beside them.")
+           "The menus in the middle 16:9; black beside them.",
+           // ((Triforce) host/hos_wide_ui.c: the menus' layouts planned as the HUD's)
+           "The menus at their 16:9 size, what sits at their sides moved out to the screen's edges.")
 MENU_HINTS(hn_robust, 0, "Off, on every card.", "Can be faster on some NVIDIA cards.", "Always on.")
 MENU_HINTS(hn_mesh, 0, "As the game finds best for this GPU: the fallback on AMD's RX 6000 driver, native mesh shaders elsewhere.",
            "Every mesh draw through compute shaders: a little slower. Try it if walls glow or the GPU stops responding on an AMD "
@@ -1313,22 +1682,31 @@ MENU_HINTS(hn_mesh, 0, "As the game finds best for this GPU: the fallback on AMD
 MENU_HINTS(hn_fps, 0, nullptr, "With frame generation on, the game's own rate too.",
            "In the counter's place in the top right corner, a see-through panel: the GPU's and the CPU's load, temperatures and memory, "
            "the frame rate with its lows, the frame times and their graph, the waits per frame and the picture's settings. It "
-           "measures only while it is shown.")
+           "measures only while it is shown.",
+           // ((Triforce) the levels between On and Full, fps_levels.h: the values after Full's, shown before it)
+           "The frame rate, and under it the frame time and the 1% low as a frame time.",
+           "Frame time, and a graph of the last frames against the Frame rate cap's frame time.",
+           "Graph, and where the frame's time goes: the game, the renderer, its waits for pipelines and shaders, and the GPU's time "
+           "beside them.",
+           "Breakdown, and the renderer's own numbers: video memory, draws, dispatches, passes and uploads a frame, pipelines built.")
 /// (Triforce) The FPS counter row's third value, Full, after NX2navi's perf_overlay (off, fps, full): 0 and 1 are Off and
 /// On as before. The row keeps its name, and with it its key in the options file (fps_counter)
-const char* tx_perf(int v) { return v == 1 ? "On" : v >= 2 ? "Full" : "Off"; }
+const char* tx_perf(int v) { return fps_levels::name(v); }   // ((Triforce) and the levels between On and Full: fps_levels.h
 MENU_HINTS(hn_menu_size, 0, "Large in fullscreen on a screen of 1080 lines or more while a controller is in use, else Medium.",
            "Smaller, for a desk.", "The usual size.", "Larger, for a TV across the room.")
 MENU_HINTS(hn_speed, 0, "A step each frame: the game slows down whenever it runs below 60 fps.",
            "Normal speed down to 15 fps, by taking longer steps.")
 MENU_HINTS(hn_text_speed, 0, "The game's own pace, with its pauses.", "Twice as fast.", "Four times as fast.",
            "Each page at once, as pressing A does.")
-MENU_HINTS(hn_audio_output, 0, "5.1 when the default output device has 5.1 or more speakers, else stereo.",
-           "Stereo, whatever the device has.", "5.1, whatever the device has. Mixed down on stereo speakers.")
+MENU_HINTS(hn_text_size, 0, "The game's own size.", "A little larger.", "Larger.", "Much larger.", "The largest.")
+MENU_HINTS(hn_audio_output, 0, "5.1 when the output device has 5.1 or more speakers, else stereo.",
+           "Stereo, whatever the device has.", "5.1, whatever the device has. Mixed down on stereo speakers.",
+           "The same sound in both ears: the average of stereo's two channels. At once from Stereo; after a restart from 5.1.")
 MENU_HINTS(hn_background, 0, "Only while the game's window has the focus.",
            "Also behind other windows, for streaming or other apps. The keyboard and mouse still need the game's window.")
 MENU_HINTS(hn_mousecam, 0, "The mouse stands in for the right stick, with its curve and top speed.",
-           "The mouse turns the camera itself, one to one, as in a PC game.")
+           "The mouse turns the camera itself, one to one, as in a PC game.",
+           "The mouse plays no part: a click in the window does not capture it. For a controller or the keyboard alone.")
 MENU_HINTS(hn_mouse_invert, 0, nullptr, "Moving the mouse forward tilts the camera down.")
 MENU_HINTS(hn_gyro, 0, "The sticks alone aim.",
            "Switch Pro controllers and pads in Switch mode, DualSense and DualShock 4. The value says whether the "
@@ -1354,7 +1732,12 @@ MENU_HINTS(hn_walk_key, 0, "The movement keys always push the stick all the way:
            "the walk key it does not press it.",
            "Tab is one of Plus's keys by default. While it is the walk key it does not press Plus; Enter still does.")
 // (Triforce) the Lazy write-back row (vk_memory.cpp lazy_decide, wb_lazy_state.h choose)
-MENU_HINTS(hn_lazy_write_back, 0, "Copied back after every submission, as always.",
+// ((Triforce) the Threaded rendering row: Off, On, Auto (threaded_rendering.h's order)
+const char* tx_threaded(int v) { return v == 2 ? "Auto" : tx_onoff(v); }
+MENU_HINTS(hn_threaded, 0, "The game's own thread turns its commands into the graphics card's, as always.",
+           "A render thread, a recorder thread and a present thread, whatever the processor.",
+           "On with 4 processor cores or more; with no video memory mirrors only the recorder thread, from 6 cores.")
+MENU_HINTS(hn_lazy_write_back, 0,"Copied back after every submission, as always.",
            "Copied back when it is read. Stays off with an AMD card's driver unless RX_VK_LAZY_WB=1 is set, and does nothing "
            "with no VRAM mirrors.")
 
@@ -1435,6 +1818,9 @@ Row rows[] = {
     MENU_HEADING(TAB_DISPLAY, "Screen"),
     {TAB_DISPLAY, "Fullscreen", &opts.fullscreen, 0, 1, 1, tx_onoff,
      "The game fills the whole screen, without the window's border. F10 and Alt+Enter do the same.", nullptr, false, true},
+    {TAB_DISPLAY, "Fullscreen screen", &opts.fs_screen, 0, 15, 1, tx_fs_screen,
+     "Which screen Fullscreen fills: Automatic, the one the window is on, or one of the connected screens. Changes at once.",
+     nullptr, false, true},
     {TAB_DISPLAY, "Output resolution", &opts.output_res, 0, kLastOutput, 1, tx_output_res,
      "The picture's size, before it is scaled to the window: the fixed sizes, and the size of each connected screen by its "
      "name. A size that is not 16:9 is a wider or narrower picture: the HUD, menus and story movies keep their 16:9 shape at its "
@@ -1446,12 +1832,14 @@ Row rows[] = {
     {TAB_DISPLAY, kUseWindowSize, nullptr, 0, 0, 0, nullptr,
      "Copy the current window's pixel size to Custom. In fullscreen this uses the fullscreen size. Applies after a restart."},
     {TAB_DISPLAY, "Output width", &opts.output_width, OUTPUT_MIN_W, OUTPUT_MAX_W, 8, tx_custom_width,
-     "The output resolution's width in pixels, where it is a screen's size or Custom; hold Left or Right to move faster. Output "
-     "resolution shows the size the game takes: 5:4 to 32:9 in shape, at most the pixels of 5120x2880. Applies after a restart.",
+     "The output resolution's width in pixels, where it is a screen's size or Custom; hold Left or Right to move faster, or type "
+     "a number and press Enter. Output resolution shows the size the game takes: 5:4 to 48:9 in shape, at most the pixels of "
+     "5120x2880. Applies after a restart.",
      nullptr, true},
     {TAB_DISPLAY, "Output height", &opts.output_height, OUTPUT_MIN_H, OUTPUT_MAX_H, 8, tx_custom_height,
-     "The output resolution's height in pixels, where it is a screen's size or Custom; hold Left or Right to move faster. Output "
-     "resolution shows the size the game takes: 5:4 to 32:9 in shape, at most the pixels of 5120x2880. Applies after a restart.",
+     "The output resolution's height in pixels, where it is a screen's size or Custom; hold Left or Right to move faster, or type "
+     "a number and press Enter. Output resolution shows the size the game takes: 5:4 to 48:9 in shape, at most the pixels of "
+     "5120x2880. Applies after a restart.",
      nullptr, true},
     {TAB_DISPLAY, "GPU device", &opts.gpu_device, 0, 8, 1, tx_gpu,
      "Which graphics card the game runs on. Applies after a restart.", hn_gpu, true, true},
@@ -1483,14 +1871,37 @@ Row rows[] = {
      "for a screen or a window of that shape, or 4:3, a TV's of 1998. A screen of another shape shows the picture between black bars. An Output "
      "resolution that is not 16:9 has its own shape, shown here. Applies after a restart.", hn_shape, true},
     // (Triforce: host/oot_wide_hud.c)
+    // ((Triforce) Screen edges: host/hos_wide_ui.c plans the HUD's layouts for the picture at each present, so it changes at once)
     {TAB_DISPLAY, "HUD position", &opts.wide_hud, 0, 1, 1, tx_wide_hud,
      "With a picture wider than 16:9: where corner HUD elements, tips and notices sit. Middle: in the "
-     "middle 16:9, as on a normal screen. Screen edges: out in the screen's corners. Applies after a restart.", nullptr,
-     true, true},
-    {TAB_DISPLAY, "Menu sides", &opts.wide_menus, 0, 2, 1, tx_wide_menus,
+     "middle 16:9, as on a normal screen. Screen edges: out in the screen's corners. Changes at once.", nullptr,
+     false, true},
+    {TAB_DISPLAY, "Menu sides", &opts.wide_menus, 0, 3, 1, tx_wide_menus,   // ((Triforce) 3 Extended: host/hos_wide_ui.c)
      "With a picture wider than 16:9: the pause, item and map menus, and what shows beside them. Loading screens and story movies, "
      "which draw no world either, get the same sides (the title's movie fills the picture up to 12:5); a fade always covers the "
      "whole screen. Changes at once.", hn_wide_menus},
+    // ((Triforce) the HUD's three groups moved and sized, on a 16:9 or wider picture: host/hos_wide_ui.c, changes at once)
+    MENU_HEADING(TAB_DISPLAY, "HUD"),
+    {TAB_DISPLAY, "HUD placement", &opts.hud_placement, 0, 1, 1, tx_hud_placement,
+     "Where the hearts, the buttons and the minimap sit in play. Custom moves and resizes each group. Changes at once.",
+     hn_hud_placement, false, true},
+    {TAB_DISPLAY, "Hearts and magic across", &opts.hud_health_x, -15, 15, 1, tx_percent,
+     "Moves the hearts and magic left or right, as a share of the picture's width.", nullptr, false, true},
+    {TAB_DISPLAY, "Hearts and magic up", &opts.hud_health_y, -15, 15, 1, tx_percent,
+     "Moves the hearts and magic down or up, as a share of the picture's height.", nullptr, false, true},
+    {TAB_DISPLAY, "Hearts and magic size", &opts.hud_health_scale, 75, 125, 1, tx_percent,
+     "Resizes the hearts and magic together.", nullptr, false, true},
+    {TAB_DISPLAY, "Buttons across", &opts.hud_buttons_x, -15, 15, 1, tx_percent,
+     "Moves the action prompts and the item buttons left or right, as a share of the picture's width.", nullptr, false, true},
+    {TAB_DISPLAY, "Buttons up", &opts.hud_buttons_y, -15, 15, 1, tx_percent,
+     "Moves the action prompts and the item buttons down or up, as a share of the picture's height.", nullptr, false, true},
+    {TAB_DISPLAY, "Buttons size", &opts.hud_buttons_scale, 75, 125, 1, tx_percent,
+     "Resizes the action prompts and the item buttons together.", nullptr, false, true},
+    {TAB_DISPLAY, "Minimap across", &opts.hud_minimap_x, -15, 15, 1, tx_percent,
+     "Moves the minimap left or right, as a share of the picture's width.", nullptr, false, true},
+    {TAB_DISPLAY, "Minimap up", &opts.hud_minimap_y, -15, 15, 1, tx_percent,
+     "Moves the minimap down or up, as a share of the picture's height.", nullptr, false, true},
+    {TAB_DISPLAY, "Minimap size", &opts.hud_minimap_scale, 75, 125, 1, tx_percent, "Resizes the minimap.", nullptr, false, true},
     MENU_HEADING(TAB_DISPLAY, "HDR"),
     // (HDR and RenoDX HDR in one row: merged_rows.h. Off, Expanded and Native change at once, as the HDR row did; Native +
     // RenoDX, which the scene's format and RenoDX's shaders are chosen for at the start (host/nn_vi.c hos_scene_rgba16f),
@@ -1550,14 +1961,32 @@ Row rows[] = {
     {TAB_DISPLAY, "Bloom", &opts.rdx_bloom, 0, 100, 5, tx_rdx_grade,
      "The glow around bright things. 50 is the game's. RenoDX is by Carlos Lopez (clshortfuse), under the MIT license.",
      nullptr, false, true},
+    // ((Triforce) 11-24) the picture's colours for a colour vision deficiency (vk_framegen.cpp framegen_scale). Taken at once
+    MENU_HEADING(TAB_DISPLAY, "Accessibility"),
+    {TAB_DISPLAY, "Color vision correction", &opts.colour_vision, 0, 3, 1, tx_colour_vision,
+     "Recolors the finished picture for red-green or blue-yellow color vision deficiency, keeping its brightness. Not with "
+     "HDR Native. Changes at once.", hn_colour_vision, false, true},
     MENU_HEADING(TAB_DISPLAY, "Overlay"),
     // (Triforce, after NX2navi's perf_overlay: a third value, Full, NX2navi's full performance overlay: perf_sample, draw_perf)
-    {TAB_DISPLAY, "FPS counter", &opts.show_fps, 0, 2, 1, tx_perf,
+    {TAB_DISPLAY, "FPS counter", &opts.show_fps, 0, fps_levels::kMax, 1, tx_perf,
      "Frames per second in the top right corner. Full: a performance panel in its place: the GPU's and the CPU's load, "
      "temperatures and memory, the frame rate and its lows, the frame times and their graph, the waits per frame and the "
      "picture's settings.", hn_fps, false, true},
 
     // ---- Graphics: the picture, top to bottom ----
+    // ((Triforce, 11-23) Evil HD, the owner's one switch for a powerful PC: evil_hd.h. First, over the rows it stands for)
+    MENU_HEADING(TAB_GRAPHICS, "Evil HD"),
+    {TAB_GRAPHICS, "Evil HD", &opts.evil_hd, 0, 1, 1, tx_onoff,
+     "The fullest picture the game can give, for a powerful PC: SMAA Ultra edges, 16x texture filtering, every texture whole, "
+     "the shadows of distant grass and leaves as the game draws them, and soft shadows in corners and creases (ambient "
+     "occlusion), and the grass, plants, flowers and stones drawn 4 times as far (in the areas you enter after it is turned on). "
+     "Your own choices in those rows come back when it is off. F2 turns it on and off.", hn_evil_hd, false, true},
+    // ((Triforce) Auto (this PC): auto_settings.h, auto_apply. Off by default: nothing set, nothing tuned)
+    MENU_HEADING(TAB_GRAPHICS, "This PC"),
+    {TAB_GRAPHICS, "Auto (this PC)", &opts.auto_pc, 0, 1, 1, tx_onoff,
+     "On: the Upscaler, Render resolution, Texture detail, Shadow resolution and Grass distance are set for this PC's graphics "
+     "card, memory and processor, and adjusted in the first minutes of play to hold the Frame rate cap. Changing one of those "
+     "rows yourself turns it Off. The Render resolution and Upscaler apply after a restart.", hn_auto_pc, false, true},
     MENU_HEADING(TAB_GRAPHICS, "Upscaling"),
     // (the Upscaler only in a build with DLSS or FSR 4, or where AMD FSR 3.1 runs: row_shown. An engine's native anti-aliasing
     // is the Render resolution's Native (100%), upscaler_rows.h)
@@ -1565,6 +1994,8 @@ Row rows[] = {
      hn_upscaler},
     {TAB_GRAPHICS, "DLSS model", &opts.dlss_model, 0, ur::kModels - 1, 1, tx_dlss_model,
      "Which of NVIDIA's DLSS networks draws the picture.", hn_dlss_model, false, true},
+    {TAB_GRAPHICS, "FSR 4 model", &opts.fsr4_model, 0, ur::kFsr4Models - 1, 1, tx_fsr4_model,   // ((Triforce))
+     "The FSR 4 network: Auto lets AMD pick for this GPU, Lite is the faster INT8 network.", hn_fsr4_model, false, true},
     // (Triforce: read once, at the start (host/nn_vi.c): Auto -> 100% in game left the 3D at the dynamic path's size)
     {TAB_GRAPHICS, "Render resolution", &opts.resolution, 0, ur::kValues - 1, 1, tx_resolution,
      "The size the 3D is drawn at; the upscaler fills in the rest. Applies after a restart.", hn_resolution, true},
@@ -1615,21 +2046,50 @@ Row rows[] = {
     MENU_HEADING(TAB_N64, "Start again"),
     {TAB_N64, "Copy Faithful", nullptr, 0, 0, 0, nullptr, "Remembered set to Faithful's values: a start for your own."},
     {TAB_N64, "Reset to defaults", nullptr, 0, 0, 0, nullptr, "Remembered as it was at first."},
+    // ((Triforce, 11-24) the Simulated turf page (TAB_SIM_TURF), which Simulated turf opens: each area's own values, or
+    // multipliers of every area's. Each change at once, kept in sim_turf_settings.ini (vk_sim_turf.cpp takes the rows' changes)
+    {TAB_SIM_TURF, "Use global multipliers", &sim_turf_settings::global, 0, 1, 1, tx_onoff,
+     "On: every area's own simulated turf scaled by the four multipliers below (1.0x is the area's own). Off: this area's own "
+     "values, set one by one.", nullptr, false, true},
+    {TAB_SIM_TURF, "Fade start multiplier", &sim_turf_settings::multipliers[0], 0, 100, 1, sim_turf_text_multiplier,
+     "Scales each area's fade start within the game's fade range.", nullptr, false, true},
+    {TAB_SIM_TURF, "Turf density multiplier", &sim_turf_settings::multipliers[1], 0, 100, 1, sim_turf_text_multiplier,
+     "Scales each area's simulated turf density. 0.0x leaves almost none.", nullptr, false, true},
+    {TAB_SIM_TURF, "Minimum blades multiplier", &sim_turf_settings::multipliers[2], 0, 100, 1, sim_turf_text_multiplier,
+     "Scales each area's fewest simulated turf blades, rounded to a whole blade.", nullptr, false, true},
+    {TAB_SIM_TURF, "Far power multiplier", &sim_turf_settings::multipliers[3], 0, 100, 1, sim_turf_text_multiplier,
+     "Scales how quickly each area's simulated turf thins with distance.", nullptr, false, true},
+    {TAB_SIM_TURF, "Fade start", &sim_turf_settings::values[0], 0, 649, 1, sim_turf_text_fade,
+     "How far away the simulated turf begins to fade. 0 with Minimum blades 0: none in this area, for a slower PC.",
+     hn_sim_turf_area, false, true},
+    {TAB_SIM_TURF, "Turf density", &sim_turf_settings::values[1], 1, 500, 1, sim_turf_text_count,
+     "How densely the simulated turf is laid. The game divides by it: lower is denser.", hn_sim_turf_area, false, true},
+    {TAB_SIM_TURF, "Minimum blades", &sim_turf_settings::values[2], 0, 128, 1, sim_turf_text_count,
+     "The fewest blades the simulated turf keeps as it thins with distance.", hn_sim_turf_area, false, true},
+    {TAB_SIM_TURF, "Far power", &sim_turf_settings::values[3], 0, 400, 5, sim_turf_text_power,
+     "How the simulated turf's density falls with distance.", hn_sim_turf_area, false, true},
+    {TAB_SIM_TURF, "Reset current area", nullptr, 0, 0, 0, nullptr,
+     "This area's edits gone: the game's own simulated turf here again.", hn_sim_turf_reset},
     MENU_HEADING(TAB_GRAPHICS, "Frame generation"),
     // (Frame generation and DLSS frame generation in one row, merged_rows.h: the renderer's own, AMD FSR 4 where its library
     // makes the frames, NVIDIA DLSS where it can run (vk_dlssg.cpp: read at the start, so it takes a restart))
     {TAB_GRAPHICS, "Frame generation", &merged.framegen, 0, mr7::FG_DLSS_LAST, 1, tx_framegen_row,
      "Makes frames between the game's own, for smoother motion, at a little input delay. Fast motion and camera cuts can "
      "show artifacts. NVIDIA DLSS applies after a restart.", hn_framegen_row, true, true},
+    // ((Triforce) 11-24) who makes them at Auto and 2x to 8x: the renderer's own (the default, as before) or AMD FSR 3.1's frame
+    // interpolation, vk_fsr3fi.h. Shown with those values alone (row_shown)
+    {TAB_GRAPHICS, "Frame generation by", &opts.fg_by, 0, framegen_rows::kByMax, 1, tx_fg_by,
+     "Who makes the frames at Auto and 2x to 8x.", hn_fg_by, false, true},
     MENU_HEADING(TAB_GRAPHICS, "Frame rate & latency"),
-    {TAB_GRAPHICS, "Frame rate cap", &opts.fps_cap, -3, 6, 1, tx_fps_cap,   // (6: Monitor's rate, fps_cap.h kMonitor)
+    {TAB_GRAPHICS, "Frame rate cap", &opts.fps_cap, -3, 7, 1, tx_fps_cap,   // (6: Monitor's rate, 7: Uncapped, fps_cap.h)
      "The most frames the game renders a second; made frames come on top. 60 is the safe choice: past it some cutscenes and "
      "bosses can misbehave. 30, 40 and 45 are for a PC that holds one of them where 60 swings. Monitor's rate: the refresh "
-     "rate of the screen the game starts on. Applies after a restart.", nullptr, true, true},
+     "rate of the screen the game starts on. Uncapped: as fast as the PC can, still at real time; with VSync on, the screen's "
+     "refresh rate is the limit. Changes at once.", nullptr, false, true},
     // (Triforce, after NX2navi's VSync switch: the swapchain's present mode, made again at once. present_mode.h, vk_main.cpp)
-    {TAB_GRAPHICS, "VSync", &opts.vsync, 0, 1, 1, tx_onoff,
+    {TAB_GRAPHICS, "VSync", &opts.vsync, 0, 2, 1, tx_vsync,
      "Whether a finished frame waits for the screen's next refresh. Off: a little less delay, and the picture can tear. "
-     "Changes at once.", hn_vsync, false, true},
+     "Every refresh: always the screen's own pacing (FIFO), for a display that tears or stutters otherwise. Changes at once.", hn_vsync, false, true},
     // (Frame pacing and Steady frame rate in one row, merged_rows.h: host/pace_steady.h, host/nn_vi.c steady_period)
     {TAB_GRAPHICS, "Frame pacing", &merged.pacing, 0, 3, 1, tx_pacing,
      "When each frame is shown. Steady paces the game to a rate this PC holds where you are: steadier, at some frame rate.",
@@ -1641,11 +2101,37 @@ Row rows[] = {
     MENU_HEADING(TAB_GRAPHICS, "Textures"),
     {TAB_GRAPHICS, "Texture filtering", &opts.aniso, 0, 4, 1, tx_aniso,   // (Triforce: vk_draw.cpp sampler_for)
      "Keeps ground, paths and walls sharp where they slope away from the camera. Game: what the game asks for; 16x is the "
-     "sharpest, at a small cost."},
+     "sharpest, at a small cost.", hn_aniso},
     // (Triforce, after NX2navi's texture_detail: tex_detail.h, vk_texture.cpp texture_detail_level. Read at the first texture)
     {TAB_GRAPHICS, "Texture detail", &opts.tex_detail, 0, 3, 1, tx_tex_detail,
      "How large the game's textures are kept in video memory. Automatic suits the graphics card. Applies after a restart.",
      hn_tex_detail, true},
+    // ((Triforce) 11-24) the ReShade presets (reshade_menu.h, reshade/fx_runtime.cpp): Off, the default, runs nothing. The User
+    // preset file and Rescan rows with User chosen (row_shown); the file itself is the game folder's reshade/selected.txt
+    MENU_HEADING(TAB_GRAPHICS, "Post-processing"),
+    {TAB_GRAPHICS, "ReShade preset", &opts.reshade, 0, reshade::last_builtin_preset, 1, reshade_menu::tx_preset,
+     "Native HDR supports built-in and LinearHDR presets. Use Expanded HDR for imported SDR presets.", reshade_menu::hn_preset,
+     false, true},
+    {TAB_GRAPHICS, kReshadeCompare, nullptr, 0, 0, 0, nullptr, "Preview presets. Back restores your saved selection."},
+    {TAB_GRAPHICS, "User preset file", &reshade_menu::user_pick, 0, 0, 1, reshade_menu::tx_user,
+     "Copy INI files to reshade/presets and FX and FXH files to reshade/shaders, then rescan.", nullptr, false, true},
+    {TAB_GRAPHICS, kReshadeRescan, nullptr, 0, 0, 0, nullptr,
+     "Refreshes the user preset list and reloads the selected file."},
+    // ((Triforce) 11-24) how far and how fine the scene's details go: the short grass's reach (vk_draw.cpp grass_reach) and the
+    // sun's shadow maps (host/oot_shadow.c, HOS_OPT_SHADOW_RES). Both taken at once; Game's, the default, is as shipped
+    MENU_HEADING(TAB_GRAPHICS, "Detail"),
+    {TAB_GRAPHICS, "Grass distance", &opts.grass_distance, 0, 3, 1, tx_grass_distance,
+     "How far away short grass blades reach, such as Kokiri Forest's tufts and the moss on its stones. The game stops them at "
+     "about 20 m. Higher extends their reach for some GPU time. Changes at once."},
+    // ((Triforce, 11-24) opens the Simulated turf page, the TAB_SIM_TURF rows: vk_sim_turf.cpp, sim_turf_settings.h)
+    {TAB_GRAPHICS, "Simulated turf", nullptr, 0, 0, 0, nullptr,
+     "The broad field grass the game's wind and fluid simulation moves: the dense carpet that bends and ripples around Link. "
+     "Its fade, density and blades, area by area. Grass distance is the separate short blades."},
+    {TAB_GRAPHICS, "Shadow resolution", &opts.shadow_res, 0, 2, 1, tx_shadow_res,
+     "The size of the sun's shadow maps: higher keeps the shadows of thin things near you, such as chains, fences and leaves, "
+     "smooth instead of stair-stepped, for more video memory and a little GPU time. Highest also makes them shimmer less while "
+     "the camera moves. Changes at once.",
+     hn_shadow_res},
     // ((Triforce, 11-18, v0.5.1) a player's RX 7700S: glowing doors and walls with native mesh shaders, gone with the compute
     // fallback (#bug-tracker). The row's key, mesh_shaders, is read where the device is made: vk_main.cpp. Its own group, as
     // v0.5.1's Advanced section had it, after the picture's)
@@ -1674,11 +2160,34 @@ Row rows[] = {
     {TAB_SYSTEM, "Game language", &opts.language, 0, 0, 1, tx_language,
      "The language of the game's texts, of those your game has (language.txt in the game folder). Applies after a restart.",
      hn_language, true, true},
+    // ((Triforce) this menu's own language: English by default, as before the row; the texts its tables lack stay English)
+    {TAB_SYSTEM, "Menu language", &opts.menu_lang, 0, i18n::lang_count(), 1, tx_menu_lang, "The language of this menu.",
+     hn_menu_lang, false, true},
     {TAB_SYSTEM, "Text speed", &opts.text_speed, 0, 3, 1, tx_text_speed,
      "How fast the letters of dialogue and other messages appear.", hn_text_speed},
+    // (Triforce: host/oot_text_size.c, the text panes' own scale; taken at once)
+    {TAB_SYSTEM, "Text size", &opts.text_size, 0, 4, 1, tx_text_size,
+     "How large the text of dialogue, Navi and signs is drawn.", hn_text_size, false, true},
     // (host/nn_vi.c realtime_step, hos_vi_native_interval: Per frame is the console's, paced to the game's own interval)
     {TAB_SYSTEM, "Game speed", &opts.realtime, 0, 1, 1, tx_speed, "How the game keeps time when it runs below 60 fps.",
      hn_speed},
+    // (Triforce: host/oot_fov.c, the camera's angle as the game builds its projection; taken at once)
+    {TAB_SYSTEM, "Field of view", &opts.fov, 50, 150, 5, tx_fov,
+     "How much of the world the camera shows while you play: higher is wider. Cutscenes keep their own view.", nullptr, false,
+     true},
+    // (Triforce: host/oot_damage.c, Link's life as the game writes it after a hit; taken at once)
+    {TAB_SYSTEM, "Damage taken", &opts.damage_taken, 0, 3, 1, tx_damage_taken,
+     "How much of his hearts Link loses from a hit. Half rounds up to the next quarter heart. Healing stays as it is.",
+     nullptr, false, true},
+    // (Triforce: host/oot_autoload.c, the title's list and the file select pressed through as benchmark mode does; read once,
+    // when the title's list first shows, so a change is the next start's)
+    {TAB_SYSTEM, "Skip title screen", &opts.skip_title, 0, 1, 1, tx_onoff,
+     "Starts the game straight on your newest save: Continue and Load are pressed for you, unless you press something "
+     "first. From the game's next start.", nullptr, false, true},
+    // (Triforce: host/oot_opening.c, the opening's two movies not started; for a new game started with it on)
+    {TAB_SYSTEM, "Skip opening", &opts.skip_opening, 0, 1, 1, tx_onoff,
+     "A new game starts without its opening, the story movie and Navi waking Link. Every later cutscene plays as it does.",
+     nullptr, false, true},
     // ---- Audio ----
     MENU_HEADING(TAB_AUDIO, "Sound"),
     // (Triforce, after NX2navi's volume row: over the game's own mix, host/nn_audio.c; the game's own Options have none)
@@ -1687,12 +2196,80 @@ Row rows[] = {
     // (Triforce, after NX2navi's menu_sound_volume: the options' own sounds, host/menu_sound.c; under the Master volume)
     {TAB_AUDIO, "Menu sounds", &opts.menu_sounds, 0, 100, 5, tx_menu_sounds,
      "How loud these options' own sounds are, the game's interface sounds from your game files.", nullptr, false, true},
-    {TAB_AUDIO, "Audio output", &opts.audio_output, 0, 2, 1, tx_audio_output,
-     "The speakers the game mixes its sound for. Applies after a restart.", hn_audio_output, true, true},
+    // (Triforce: host/nn_audio.c master_volume, the Master volume's gain 0 while another window is in front; taken at once)
+    {TAB_AUDIO, "Mute in background", &opts.mute_background, 0, 1, 1, tx_onoff,
+     "No sound while another window has the focus.", nullptr, false, true},
+    {TAB_AUDIO, "Audio output", &opts.audio_output, 0, 3, 1, tx_audio_output,
+     "The speakers the game mixes its sound for. Applies after a restart; Stereo and Mono change at once.", hn_audio_output,
+     true, true},
+    // ((Triforce) 11-24: host/audio_output_devices.c, host/nn_audio.c output_route_update; taken at once. Shown where the host
+    // lists devices: row_shown. Saved by the device's id, not its number: save)
+    {TAB_AUDIO, "Output device", &output_pick, 0, 0, 1, tx_output_device,
+     "The device the game plays its sound on: the system's default, or one you choose.", hn_output_device, false, true},
     MENU_HEADING(TAB_AUDIO, "Microphone"),
     {TAB_AUDIO, "Microphone", &opts.mic, 0, 2 + kMaxMics, 1, tx_mic,
      "What the ocarina hears when the game's microphone option is on (playing an instrument, or humming).", hn_mic, false,
      true},
+    // (Triforce: host/nn_audio_in.c pump, the microphone's samples scaled before the game's streams get them; taken at once.
+    // Shown with a microphone chosen: row_shown)
+    {TAB_AUDIO, "Microphone gain", &opts.mic_gain, 25, 400, 25, tx_percent,
+     "How loud the microphone is for the ocarina, in percent of what it gives. Raise it if your notes are not heard.",
+     nullptr, false, true},
+    // ((Triforce) 11-24: an action; the meter in its cell while on: mic_testing. Shown with a microphone chosen: row_shown)
+    {TAB_AUDIO, kTestMic, nullptr, 0, 0, 0, nullptr,
+     "Listens to the microphone while you set its gain, and shows how loud it is. Nothing is played back or recorded; the "
+     "test stops when you leave the Audio tab."},
+    // ((Triforce) 11-24) a DualSense's own speaker and headphones (host/pad_speaker.c, host/audio_source.c; the host reads
+    // them packed: HOS_OPT_PAD_SPEAKER_*). Every kind Off and the headphones Off by default: nothing opens, as before
+    MENU_HEADING(TAB_AUDIO, "Controller speaker"),
+    {TAB_AUDIO, "Speaker volume", &opts.pad_speaker_volume, 0, 200, 10, tx_percent,
+     "How loud a DualSense's own speaker plays the sounds sent to it below (the controller on a USB cable). A short tone "
+     "plays on it when you change this.", nullptr, false, true},
+    {TAB_AUDIO, "Controller sync", &opts.pad_speaker_sync, -100, 150, 10, tx_pad_sync,
+     "Lines up the sounds set to Controller + TV. If the controller plays later than the TV, go below 0: the TV waits. If "
+     "the TV plays later, go above 0: the controller waits.", nullptr, false, true},
+    {TAB_AUDIO, "Headphones on the controller", &opts.pad_speaker_headphones, 0, 2, 1, tx_pad_headphones,
+     "With headphones in a DualSense's jack (on a USB cable). All sound: the whole game plays on them and the TV is silent, "
+     "as on the console. Controller sounds: only the sounds set to play on the controller go to them. Off: they are left "
+     "out.", nullptr, false, true},
+    {TAB_AUDIO, "Headphone volume", &opts.pad_speaker_headphone_volume, 0, 100, 10, tx_percent,
+     "How loud the headphones in the controller's jack play.", nullptr, false, true},
+    {TAB_AUDIO, "Navi's voice", &opts.pad_speaker[0], 0, 2, 1, tx_pad_speaker,
+     "Where this kind of sound plays with a DualSense on a USB cable. Off: with the rest of the game's sound. Controller "
+     "only: on the controller's speaker, and no longer on the TV. Controller + TV: on both.", nullptr, false, true},
+    {TAB_AUDIO, "Navi's flight sounds", &opts.pad_speaker[1], 0, 2, 1, tx_pad_speaker,
+     "Where this kind of sound plays with a DualSense on a USB cable. Off: with the rest of the game's sound. Controller "
+     "only: on the controller's speaker, and no longer on the TV. Controller + TV: on both.", nullptr, false, true},
+    {TAB_AUDIO, "Z-targeting", &opts.pad_speaker[2], 0, 2, 1, tx_pad_speaker,
+     "Where this kind of sound plays with a DualSense on a USB cable. Off: with the rest of the game's sound. Controller "
+     "only: on the controller's speaker, and no longer on the TV. Controller + TV: on both.", nullptr, false, true},
+    {TAB_AUDIO, "Ocarina", &opts.pad_speaker[3], 0, 2, 1, tx_pad_speaker,
+     "Where this kind of sound plays with a DualSense on a USB cable. Off: with the rest of the game's sound. Controller "
+     "only: on the controller's speaker, and no longer on the TV. Controller + TV: on both.", nullptr, false, true},
+    {TAB_AUDIO, "Pick-ups", &opts.pad_speaker[4], 0, 2, 1, tx_pad_speaker,
+     "Where this kind of sound plays with a DualSense on a USB cable. Off: with the rest of the game's sound. Controller "
+     "only: on the controller's speaker, and no longer on the TV. Controller + TV: on both.", nullptr, false, true},
+    {TAB_AUDIO, "Items", &opts.pad_speaker[5], 0, 2, 1, tx_pad_speaker,
+     "Where this kind of sound plays with a DualSense on a USB cable. Off: with the rest of the game's sound. Controller "
+     "only: on the controller's speaker, and no longer on the TV. Controller + TV: on both.", nullptr, false, true},
+    {TAB_AUDIO, "Fairies", &opts.pad_speaker[6], 0, 2, 1, tx_pad_speaker,
+     "Where this kind of sound plays with a DualSense on a USB cable. Off: with the rest of the game's sound. Controller "
+     "only: on the controller's speaker, and no longer on the TV. Controller + TV: on both.", nullptr, false, true},
+    {TAB_AUDIO, "Interface sounds", &opts.pad_speaker[7], 0, 2, 1, tx_pad_speaker,
+     "Where this kind of sound plays with a DualSense on a USB cable. Off: with the rest of the game's sound. Controller "
+     "only: on the controller's speaker, and no longer on the TV. Controller + TV: on both.", nullptr, false, true},
+    {TAB_AUDIO, "Stone of Agony", &opts.pad_speaker[8], 0, 2, 1, tx_pad_speaker,
+     "Where this kind of sound plays with a DualSense on a USB cable. Off: with the rest of the game's sound. Controller "
+     "only: on the controller's speaker, and no longer on the TV. Controller + TV: on both.", nullptr, false, true},
+    {TAB_AUDIO, "Low health alarm", &opts.pad_speaker[9], 0, 2, 1, tx_pad_speaker,
+     "Where this kind of sound plays with a DualSense on a USB cable. Off: with the rest of the game's sound. Controller "
+     "only: on the controller's speaker, and no longer on the TV. Controller + TV: on both.", nullptr, false, true},
+    {TAB_AUDIO, "Fishing", &opts.pad_speaker[10], 0, 2, 1, tx_pad_speaker,
+     "Where this kind of sound plays with a DualSense on a USB cable. Off: with the rest of the game's sound. Controller "
+     "only: on the controller's speaker, and no longer on the TV. Controller + TV: on both.", nullptr, false, true},
+    {TAB_AUDIO, "Bottles", &opts.pad_speaker[11], 0, 2, 1, tx_pad_speaker,
+     "Where this kind of sound plays with a DualSense on a USB cable. Off: with the rest of the game's sound. Controller "
+     "only: on the controller's speaker, and no longer on the TV. Controller + TV: on both.", nullptr, false, true},
     MENU_HEADING(TAB_SYSTEM, "Saves & reports"),
     // (Triforce, after NX2navi's save rows: they act on a press, share_row; the host does the work, host/save_share.c)
     {TAB_SYSTEM, "Export save", nullptr, 0, 0, 0, nullptr,
@@ -1710,6 +2287,16 @@ Row rows[] = {
     {TAB_SYSTEM, "Save files", nullptr, 0, 0, 0, nullptr,   // (kFilesRow)
      "Your save files: each is a playthrough of its own, with its own saves and autosaves. Choosing another restarts the game "
      "on it, so save first."},
+    // (Triforce: host/oot_autosave.c, the save requests of a crossing answered "not queued"; taken at once.
+    // The group's last row: the rows that act on a press stand together after Microphone, tests/test_save_rows.py)
+    {TAB_SYSTEM, "Autosave", &opts.autosave, 0, 1, 1, tx_onoff,
+     "Whether the game saves by itself as you go from one area to another. Off skips those saves; saving from the pause "
+     "menu still works.", nullptr, false, true},
+    // ((Triforce) 11-24: NFC: opens the Scan amiibo page, menu_tick)
+    MENU_HEADING(TAB_SYSTEM, "NFC"),
+    {TAB_SYSTEM, kNfcTag, nullptr, 0, 0, 0, nullptr,
+     "Hold one of your own amiibo to the game's reader: choose a dump (.bin, or a Flipper .nfc) from the folder \"amiibo\" in the game folder, "
+     "then use amiibo in the game. Choose it again to take it off."},
     MENU_HEADING(TAB_SYSTEM, "Online"),
     {TAB_SYSTEM, "Discord status", &opts.discord, 0, 1, 1, tx_onoff,
      "Shows \"Playing Triforce\" and the time played in your Discord status, while Discord runs on this PC.", nullptr, false,
@@ -1725,10 +2312,10 @@ Row rows[] = {
      "Whether the controller plays the game while another window has the focus.", hn_background},
     // (Triforce, after NX2navi's lstick_deadzone and rstick_deadzone: host/nn_hid.c hos_stick_axis_own)
     {TAB_CONTROLS, "Left stick dead zone", &opts.lstick_dead_zone, -1, 50, 1, tx_own_dead_zone,
-     "How far the left stick moves before the game sees it, in percent of its travel on each axis: lower for a precise "
+     "How far the left stick moves from its centre before the game sees it, in percent of its travel: lower for a precise "
      "stick, higher for one that drifts. The game's own dead zone still follows.", nullptr, false, true},
     {TAB_CONTROLS, "Right stick dead zone", &opts.rstick_dead_zone, -1, 50, 1, tx_own_dead_zone,
-     "How far the right stick moves before the game sees it, in percent of its travel on each axis: lower for a precise "
+     "How far the right stick moves from its centre before the game sees it, in percent of its travel: lower for a precise "
      "stick, higher for one that drifts. The game's own dead zone still follows.", nullptr, false, true},
     // (Triforce: host/prompts.c build_camera)
     {TAB_CONTROLS, "Camera speed", &opts.camera_speed, 25, 300, 5, tx_sens,
@@ -1738,20 +2325,26 @@ Row rows[] = {
     {TAB_CONTROLS, "Invert camera Y", &opts.invert_cam_y, 0, 1, 1, tx_onoff,
      "Swaps up and down for the right stick's camera.", nullptr, false, true},
     MENU_HEADING(TAB_CONTROLS, "Mouse & keyboard"),
-    {TAB_CONTROLS, "Mouse camera", &opts.mouse_native, 0, 1, 1, tx_mousecam, "How the captured mouse turns the camera.",
+    {TAB_CONTROLS, "Mouse camera", &opts.mouse_native, 0, 2, 1, tx_mousecam, "How the captured mouse turns the camera.",
      hn_mousecam, false, true},
     {TAB_CONTROLS, "Mouse sensitivity", &opts.mouse_sens, 10, 500, 10, tx_sens,
      "How far the camera turns for a mouse movement. The - and = keys change it in game too.", nullptr, false, true},
     {TAB_CONTROLS, "Invert mouse vertical", &opts.mouse_invert, 0, 1, 1, tx_onoff, "Swaps up and down for the mouse.",
      hn_mouse_invert, false, true},
+    // ((Triforce) 11-24: with Mouse camera on Native the game's own camera inversion, and Invert camera X, which turn the
+    // right stick around, never reach the mouse: this row swaps its left and right, in both modes)
+    {TAB_CONTROLS, "Invert mouse horizontal", &opts.mouse_invert_x, 0, 1, 1, tx_onoff,
+     "Swaps left and right for the mouse.", nullptr, false, true},
     // (Triforce, after NX2navi's walk_key and walk_scale: host/nn_hid.c walk_key_code, walk_keys)
     {TAB_CONTROLS, "Walk key", &opts.walk_key, 0, 4, 1, tx_walk_key,
      "A key that makes Link walk: held with the movement keys, they push the stick only as far as Walk scale. While it is "
      "chosen the key presses nothing else.", hn_walk_key, false, true},
     {TAB_CONTROLS, "Walk scale", &opts.walk_scale, 20, 90, 1, tx_sens,
      "How far the movement keys push the stick while the Walk key is held: 1.00 would be all the way.", nullptr, false, true},
-    {TAB_CONTROLS, "Menu shortcut", &opts.menu_shortcut, 0, 1, 1, tx_menu_shortcut,
-     "Which keys open and close these options from anywhere. F1 always does; F1 only leaves Insert free for an overlay.",
+    {TAB_CONTROLS, "Menu shortcut", &opts.menu_shortcut, 0, 4, 1, tx_menu_shortcut,
+     "Which keys open and close these options from anywhere. F1 always does; F1 only leaves Insert free for an overlay. With "
+     "Esc, Esc opens them too, as a PC game's pause menu (open, Esc still goes back a page or closes them). With touchpad, a "
+     "DualShock 4's or DualSense's touchpad click opens and closes them as F1 does.",
      nullptr, false, true},
     MENU_HEADING(TAB_CONTROLS, "Rumble"),
     // (Triforce: to 300 as NX2navi's rumble_strength, 150 before)
@@ -1764,6 +2357,16 @@ Row rows[] = {
     // (Triforce, after NX2navi's rumble_triggers: host/pad_sdl.c trigger_poll)
     {TAB_CONTROLS, "Trigger vibration", &opts.rumble_triggers, 0, 1, 1, tx_onoff,
      "Xbox One and Series controllers: the motors in the triggers rumble too.", nullptr, false, true},
+    // ((Triforce) 11-24) Vibration (host/vibration.h) and RenHDrum's HD Haptics (host/rumble_renhdrum.c). Without
+    // renhdrum.dll beside the game, Auto plays as before: a Switch controller's own HD rumble, every other one's motors
+    {TAB_CONTROLS, "Vibration", &opts.vibration, 0, 2, 1, tx_vibration,
+     "How the controller vibrates. Auto plays the best it can: with RenHDrum beside the game a DualSense its voice coils, a "
+     "Switch controller and an Xbox controller RenHDrum's HD rumble, a Steam Controller (2026) its grips; without it a "
+     "Switch controller its own HD rumble and every other controller its motors. Basic plays the motors on every "
+     "controller. Off stops it. The line below says what plays the controller used last.", hn_vibration, false, true},
+    {TAB_CONTROLS, "DualSense HD Haptics", &opts.ds_hd_haptics, 0, 1, 1, tx_onoff,
+     "A DualSense that RenHDrum plays also taps its speaker and kicks back on L2 and R2 while you hold them, from the "
+     "game's vibration, with deeper heavy hits. Off: its fine haptics alone.", nullptr, false, true},
     MENU_HEADING(TAB_CONTROLS, "Gameplay"),
     // (Triforce, after NX2navi's sprint button: host/oot_sprint.h)
     {TAB_CONTROLS, "Sprint button", &opts.sprint_button, 0, 2, 1, tx_sprint,
@@ -1776,6 +2379,10 @@ Row rows[] = {
     {TAB_CONTROLS, "Right handed Link", &opts.right_handed, 0, 1, 1, tx_onoff,
      "Link holds his sword and what he uses in his right hand, his shield on his left arm: his moves are mirrored, his body "
      "is not.", nullptr, false, true},
+    // (Triforce: nx2/oot_patches.py patch_camera_centering, host/mouse_native.c hos_disable_camera_centering; taken at once)
+    {TAB_CONTROLS, "Camera centering", &opts.camera_centering, 0, 1, 1, tx_onoff,
+     "Whether the camera turns by itself the way Link moves. Off: it stays where you put it, which suits the mouse; the "
+     "game's own recentring still works.", nullptr, false, true},
     {TAB_MOTION, "Motion controls", &opts.gyro, 0, 1, 1, tx_gyro,
      "Aims and looks with the controller's gyroscope where the game uses motion, as on the Switch: Switch Pro controllers "
      "and pads in Switch mode, DualSense and DualShock 4.", hn_gyro, false, true},
@@ -1790,6 +2397,40 @@ Row rows[] = {
     {TAB_MOTION, "Motion deadzone", &opts.gyro_deadzone, 0, 2, 1, tx_deadzone,
      "How slow a turn counts as none, the console's three settings: Standard is its own. High steadies a pad that jitters; "
      "Low keeps the smallest movements.", nullptr, false, true},
+    // ((Triforce) 11-24: hold-to-toggle, for players who cannot keep a button held: a row for each of the Switch's buttons
+    // that the game holds (not Plus, Minus or the directions). The rows' names are their keys, toggle_<button>;
+    // host/hold_toggle.h has the rule, host/nn_hid.c npad_states reads them as one mask, HOS_OPT_HOLD_TOGGLE)
+    MENU_HEADING(TAB_CONTROLS, "Hold to toggle"),
+    {TAB_CONTROLS, "Toggle ZL", &opts.toggle[HOS_SW_ZL], 0, 1, 1, tx_onoff,
+     "One press of ZL holds it, the next lets it go, with whatever is bound to it. Opening a menu or pressing Plus or Minus lets it go too.",
+     nullptr, false, true},
+    {TAB_CONTROLS, "Toggle ZR", &opts.toggle[HOS_SW_ZR], 0, 1, 1, tx_onoff,
+     "One press of ZR holds it, the next lets it go, with whatever is bound to it. Opening a menu or pressing Plus or Minus lets it go too.",
+     nullptr, false, true},
+    {TAB_CONTROLS, "Toggle L", &opts.toggle[HOS_SW_L], 0, 1, 1, tx_onoff,
+     "One press of L holds it, the next lets it go, with whatever is bound to it. Opening a menu or pressing Plus or Minus lets it go too.",
+     nullptr, false, true},
+    {TAB_CONTROLS, "Toggle R", &opts.toggle[HOS_SW_R], 0, 1, 1, tx_onoff,
+     "One press of R holds it, the next lets it go, with whatever is bound to it. Opening a menu or pressing Plus or Minus lets it go too.",
+     nullptr, false, true},
+    {TAB_CONTROLS, "Toggle A", &opts.toggle[HOS_SW_A], 0, 1, 1, tx_onoff,
+     "One press of A holds it, the next lets it go, with whatever is bound to it. Opening a menu or pressing Plus or Minus lets it go too.",
+     nullptr, false, true},
+    {TAB_CONTROLS, "Toggle B", &opts.toggle[HOS_SW_B], 0, 1, 1, tx_onoff,
+     "One press of B holds it, the next lets it go, with whatever is bound to it. Opening a menu or pressing Plus or Minus lets it go too.",
+     nullptr, false, true},
+    {TAB_CONTROLS, "Toggle X", &opts.toggle[HOS_SW_X], 0, 1, 1, tx_onoff,
+     "One press of X holds it, the next lets it go, with whatever is bound to it. Opening a menu or pressing Plus or Minus lets it go too.",
+     nullptr, false, true},
+    {TAB_CONTROLS, "Toggle Y", &opts.toggle[HOS_SW_Y], 0, 1, 1, tx_onoff,
+     "One press of Y holds it, the next lets it go, with whatever is bound to it. Opening a menu or pressing Plus or Minus lets it go too.",
+     nullptr, false, true},
+    {TAB_CONTROLS, "Toggle LS", &opts.toggle[HOS_SW_LS], 0, 1, 1, tx_onoff,
+     "One press of the left stick's click holds it, the next lets it go, with whatever is bound to it. Opening a menu or pressing Plus or Minus lets it go too.",
+     nullptr, false, true},
+    {TAB_CONTROLS, "Toggle RS", &opts.toggle[HOS_SW_RS], 0, 1, 1, tx_onoff,
+     "One press of the right stick's click holds it, the next lets it go, with whatever is bound to it. Opening a menu or pressing Plus or Minus lets it go too.",
+     nullptr, false, true},
     MENU_HEADING(TAB_CONTROLS, "Motion & buttons"),
     {TAB_CONTROLS, "Motion", nullptr, 0, 0, 0, nullptr,   // (hookshot: opens the Motion page, the TAB_MOTION rows)
      "Aiming with the controller's gyroscope: on or off, its sensitivity and its inverts."},
@@ -1873,12 +2514,14 @@ Row rows[] = {
     // ---- Debug: the tools' switch, the tools themselves below it while they are on (cheat: menu_tick does what they do),
     // then the developer's rows ----
     {TAB_DEBUG, "Debug tools", &opts.debug_tools, 0, 1, 1, tx_onoff,
-     "Testing tools: no-clip flight, a free camera, teleport, Link's age, the inventory, the clock and heart protection. Off "
-     "puts flight, the free camera and heart protection away.", nullptr, false, true},
+     "Testing tools: no-clip flight, a free camera, teleport, Link's age, the inventory, the clock, heart protection and "
+     "movement speed. Off puts flight, the free camera and heart protection away and Link back to his own speed.", nullptr,
+     false, true},
     {TAB_DEBUG, "Heart protection", nullptr, 0, 0, 0, nullptr,
      "Protects Link's hearts. Hits can still knock him back.", nullptr, false, true, 0},
     {TAB_DEBUG, "No-clip flight", nullptr, 0, 0, 0, nullptr,
-     "Enable double-tap Jump for takeoff and landing. Hold Jump to climb or L to descend.", nullptr, false, true, 1},
+     "Enable double-tap Jump for takeoff and landing: X (Space), or B with the game's Swap Jump Controls. Hold Jump or R to "
+     "climb, L to descend.", nullptr, false, true, 1},
     {TAB_DEBUG, "Mark position", nullptr, 0, 0, 0, nullptr,
      "Remember Link's position for this loaded scene.", nullptr, false, true, 2},
     {TAB_DEBUG, "Return to mark", nullptr, 0, 0, 0, nullptr,
@@ -1897,6 +2540,10 @@ Row rows[] = {
      "Swaps Link between child and adult and reloads this map in the other age (the Market when this map has no match).", nullptr, false, true, 9},
     {TAB_DEBUG, "Inventory", nullptr, 0, 0, 0, nullptr,
      "Enter opens the inventory editor: unlock or relock equipment, items, upgrades and quest items, and change amounts.", nullptr, false, true, 10},
+    // (Triforce: host/hos_main.c hos_oot_cct_speed, the forward speed the game sets on Link's character controller; 1x at
+    // every start, and with the tools off)
+    {TAB_DEBUG, "Movement speed", nullptr, 0, 0, 0, nullptr,
+     "How fast Link walks, runs and swims, as a multiple of his own speed. Choose with Left or Right.", nullptr, false, true, 14},
     // (Triforce: the name pages, after NX2navi's flags by name, cutscene starter and amiibo. Nothing is read, listed or sent
     // until one is opened)
     {TAB_DEBUG, "Game flags", nullptr, 0, 0, 0, nullptr,
@@ -1906,20 +2553,24 @@ Row rows[] = {
      "Opens the game's events by name, read from your game files, and starts one as the game's own actors do. Many belong to "
      "one place or one moment of the story and may not play as they should anywhere else. Save first.", nullptr, false, true, 12},
     {TAB_DEBUG, "Scan amiibo", nullptr, 0, 0, 0, nullptr,
-     "Opens the dumps in the folder \"amiibo\" in the game folder (.bin files you made of your own figures). Choose one, then use "
+     "Opens the dumps in the folder \"amiibo\" in the game folder (.bin files, or Flipper .nfc files, you made of your own figures). Choose one, then use "
      "amiibo in the game: the figure is on the reader when the game looks for one.", nullptr, false, true, 13},
     {TAB_DEBUG, "Developer", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},
     {TAB_DEBUG, "Descriptor reuse", &opts.descriptor_reuse, 0, 1, 1, tx_onoff,
      "A draw keeps its descriptors while the texture slots it samples are unchanged, so streaming elsewhere in the game no longer "
-     "rebuilds every set each frame. Applies after restart.", nullptr, true},
+     "rebuilds every set each frame. Changes at once.", nullptr},
     // (Triforce: vk_draw.cpp gpl_wanted, what RX_VK_GPL=1 does; gpl_rules.h. On by default since options_version 5)
     {TAB_DEBUG, "Fast pipeline link", &opts.fast_pipeline_link, 0, 1, 1, tx_onoff,
      "Experimental. A new pipeline is first linked from its shaders' libraries, in milliseconds where the graphics driver has "
      "them compiled, and the optimised one takes its place once it is built. The first start with it compiles those libraries "
      "once, which takes minutes. Needs a card with pipeline libraries. Applies after restart.", nullptr, true, true},
+    // ((Triforce, 11-24) gpu/vk/compile_level.h: read by the shader preparation, compile_level_now; RX_VK_COMPILE_SHADERS over it)
+    {TAB_DEBUG, "Compile shaders", &opts.compile_shaders, 0, 1, 1, tx_compile_shaders,
+     "How much of the graphics driver's work the shader preparation does before the title, after an update, a new driver "
+     "or a new install. Applies at the next preparation.", hn_compile_shaders, true, true},
     {TAB_DEBUG, "Sampler cache", &opts.sampler_cache, 0, 1, 1, tx_onoff,
      "What a sampler holds is kept beside it on the replay thread, so resolving a sampler that was not registered anew takes no "
-     "lock. Helps while the game streams textures. Applies after restart.", nullptr, true},
+     "lock. Helps while the game streams textures. Changes at once.", nullptr},
     // (Triforce: vk_memory.cpp "lazy write-back", wb_lazy_state.h; RX_VK_LAZY_WB over it. On by default since options_version
     // 5, but nowhere on AMD's driver by this row alone. Windows only: row_shown)
     {TAB_DEBUG, "Lazy write-back", &opts.lazy_write_back, 0, 1, 1, tx_onoff,
@@ -1939,6 +2590,15 @@ Row rows[] = {
      "Experimental. The game starts its next frame while the graphics card still draws the end of this one (the upscaling "
      "and the interface), where that end holds nothing the game reads back. Other frames run as before. Applies after "
      "restart.", nullptr, true, true},
+    // ((Triforce) Threaded rendering: threaded_rendering.h, vk_main.cpp threaded_choice; RX_VK_THREADED over it. Read at the start;
+    // Off by default again (11-24): the owner saw whole-screen flashes with it on in play that the frame log (taken before the
+    // window's image) does not show; +3% fps on a moving tour in the lab. On again once the flashes are fixed)
+    {TAB_DEBUG, "Threaded rendering", &opts.threaded_rendering, 0, 2, 1, tx_threaded,
+     "Experimental. The graphics work runs on threads of its own: the game's commands are turned into the graphics card's on a "
+     "render thread while the game goes on with its next frame, the driver's calls are made by a recorder thread beside it, "
+     "and the picture is shown from a thread of its own. Auto: on with 4 processor cores or more. Turn it off if frames "
+     "flicker. Applies after restart.",
+     hn_threaded, true, true},
     // (Triforce, after NX2navi's astc_bc1: tex_bc1.h, vk_texture.cpp bc1_on. Read at the first texture; on by default since
     // options_version 5. The owner, 11-16: "put this in debug dev tab too": a Developer row, after Start next frame early)
     {TAB_DEBUG, "Opaque textures as BC1", &opts.tex_bc1, 0, 1, 1, tx_onoff,
@@ -1983,6 +2643,9 @@ Row rows[] = {
     {TAB_HIDDEN, "Steady frame rate", &opts.steady_fps, 0, 2, 1, tx_steady_fps, nullptr},
     {TAB_HIDDEN, "NVIDIA Reflex", &opts.reflex, 0, 2, 1, tx_latency, nullptr},
     {TAB_HIDDEN, "AMD Anti-Lag 2", &opts.antilag, 0, 1, 1, tx_onoff, nullptr},
+    // ((Triforce) Auto (this PC)'s state: its tuning (auto_tune=) and the hardware it chose for (auto_for=), auto_settings.h)
+    {TAB_HIDDEN, "Auto tune", &opts.auto_tune, 0, 15, 1, nullptr, nullptr},
+    {TAB_HIDDEN, "Auto for", &opts.auto_for, 0, 0x7fffffff, 1, nullptr, nullptr},
     // ((Triforce, N64 Classic, step 5) F7's preset from Off (n64_rules.h Toggle): saved as n64_classic_last, its name's key)
     {TAB_HIDDEN, "N64 Classic last", &opts.n64_last, n64_rules::FAITHFUL, n64_rules::REMEMBERED, 1, nullptr, nullptr},
 
@@ -2142,6 +2805,14 @@ float mods_browse_px = 0;
 std::mutex mods_typed_mu;
 std::vector<int> mods_typed;         // (code points typed, from the window's thread: taken by mods_tick)
 std::atomic<bool> mods_text_wanted{false};
+// ((Triforce) The Output width and Output height rows typed into: with either selected, the keyboard's digits are the row's
+// (host/display.c sends them as the Mods search's text, HOS_OPT_TEXT_CHAR, while size_text_wanted): the first starts a new
+// number, Backspace takes one off, Enter takes the number (rounded down to the row's step of 8, held to its range), Esc
+// leaves it as it was. Left and Right step it as before)
+std::atomic<bool> size_text_wanted{false};
+std::vector<int> size_typed;   // (code points typed for the two rows, under mods_typed_mu)
+int* size_edit = nullptr;      // (the row typed into now, nullptr none)
+std::string size_text;         // (its digits so far)
 float mods_kbd_box[4] = {0, 0, 0, 0};   // (the on-screen keyboard's box as last drawn, pixels: x0 y0 x1 y1)
 // (the keyboard: four rows of ten keys, the letters shown capital and typed small, and a row of Space, Delete, Clear, Search)
 const char* const kKbdRows[4] = {"1234567890", "qwertyuiop", "asdfghjkl'", "zxcvbnm-.&"};
@@ -2186,6 +2857,11 @@ std::atomic<int> player_flight{-1};
 std::atomic<int> free_camera{0};
 std::atomic<int> cheat_action{0};
 std::atomic<int> link_age{-1};   // (the game side's report, OOT_CHEAT_AGE_ID: 0 child, 1 adult, -1 no save loaded)
+// ((Triforce) Movement speed: the choice, an index of link_speeds; the game side reads it in percent, HOS_OPT_CHEAT_SPEED)
+constexpr int link_speeds[] = {100, 125, 150, 200, 300};
+constexpr const char* link_speed_names[] = {"1x", "1.25x", "1.5x", "2x", "3x"};
+constexpr int kLinkSpeeds = sizeof link_speeds / sizeof link_speeds[0];
+std::atomic<int> link_speed{0};
 int clock_hour = 12;
 int pouch_item = 0;
 int pouch_delta = 1;
@@ -2307,7 +2983,7 @@ void choose_inventory_filter(int filter) {
     inventory_amount = false;
     inventory_reveal();
 }
-constexpr int kCheatRows = 14;   // (the debug tools' rows: Row::cheat 0 to 13; 11 to 13 Triforce's name pages)
+constexpr int kCheatRows = 15;   // (the debug tools' rows: Row::cheat 0 to 14; 11 to 13 Triforce's name pages, 14 Movement speed)
 /// A debug tool's value as its row shows it ("" an action: confirm does it)
 std::string cheat_value(int i) {
     char t[16];
@@ -2318,23 +2994,25 @@ std::string cheat_value(int i) {
     case 5: return pouch_items[pouch_item];
     case 6: return snprintf(t, sizeof t, "%+d", pouch_delta), t;
     case 7: return tx_onoff(free_camera.load());
+    case 14: return link_speed_names[std::clamp(link_speed.load(), 0, kLinkSpeeds - 1)];
     default: return "";
     }
 }
-/// The tools that choose with Left and Right (arrows at their value's ends): Set time, Inventory item, Change quantity
-bool cheat_chooses(int i) { return i == 4 || i == 5 || i == 6; }
+/// The tools that choose with Left and Right (arrows at their value's ends): Set time, Inventory item, Change quantity,
+/// Movement speed
+bool cheat_chooses(int i) { return i == 4 || i == 5 || i == 6 || i == 14; }
 /// Switch age as Kid | Adult, Link's age lit: once the game side has said it (a save loaded)
 bool age_shown(int i) { return i == 9 && link_age.load(std::memory_order_relaxed) >= 0; }
 /// What confirm does on a tool's row, for its prompt (nullptr: nothing)
 const char* cheat_confirm(int i) {
     static const char* const says[kCheatRows] = {"Toggle", "Toggle", "Apply", "Apply", "Set", nullptr, "Apply", "Toggle", "Open list",
-                                                 "Switch", "Open", "Open list", "Open list", "Open list"};
+                                                 "Switch", "Open", "Open list", "Open list", "Open list", nullptr};
     return i >= 0 && i < kCheatRows ? says[i] : nullptr;
 }
 constexpr int kRows = sizeof rows / sizeof rows[0];
 
 int cur_tab = TAB_DISPLAY;
-int tab_selected[TAB_N64 + 1] = {};   // (and the pages the rows open: Motion, VR Controls, 3D Settings, VR Settings, Remembered)
+int tab_selected[TAB_SIM_TURF + 1] = {};   // (and the pages the rows open: Motion, VR Controls, 3D Settings, VR Settings, Remembered, Simulated turf)
 bool is_motion_row(const Row& r) { return r.tab == TAB_CONTROLS && !r.value && !strcmp(r.name, "Motion"); }
 /// ((Triforce VR) the page a row opens (Controls: VR Controls; Display: 3D Settings, VR Settings), -1 none. Motion keeps its own
 int row_page(const Row& r) {
@@ -2345,9 +3023,11 @@ int row_page(const Row& r) {
     return -1;
 }
 /// ((Triforce VR) a page a row opens: under its row's tab, Back to it
-bool sub_page(int tab) { return tab == TAB_MOTION || tab == TAB_VRPAGE || tab == TAB_3DPAGE || tab == TAB_VRSET || tab == TAB_N64; }
+bool sub_page(int tab) { return tab == TAB_MOTION || tab == TAB_VRPAGE || tab == TAB_3DPAGE || tab == TAB_VRSET ||
+                                tab == TAB_N64 || tab == TAB_SIM_TURF; }
 int page_parent(int tab) {
-    return tab == TAB_3DPAGE || tab == TAB_VRSET ? TAB_DISPLAY : tab == TAB_N64 ? TAB_GRAPHICS : sub_page(tab) ? TAB_CONTROLS : tab;
+    return tab == TAB_3DPAGE || tab == TAB_VRSET ? TAB_DISPLAY
+         : tab == TAB_N64 || tab == TAB_SIM_TURF ? TAB_GRAPHICS : sub_page(tab) ? TAB_CONTROLS : tab;
 }
 
 // (Triforce) The System tab's rows that act on a press, after NX2navi's: Export save, Export save for a bug report, Import a
@@ -2414,7 +3094,9 @@ int restart_value_of(const Row& r) {
     if (r.value == &merged.framegen) return opts.dlssg;
     if (r.value == &merged.pacing) return opts.steady_fps;
     if (r.value == &merged.view3d) return opts.vr;   // ((Triforce VR) VR on or off alone: the 3D styles apply at once)
-    if (r.value == &opts.resolution) return opts.resolution + (ur::full_scale(opts.dlss) ? 100 : 0);
+    if (r.value == &opts.resolution) return ur::snap(upscaler(), opts.resolution) + (ur::full_scale(opts.dlss) ? 100 : 0);
+    // ((Triforce) Audio output: Mono is stereo's layout, the game asked for the same speakers; its average is taken at once)
+    if (r.value == &opts.audio_output && *r.value == 3) return 1;
     return *r.value;
 }
 void restart_init() {
@@ -2455,6 +3137,12 @@ bool restart_ask() {
 }
 std::string restart_list(const char* last) {
     return mr::names(restart_names, restart_state.n, restart_pending(), ", ", last);
+}
+/// ((Triforce) restart_list in the menu's language, for the restart question: the log keeps the English)
+std::string restart_list_shown(const char* last) {
+    const char* names[mr::kMax];
+    for (int i = 0; i < restart_state.n; i++) names[i] = i18n::tr(restart_names[i]);
+    return mr::names(names, restart_state.n, restart_pending(), ", ", last);
 }
 int ask_sel = 0;   // (the restart question's choice: 0 Later, 1 Restart now)
 
@@ -2544,14 +3232,16 @@ void ahead_thread() {
     const int64_t t2 = prof_now();
     (void)fsr4fg::why();
     const int64_t t3 = prof_now();
+    xess_probe();   // ((Triforce) Intel XeSS's context made once, where its library is there)
+    const int64_t t4 = prof_now();
     logf("menu: the upscalers asked ahead of the menu, on a thread of their own: NVIDIA DLSS %.0f ms, AMD FSR 4 %.0f ms, its frame "
-         "generation %.0f ms", (t1 - t0) / 1e6, (t2 - t1) / 1e6, (t3 - t2) / 1e6);
+         "generation %.0f ms, Intel XeSS %.0f ms", (t1 - t0) / 1e6, (t2 - t1) / 1e6, (t3 - t2) / 1e6, (t4 - t3) / 1e6);
     ahead_state.store(2, std::memory_order_release);
 }
 void menu_ahead() {
     if (!dev.device) return;
     if (!ahead_allowed()) {   // (as before: on this thread, at the open)
-        dlss_probe(), fsr4_probe(), (void)fsr4fg::why();
+        dlss_probe(), fsr4_probe(), (void)fsr4fg::why(), xess_probe();
         ahead_state.store(2, std::memory_order_release);
         return;
     }
@@ -2562,20 +3252,30 @@ bool group_shown(int heading);
 /// A row on its tab: the debug tools only with them on, the Upscaler only in a build with DLSS or FSR 4, or where AMD FSR 3.1
 /// runs, ...; ((Triforce, options_version 7) a group's heading while a row of its group is shown, group_shown)
 bool row_shown(int i) {
-    const int up = rows[i].value == &opts.upscale_pre || rows[i].value == &opts.dlss_model || rows[i].value == &opts.aa ? upscaler() : ur::GAME;
+    const int up = rows[i].value == &opts.upscale_pre || rows[i].value == &opts.dlss_model || rows[i].value == &opts.aa ||
+                           rows[i].value == &opts.fsr4_model
+                       ? upscaler()
+                       : ur::GAME;
     return (rows[i].cheat < 0 || cheats_on()) &&
            (rows[i].name != kUseWindowSize || (opts.output_res == OUTPUT_CUSTOM && !custom_env())) &&
            // ((Triforce) the Custom size's two sides only while the Output resolution is Custom)
            ((rows[i].value != &opts.output_width && rows[i].value != &opts.output_height) ||
             output_choice(opts.output_res) == OUTPUT_CUSTOM) &&
-           (rows[i].value != &opts.dlss || ur::upscaler_shown(dlss_built() || fsr4_built(), fsr3::supported())) &&
+           // ((Triforce) 11-24: the Upscaler everywhere: its Off runs on any GPU)
+           (rows[i].value != &opts.dlss || ur::upscaler_shown(true)) &&
            // ((Triforce, options_version 7) the DLSS model with NVIDIA DLSS as the Upscaler alone; Upscale before bloom with any
            // upscaler but the game's own, which it does nothing with (vk_temporal.cpp pre_wanted); Anti-aliasing with the game's
            // own alone: DLSS and FSR smooth the edges themselves (aa_rows.h))
            (rows[i].value != &opts.dlss_model || (ur::model_shown(dlss_built()) && ur::is_dlss(up))) &&
-           (rows[i].value != &opts.upscale_pre || up != ur::GAME) && (rows[i].value != &opts.aa || up == ur::GAME) &&
+           // ((Triforce) the FSR 4 model with AMD FSR 4 as the Upscaler alone, where its Lite provider is hooked: vk_fsr4.cpp)
+           (rows[i].value != &opts.fsr4_model ||
+            (ur::fsr4_model_shown(fsr4_why() == FSR_OK, fsr4_lite_available()) && ur::is_fsr4(up))) &&
+           // ((Triforce) 11-24: Off as the game's own here: the game's SMAA still runs on its input, nothing to upscale early)
+           (rows[i].value != &opts.upscale_pre || (up != ur::GAME && up != ur::OFF)) &&
+           (rows[i].value != &opts.aa || up == ur::GAME || up == ur::OFF) &&
            // ((Triforce, 11-22, N64 Classic) Remembered settings with Remembered chosen)
            (!is_n64_page_row(rows[i]) || n64_preset() == n64_rules::REMEMBERED) &&
+           sim_turf_row_shown(rows[i]) &&   // ((Triforce, 11-24) the Simulated turf page's, by Use global multipliers)
            // (local, RenoDX port: its rows with HDR Native, in a build with its shaders; Triforce: and its own row on, and
            // of the rows one tonemapper alone reads those of the one chosen. (options_version 7) The UI brightness is one of them:
            // without RenoDX the HUD's white is the picture's, Paper white)
@@ -2586,7 +3286,24 @@ bool row_shown(int i) {
            ((rows[i].value != &opts.hdr_white && rows[i].value != &opts.hdr_peak) || opts.hdr != 0) &&
            ((rows[i].value != &opts.wide_hud && rows[i].value != &opts.wide_menus) || (output_picture_of(opts.output_res, opts.ultrawide).w > output_picture_of(opts.output_res, opts.ultrawide).h * (16.0 / 9.0) * 1.01)) &&
            (rows[i].value != &opts.sprint_mode || opts.sprint_button != 0) && (rows[i].value != &opts.walk_scale || opts.walk_key != 0) &&
+           (rows[i].value != &opts.mic_gain || opts.mic != 0) &&   // ((Triforce) the Microphone gain with a microphone chosen)
+           // ((Triforce) HUD placement on a 16:9 or wider picture (host/hos_wide_ui.c leaves a narrower one), Custom's rows with it)
+           ((rows[i].value != &opts.hud_placement && !hud_custom_row(rows[i].value)) ||
+            (output_picture_of(opts.output_res, opts.ultrawide).w >= output_picture_of(opts.output_res, opts.ultrawide).h * (16.0 / 9.0) * 0.99 &&
+             (rows[i].value == &opts.hud_placement || opts.hud_placement == 1))) &&
+           (rows[i].name != kTestMic || (opts.mic != 0 && host && host->mic_test)) &&   // ((Triforce) 11-24: and its test)
+           // ((Triforce) 11-24: the ReShade User preset's file and Rescan rows with User chosen)
+           (!reshade_menu::user_row(rows[i].name, rows[i].value) || opts.reshade == reshade::user_preset) &&
+           // ((Triforce) 11-24: the Output device row where the host lists devices, or one was chosen)
+           (rows[i].value != &output_pick || (can_outputs() && (!output_devices.empty() || output_missing))) &&
            (rows[i].value != &merged.latency || latency_vendor() != mr7::LATENCY_NONE) &&
+           // ((Triforce) 11-24: Frame generation by with Frame generation at Auto or 2x to 8x, the renderer's own values)
+           (rows[i].value != &opts.fg_by || framegen_rows::by_applies(opts.framegen)) &&
+#ifdef _WIN32   // ((Triforce) the Fullscreen screen with two screens or more: host/display.c, Windows only)
+           (rows[i].value != &opts.fs_screen || fs_screen_labels.size() > 1) &&
+#else
+           rows[i].value != &opts.fs_screen &&
+#endif
 #ifndef _WIN32   // (Triforce: the lazy write-back's fault handler pays on Windows only, vk_memory.cpp)
            rows[i].value != &opts.lazy_write_back &&
 #endif
@@ -2645,7 +3362,7 @@ bool mouse_read = false;   // (the menu has read the mouse since it opened)
 bool is_slider(const Row& r) { return r.value == &opts.sharpness || r.value == &opts.mouse_sens || r.value == &opts.gyro_sens_x || r.value == &opts.gyro_sens_y || r.value == &opts.output_width || r.value == &opts.output_height ||
                                     ((r.tab == TAB_VRSET || r.tab == TAB_VRPAGE) && r.value && r.hi - r.lo > 2); }
 /// (a scale: the arrows and a click stop at its ends; Rumble strength would go from Off to its strongest)
-bool stops_at_ends(const Row& r) { return r.value == &opts.mouse_sens || r.value == &opts.rumble || r.value == &opts.rumble_curve || r.value == &opts.lstick_dead_zone || r.value == &opts.rstick_dead_zone || r.value == &opts.walk_scale || r.value == &opts.gyro_sens_x || r.value == &opts.gyro_sens_y || r.value == &opts.output_width || r.value == &opts.output_height; }
+bool stops_at_ends(const Row& r) { return (r.tab == TAB_SIM_TURF && r.hi > 1) || r.value == &opts.mouse_sens || r.value == &opts.fov || r.value == &opts.mic_gain || r.value == &opts.rumble || r.value == &opts.rumble_curve || r.value == &opts.lstick_dead_zone || r.value == &opts.rstick_dead_zone || r.value == &opts.walk_scale || r.value == &opts.gyro_sens_x || r.value == &opts.gyro_sens_y || r.value == &opts.output_width || r.value == &opts.output_height; }
 /// (the ini's Rumble strength on the menu's steps: 0 to 300, the nearest 25)
 int rumble_step(int v) { return (std::min(std::max(v, 0), 300) + 12) / 25 * 25; }
 std::string ini_path() {
@@ -2702,12 +3419,26 @@ const char* ini_key(const Row& r) {
         {"Hue correction", "renodx_hue_correction"}, {"Color grading", "renodx_color_grading"}, {"Highlights", "renodx_highlights"},
         {"Shadows", "renodx_shadows"}, {"Contrast", "renodx_contrast"}, {"Saturation", "renodx_saturation"},
         {"Bloom", "renodx_bloom"},
+        // ((Triforce) HUD placement's Custom rows, by the keys their values are)
+        {"Hearts and magic across", "hud_health_x"}, {"Hearts and magic up", "hud_health_y"}, {"Hearts and magic size", "hud_health_scale"},
+        {"Buttons across", "hud_buttons_x"}, {"Buttons up", "hud_buttons_y"}, {"Buttons size", "hud_buttons_scale"},
+        {"Minimap across", "hud_minimap_x"}, {"Minimap up", "hud_minimap_y"}, {"Minimap size", "hud_minimap_scale"},
         // ((Triforce, 11-22, N64 Classic) the Remembered page's rows, under n64_rules.h kSpec's keys (tests/test_n64_row.py holds
         // the two the same; its saturation is Colour saturation, RenoDX's row having Saturation)
         {"Frame rate", "n64_rem_fps"}, {"3D resolution", "n64_rem_lines"}, {"Colour", "n64_rem_colour"}, {"Dither", "n64_rem_dither"},
         {"Texture blur", "n64_rem_blur"}, {"CRT TV", "n64_rem_tv"}, {"Scanlines", "n64_rem_scanlines"}, {"Mask", "n64_rem_mask"},
         {"Mask strength", "n64_rem_mask_strength"}, {"Colour bleed", "n64_rem_bleed"}, {"Glow", "n64_rem_glow"},
         {"Curvature", "n64_rem_curvature"}, {"Colour saturation", "n64_rem_saturation"},
+        // ((Triforce) Auto (this PC) and its state, auto_settings.h)
+        {"Auto (this PC)", "auto_pc"}, {"Auto tune", "auto_tune"}, {"Auto for", "auto_for"},
+        // ((Triforce) 11-24) the Controller speaker rows, by the host's HOS_PAD_SPEAKER_* switches' names (host/pad_speaker.c)
+        {"Speaker volume", "pad_speaker_volume"}, {"Controller sync", "pad_speaker_sync"},
+        {"Headphones on the controller", "pad_speaker_headphones"}, {"Headphone volume", "pad_speaker_headphone_volume"},
+        {"Navi's voice", "pad_speaker_navi_voice"}, {"Navi's flight sounds", "pad_speaker_navi_sound"},
+        {"Z-targeting", "pad_speaker_target"}, {"Ocarina", "pad_speaker_ocarina"}, {"Pick-ups", "pad_speaker_pickup"},
+        {"Items", "pad_speaker_item"}, {"Fairies", "pad_speaker_fairy"}, {"Interface sounds", "pad_speaker_ui"},
+        {"Stone of Agony", "pad_speaker_agony"}, {"Low health alarm", "pad_speaker_low_health"},
+        {"Fishing", "pad_speaker_fishing"}, {"Bottles", "pad_speaker_bottle"},
     };
     for (const auto& k : kept)
         if (r.value && !strcmp(r.name, k[0])) return k[1];
@@ -2724,7 +3455,7 @@ const char* ini_key(const Row& r) {
 }
 /// (Triforce) A row kept in triforce_options.ini: every row with a value but the Game language, whose choice is
 /// language.txt's
-bool ini_row(const Row& r) { return r.value && r.value != &opts.language && !is_merged(r.value); }
+bool ini_row(const Row& r) { return r.value && r.value != &opts.language && !is_merged(r.value) && r.value != &output_pick; }
 // ((Triforce, handoff §9) The options file's other writers. ini_base: what the game had for each of the file's lines when it last
 // read (menu_init) or wrote (save) the file; save merges each line it writes by its key with what the file has now
 // (ini_merge.h) and writes the file whole (file_whole.h: a reader at a start, the host's or the renderer's, never meets half a
@@ -2780,6 +3511,13 @@ void lang_load() {
     }
     if (lang_saved < 0) lang_count = 0;
     opts.language = std::max(lang_saved, 0);
+    {   // ((Triforce) the language the game runs in, as the host reads it: HOS_LANGUAGE over the file; English (US) when the
+        // one it names is none of the game's. The Menu language row's Auto follows it)
+        const char* env = getenv("HOS_LANGUAGE");
+        const int file = text.empty() ? -1 : gl::read(text).chosen;
+        const int run = env ? gl::find(env) : file;
+        i18n::set_game_started(run >= 0 ? run : gl::kDefault);
+    }
     for (Row& r : rows)
         if (r.value == &opts.language) r.hi = std::max(lang_count - 1, 0);
 }
@@ -2808,7 +3546,9 @@ void lang_store() {
 // (hookshot) the controls, kept by the host (host/nn_hid.c reads them back from here): pad_<button>, key_<button>
 const char* const bind_names[HOS_KEY_N] = {"a", "b", "x", "y", "ls", "rs", "l", "r", "zl", "zr", "plus", "minus",
                                            "left", "up", "right", "down", "move_up", "move_down", "move_left",
-                                           "move_right", "cam_up", "cam_down", "cam_left", "cam_right"};
+                                           "move_right", "cam_up", "cam_down", "cam_left", "cam_right",
+                                           "note_l", "note_r", "note_a", "note_y", "note_x",
+                                           "toggle_hud"};   // ((Triforce) Toggle HUD, host/nn_hid.c hud_shortcut)
 bool can_bind() { return host && host->binding && host->bind && host->pad_raw; }
 const char* tx_pad_layout(int v) {
     static const char* t[] = {"Nintendo (Def)", "Xbox / PC", "Swap Face", "Custom"};
@@ -2847,6 +3587,35 @@ int detect_pad_layout() {
 // (hookshot) the row's choice to the host: off, the default, or a microphone by its name (and its place in the host's list,
 // -1 while it is unplugged: of two with one name, the one chosen). Unplugged, the name is the kept one, cut: the host takes
 // a name that starts with it
+// ((Triforce) 11-24) The playback devices listed again (one plugged in since shows up), the row on output_want's
+void refresh_outputs() {
+    output_devices.clear();
+    if (can_outputs()) {
+        const int count = std::min(std::max(0, host->audio_output_count()), 256);
+        for (int i = 0; i < count; i++) {
+            char id[HOS_OUTPUT_ID_CAP], name[HOS_OUTPUT_NAME_CAP];
+            if (host->audio_output_info(i, id, sizeof id, name, sizeof name)) output_devices.push_back({id, name});
+        }
+    }
+    output_pick = 0;
+    for (size_t i = 0; i < output_devices.size(); i++)
+        if (!output_want.empty() && output_devices[i].id == output_want) output_pick = (int)i + 1, output_saved_name = output_devices[i].name;
+    output_missing = !output_want.empty() && !output_pick;
+    if (output_missing) output_pick = (int)output_devices.size() + 1;
+    for (Row& r : rows)
+        if (r.value == &output_pick) r.hi = (int)output_devices.size() + (output_missing ? 1 : 0);
+}
+// (the row changed by the player: the choice is now this device, by its id; the "(not connected)" entry only while chosen)
+void output_chosen() {
+    if (output_forced() || !can_outputs()) return;
+    if (output_pick <= 0) output_want.clear(), output_saved_name.clear();
+    else if ((size_t)(output_pick - 1) < output_devices.size()) {
+        output_want = output_devices[(size_t)output_pick - 1].id;
+        output_saved_name = mic_key(output_devices[(size_t)output_pick - 1].name.c_str());
+    }
+    host->audio_output_select(output_want.c_str());
+    refresh_outputs();
+}
 void mic_tell_host() {
     if (!can_mic()) return;
     if (opts.mic <= 1) host->mic_select(opts.mic <= 0 ? 0 : 1, "", -1);
@@ -2901,7 +3670,7 @@ void save() {
     const bool own_custom = remembered_custom.h || ini_base.count("output_custom_size") || !merge;
     ini_merge::Map disk;   // ((Triforce) the file's lines as they are now)
     if (FILE* f = fopen(ini_path().c_str(), "r")) {
-        char line[256];
+        char line[1024];   // ((Triforce) a discord_text= template is up to 512 bytes: a line cut in two lost its end)
         while (fgets(line, sizeof line, f)) {
             ini_merge::add_line(disk, line);
             if (!strncmp(line, "pad_", 4) || !strncmp(line, "key_", 4)) {
@@ -2911,7 +3680,8 @@ void save() {
             const char* eq = strchr(line, '=');
             if (!eq || eq == line) continue;
             const std::string key(line, (size_t)(eq - line));
-            bool mine = (key == "output_custom_size" && own_custom) || key == "microphone_device" || key == "options_version" || key == "debug_tab" || key == "gpu_device_name";
+            bool mine = (key == "output_custom_size" && own_custom) || key == "microphone_device" || key == "options_version" || key == "debug_tab" || key == "gpu_device_name" ||
+                        key == "fullscreen_screen_name" || key == "audio_output_device_id" || key == "audio_output_device_name";
             // (Triforce: the RivaTuner limit row of the test builds is gone, RivaTuner being the limiter wherever it can be:
             // its line is read by nothing and is not written again. (options_version 7) Nor are the lines of the rows whose job
             // is done otherwise now: merged_rows.h kDropped, read once by menu_init's migration)
@@ -2938,11 +3708,17 @@ void save() {
     if (remembered_custom.h) put("output_custom_size", std::to_string(remembered_custom.w) + "x" + std::to_string(remembered_custom.h));
     else if (own_custom && disk.count("output_custom_size")) put("output_custom_size", "");
     if (!mic_want.empty()) put("microphone_device", mic_want);   // (hookshot: also while it is unplugged)
+    if (!output_want.empty()) {   // ((Triforce) 11-24: the Output device row's device, by its id; also while it is unplugged)
+        put("audio_output_device_id", output_want);
+        put("audio_output_device_name", output_saved_name);
+    }
     // ((Triforce) 11-20) the GPU device row's card by its name beside its number: the chosen card's as this run lists them;
     // a choice past the list (the card taken out) keeps the name it had; Auto writes none
     if (opts.gpu_device <= 0) gpu_want.clear();
     else if ((size_t)opts.gpu_device <= gpu_device_names.size()) gpu_want = mic_key(gpu_device_names[(size_t)opts.gpu_device - 1].c_str());
     if (!gpu_want.empty()) put("gpu_device_name", gpu_want);
+    // ((Triforce) 11-24) the Fullscreen screen by its name and size beside its number; Automatic writes none
+    if (opts.fs_screen > 0 && opts.fs_screen <= (int)fs_screen_labels.size()) put("fullscreen_screen_name", fs_key(fs_screen_labels[(size_t)opts.fs_screen - 1]));
     // (2: game_speed below 2 was only ever the old default, see menu_init; 3: the mouse's buttons are bindings, see
     // host/nn_hid.c binds_load; 4: Descriptor reuse on by default, see menu_init and vk_draw.cpp desc_slotgen_on; 5: Sampler
     // cache, Fast pipeline link, Lazy write-back, Opaque textures as BC1 and NVIDIA Reflex On + Boost by default, see menu_init;
@@ -2952,12 +3728,17 @@ void save() {
     // see merged_rows.h migrate (the 436f9ac-based builds wrote 7 for that: such a file has none of the dropped lines, so
     // migrate leaves it as it is))
     static_assert(merged_rows::kVersion == 8, "the options file's version as merged_rows.h migrates to it");
-    // (Triforce) 9: stock and native output numbers share one schema, see output_sizes.h)
-    out += "options_version=9\n";
+    // (Triforce) 9: stock and native output numbers share one schema, see output_sizes.h; 10: Plus is Tab alone, Enter no
+    // longer its second key, see host/nn_hid.c binds_load (the keys alone: every rule here that reads a 9 reads a 10 the same))
+    out += "options_version=10\n";
     out += others;
     if (!can_bind()) out += kept;
-    for (int i = 0; i < HOS_KEY_N && can_bind(); i++) {   // (the keys-only controls, HOS_KEY_*, have no pad_ line)
-        if (i < HOS_SW_N) put(std::string("pad_") + bind_names[i], std::to_string(host->binding(HOS_BIND_PAD, i, 0)));
+    // (the stick's and the camera's rows, HOS_KEY_MOVE_* and HOS_KEY_CAM_*, have no pad_ line; (Triforce, 11-24) the
+    // ocarina's note rows have one)
+    for (int i = 0; i < HOS_KEY_N && can_bind(); i++) {
+        if (i < HOS_SW_N || (i >= HOS_KEY_OC_NOTE_L && i <= HOS_KEY_OC_NOTE_X) || i == HOS_KEY_TOGGLE_HUD)
+            put(std::string("pad_") + bind_names[i], std::to_string(host->binding(HOS_BIND_PAD, i, 0)) +   // ((Triforce) and Input 2)
+                (i < HOS_SW_N && host->binding(HOS_BIND_PAD, i, 1) >= 0 ? "," + std::to_string(host->binding(HOS_BIND_PAD, i, 1)) : ""));
         put(std::string("key_") + bind_names[i],
             std::to_string(host->binding(HOS_BIND_KEY, i, 0)) + "," + std::to_string(host->binding(HOS_BIND_KEY, i, 1)));
     }
@@ -2986,11 +3767,23 @@ void save() {
     said = outside;
 }
 
+/// ((Triforce) the button prompts' live part) The Button prompts row: a controller's face shows at once where the game has every
+/// part of the prompts from host/prompts.c (MkwVkHost prompts_live), nothing to restart for then; the keyboard and mouse face,
+/// or a game without them, at the next start as the other restart rows
+void prompts_at_once(const Row& r) {
+    if (r.value != &opts.prompts || *r.value == HOS_PROMPT_KEYBOARD + 1 || !host || !host->prompts_live) return;
+    const int slot = restart_slot_of(r);
+    if (slot >= 0 && (host->prompts_live() & HOS_PROMPTS_LIVE_ALL) == HOS_PROMPTS_LIVE_ALL)
+        restart_state.restart_value(slot, restart_value_of(r));
+}
+
 /// A row's new value v, as the arrows set it (dir: 1 up, -1 down, for the rows that skip or wrap), saved unless !keep
 /// (a slider's drag: saved once it is let go)
+void auto_row_set(const int* value);   // ((Triforce) Auto (this PC), below)
 void set_row(Row& r, int v, int dir, bool keep = true) {
     // (nothing else to choose: no change, no save. A saved choice that cannot run here is kept)
     if (row_fixed(r.value)) return;
+    if (r.value == &output_pick && output_forced()) return;   // ((Triforce) HOS_AUDIO_DEVICE has the device this run)
     // (the scaling rows: only what can run here. (Triforce, options_version 7) The Upscaler steps through the engines, the Render
     // resolution through the Upscaler's own steps with Native (100%) among them, an engine's native AA: upscaler_rows.h)
     int upscaler_now = -1;   // (the Upscaler's value the step chose with it, -1 none)
@@ -2999,7 +3792,7 @@ void set_row(Row& r, int v, int dir, bool keep = true) {
         v = to.upscaler, opts.resolution = to.resolution;
     }
     if (r.value == &opts.resolution) {
-        const ur::Scaling to = ur::step_resolution(upscaler(), *r.value, dir);
+        const ur::Scaling to = ur::step_resolution(upscaler(), ur::snap(upscaler(), *r.value), dir);
         v = to.resolution;
         if (to.upscaler != upscaler()) upscaler_now = to.upscaler;   // (Native (100%) on or off: the engine's native AA)
     }
@@ -3008,6 +3801,7 @@ void set_row(Row& r, int v, int dir, bool keep = true) {
         v = *r.value;
     }
     if (is_merged(r.value)) v = merged_step(r.value, *r.value, dir);   // ((Triforce, options_version 7) its choices here)
+    if (r.value == &opts.show_fps) v = fps_levels::step(*r.value, dir);   // ((Triforce) the levels in the order of what they show
     if (stops_at_ends(r)) v = std::min(std::max(v, r.lo), r.hi);   // (a scale: it stops at its ends)
     if ((r.value == &opts.output_width || r.value == &opts.output_height) && v != *r.value) remembered_custom = {};
     if (r.value == &opts.pad_layout) {
@@ -3018,11 +3812,18 @@ void set_row(Row& r, int v, int dir, bool keep = true) {
     } else {
         *r.value = v > r.hi ? r.lo : v < r.lo ? r.hi : v;
         if (upscaler_now >= 0) opts.dlss = upscaler_now;
-        // (another Upscaler: the Render resolution moves to the nearest of its steps, DLSS's modes or the game's)
-        if (r.value == &opts.dlss) opts.resolution = ur::snap(upscaler(), opts.resolution);
+        // ((Triforce) 11-24) Another Upscaler no longer moves the saved Render resolution to the nearest of its steps: the
+        // player's scale is kept, and each Upscaler takes its own step for it where it is read (ur::snap: tx_resolution,
+        // resolution_scale, restart_value_of), so a scale another engine lacks comes back on return. Before, FSR 3.1's 58%
+        // through DLSS became DLSS's 50% for good
         if (is_merged(r.value)) merged_store(r.value), merged_sync();   // (the saved values it stands for)
     }
     if (r.value == &opts.mic && can_mic()) mic_chosen();   // (hookshot)
+    if (r.value == &output_pick) output_chosen();   // ((Triforce) 11-24)
+    auto_row_set(r.value);   // ((Triforce) Auto (this PC): On applies it; a row it sets changed by hand turns it Off)
+    prompts_at_once(r);   // ((Triforce) the button prompts' live part)
+    if (r.value == &opts.reshade) reshade_menu::preset_chosen();   // ((Triforce) 11-24: the ReShade preset, prepared anew)
+    if (r.value == &reshade_menu::user_pick) reshade_menu::user_picked();
     {   // (a row that takes a restart: asked again at the next close)
         int now[mr::kMax];
         restart_values(now);
@@ -3056,9 +3857,30 @@ const Control controls[] = {{HOS_SW_A, "A"}, {HOS_SW_B, "B"}, {HOS_SW_X, "X"}, {
                             {HOS_KEY_MOVE_DOWN, "Move back"}, {HOS_KEY_MOVE_LEFT, "Move left"},
                             {HOS_KEY_MOVE_RIGHT, "Move right"}, {HOS_KEY_CAM_UP, "Camera up"},
                             {HOS_KEY_CAM_DOWN, "Camera down"}, {HOS_KEY_CAM_LEFT, "Camera left"},
-                            {HOS_KEY_CAM_RIGHT, "Camera right"}};
+                            {HOS_KEY_CAM_RIGHT, "Camera right"},
+                            // ((Triforce) 11-24: the ocarina's notes on inputs of their own, none out of the box: the game's
+                            // buttons play until a row is bound. Named by the button each note is in the game, host/nn_hid.c)
+                            {HOS_KEY_OC_NOTE_L, "Ocarina note (L)"}, {HOS_KEY_OC_NOTE_R, "Ocarina note (R)"},
+                            {HOS_KEY_OC_NOTE_A, "Ocarina note (A)"}, {HOS_KEY_OC_NOTE_Y, "Ocarina note (Y)"},
+                            {HOS_KEY_OC_NOTE_X, "Ocarina note (X)"},
+                            // ((Triforce) hides or shows the HUD in play, unbound out of the box: host/nn_hid.c hud_shortcut)
+                            {HOS_KEY_TOGGLE_HUD, "Toggle HUD"}};
 constexpr int kControls = sizeof controls / sizeof controls[0];   // (then "Reset to defaults")
-bool keys_only(int i) { return i < kControls && controls[i].button >= HOS_SW_N; }   // (no gamepad input for those)
+// (the stick's and the camera's directions: keys only; the ocarina's note rows take a gamepad input too, and no mouse button)
+bool keys_only(int i) { return i < kControls && controls[i].button >= HOS_KEY_MOVE_UP && controls[i].button <= HOS_KEY_CAM_RIGHT; }
+bool note_row(int i) { return i >= 0 && i < kControls && controls[i].button >= HOS_KEY_OC_NOTE_L && controls[i].button <= HOS_KEY_OC_NOTE_X; }
+// ((Triforce) 11-24) The Controls page's columns: a Switch button's two gamepad inputs (Input 1 and Input 2, either presses
+// it: host/nn_hid.c) and its keys. A note row has one gamepad input, the keys-only controls none
+// ((Triforce) per-control reset) and, at the right, a control's own Reset: there while its bindings are not its defaults
+// (MkwVkHost binding_is_default, reset_binding; a host without them, never)
+enum { kColPad, kColAlt, kColKeys, kColReset, kCols };
+bool has_alt(int i) { return i >= 0 && i < kControls && controls[i].button < HOS_SW_N; }
+bool can_reset_rows() { return host && host->reset_binding && host->binding_is_default && host->rebind_control; }
+bool reset_usable(int i) { return i >= 0 && i < kControls && can_reset_rows() && !host->binding_is_default(controls[i].button); }
+bool col_usable(int i, int col) {
+    if (col == kColReset) return reset_usable(i);
+    return col == kColKeys || (!keys_only(i) && (col == kColPad || has_alt(i)));
+}
 // a pad input's name on the controller of the button prompts (the Button prompts row's choice; Auto: the face in use),
 // else by its place ((Triforce) by its place too with the keyboard and mouse face, which is no controller's)
 const char* pad_name(int p) {
@@ -3079,6 +3901,8 @@ const char* pad_name(int p) {
     // ((Triforce, 11-19) with the keys' face, the controller used last's names, as the overlay's icons (vk_imgui.cpp))
     if ((face < 0 || face == HOS_PROMPT_KEYBOARD) && host && host->prompt_pad_face && host->prompt_pad_face() >= 0)
         face = host->prompt_pad_face();
+    static const char* const paddles[] = {"R4", "L4", "R5", "L5"};   // ((Triforce) 11-24: the rear paddles, by SDL's names)
+    if (p >= HOS_PAD_RPADDLE1 && p <= HOS_PAD_LPADDLE2) return paddles[p - HOS_PAD_RPADDLE1];
     return p >= 0 && p < HOS_PAD_N ? t[face >= 0 && face < HOS_PROMPT_KEYBOARD ? face + 1 : 0][p] : "None";
 }
 const char* key_name(int vk) {
@@ -3174,6 +3998,10 @@ const std::vector<int>& bindable_keys() {
     }
     return k;
 }
+// ((Triforce) the tuning bar: the options page as one row in a bar at the foot of the screen, the game seen whole above it, for
+// judging a setting's change live (draw_tune_bar). Right Ctrl or the gamepad's left face button switches to it and back on the
+// options page over play; Right Ctrl held while the menu opens opens it so. Not inside the game's own Options screen)
+bool tune_mode = false;
 int page = 0;          // 0 the options, 1 the controls, 3 the teleport list, 4 the inventory, 5 the restart question (2: was the
                        // debug tools' own page, now on the Debug tab), 6 (Triforce) a name page: Game flags, Cutscenes, Scan amiibo
 /// (Triforce) Whether the Mods screen's search takes the keyboard's text now (mods_text_wanted): the keys bound to the Switch's
@@ -3186,6 +4014,54 @@ const int kTop = tab_row_count(TAB_PAGE);   // (Layout preset and Button prompts
 int listening = 0;     // waiting for the new input: 1 a gamepad's, 2 a key
 bool listen_armed = false;   // (once what started it was let go)
 int64_t listen_end = 0;
+// ---- ((Triforce) per-control reset and confirmed rebinds) What the Controls page asks before it changes: a control reset,
+// all of them reset, or a new input another control has (its name said: that control loses it, or trades a gamepad input for
+// this one's, host/nn_hid.c hos_bind's rules). Cancel is the choice at first ----
+enum ControlAsk { kAskNone, kAskRebind, kAskResetRow, kAskResetAll };
+struct ControlConfirmation {
+    int action = kAskNone;
+    int row = -1, set = 0, slot = 0, code = 0, choice = 0;
+    uint64_t conflicts = 0;
+};
+ControlConfirmation control_confirmation;
+int blocked_reset_row = -1;   // (a reset refused: another control has one of the row's defaults; its help says so)
+int pad_clear = HOS_PAD_NORTH;   // (the Controls page's Clear on a controller: a face button neither Bind's nor Back's)
+/// The next row Up or Down (direction -1, 1) goes to: on the Reset column, the next control with a Reset of its own
+/// (wrapping, the column kept); elsewhere the next row of the page
+int next_control_selection(int selection, int col, int direction) {
+    const int row = selection - kTop, n = kTop + kControls + 1;
+    if (row < 0 || row >= kControls || col != kColReset) return (selection + n + direction) % n;
+    for (int step = 1, next = row; step < kControls; step++) {
+        next = (next + kControls + direction) % kControls;
+        if (col_usable(next, col)) return kTop + next;
+    }
+    return selection;
+}
+/// The names of the controls of conflicts' bits (HOS_SW_* / HOS_KEY_*), as the page lists them
+std::string control_names(uint64_t conflicts) {
+    std::string out;
+    for (int i = 0; i < kControls; i++)
+        if (conflicts >> controls[i].button & 1) out += (out.empty() ? "" : ", ") + std::string(i18n::tr(controls[i].name));
+    return out;
+}
+void after_binding(int set) {   // (a binding changed: the Layout preset as the face buttons now are, and saved)
+    if (set == HOS_BIND_PAD) opts.pad_layout = detect_pad_layout();
+    save();
+}
+/// A new input for row's slot: bound at once, or asked about first when it takes the input from other controls (a host
+/// without rebind_control binds as before)
+void bind_or_ask(int set, int row, int slot, int code) {
+    const int button = controls[row].button;
+    if (!can_reset_rows()) {
+        host->bind(set, button, set == HOS_BIND_PAD ? slot : 0, code);
+        if (set == HOS_BIND_KEY) host->bind(HOS_BIND_KEY, button, 1, 0);
+        after_binding(set);
+        return;
+    }
+    uint64_t conflicts = 0;
+    if (host->rebind_control(set, button, slot, code, 0, &conflicts)) after_binding(set);
+    else if (conflicts) control_confirmation = {kAskRebind, row, set, slot, code, 0, conflicts};
+}
 std::string keys_text(int button) {
     const int a = host->binding(HOS_BIND_KEY, button, 0), b = host->binding(HOS_BIND_KEY, button, 1);
     std::string t = a ? key_name(a) : "";
@@ -3262,19 +4138,26 @@ menu_hit::Map hits;      // (the menu's controls as last drawn: the mouse's, men
 // ((Triforce, 11-22, N64 Classic) the options were drawn under its TV at the last present (menu_tv_layer): the mouse is
 // taken through the TV's curve to where they were drawn (vk_n64.h n64_screen_point). The presenting thread's, as hits is
 bool options_under_tv = false;
-float scroll_at[TAB_N64 + 1];   // (the first row shown, eased toward the selection: the options' tabs and the pages rows open,
+float scroll_at[TAB_SIM_TURF + 1];   // (the first row shown, eased toward the selection: the options' tabs and the pages rows open,
                                 // the Controls page: kControlsSlot, then the Remembered page)
 constexpr int kControlsSlot = TAB_PAGE;
-int wheel_rows[TAB_N64 + 1];   // (the mouse wheel's notches since the last drawing, a slot each: scroll_rows scrolls by them)
-int scrolled_to[TAB_N64 + 1] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};   // (the selection scroll_rows last brought into view)
-static_assert(TAB_N64 + 1 == 12, "scrolled_to: a slot for each tab, each page a row opens, the Controls page and the Remembered page");
-float scroll_want[TAB_N64 + 1];   // (where scroll_at is going: the wheel moves it, a new selection too)
+int wheel_rows[TAB_SIM_TURF + 1];   // (the mouse wheel's notches since the last drawing, a slot each: scroll_rows scrolls by them)
+int scrolled_to[TAB_SIM_TURF + 1] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};   // (the selection scroll_rows last brought into view)
+static_assert(TAB_SIM_TURF + 1 == 13, "scrolled_to: a slot for each tab, each page a row opens, the Controls page, the Remembered page and the Simulated turf page");
+float scroll_want[TAB_SIM_TURF + 1];   // (where scroll_at is going: the wheel moves it, a new selection too)
 float ease_step = 0;     // (this drawing's share of the way: the time since the last one)
 bool ease_live = false;  // ((Triforce) menu_record steps the easing: a window's frames. Without them a still is drawn settled)
 
 ui::Ctx ui_ctx(uint32_t w, uint32_t h) {
     ui::Ctx c{ImGui::GetForegroundDrawList(), ui::fonts(), 1, (float)w, (float)h, 0, pad_last};
     c.confirm_dot = menu_keys::dot(pad_confirm), c.back_dot = menu_keys::dot(pad_back);
+    {   // ((Triforce) per-control reset) the Controls page's Clear on a controller: the icon of the Switch face button bound to it
+        static const int face[4] = {HOS_SW_A, HOS_SW_B, HOS_SW_X, HOS_SW_Y};
+        static const char* const icons[4] = {ui::kIconA, ui::kIconB, ui::kIconX, ui::kIconY};
+        for (int i = 0; i < 4 && host && host->binding; i++)
+            if (host->binding(HOS_BIND_PAD, face[i], 0) == pad_clear) c.clear_icon = icons[i];
+        c.clear_name = pad_name(pad_clear);
+    }
     {   // ((Triforce) the keys the tab strip's ends and the guides name: those bound to the Switch's L, R and B where the menu
         // takes them (menu_bound_key), as the game's own guides name the bindings; else the menu's own Q, E and Esc)
         static char names[3][24];   // (fixed places: a Ctx made before keeps pointing at them)
@@ -3393,7 +4276,8 @@ std::vector<size_t> char_starts(const std::string& t) {
     at.push_back(t.size());
     return at;
 }
-std::string fit(ui::Ctx& c, ImFont* f, float px, float room, const std::string& label, bool sel) {
+std::string fit(ui::Ctx& c, ImFont* f, float px, float room, const std::string& english, bool sel) {
+    const std::string label = i18n::tr(english.c_str());   // ((Triforce) in the menu's language: cut and slid as it is drawn)
     auto width = [&](const std::string& t) { return ui::size_of(f, px, t.c_str()).x; };
     if (width(label) <= room) return label;
     const std::vector<size_t> at = char_starts(label);
@@ -3444,7 +4328,7 @@ void scroll_bar(ui::Ctx& c, float x, float top, float bottom, int n, int shown, 
     if (n <= shown) n = shown = 1, first = 0;
     const float mid = (top + bottom) * 0.5f, half = ui::lu(c, 156), w = ui::lu(c, 16);
     const float y0 = mid - half + 2 * half * first / n, y1 = mid - half + 2 * half * (first + shown) / n;
-    if (const ui::Art* t = ui::art("ScrollBarBase_00")) {
+    if (const ui::Art* t = ui::skin("ScrollBarBase_00")) {
         ui::image(c, t, ImVec2(x - w, mid - half), ImVec2(x + w, mid + half), ui::rgba(18, 14, 9, 235));
         c.d->PushClipRect(ImVec2(x - w, y0), ImVec2(x + w, y1), true);
         ui::image(c, t, ImVec2(x - w, mid - half), ImVec2(x + w, mid + half), ui::rgba(200, 146, 66));
@@ -3540,7 +4424,7 @@ void name_cell(ui::Ctx& c, ImVec2 a, ImVec2 b, const char* name, bool sel, bool 
     (void)sel;
     ui::plate(c, a, b);
     if (pending) {
-        if (const ui::Art* t = ui::art("OptionCheckMark_00")) ui::image(c, t, a + ImVec2(ui::lu(c, -8), ui::lu(c, -8)), a + ImVec2(ui::lu(c, 82), ui::lu(c, 82)), ui::kGoldHi);
+        if (const ui::Art* t = ui::skin("OptionCheckMark_00")) ui::image(c, t, a + ImVec2(ui::lu(c, -8), ui::lu(c, -8)), a + ImVec2(ui::lu(c, 82), ui::lu(c, 82)), ui::kGoldHi);
         else ui::diamond(c, ImVec2(a.x + 10 * s, a.y + 10 * s), 4 * s, ui::kGoldHi);
     }
     const float room = b.x - a.x - ui::lu(c, 110);
@@ -3596,8 +4480,15 @@ std::string restart_line(ui::Ctx& c, float px, float width) {
         int named = 0, more = 0;
         for (int i = 0; i < restart_state.n; i++)
             if ((all >> i) & 1) (named < keep ? (shown |= 1u << i, named++) : more++);
-        line = "Restart needed: " + mr::names(restart_names, restart_state.n, shown);
-        if (more) line += (named ? " and " : "") + std::to_string(more) + (named ? " more" : more > 1 ? " settings" : " setting");
+        // ((Triforce) in the menu's language: the rows' names and the pieces between them)
+        const char* names[mr::kMax];
+        for (int i = 0; i < restart_state.n; i++) names[i] = i18n::tr(restart_names[i]);
+        line = i18n::tr("Restart needed: ") + mr::names(names, restart_state.n, shown);
+        if (more) {   // (" settings (many)": the form Russian and Polish take for 5 and up, i18n::plural; never asked in English)
+            const int form = i18n::plural(more);
+            line += std::string(named ? i18n::tr(" and ") : "") + std::to_string(more) +
+                    i18n::tr(named ? " more" : form == 0 ? " setting" : form == 1 ? " settings" : " settings (many)");
+        }
         if (ui::size_of(c.f.strong, px, line.c_str()).x <= width) break;
     }
     return line;
@@ -3606,9 +4497,9 @@ std::string restart_line(ui::Ctx& c, float px, float width) {
 /// (hookshot) The Debug tab's order: the tools' rows by their group (Row::cheat), Up and Down walking them so; Inventory item
 /// and Change quantity are not shown (the Inventory page edits every amount)
 struct DebugGroup { const char* title; int from, to; };   // (debug_tools_order[from, to))
-// ((Triforce) Story & amiibo: the name pages' rows, after Player)
-constexpr int debug_tools_order[] = {0, 1, 9, 10, 11, 12, 13, 8, 2, 3, 7, 4};
-constexpr DebugGroup debug_groups[] = {{"Player", 0, 4}, {"Story & amiibo", 4, 7}, {"Travel", 7, 10}, {"Camera & world", 10, 12}};
+// ((Triforce) Story & amiibo: the name pages' rows, after Player; Movement speed (14) with Player's)
+constexpr int debug_tools_order[] = {0, 1, 14, 9, 10, 11, 12, 13, 8, 2, 3, 7, 4};
+constexpr DebugGroup debug_groups[] = {{"Player", 0, 5}, {"Story & amiibo", 5, 8}, {"Travel", 8, 11}, {"Camera & world", 11, 13}};
 constexpr int kDebugGroups = sizeof debug_groups / sizeof debug_groups[0];
 /// (Triforce) The Debug tab's list from the top, drawn as every other tab's (draw_options: the same column, rows and headings):
 /// the Debug tools switch; while the tools are on, each group of them under its heading (a group with no row shown has
@@ -3682,8 +4573,8 @@ void draw_tabs(ui::Ctx& c, int sel, bool game, bool hit) {
             // texture as P_PlusMenuBg_00 colours it, vk_game_tex.h tab_select; was the texture times a measured 190,125,62)
             const ImVec2 m = ui::at(c, 0, 966), a(x - std::min(ui::lu(c, 270), step * 0.5f + ui::lu(c, 40)), m.y - ui::lu(c, 130));
             const ImVec2 b(2 * x - a.x, m.y + ui::lu(c, 130));
-            if (const ui::Art* t = ui::art("tab_select")) ui::image(c, t, a, b);
-            else if (const ui::Art* g = ui::art("MenuHeaderSelect_00")) ui::image(c, g, a, b, ui::rgba(190, 125, 62));
+            if (const ui::Art* t = ui::skin("tab_select")) ui::image(c, t, a, b);
+            else if (const ui::Art* g = ui::skin("MenuHeaderSelect_00")) ui::image(c, g, a, b, ui::rgba(190, 125, 62));
             else c.d->AddRectFilled(ImVec2(x - step * 0.5f, 0), ImVec2(x + step * 0.5f, hh + ui::lu(c, 6)), ui::kTabInset);
         } else if (hit && tab >= 0 && tab == hover_tab) {
             c.d->AddRectFilled(ImVec2(x - step * 0.5f + 4 * s, ty - ui::lu(c, 60)), ImVec2(x + step * 0.5f - 4 * s, ty + ui::lu(c, 60)), ui::rgba(60, 42, 22, 70), 6 * s);
@@ -3708,6 +4599,116 @@ void draw_tabs(ui::Ctx& c, int sel, bool game, bool hit) {
         }
         if (hit) hits.add(i ? x - ui::lu(c, 90) : 0, 0, i ? c.w : x + ui::lu(c, 90), hh, i ? menu_hit::kTabNext : menu_hit::kTabPrev, -1);
     }
+    {   // ((Triforce) the logo and the name at the banner's left, left of the L key: at the tabs' size, smaller until they fit
+        // (on half-point steps, to 34 units), or not at all where the strip leaves no room. The version stays on the System
+        // tab, as before)
+        float aspect = 1;
+        ImTextureData* logo = ui::logo(&aspect);
+        const float room = tx0 - ui::lu(c, 298) - ui::lu(c, 90) - c.safe - ui::lu(c, 40);
+        const auto width = [&](float p) { return (logo ? p * 1.25f * aspect + ui::lu(c, 24) : 0) + ui::size_of(c.f.strong, p, "Triforce").x; };
+        float px = tpx;
+        while (px > ui::lu(c, 34) && width(px) > room) px -= 0.5f * s;
+        if (room > 0 && width(px) <= room) {
+            float lx = c.safe + ui::lu(c, 40);
+            if (logo) {
+                const float lh = px * 1.25f;
+                c.d->AddImage(logo->GetTexRef(), ImVec2(lx, ty - lh * 0.5f), ImVec2(lx + lh * aspect, ty + lh * 0.5f));
+                lx += lh * aspect + ui::lu(c, 24);
+            }
+            ui::text_mid(c, c.f.strong, px, lx, ty, ui::kInk, "Triforce");
+        }
+    }
+}
+
+/// A row's value cell over va..vb, as the options' list draws it and (Triforce) the tuning bar (draw_tune_bar): a mod's cheat, a
+/// debug tool, a page, a slider, a toggle's halves or a choice. *t0, *t1: a slider's track; returns where a toggle's halves meet
+/// (0: none), for the mouse
+float row_value_cell(ui::Ctx& c, const Row& r, ImVec2 va, ImVec2 vb, bool selected, float* t0_out, float* t1_out) {
+    float t0 = 0, t1 = 0, vm = 0;   // ((Triforce) vm: where a toggle's halves meet, for the mouse)
+    if (const int cheat = mod_cheat_slot(r.name); cheat >= 0) {   // (Triforce: a mod's cheat: On | Off as the toggles, or why not)
+        if (mod_cheats.fixed(cheat)) choice_cell(c, va, vb, mod_cheats.fixed_text(cheat), selected, false, false, true);
+        else {
+            halves_cell(c, va, vb, "On", "Off", !mod_cheats.is_on(cheat), selected, false);
+            vm = halves_meet(va, vb);
+        }
+    } else if (r.cheat >= 0) {   // (a debug tool: On and Off, Link's age, a choice of its own, or a button that acts)
+        if (r.cheat == 0 || r.cheat == 1 || r.cheat == 7) {
+            halves_cell(c, va, vb, "On", "Off", cheat_value(r.cheat) != "On", selected, false);
+            vm = halves_meet(va, vb);
+        } else if (age_shown(r.cheat)) {   // (Link's age now: the other half switches)
+            halves_cell(c, va, vb, "Kid", "Adult", link_age.load(std::memory_order_relaxed) == 1, selected, false);
+            vm = halves_meet(va, vb);
+        } else {
+            static const char* const buttons[kCheatRows] = {"", "", "Mark", "Return", "", "", "", "", "Choose map", "Switch",
+                                                            "Edit items", "Open list", "Open list", "Choose file", ""};
+            const std::string v = cheat_value(r.cheat);
+            if (cheat_chooses(r.cheat)) choice_cell(c, va, vb, v, selected, true, true);
+            else action_cell(c, va, vb, v.empty() ? buttons[r.cheat] : v, selected, r.cheat == 9);   // (Switch age: none known yet)
+        }
+    } else if (!r.value) {   // (a page, or Restart and Quit: Confirm until the second press)
+        const bool ends = false;
+        if (pending == &r) choice_cell(c, va, vb, "Press again", selected, false, false);
+        else if (r.name == kTestMic && mic_testing) {   // ((Triforce) 11-24: the level after the gain, both figures in words)
+            char level[48];
+            snprintf(level, sizeof level, "%d%% > %d%%", std::clamp(mic_levels[0], 0, 1000) / 10, std::clamp(mic_levels[1], 0, 1000) / 10);
+            slider_cell(c, va, vb, level, std::clamp(mic_levels[1], 0, 1000), selected, &t0, &t1);
+            t0 = t1 = 0;   // (a meter: nothing to drag)
+        } else if (r.name == kTestMic) action_cell(c, va, vb, "Start test", selected);
+        else if (reshade_menu::action_label(r.name)) action_cell(c, va, vb, reshade_menu::action_label(r.name), selected);
+        else action_cell(c, va, vb, r.name == kUseWindowSize ? "Copy" : ends ? r.name : share_row(r) ? share_label(share_row(r)) : "Open", selected);
+    } else {
+        const bool fixed = row_fixed(r.value);
+        // ((Triforce) the Output width or height being typed into: the digits so far and a caret, size_edit)
+        const std::string typing = size_edit && size_edit == r.value ? size_text + "_" : std::string();
+        if (is_slider(r) && !fixed) {   // ((Triforce) a fixed one: its value alone, as a choice with nothing to choose)
+            slider_cell(c, va, vb, typing.empty() ? r.text(*r.value) : typing.c_str(),
+                        menu_hit::slider_permille(*r.value, r.lo, r.hi), selected, &t0, &t1);
+            t0 = t1 = 0;   // (no track to drag: the arrows step it)
+        } else if (r.text == tx_onoff && !fixed) {   // (a toggle as the game's: On at the left, Off at the right)
+            halves_cell(c, va, vb, "On", "Off", *r.value == 0, selected, fixed);
+            vm = halves_meet(va, vb);
+        } else {
+            const bool output_row = r.value == &opts.output_res;
+            bool left = !fixed && (!output_row || output_step(-1, false)) && (!stops_at_ends(r) || *r.value > r.lo);
+            bool right = !fixed && (!output_row || output_step(1, false)) && (!stops_at_ends(r) || *r.value < r.hi);
+            if (r.value == &opts.show_fps)   // ((Triforce) the FPS counter's levels stop at Off and Full: fps_levels.h step
+                left = fps_levels::step(*r.value, -1) != *r.value, right = fps_levels::step(*r.value, 1) != *r.value;
+            choice_cell(c, va, vb, r.text(*r.value), selected, left, right, fixed);
+        }
+    }
+    *t0_out = t0, *t1_out = t1;
+    return vm;
+}
+
+/// ((Triforce) The tuning bar (tune_mode): the options page's selected row at the foot of the screen, over the game seen whole,
+/// with its tab's name, the row's name and value as in the list, and the guides; Up and Down choose the row, Left and Right
+/// change it, L and R the tab, as on the page (menu_tick's page 0)
+void draw_tune_bar(ui::Ctx& c) {
+    const int count = tab_row_count(cur_tab), sel = tab_selected[cur_tab];
+    if (count <= 0) return;
+    const Row& r = rows[tab_row_to_global(cur_tab, std::clamp(sel, 0, count - 1))];
+    static const char* const names[TAB_COUNT] = {"Display", "Graphics", "Audio", "Controls", "System", "Debug"};
+    const char* tab = cur_tab == TAB_MOTION ? "Motion" : cur_tab == TAB_N64 ? "N64 Classic" : cur_tab < TAB_COUNT ? names[cur_tab] : "";
+    // (the bar: the caption plate, 3000 x 330 units, its foot 60 units over the screen's)
+    const ImVec2 a = ui::at(c, -1500, -1080 + 390), b = ui::at(c, 1500, -1080 + 60);
+    ui::box(c, a, b, 0.92f);
+    const float px = ui::lu(c, 40 * ui::kType), ty = a.y + ui::lu(c, 46);
+    ui::text_mid(c, c.f.heading, px, a.x + ui::lu(c, 40), ty, ui::kGoldHi, tab);
+    if (restart_changed(r))
+        ui::text_mid(c, c.f.body, ui::lu(c, 36 * ui::kType), a.x + ui::lu(c, 80) + ui::size_of(c.f.heading, px, tab).x, ty, ui::kGoldHi,
+                     "Applies after a restart");
+    // (the row: as in the list, its plate 2200 units wide here, its value's panel 804 x 108 at its right)
+    const float rh = ui::lu(c, 124), y = a.y + ui::lu(c, 96), my = y + rh * 0.5f;
+    const float rx0 = a.x + ui::lu(c, 40), rx1 = b.x - ui::lu(c, 40), vx = rx1 - ui::lu(c, 452);
+    name_cell(c, ImVec2(rx0, y), ImVec2(rx1, y + rh), r.name, true, restart_changed(r));
+    const ImVec2 va(vx - ui::lu(c, 402), my - ui::lu(c, 54)), vb(vx + ui::lu(c, 402), my + ui::lu(c, 54));
+    float t0 = 0, t1 = 0;
+    const float vm = r.heading ? 0 : row_value_cell(c, r, va, vb, true, &t0, &t1);
+    hits.add(rx0, y, rx1, y + rh, menu_hit::kRow, sel, va.x, vb.x, t0, t1, 0, vm);
+    // (the guides, inside the bar's foot)
+    const ui::Prompt list[4] = {{ui::kUpDown, "Choose"}, {ui::kLeftRight, "Change"}, {ui::kKey, "Full menu", "RCtrl"}, {ui::kBack, "Close"}};
+    const float pw = ui::prompts(c, 0, 0, list, 4, false);
+    ui::prompts(c, (a.x + b.x - pw) * 0.5f, b.y - ui::lu(c, 50), list, 4, true);
 }
 
 /// The Options screen: the header with the tabs across it (as the pause menu's categories: MenuOverlay_00, 460 units apart,
@@ -3729,6 +4730,7 @@ void draw_options(ui::Ctx& c) {
     const int count = tab_row_count(cur_tab), sel = tab_selected[cur_tab];
     const Row& selr = rows[tab_row_to_global(cur_tab, sel)];
     const char* hint = selr.value && selr.hint ? selr.hint(*selr.value, -1) : nullptr;
+    if (selr.name == kTestMic) hint = mic_test_line();   // ((Triforce) 11-24: what the test shows now)
     const std::string share_hint = share_row(selr) ? share_line(share_row(selr)) : std::string();   // (Triforce: what the host did)
     if (!share_hint.empty()) hint = share_hint.c_str();
     const int sel_cheat = mod_cheat_slot(selr.name);   // (Triforce: a mod's cheat: the mod it is from, or why it cannot be switched)
@@ -3736,7 +4738,9 @@ void draw_options(ui::Ctx& c) {
     const float cap_w = hx1 - hx0 - 2 * ui::lu(c, 76);
     const std::string pending_line = restart_pending() ? restart_line(c, kHintPt * s, cap_w - 20 * s) : "";
     static float help_tall = 0, help_tall_w = 0;
-    if (help_tall_w != cap_w) help_tall_w = cap_w, help_tall = measure_help(c, cap_w);
+    static int help_tall_lang = -1;   // ((Triforce) the menu's language it was measured in: another one's texts are longer or shorter)
+    if (help_tall_w != cap_w || help_tall_lang != i18n::lang_now())
+        help_tall_w = cap_w, help_tall_lang = i18n::lang_now(), help_tall = measure_help(c, cap_w);
     // (the guides: what the buttons do on this row, as the game's own say only that)
     const bool confirms = false;   // ((Triforce) 11-19: no Restart and Quit rows any more: the pause menu's Quit)
     ui::Prompt prompt_list[5] = {{ui::kLeftRight, "Change"}, {ui::kTabs, "Category"}, {ui::kBack, "Back"}};
@@ -3746,6 +4750,7 @@ void draw_options(ui::Ctx& c) {
     if (n64_action(selr)) prompt_list[0] = {ui::kConfirm, "Apply"};   // ((Triforce, N64 Classic) Copy Faithful, Reset to defaults)
     if (sel_cheat >= 0) prompt_list[0] = {ui::kLeftRight, "Change"};   // (Triforce: a mod's cheat, On | Off)
     if (sub_page(cur_tab)) prompt_list[1] = {ui::kBack, "Back"}, prompts_n = 2;   // (Esc: to the tab it is under)
+    if (is_sim_turf_reset_row(selr)) prompt_list[0] = {ui::kConfirm, "Reset"};
     if (selr.cheat >= 0) {   // (a debug tool: Change when Left and Right do something, then what confirm does)
         prompts_n = 0;
         if (selr.cheat <= 1 || selr.cheat == 7 || cheat_chooses(selr.cheat) || age_shown(selr.cheat))
@@ -3753,6 +4758,8 @@ void draw_options(ui::Ctx& c) {
         if (const char* says = cheat_confirm(selr.cheat)) prompt_list[prompts_n++] = {ui::kConfirm, says};
         prompt_list[prompts_n++] = {ui::kTabs, "Category"}, prompt_list[prompts_n++] = {ui::kBack, "Back"};
     }
+    // ((Triforce) over play, with the keys: Right Ctrl's tuning bar, draw_tune_bar)
+    if (!embed_open && !c.pad && prompts_n < 5) prompt_list[prompts_n++] = {ui::kKey, "Tuning bar", "RCtrl"};
     const float bar_top = ui::prompt_bar_top(c);   // (the strip itself drawn last, over all: below)
     const bool after = restart_changed(selr);
     caption(c, hx0, hx1, nullptr, selr.help, hint, pending_line.empty() ? nullptr : pending_line.c_str(), help_tall, after);
@@ -3793,46 +4800,8 @@ void draw_options(ui::Ctx& c) {
         const bool selected = i == sel;
         name_cell(c, ImVec2(rx0, y), ImVec2(rx1, y + rh), r.name, selected, restart_changed(r));
         const ImVec2 va(vx - vhw, my - vhh), vb(vx + vhw, my + vhh);
-        float t0 = 0, t1 = 0, vm = 0;   // ((Triforce) vm: where a toggle's halves meet, for the mouse)
-        if (const int cheat = mod_cheat_slot(r.name); cheat >= 0) {   // (Triforce: a mod's cheat: On | Off as the toggles, or why not)
-            if (mod_cheats.fixed(cheat)) choice_cell(c, va, vb, mod_cheats.fixed_text(cheat), selected, false, false, true);
-            else {
-                halves_cell(c, va, vb, "On", "Off", !mod_cheats.is_on(cheat), selected, false);
-                vm = halves_meet(va, vb);
-            }
-        } else if (r.cheat >= 0) {   // (a debug tool: On and Off, Link's age, a choice of its own, or a button that acts)
-            if (r.cheat == 0 || r.cheat == 1 || r.cheat == 7) {
-                halves_cell(c, va, vb, "On", "Off", cheat_value(r.cheat) != "On", selected, false);
-                vm = halves_meet(va, vb);
-            } else if (age_shown(r.cheat)) {   // (Link's age now: the other half switches)
-                halves_cell(c, va, vb, "Kid", "Adult", link_age.load(std::memory_order_relaxed) == 1, selected, false);
-                vm = halves_meet(va, vb);
-            } else {
-                static const char* const buttons[kCheatRows] = {"", "", "Mark", "Return", "", "", "", "", "Choose map", "Switch",
-                                                                "Edit items", "Open list", "Open list", "Choose file"};
-                const std::string v = cheat_value(r.cheat);
-                if (cheat_chooses(r.cheat)) choice_cell(c, va, vb, v, selected, true, true);
-                else action_cell(c, va, vb, v.empty() ? buttons[r.cheat] : v, selected, r.cheat == 9);   // (Switch age: none known yet)
-            }
-        } else if (!r.value) {   // (a page, or Restart and Quit: Confirm until the second press)
-            const bool ends = false;
-            if (pending == &r) choice_cell(c, va, vb, "Press again", selected, false, false);
-            else action_cell(c, va, vb, r.name == kUseWindowSize ? "Copy" : ends ? r.name : share_row(r) ? share_label(share_row(r)) : "Open", selected);
-        } else {
-            const bool fixed = row_fixed(r.value);
-            if (is_slider(r) && !fixed) {   // ((Triforce) a fixed one: its value alone, as a choice with nothing to choose)
-                slider_cell(c, va, vb, r.text(*r.value), menu_hit::slider_permille(*r.value, r.lo, r.hi), selected, &t0, &t1);
-                t0 = t1 = 0;   // (no track to drag: the arrows step it)
-            } else if (r.text == tx_onoff && !fixed) {   // (a toggle as the game's: On at the left, Off at the right)
-                halves_cell(c, va, vb, "On", "Off", *r.value == 0, selected, fixed);
-                vm = halves_meet(va, vb);
-            } else {
-                const bool output_row = r.value == &opts.output_res;
-                const bool left = !fixed && (!output_row || output_step(-1, false)) && (!stops_at_ends(r) || *r.value > r.lo);
-                const bool right = !fixed && (!output_row || output_step(1, false)) && (!stops_at_ends(r) || *r.value < r.hi);
-                choice_cell(c, va, vb, r.text(*r.value), selected, left, right, fixed);
-            }
-        }
+        float t0 = 0, t1 = 0;
+        const float vm = row_value_cell(c, r, va, vb, selected, &t0, &t1);
         hits.add(rx0, std::max(y, clip0), rx1, std::min(y + rh, clip1), menu_hit::kRow, i, va.x, vb.x, t0, t1, 0, vm);
     }
     c.d->PopClipRect();
@@ -3841,6 +4810,52 @@ void draw_options(ui::Ctx& c) {
         ui::text_mid(c, c.f.body, ui::lu(c, 36), ui::at(c, -1840, 0).x, ui::at(c, 0, -1030).y, ui::rgba(255, 251, 238, 120), ver.c_str());
     }
     ui::prompt_bar(c, prompt_list, prompts_n);   // (the guides, on top of the caption and the rows)
+}
+
+/// ((Triforce) per-control reset and confirmed rebinds) The Controls page's question (control_confirmation) over it, as the
+/// restart question is drawn: its title in the banner, what changes, Cancel (the lower button, the choice at first) and the
+/// change (the upper one)
+void draw_control_confirmation(ui::Ctx& c) {
+    const ControlConfirmation& q = control_confirmation;
+    dim_page(c, ui::rgba(8, 5, 2, 110));
+    std::string ask;
+    const char *title = "Reset Control", *accept = "Reset";
+    if (q.action == kAskRebind) {
+        title = "Input In Use", accept = "Bind";
+        const std::string what = q.set == HOS_BIND_PAD ? pad_name(q.code) : key_name(q.code);
+        ask = what + i18n::tr(" is bound to ") + control_names(q.conflicts) + i18n::tr(". Bind it to ") +
+              i18n::tr(controls[q.row].name) +
+              (q.set == HOS_BIND_PAD ? i18n::tr(" anyway? That control takes this one's gamepad input in its place, or loses it.")
+                                     : i18n::tr(" anyway? That control loses it."));
+    } else if (q.action == kAskResetRow) {
+        ask = i18n::tr(controls[q.row].name) + std::string(i18n::tr(": its default gamepad input and keys back?"));
+    } else {
+        title = "Reset All Controls", accept = "Reset All";
+        ask = i18n::tr("Every control's gamepad inputs and keys back to their defaults, and the Layout preset to its first?");
+    }
+    ui::banner(c, 0, title);
+    const float wrap = ui::lu(c, 1440), px = ui::lu(c, 54 * ui::kType);
+    const float th = ui::para(c, c.f.body, px, ImVec2(), 0, ask.c_str(), wrap, false);
+    float y = ui::at(c, 0, 250).y - th * 0.5f;
+    for (const char *t = ask.c_str(), *end = t + ask.size(); t < end;) {   // (each line centred, as draw_ask's)
+        const char* cut = c.f.body->CalcWordWrapPosition(px, t, end, wrap);
+        if (cut == t) cut = t + 1;
+        const float lw = c.f.body->CalcTextSizeA(px, FLT_MAX, 0, t, cut).x;
+        c.d->AddText(c.f.body, px, ImVec2(c.w * 0.5f - lw * 0.5f, y), ui::kInk, t, cut);
+        y += px * 1.3f;
+        t = cut;
+        while (t < end && (*t == ' ' || *t == '\n')) t++;
+    }
+    const float bw = ui::lu(c, 336), bh = ui::lu(c, 72);
+    const char* labels[2] = {"Cancel", accept};
+    for (int i = 0; i < 2; i++) {
+        const float my = ui::at(c, 0, i ? -330.0f : -518.0f).y;
+        const ImVec2 a(c.w * 0.5f - bw, my - bh), b(c.w * 0.5f + bw, my + bh);
+        ui::button(c, a, b, labels[i], i == q.choice);
+        hits.add(a.x, a.y, b.x, b.y, menu_hit::kButton, i);
+    }
+    const ui::Prompt prompt_list[] = {{ui::kConfirm, "Confirm"}, {ui::kBack, "Cancel"}};
+    ui::prompt_bar(c, prompt_list, 2);
 }
 
 void draw_controls(ui::Ctx& c) {
@@ -3852,30 +4867,46 @@ void draw_controls(ui::Ctx& c) {
     columns(c, &cx0, &cx1, &hx0, &hx1, &narrow);
     column(c, cx0, cx1, hh);
     const int n = kTop + kControls + 1, sel_i = csel - kTop;   // (sel_i: the control's, kControls Reset; negative: a page row)
-    const ui::Prompt idle[] = {{ui::kUpDown, "Choose"}, {ui::kLeftRight, "Column"}, {ui::kConfirm, "Bind"}, {ui::kKey, "Clear", "Del"},
+    // ((Triforce) per-control reset: Clear by a controller's free face button too, ui::kClear)
+    const ui::Prompt idle[] = {{ui::kUpDown, "Choose"}, {ui::kLeftRight, "Column"}, {ui::kConfirm, "Bind"}, {ui::kClear, "Clear"},
                                {ui::kBack, "Back"}};
     const ui::Prompt option[] = {{ui::kUpDown, "Choose"}, {ui::kLeftRight, "Change"}, {ui::kBack, "Back"}};
     const ui::Prompt wait[] = {{ui::kKey, "Cancel", "Esc"}};   // ((Triforce) Esc alone while it waits: B's key may be the one bound)
+    const ui::Prompt reset[] = {{ui::kUpDown, "Choose"}, {ui::kLeftRight, "Column"}, {ui::kConfirm, "Reset"}, {ui::kBack, "Back"}};
+    const bool on_reset = sel_i >= 0 && sel_i < kControls && ccol == kColReset && col_usable(sel_i, kColReset);
     const float bar_top = ui::prompt_bar_top(c);   // (the strip itself drawn last, over all: below)
     const Row* page_row = sel_i < 0 ? &rows[tab_row_to_global(TAB_PAGE, csel)] : nullptr;
     const char* title = page_row ? page_row->name : sel_i < kControls ? controls[sel_i].name : "Reset to defaults";
     const char* help = listening ? (listening == 1 ? "Press the gamepad button to use. Esc cancels." : "Press the key to use. Esc cancels.")
                        : page_row ? page_row->help
-                                  : "Which gamepad button and which keys press each of the Switch's buttons. Enter binds the one "
-                                    "selected; Delete clears it. The game's button icons follow after a restart.";
+                       : on_reset ? (blocked_reset_row == sel_i ? "Another control has one of this control's defaults. Clear it there first."
+                                                                : "Puts this control's default gamepad input and keys back.")
+                                  : "Which gamepad inputs and which keys press each of the Switch's buttons: either of its two "
+                                    "gamepad inputs presses it. Enter binds the one selected; Delete clears it. A button's only "
+                                    "gamepad input stays with it. The game's button icons follow after a restart.";
     const char* hint = page_row ? (page_row->hint ? page_row->hint(*page_row->value, -1) : nullptr)
-                                : "Gamepad: the D-pad moves, A binds, B goes back.";
+                       : note_row(sel_i) ? "An ocarina note's input is a note only while the ocarina waits for one; away from it, it "
+                                           "does its other job. Unset, the game's own button plays the note."
+                       : sel_i < kControls && controls[sel_i].button == HOS_KEY_TOGGLE_HUD
+                           ? "A press hides the HUD in play, the next shows it again. Its inputs are its own while it has them; "
+                             "another control bound to one has it back once this is cleared."
+                                         : "Gamepad: the D-pad moves, A binds, B goes back.";
     const float bottom = bar_top - 6 * s;   // (the rows end above the guides)
     caption(c, hx0, hx1, title, help, hint, nullptr, 0, page_row && restart_changed(*page_row));
-    // (the options' rows, a little lower: 24 controls. A plate across the row, its name at the left, the gamepad's input and the
+    // (the options' rows, a little lower: 30 controls. A plate across the row, its name at the left, the gamepad's input and the
     // keys on value plates at the right)
     const float rxm = ui::at(c, kListX, 0).x, rx0 = rxm - ui::lu(c, 912), rx1 = rxm + ui::lu(c, 912);
-    const float pad_x = rx0 + (rx1 - rx0) * 0.34f, key_x = rx0 + (rx1 - rx0) * 0.67f;
+    // ((Triforce) 11-24: three value cells, the gamepad's two inputs and the keys)
+    const float pad_x = rx0 + (rx1 - rx0) * 0.30f, alt_x = rx0 + (rx1 - rx0) * 0.51f, key_x = rx0 + (rx1 - rx0) * 0.72f;
+    const float rh = ui::lu(c, 112), pitch = ui::lu(c, 140), vin = ui::lu(c, 8);
+    // ((Triforce) per-control reset: a square at the row's right end, the keys' cell narrower by it, where the host has it)
+    const float reset_side = can_reset_rows() ? rh - 2 * vin : 0, reset_x1 = rx1 - ui::lu(c, 8), reset_x0 = reset_x1 - reset_side;
+    const float col_x[kColReset + 1] = {pad_x, alt_x, key_x, can_reset_rows() ? reset_x0 - 3 * s : rx1 - ui::lu(c, 8)};
     float top = hh + 12 * s;
-    ui::text_mid_centre(c, c.f.body, ui::lu(c, 40), (pad_x + key_x) * 0.5f, top + 9 * s, ui::kSoft, "Gamepad");
+    ui::text_mid_centre(c, c.f.body, ui::lu(c, 40), (pad_x + alt_x) * 0.5f, top + 9 * s, ui::kSoft, "Input 1");
+    ui::text_mid_centre(c, c.f.body, ui::lu(c, 40), (alt_x + key_x) * 0.5f, top + 9 * s, ui::kSoft, "Input 2");
     ui::text_mid_centre(c, c.f.body, ui::lu(c, 40), (key_x + rx1) * 0.5f - ui::lu(c, 8), top + 9 * s, ui::kSoft, "Keyboard");
     top += 24 * s;
-    const float rh = ui::lu(c, 112), pitch = ui::lu(c, 140), vin = ui::lu(c, 8);
     int shown = 0;
     const float first = scroll_rows(kControlsSlot, n, csel, top, bottom, pitch, &shown);
     scroll_bar(c, cx0 + 20 * s, top, top + shown * pitch - (pitch - rh), n, shown, first);
@@ -3903,24 +4934,42 @@ void draw_controls(ui::Ctx& c) {
         const Control& ctl = controls[i];
         name_cell(c, ImVec2(rx0, y), ImVec2(rx1, y + rh), ctl.name, sel, false, 17);
         hits.add(rx0, y0, pad_x, y1, menu_hit::kCtlRow, i);
-        for (int col = 0; col < 2; col++) {   // (two value cells, a gap between them, each drawn as the tabs' values are)
-            const float a = col ? key_x + 3 * s : pad_x, b = col ? rx1 - vin : key_x - 3 * s;
-            std::string v = col == 0 ? (keys_only(i) ? "-" : pad_name(host->binding(HOS_BIND_PAD, ctl.button, 0))) : keys_text(ctl.button);
+        if (can_reset_rows()) {   // ((Triforce) per-control reset: its square, an arrow turning back; dim when there is nothing to reset)
+            const bool usable = col_usable(i, kColReset), here = sel && ccol == kColReset && usable;
+            const ImVec2 va(reset_x0, y + vin), vb(reset_x1, y + rh - vin);
+            choice_cell(c, va, vb, "", here, false, false, !usable);
+            const ImVec2 m = (va + vb) * 0.5f;
+            const float r = reset_side * 0.26f, end = -0.92f;   // (an arc from the left round to the top right, its head there)
+            const ImU32 ink = usable ? ui::kInk : ui::kSoft;
+            c.d->PathArcTo(m, r, 4.06f, end, 20);
+            c.d->PathStroke(ink, ImDrawFlags_None, std::max(1.0f, reset_side * 0.06f));
+            const ImVec2 radial(std::cos(end), std::sin(end)), tangent(radial.y, -radial.x), head = m + radial * r;
+            const ImVec2 base = head - tangent * (reset_side * 0.1f), wing = radial * (reset_side * 0.11f);
+            c.d->AddTriangleFilled(head + tangent * (reset_side * 0.11f), base + wing, base - wing, ink);
+            if (usable) hits.add(va.x, y0, vb.x, y1, menu_hit::kCtlCell, i, 0, 0, 0, 0, kColReset);
+        }
+        for (int col = 0; col < kColReset; col++) {   // (three value cells, gaps between them, each drawn as the tabs' values are)
+            const float a = col_x[col] + (col ? 3 * s : 0), b = col_x[col + 1] - (col + 1 < kColReset ? 3 * s : 0);
+            const bool usable = col_usable(i, col);
+            std::string v = col == kColKeys ? keys_text(ctl.button) : !usable ? "-"
+                          : pad_name(host->binding(HOS_BIND_PAD, ctl.button, col == kColAlt ? 1 : 0));
             const bool here = sel && col == ccol;
             const ImVec2 va(a, y + vin), vb(b, y + rh - vin);
             if (here && listening) {   // (waiting for the new input: the light plate, the cursor round it)
                 ui::value_plate(c, va, vb);
                 ui::text_mid_centre(c, c.f.body, ui::lu(c, 50), (a + b) * 0.5f, y + rh * 0.5f - ui::lu(c, 2), ui::kInk,
-                                    col == 0 ? "Press a button..." : "Press a key...");
+                                    col != kColKeys ? "Press a button..." : "Press a key...");
                 ui::cursor(c, va - ImVec2(ui::lu(c, 2.5f), ui::lu(c, 3)), vb + ImVec2(ui::lu(c, 2.5f), ui::lu(c, 3)));
             } else {
-                choice_cell(c, va, vb, v, here, false, false, col == 0 && keys_only(i));
+                choice_cell(c, va, vb, v, here, false, false, !usable);
             }
-            if (!(col == 0 && keys_only(i))) hits.add(a, y0, b, y1, menu_hit::kCtlCell, i, 0, 0, 0, 0, col);
+            if (usable) hits.add(a, y0, b, y1, menu_hit::kCtlCell, i, 0, 0, 0, 0, col);
         }
     }
     c.d->PopClipRect();
-    (void)(listening ? ui::prompt_bar(c, wait, 1) : sel_i < 0 ? ui::prompt_bar(c, option, 3) : ui::prompt_bar(c, idle, 5));   // (the prompts, on top of the help and the rows)
+    if (control_confirmation.action != kAskNone) draw_control_confirmation(c);   // ((Triforce) its own prompts)
+    else (void)(listening ? ui::prompt_bar(c, wait, 1) : sel_i < 0 ? ui::prompt_bar(c, option, 3)
+                : on_reset || sel_i == kControls ? ui::prompt_bar(c, reset, 4) : ui::prompt_bar(c, idle, 5));   // (the prompts, on top of the help and the rows)
 }
 
 // ---- (Triforce) The Debug tab's name pages: Game flags, Cutscenes and Scan amiibo (page 6) ----
@@ -3960,7 +5009,7 @@ const char* amiibo_text(int said, bool brief) {
     case HOS_AMIIBO_WAITING: return brief ? "amiibo: waiting for the game to look for it" : "Chosen. It is on the reader as soon as the game looks for a figure.";
     case HOS_AMIIBO_ON_READER: return brief ? "amiibo: the game found the figure" : "The game found the figure and reads it.";
     case HOS_AMIIBO_READ: return brief ? "amiibo: read by the game" : "The game has read the figure. Choose it again for another touch.";
-    case HOS_AMIIBO_REFUSED: return brief ? "amiibo: not a figure's dump" : "That file is not a figure's dump (532, 540 or 572 bytes, as a tag has them).";
+    case HOS_AMIIBO_REFUSED: return brief ? "amiibo: not a figure's dump" : "That file is not a figure's dump (532, 540 or 572 bytes, as a tag has them, or a Flipper .nfc file of one).";
     case HOS_AMIIBO_NO_FILE: return brief ? "amiibo: the file could not be read" : "The file could not be read.";
     }
     return nullptr;
@@ -4008,7 +5057,11 @@ void names_open(int kind) {
         char exe[MAX_PATH];
         const DWORD n = game_module_path(exe, MAX_PATH);
         const std::string dir(exe, n);
-        names_page[kind].set_list(dn::make_list(ui::folder_files(dir.substr(0, dir.find_last_of("\\/") + 1) + "amiibo", ".bin"), false, "Your figures"));
+        // ((Triforce) a tag's bytes, .bin, and a Flipper Zero's NFC files, .nfc: host/amiibo.h amiibo_flipper)
+        const std::string folder = dir.substr(0, dir.find_last_of("\\/") + 1) + "amiibo";
+        std::vector<std::string> dumps = ui::folder_files(folder, ".bin"), nfc = ui::folder_files(folder, ".nfc");
+        dumps.insert(dumps.end(), nfc.begin(), nfc.end());
+        names_page[kind].set_list(dn::make_list(std::move(dumps), false, "Your figures"));
     } else {
         int none = 0;
         if (names_scan.compare_exchange_strong(none, 1)) std::thread(names_scan_thread).detach();
@@ -5921,7 +6974,7 @@ void draw_ask(ui::Ctx& c) {
     const float s = c.s;
     dim_page(c, ui::rgba(8, 5, 2, 110));   // (the dialog over the page: darker still; the whole window, the Full panel with it)
     ui::banner(c, 0, "Restart Needed");
-    const std::string ask = "Restart to apply " + restart_list(" and ") + "?";
+    const std::string ask = i18n::tr("Restart to apply ") + restart_list_shown(i18n::tr(" and ")) + "?";   // ((Triforce) translated)
     const float wrap = ui::lu(c, 1440), px = ui::lu(c, 54 * ui::kType);
     const float th = ui::para(c, c.f.body, px, ImVec2(), 0, ask.c_str(), wrap, false);
     float y = ui::at(c, 0, 250).y - th * 0.5f;
@@ -6052,6 +7105,11 @@ float mods_screen_alpha() {
 /// ((Triforce, 11-19) The Mods entry's page (Mods and Quit under the game's list, Quit's dialog) on the game's own grid, where
 /// its list is: game_grid.h)
 void draw_menu(ui::Ctx& c, bool perf_under) {
+    if (reshade_menu::comparing()) {   // ((Triforce) 11-24: the ReShade comparison's bar alone, over the game seen whole)
+        menu_map = {};
+        reshade_menu::draw_comparison(c, hits);
+        return;
+    }
     const bool row = page == kModsRowPage;   // ((Triforce) the Mods entry has the cursor: over the game's list, nothing dimmed)
     // ((Triforce, 11-20) the Mods screen's In: while it plays, the entries that opened it (Mods, and Quit under it) are still
     // drawn under it, on the game's list, and go as the screen comes; without them the list stood a frame without its Mods
@@ -6065,7 +7123,8 @@ void draw_menu(ui::Ctx& c, bool perf_under) {
     const int vtx_page = c.d->VtxBuffer.Size;   // (from here the page: its background, its column and all it draws)
     // (the game behind: inside its own Options screen its own background, untouched; over play the System screens' own
     // (ui::system_bg), or dimmed flat without its textures)
-    if (!embed_open && !row && !ui::system_bg(c)) c.d->AddRectFilled(ImVec2(0, 0), ImVec2(c.w, c.h), ui::rgba(8, 5, 2, ui::kDimAlpha));
+    const bool tuning = tune_mode && page == 0 && !embed_open && !row;   // ((Triforce) the tuning bar: the game seen whole
+    if (!embed_open && !row && !tuning && !ui::system_bg(c)) c.d->AddRectFilled(ImVec2(0, 0), ImVec2(c.w, c.h), ui::rgba(8, 5, 2, ui::kDimAlpha));
     // ((Triforce, 11-19) inside the game's own Options screen the Full panel between our page and our header, as on the game's
     // own tab it is over the game's panes and under our header (menu_record: draw_perf, then draw_game_tab): the lab's "our
     // help box draws over part of the stats panel" (fullscreen 3440 x 1440). ((11-20) Over play under the pages, as before.
@@ -6101,7 +7160,7 @@ void draw_menu(ui::Ctx& c, bool perf_under) {
     hits.clear(0, 0, k.w, k.h);
     hits_game_tab = false;
     if (row) draw_mods_row(k, true);
-    else if (page != 5) {   // (the System screens' dark column behind the list: SystemBg_05, under the header)
+    else if (page != 5 && !tuning) {   // (the System screens' dark column behind the list: SystemBg_05, under the header)
         float cx0, cx1, hx0, hx1;
         bool narrow;
         columns(k, &cx0, &cx1, &hx0, &hx1, &narrow);
@@ -6121,6 +7180,7 @@ void draw_menu(ui::Ctx& c, bool perf_under) {
     else if (page == kModsPage) draw_mods(k);
     else if (page == kAchPage) draw_achievements(k);   // ((Triforce) the System tab's Achievements)
     else if (page == kFilesPage) draw_files(k);        // ((Triforce) the title's file select, and the System tab's Save files)
+    else if (tuning) draw_tune_bar(k);
     else draw_options(k);
     if (on_game) c.d->PopClipRect();
     int perf0 = 0, perf1 = 0;   // (the Full panel's vertices: in the window's pixels already)
@@ -6139,6 +7199,169 @@ void draw_menu(ui::Ctx& c, bool perf_under) {
     // (the draw list's current header, for whatever is drawn next: the window's again after the pages' pops)
 }
 
+// ---- ((Triforce) the FPS counter's levels between On and Full (fps_levels.h): Frame time, Graph, Breakdown, Dev. Their texts
+// are made twice a second where the counter's number is (menu_tick, fps_detail_sample), from the frames' ring Full measures
+// with (perf_ring) and the counts the renderer keeps anyway; the graph is drawn from the ring's newest frames. The render
+// thread's lane shows only once a render thread has told its times (menu_fps_render_thread): none in a build without one ----
+std::atomic<int64_t> rt_work_ns{0}, rt_wait_ns{0};
+std::atomic<bool> rt_seen{false};
+struct FpsDetail {
+    bool have = false;
+    char time[32] = "", low[32] = "";
+    double frame_ms = 0, part[fps_levels::kParts] = {}, gpu_ms = -1;   // (ms a frame; gpu_ms -1: no timestamps)
+    bool rt = false;
+    double rt_work_ms = 0, rt_wait_ms = 0;
+    char dev[fps_levels::kDevLines][40] = {};
+    perf_stats::Base base;
+    int64_t frames = 0, draws = 0, skipped = 0, dispatches = 0, passes = 0, uploads = 0, pipelines = 0, rt_work = 0, rt_wait = 0;
+    int level = 0;   // (the level the counts were taken at: another one starts them anew)
+} fps_detail;
+float auto_cap_fps();   // (below: the Frame rate cap's rate)
+void edged_text(ui::Ctx& c, ImFont* f, float px, ImVec2 p, ImU32 col, const char* t);   // (below)
+/// The Frame rate cap's frame time, ms; 0 with Uncapped (no target)
+double fps_target_ms() { return opts.fps_cap >= fps_cap::kUncapped ? 0.0 : 1000.0 / std::max(1.0f, auto_cap_fps()); }
+void fps_detail_sample() {
+    FpsDetail& d = fps_detail;
+    const bool fresh = d.level != opts.show_fps;
+    d.level = opts.show_fps;
+    perf_stats::Summary second, ten;
+    {
+        std::lock_guard lk(perf_mu);
+        second = perf_stats::summarize(perf_ring, 1000000000ll);
+        ten = perf_stats::summarize(perf_ring);
+    }
+    if (second.frames) fps_levels::frame_time_text(d.time, sizeof d.time, second.avg_ms), d.frame_ms = second.avg_ms;
+    else snprintf(d.time, sizeof d.time, "-");
+    fps_levels::low_text(d.low, sizeof d.low, ten.low1_fps);
+    d.have = true;
+    if (!fps_levels::shows_breakdown(opts.show_fps)) return;
+    // (the parts a frame since the sample before, as Full's figures per frame: perf_stats::per_frame)
+    perf_stats::Counts now;
+    now.frames = game_frames.load(std::memory_order_relaxed);
+    now.prep_ns = prof_ns[PROF_SUBMIT] + prof_ns[PROF_PRESENT], now.gpu_ns = gpu_time_busy_ns();
+    int64_t astc = 0, bytes = 0;
+    texture_stats(&now.uploads, &astc, &bytes);
+    draw_wait_split(&now.pipe_us, &now.shader_us);
+    perf_stats::PerFrame f;
+    const perf_stats::Step st = perf_stats::per_frame(d.base, now, fresh, &f);
+    if (st == perf_stats::STEP_NEW) {
+        fps_levels::split(d.frame_ms, f.prep_ms, f.pipe_ms, f.shader_ms, d.part);
+        d.gpu_ms = f.gpu_ms;
+    }
+    // (the render thread's lane, once it has told its times: its work and its waits a game frame)
+    const int64_t work = rt_work_ns.load(std::memory_order_relaxed), wait = rt_wait_ns.load(std::memory_order_relaxed);
+    const int64_t n = now.frames - d.frames;
+    d.rt = rt_seen.load(std::memory_order_relaxed);
+    if (d.rt && n > 0 && !fresh) d.rt_work_ms = (work - d.rt_work) / 1e6 / n, d.rt_wait_ms = (wait - d.rt_wait) / 1e6 / n;
+    d.rt_work = work, d.rt_wait = wait;
+    if (fps_levels::shows_dev(opts.show_fps)) {   // (the renderer's own numbers a frame since the sample before)
+        int64_t draws = 0, skipped = 0, dispatches = 0, pipelines = 0, passes = 0, mesh = 0;
+        double pipeline_ms = 0;
+        draw_stats(&draws, &skipped, &dispatches, &pipelines);
+        draw_stats2(&passes, &mesh, &pipeline_ms);
+        const int64_t frames = fresh ? 0 : n;
+        uint64_t used = 0, allowed = 0;
+        const bool known = vram_usage(&used, &allowed);
+        fps_levels::vram_line(d.dev[fps_levels::kVram], sizeof d.dev[0], used, allowed, known);
+        fps_levels::per_frame_line(d.dev[fps_levels::kDraws], sizeof d.dev[0], draws - d.draws, frames);
+        fps_levels::per_frame_line(d.dev[fps_levels::kDispatches], sizeof d.dev[0], dispatches - d.dispatches, frames);
+        fps_levels::per_frame_line(d.dev[fps_levels::kPasses], sizeof d.dev[0], passes - d.passes, frames);
+        fps_levels::per_frame_line(d.dev[fps_levels::kSkipped], sizeof d.dev[0], skipped - d.skipped, frames);
+        fps_levels::per_frame_line(d.dev[fps_levels::kUploads], sizeof d.dev[0], now.uploads - d.uploads, frames);
+        snprintf(d.dev[fps_levels::kPipelines], sizeof d.dev[0], "%lld", (long long)pipelines);   // (built since the start)
+        d.draws = draws, d.skipped = skipped, d.dispatches = dispatches, d.passes = passes, d.pipelines = pipelines;
+    }
+    d.uploads = now.uploads, d.frames = now.frames;
+}
+/// (draw_fps) The levels' lines under the counter, right-aligned at x1 from y down: the frame time and the 1% low; the graph
+/// of the newest frames against the cap's frame time; the frame's parts as a bar, the GPU's (and the render thread's) lanes
+/// under it, each part named with its time; the renderer's numbers. In the counter's look: the HUD's dark edge, no plate but
+/// the graph's and the bars' own
+void draw_fps_detail(ui::Ctx& c, float x1, float y) {
+    const FpsDetail& d = fps_detail;
+    const int level = opts.show_fps;
+    if (!d.have || !fps_levels::shows_time(level)) return;
+    ImFont* f = c.f.strong;
+    const float px = ui::lu(c, 34), line = ui::lu(c, 46), w = ui::lu(c, 640);
+    auto right = [&](float yy, const char* t, ImU32 col) {   // (a line's text, its right end at x1, its middle at yy)
+        edged_text(c, f, px, ImVec2(x1 - ui::size_of(f, px, t).x, ui::mid_top(f, px, yy)), col, t);
+    };
+    char b[96];
+    snprintf(b, sizeof b, "%s   %s", d.time, d.low);
+    right(y, b, ui::kInk);
+    y += line;
+    const double target = fps_target_ms();
+    if (fps_levels::shows_graph(level)) {   // (the newest frames: the cap's frame time a line across, a frame past the top at it)
+        float ms[kPerfGraph];
+        int n = 0;
+        {
+            std::lock_guard lk(perf_mu);
+            n = perf_stats::newest(perf_ring, ms, kPerfGraph);
+        }
+        float sorted[kPerfGraph];
+        std::copy(ms, ms + n, sorted);
+        const double top = fps_levels::graph_top(target, fps_levels::typical_ms(sorted, n));
+        const float gh = ui::lu(c, 140), gx0 = x1 - w, gy0 = y - line * 0.3f, gy1 = gy0 + gh;
+        c.d->AddRectFilled(ImVec2(gx0, gy0), ImVec2(x1, gy1), ui::rgba(0, 0, 0, 110), ui::kRound * c.s);
+        if (target > 0 && target < top) {
+            const float ty = gy1 - (float)(target / top) * gh;
+            c.d->AddLine(ImVec2(gx0, ty), ImVec2(x1, ty), ui::alpha(ui::kAccent, 0.6f), std::max(1.0f, ui::lu(c, 2)));
+        }
+        for (int i = 1; i < n; i++) {
+            const auto at = [&](int k) {
+                return ImVec2(gx0 + w * (float)(kPerfGraph - n + k) / (kPerfGraph - 1),
+                              gy1 - (float)(std::min<double>(ms[k], top) / top) * gh);
+            };
+            const int grade = fps_levels::rate_grade(ms[i] > 0 ? 1000.0 / ms[i] : 0, target);
+            const ImU32 col = grade == 0 ? ui::kInk : grade == 1 ? ui::rgba(240, 190, 80) : ui::rgba(240, 96, 80);
+            c.d->AddLine(at(i - 1), at(i), col, std::max(1.0f, ui::lu(c, 3)));
+        }
+        snprintf(b, sizeof b, "%.0f ms", top);
+        edged_text(c, f, ui::lu(c, 26), ImVec2(gx0 + ui::lu(c, 8), gy0 + ui::lu(c, 4)), ui::kSoft, b);
+        y = gy1 + line * 0.8f;
+    }
+    if (fps_levels::shows_breakdown(level) && d.frame_ms > 0) {   // (the parts as a bar over the frame time, the lanes under it)
+        static const ImU32 cols[fps_levels::kParts] = {ui::rgba(120, 190, 120), ui::rgba(110, 150, 240), ui::rgba(240, 190, 80),
+                                                       ui::rgba(240, 110, 90)};
+        const float bh = ui::lu(c, 26), bx0 = x1 - w;
+        const double span = std::max(d.frame_ms, d.gpu_ms > 0 ? d.gpu_ms : 0.0);
+        auto bar = [&](float yy, double ms, ImU32 col, float x) {   // (a part from x, its share of the span)
+            const float wpx = (float)(ms / span) * w;
+            if (wpx > 0.5f) c.d->AddRectFilled(ImVec2(x, yy), ImVec2(x + wpx, yy + bh), col);
+            return x + wpx;
+        };
+        float x = bx0;
+        c.d->AddRectFilled(ImVec2(bx0, y - bh * 0.5f), ImVec2(x1, y + bh * 0.5f), ui::rgba(0, 0, 0, 110));
+        for (int p = 0; p < fps_levels::kParts; p++) x = bar(y - bh * 0.5f, d.part[p], cols[p], x);
+        y += line * 0.8f;
+        if (d.gpu_ms > 0) {
+            c.d->AddRectFilled(ImVec2(bx0, y - bh * 0.5f), ImVec2(x1, y + bh * 0.5f), ui::rgba(0, 0, 0, 110));
+            bar(y - bh * 0.5f, d.gpu_ms, ui::rgba(200, 140, 230), bx0);
+            snprintf(b, sizeof b, "GPU %.1f ms", d.gpu_ms);
+            right(y, b, ui::kSoft);
+            y += line * 0.8f;
+        }
+        if (d.rt) {   // (the render thread's lane: its work, then its waits)
+            c.d->AddRectFilled(ImVec2(bx0, y - bh * 0.5f), ImVec2(x1, y + bh * 0.5f), ui::rgba(0, 0, 0, 110));
+            bar(y - bh * 0.5f, d.rt_wait_ms, ui::rgba(90, 90, 100), bar(y - bh * 0.5f, d.rt_work_ms, ui::rgba(110, 150, 240), bx0));
+            snprintf(b, sizeof b, "Render thread %.1f ms, waits %.1f ms", d.rt_work_ms, d.rt_wait_ms);
+            right(y, b, ui::kSoft);
+            y += line * 0.8f;
+        }
+        for (int p = 0; p < fps_levels::kParts; p++) {
+            snprintf(b, sizeof b, "%s %.1f ms", fps_levels::part_name(p), d.part[p]);
+            right(y, b, cols[p]);
+            y += line * 0.8f;
+        }
+    }
+    if (fps_levels::shows_dev(level))
+        for (int i = 0; i < fps_levels::kDevLines; i++) {
+            snprintf(b, sizeof b, "%s %s", fps_levels::dev_name(i), d.dev[i][0] ? d.dev[i] : "-");
+            right(y, b, ui::kSoft);
+            y += line * 0.8f;
+        }
+}
+
 /// The FPS counter, as a counter of the game's HUD: the rate in the HUD's own digits (NinDev-Number, the rupee counter's
 /// font), white with the HUD's soft dark edge, "FPS" small beside it in the menus' font; with frame generation the game's
 /// own rate after a slash, smaller, as the HUD writes an amount of its most ("12 / 99"). No plate: the HUD has none.
@@ -6151,6 +7374,7 @@ void draw_menu(ui::Ctx& c, bool perf_under) {
 /// itself and down, dark and half seen, e (px / 20, a pixel at least) from it. The FPS counter's, and (Triforce) the Full
 /// panel's texts', so that they read over a bright scene and the HUD's own art
 void edged_text(ui::Ctx& c, ImFont* f, float px, ImVec2 p, ImU32 col, const char* t) {
+    t = i18n::tr(t);   // ((Triforce) in the menu's language, as ui::size_of measures it)
     const float e = std::max(1.0f, px * 0.05f);
     for (int k = 0; k < 8; k++) {
         const float ang = k * 0.785398f;
@@ -6204,6 +7428,7 @@ void draw_fps(ui::Ctx& window, bool under_banner) {
         x += edged(digits, small, x, my + ui::lu(c, 8), game, ui::kSoft) + gap;
     }
     edged(c.f.strong, label, x, my + ui::lu(c, 12), "FPS", ui::kAccent);
+    draw_fps_detail(c, x1, my + ui::lu(c, 74));   // ((Triforce) the levels between On and Full under it: fps_levels.h
     if (on_game) c.d->PopClipRect(), put_on_grid(c.d, vtx0, cmd0, col.map, window_clip);
 }
 
@@ -6379,7 +7604,7 @@ void draw_game_tab(ui::Ctx& c) {
 void draw_notice(ui::Ctx& c) {
     const float my = ui::at(c, 0, -1018).y, right = ui::at(c, 1840, 0).x, px = ui::lu(c, 48);
     const float w = ui::size_of(c.f.body, px, notice_text).x;
-    if (const ui::Art* t = ui::art("SystemGuideBase_00")) ui::image(c, t, ImVec2(right - w - ui::lu(c, 300), ui::prompt_bar_top(c)), ImVec2(c.w + ui::lu(c, 4), c.h), ui::rgba(0, 0, 0, 215), true);
+    if (const ui::Art* t = ui::skin("SystemGuideBase_00")) ui::image(c, t, ImVec2(right - w - ui::lu(c, 300), ui::prompt_bar_top(c)), ImVec2(c.w + ui::lu(c, 4), c.h), ui::rgba(0, 0, 0, 215), true);
     else c.d->AddRectFilled(ImVec2(right - w - ui::lu(c, 60), my - px), ImVec2(c.w, c.h), ui::kBar);
     ui::text_mid(c, c.f.body, px, right - w, my, ui::kInk, notice_text);
 }
@@ -6445,6 +7670,12 @@ void draw_startup(ui::Ctx& c) {
 }
 
 } // namespace
+/// ((Triforce) 11-24, reshade_menu.h) the User preset file row's last choice: its files' count (outside
+/// the unnamed namespace: the header declares it in mkwvk's)
+void reshade_user_rows(int hi) {
+    for (Row& r : rows)
+        if (r.value == &reshade_menu::user_pick) r.hi = hi;
+}
 
 void startup_fade_to(float f) { startup_fade.store(f, std::memory_order_relaxed); }
 
@@ -6470,6 +7701,18 @@ int renodx_at_start = 0, upscale_pre_at_start = 0;
 int tex_bc1_at_start = Options().tex_bc1;
 static_assert(Options().tex_bc1 == 1, "Opaque textures as BC1 is on by default: a first start takes it");
 int tex_detail_at_start = 0;
+extern int64_t presents_now;   // (vk_replay.cpp)
+int evil_hd_now() {
+    static const int64_t flip = [] {
+        const char* e = getenv("RX_VK_EVIL_FLIP");
+        const int64_t n = e && *e ? atoll(e) : 0;
+        if (n > 0) logf("vk: RX_VK_EVIL_FLIP=%lld: Evil HD turned the other way every %lld presents (the lab's before and after)",
+                        (long long)n, (long long)n);
+        return n > 0 ? n : 0;
+    }();
+    const int row = opts.evil_hd ? 1 : 0;
+    return flip ? row ^ (int)((presents_now / flip) & 1) : row;
+}
 int replay_threads_at_start = replay_threads::kDefaultRow;
 static_assert(Options().replay_threads == replay_threads::kDefaultRow, "the row's default is replay_threads.h's");
 bool renodx_chosen() {
@@ -6499,7 +7742,14 @@ void menu_init() {
         for (int i = 0; i < n; i++) {
             list[i].name[sizeof list[i].name - 1] = 0;
             screen_add(list[i].w, list[i].h, list[i].name, list[i].opens != 0);
+            // ((Triforce) 11-24) the Fullscreen screen row's entries, in the host's order (host/display.c counts them so)
+            char label[96];
+            snprintf(label, sizeof label, "%s (%ux%u)", list[i].name[0] ? list[i].name : ("Screen " + std::to_string(i + 1)).c_str(),
+                     list[i].w, list[i].h);
+            fs_screen_labels.push_back(label);
         }
+        for (Row& r : rows)
+            if (r.value == &opts.fs_screen) r.hi = (int)fs_screen_labels.size();
     }
     if (FILE* f = fopen(ini_path().c_str(), "r")) {
         has_options = true;
@@ -6529,8 +7779,14 @@ void menu_init() {
                 mic_want = mic_key(eq + 1);
             }
             if (!strcmp(line, "gpu_device_name")) gpu_want = mic_key(eq + 1);   // ((Triforce) 11-20: the GPU device row's card, by its name)
+            if (!strcmp(line, "fullscreen_screen_name")) fs_screen_want = fs_key(mic_key(eq + 1));   // ((Triforce) 11-24: the Fullscreen screen, by its name)
         }
         fclose(f);
+        if (!fs_screen_want.empty()) {   // ((Triforce) 11-24) the Fullscreen screen found by its name and size where it is now; gone: Automatic
+            opts.fs_screen = 0;
+            for (size_t i = 0; i < fs_screen_labels.size(); i++)
+                if (fs_key(fs_screen_labels[i]) == fs_screen_want) opts.fs_screen = (int)i + 1;
+        }
         {   // ((Triforce) Custom's size from the file's own two numbers, not each kept to its row's ends: custom_rows_read)
             const auto side = [](const char* key) {
                 const auto at = ini_base.find(key);
@@ -6545,9 +7801,29 @@ void menu_init() {
 
         hdr_at_start = opts.hdr;   // (local, RenoDX port: vk_menu.h)
         renodx_at_start = opts.renodx, upscale_pre_at_start = opts.upscale_pre;
-        tex_detail_at_start = opts.tex_detail;
+        tex_detail_at_start = evil_hd::tex_detail(opts.evil_hd, opts.tex_detail);   // ((Triforce, 11-23) Evil HD: Full)
         tex_bc1_at_start = opts.tex_bc1;
         replay_threads_at_start = opts.replay_threads;
+        {   // ((Triforce) 11-24) the Output device row's device, by its id: read whole (the lines above are cut at 80 bytes),
+            // the base for the next save as the file has it, and told to the host
+            if (FILE* g = fopen(ini_path().c_str(), "r")) {
+                char text[HOS_OUTPUT_ID_CAP + 64];
+                while (fgets(text, sizeof text, g)) {
+                    if (!strchr(text, '\n') && !feof(g)) {   // (longer than any id: not one, and its rest no line of its own)
+                        int c;
+                        while ((c = fgetc(g)) != '\n' && c != EOF) {}
+                        continue;
+                    }
+                    if (!strncmp(text, "audio_output_device_id=", 23)) output_want = output_id_key(text + 23);
+                    if (!strncmp(text, "audio_output_device_name=", 25)) output_saved_name = mic_key(output_id_key(text + 25).c_str());
+                }
+                fclose(g);
+            }
+            if (ini_base.count("audio_output_device_id")) ini_base["audio_output_device_id"] = output_want;
+            if (ini_base.count("audio_output_device_name")) ini_base["audio_output_device_name"] = output_saved_name;
+            refresh_outputs();
+            if (can_outputs()) host->audio_output_select(output_want.c_str());
+        }
         // (the saved microphone by its name, not its place; the host told the row's choice. Off or the default: no list, no SDL
         // audio at the start)
         if (!mic_want.empty()) refresh_mics();
@@ -6557,6 +7833,8 @@ void menu_init() {
         }
         if (!has_resolution && old_dynres >= 0) opts.resolution = old_dynres ? 0 : 1;
         opts.rumble = rumble_step(opts.rumble);   // (a hand-edited 60: 50, on the arrows' steps)
+        opts.vibration = std::min(std::max(opts.vibration, 0), 2);   // ((Triforce) 11-24: Auto, Basic or Off)
+        opts.ds_hd_haptics = opts.ds_hd_haptics != 0;
         // (Game speed is Real time by default now: Per frame played at half speed at 30 fps, the "slow motion" players
         // reported. An options file from before kept the old default whether chosen or not: Real time for it too)
         if (!v2) opts.realtime = 1;
@@ -6597,6 +7875,7 @@ void menu_init() {
     // Minimum set, without the preset: the 3D at 50%, the handheld profile's output, the smallest textures, frames shown
     // evenly; the memory budgets are the card's own)
     first_start_no_file = !has_options;   // ((Triforce, 11-22, PRESENT-46) for menu_first_start, once the card is known)
+    sim_turf_init(ini_path());   // ((Triforce, 11-24) the Simulated turf page's own file, beside this one)
     if (!has_options && getenv("RX_VK_LOW_SPEC") && atoi(getenv("RX_VK_LOW_SPEC")) != 0) {
         opts.resolution = ur::snap(upscaler(), 4), opts.output_res = merged_rows::kHandheldOutput, opts.tex_detail = 3;
         opts.pace = 1, opts.realtime = 1, opts.sharpness = 0;
@@ -6619,6 +7898,219 @@ void menu_init() {
     restart_init();   // (what this run started with: the rows that take a restart differ from it once changed)
 }
 
+namespace {
+// ---- ((Triforce) Auto (this PC), the Graphics tab's first row: auto_settings.h. Off (the default): nothing here runs but one
+// comparison. On: auto_apply sets the rows from the hardware when the row is turned On, or at a start whose hardware differs
+// from the one it chose for (auto_start); the replay's 120-present windows tune them in play (menu_auto_tune, on the replay's
+// thread, asks; auto_tick, on the menu's, sets). RX_VK_AUTO_TUNE=0: no tuning in play ----
+bool auto_applying = false;   // (auto_apply's own changes: no row turns Auto Off)
+std::atomic<int> auto_generation{0};   // (a new choice: the tuning starts again)
+std::atomic<int> auto_request{0};      // (the tuning's step for auto_tick: action | packed state << 8, 0 none)
+enum { AUTO_GRASS = 1, AUTO_SHADOW, AUTO_RES_LIGHTER, AUTO_RES_HEAVIER, AUTO_SETTLED };
+auto_settings::Hardware auto_hardware() {
+    auto_settings::Hardware hw;
+    const VkPhysicalDeviceProperties& p = dev.props;
+    hw.vendor = p.vendorID == 0x10de ? auto_settings::NVIDIA : p.vendorID == 0x1002 ? auto_settings::AMD
+              : p.vendorID == 0x8086 ? auto_settings::INTEL : auto_settings::OTHER;
+    hw.integrated = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+    // (the device's mesh shaders; a card the Mesh shaders row runs as compute has them all the same)
+    hw.mesh_native = dev.mesh_shader || opts.mesh_mode == 1;
+    hw.dlss_runs = dlss_why() == DLSS_OK;
+    hw.fsr4_runs = fsr4_why() == FSR_OK;
+    hw.vram_mb = (uint32_t)(device_vram_bytes() >> 20);
+    if (const char* e = getenv("RX_VK_AUTO_VRAM_MB")) hw.vram_mb = (uint32_t)std::max(0, atoi(e));   // (the lab: another card's memory)
+    hw.threads = (int)cpu_count();
+#ifdef _WIN32
+    MEMORYSTATUSEX m{};
+    m.dwLength = sizeof m;
+    if (GlobalMemoryStatusEx(&m)) hw.ram_mb = (uint32_t)(m.ullTotalPhys >> 20);
+#else
+    const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGE_SIZE);
+    if (pages > 0 && page > 0) hw.ram_mb = (uint32_t)(((uint64_t)pages * (uint64_t)page) >> 20);
+#endif
+    return hw;
+}
+/// The rows set from the hardware (when: for the log). keep: saved here (at a start; set_row saves its own)
+void auto_apply(const char* when, bool keep) {
+    if (!dev.device) return;   // (no card yet: auto_start chooses once it is known)
+    const auto_settings::Hardware hw = auto_hardware();
+    const auto_settings::Choice c = auto_settings::choose(hw);
+    auto_applying = true;
+    opts.dlss = c.upscaler;
+    opts.resolution = c.resolution;
+    opts.tex_detail = c.tex_detail;
+    __atomic_store_n(&opts.shadow_res, c.shadow_res, __ATOMIC_RELAXED);
+    __atomic_store_n(&opts.grass_distance, c.grass, __ATOMIC_RELAXED);
+    opts.auto_for = auto_settings::fingerprint(hw, dev.props.vendorID, dev.props.deviceID);
+    opts.auto_tune = 0;
+    auto_generation.fetch_add(1, std::memory_order_relaxed);
+    auto_applying = false;
+    logf("menu: Auto (this PC): %s: %s: Upscaler %s, Render resolution %s, Texture detail %s, Shadow resolution %s, Grass "
+         "distance %s (%s, %u MB of video memory, %u MB of RAM, %d threads)", when, c.why, tx_upscaler(opts.dlss),
+         tx_resolution(opts.resolution), tx_tex_detail(opts.tex_detail), tx_shadow_res(opts.shadow_res),
+         tx_grass_distance(opts.grass_distance), dev.props.deviceName, (unsigned)hw.vram_mb, (unsigned)hw.ram_mb, hw.threads);
+    if (keep) save();
+}
+/// (set_row, after a row's change) The Auto row turned On: its choice now. A row it sets changed by hand while it is On: Off
+void auto_row_set(const int* value) {
+    if (auto_applying) return;
+    if (value == &opts.auto_pc) {
+        if (opts.auto_pc) auto_apply("turned On", false);
+        else logf("menu: Auto (this PC): turned Off (the rows stay as they are)");
+        return;
+    }
+    if (opts.auto_pc && (value == &opts.dlss || value == &opts.resolution || value == &opts.tex_detail ||
+                         value == &opts.shadow_res || value == &opts.grass_distance)) {
+        opts.auto_pc = 0;
+        logf("menu: Auto (this PC): Off, a row it sets changed by hand");
+    }
+}
+/// (menu_first_start: the card is known, before the host's one read of the rows that take a restart) Auto On: chosen again
+/// for hardware other than the one it chose for, the rows that take a restart then this run's
+void auto_start() {
+    static bool done;
+    if (done || !opts.auto_pc) return;
+    done = true;
+    const int32_t fp = auto_settings::fingerprint(auto_hardware(), dev.props.vendorID, dev.props.deviceID);
+    if (fp == opts.auto_for) {
+        logf("menu: Auto (this PC): the settings chosen for this PC before (tuning state %d)", opts.auto_tune);
+        return;
+    }
+    auto_apply("new hardware", true);
+    for (const Row& r : rows)
+        if (r.value == &opts.resolution || r.value == &opts.dlss) restart_state.restart_value(restart_slot_of(r), restart_value_of(r));
+}
+/// (the tuning's Render resolution steps, dir -1 lighter, +1 heavier: the upscaler's own steps by size, up to best_step;
+/// none from Auto (dynamic) or an engine's native AA)
+int auto_res_step(int up, int res, int dir) {
+    if (ur::full_scale(up)) return res;
+    const int p = ur::percent(ur::snap(up, res));
+    if (!p) return res;
+    const int top = ur::percent(auto_settings::best_step(ur::engine(up)));
+    int n = 0, best = res, best_p = dir < 0 ? 0 : 1000;
+    const int* s = ur::steps(up, n);
+    for (int i = 0; i < n; i++) {
+        const int q = ur::percent(s[i]);
+        if (!q) continue;
+        if (dir < 0 ? (q < p && q > best_p) : (q > p && q < best_p && q <= top)) best = s[i], best_p = q;
+    }
+    return best;
+}
+/// (the cap the game runs to: the Frame rate cap row's, the display's refresh for Monitor's rate and Uncapped)
+float auto_cap_fps() {
+    const int v = opts.fps_cap;
+    static const int caps[] = {60, 90, 120, 144, 165, 240};
+    if (v < 0) return v == -1 ? 45.0f : v == -2 ? 40.0f : 30.0f;
+    if (v >= fps_cap::kMonitor) {
+        const int cap = fps_cap::of_display(display_refresh_mhz());
+        return cap ? (float)cap : 60.0f;
+    }
+    return (float)caps[std::min(v, 5)];
+}
+/// (menu_tick, the menu's thread: the tuning's step set, saved, said)
+void auto_tick() {
+    const int req = auto_request.exchange(0, std::memory_order_acquire);
+    if (!req || !opts.auto_pc) return;
+    const int action = req & 0xff;
+    const int up = upscaler();
+    char was[48];
+    snprintf(was, sizeof was, "%s", tx_resolution(opts.resolution));
+    if (action == AUTO_GRASS) __atomic_store_n(&opts.grass_distance, std::max(0, opts.grass_distance - 1), __ATOMIC_RELAXED);
+    if (action == AUTO_SHADOW) __atomic_store_n(&opts.shadow_res, std::max(0, opts.shadow_res - 1), __ATOMIC_RELAXED);
+    if (action == AUTO_RES_LIGHTER || action == AUTO_RES_HEAVIER)
+        opts.resolution = auto_res_step(up, opts.resolution, action == AUTO_RES_LIGHTER ? -1 : 1);
+    opts.auto_tune = req >> 8;
+    save();
+    if (action == AUTO_GRASS || action == AUTO_SHADOW)
+        logf("menu: Auto (this PC): frames missed with the GPU busy: %s one step lower, to %s (at once)",
+             action == AUTO_GRASS ? "Grass distance" : "Shadow resolution",
+             action == AUTO_GRASS ? tx_grass_distance(opts.grass_distance) : tx_shadow_res(opts.shadow_res));
+    else if (action != AUTO_SETTLED)
+        logf("menu: Auto (this PC): %s: Render resolution %s to %s, from the next start", action == AUTO_RES_LIGHTER
+             ? "frames missed with the GPU busy" : "the cap held with the GPU under half busy", was, tx_resolution(opts.resolution));
+    else logf("menu: Auto (this PC): the settings hold this PC's cap: tuning done");
+}
+/// ((Triforce) the replay's thread, every 120 presents: Auto (this PC)'s tuning while the row is On (not with frame
+/// generation, whose made frames are not the game's). Lighter: the Grass distance, then the Shadow resolution, a step at
+/// once; then the Render resolution, for the next start (it takes a restart: the tuning is done for this run). Heavier: the
+/// Render resolution, for the next start
+void auto_tune_window(double gpu_ms, double draws, double fps) {
+    static const bool off = getenv("RX_VK_AUTO_TUNE") && atoi(getenv("RX_VK_AUTO_TUNE")) == 0;
+    if (off || !__atomic_load_n(&opts.auto_pc, __ATOMIC_RELAXED) || framegen_on()) return;
+    static auto_settings::Tuning t;
+    static int generation = -1;
+    static bool settled;
+    if (generation != auto_generation.load(std::memory_order_relaxed)) {
+        generation = auto_generation.load(std::memory_order_relaxed);
+        t = auto_settings::Tuning{};
+        auto_settings::unpack(__atomic_load_n(&opts.auto_tune, __ATOMIC_RELAXED), t, settled);
+    }
+    const int grass = __atomic_load_n(&opts.grass_distance, __ATOMIC_RELAXED);
+    const int shadow = __atomic_load_n(&opts.shadow_res, __ATOMIC_RELAXED);
+    const int up = upscaler(), res = __atomic_load_n(&opts.resolution, __ATOMIC_RELAXED);
+    const bool lighter_res = auto_res_step(up, res, -1) != res, heavier_res = auto_res_step(up, res, 1) != res;
+    const auto_settings::Verdict v = auto_settings::tune(t, (float)gpu_ms, (float)draws, (float)fps, auto_cap_fps(),
+                                                         grass > 0 || shadow > 0 || lighter_res, heavier_res);
+    int action = 0;
+    if (v == auto_settings::LIGHTER) action = grass > 0 ? AUTO_GRASS : shadow > 0 ? AUTO_SHADOW : AUTO_RES_LIGHTER;
+    if (v == auto_settings::HEAVIER) action = AUTO_RES_HEAVIER;
+    if (action == AUTO_RES_LIGHTER || action == AUTO_RES_HEAVIER) t.done = true;   // (it applies at the next start)
+    if (v == auto_settings::KEEP) action = AUTO_SETTLED, settled = true;
+    if (v == auto_settings::CPU_BOUND)
+        logf("menu: Auto (this PC): %.1f fps of %.0f with the GPU %.1f ms a frame: the processor holds it; nothing changed this run",
+             t.fps_mid, auto_cap_fps(), t.gpu_mid);
+    if (action) auto_request.store(action | auto_settings::pack(t, settled) << 8, std::memory_order_release);
+}
+}   // namespace
+/// ((Triforce) vk_replay.cpp, every 120 presents: Auto (this PC)'s tuning (auto_tune_window)
+void menu_auto_tune(double gpu_ms, double draws, double fps) { auto_tune_window(gpu_ms, draws, fps); }
+/// ((Triforce) a render thread's frame for the FPS counter's Breakdown lane (fps_detail_sample): its time recording and its
+/// time waiting, ns, added each frame. Never called without a render thread: the lane is not shown then
+void menu_fps_render_thread(int64_t work_ns, int64_t wait_ns) {
+    rt_work_ns.fetch_add(work_ns, std::memory_order_relaxed), rt_wait_ns.fetch_add(wait_ns, std::memory_order_relaxed);
+    rt_seen.store(true, std::memory_order_relaxed);
+}
+
+namespace {
+/// ((Triforce) The Output resolution's mode_list: the display modes of the screen the game's window is on (the main one with no
+/// window), and the common sizes of each shape up to its size (output_modes.h), as the game takes them (output_size_used), each
+/// once. Read the first time the menu opens (Windows: EnumDisplaySettingsW; elsewhere the renderer cannot ask SDL for the
+/// modes: the common sizes up to the screen the window opens on)
+void read_mode_sizes() {
+    static bool read = false;
+    if (read) return;
+    read = true;
+    std::vector<Out>& sizes = mode_list;
+    std::vector<output_modes::Size> modes;
+    unsigned sw = 0, sh = 0;
+#ifdef _WIN32
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof mi;
+    const HWND w = app_window();
+    const bool known = GetMonitorInfoW(w ? MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST) : MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY), &mi);
+    DEVMODEW dm{};
+    dm.dmSize = sizeof dm;
+    if (known && EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) sw = dm.dmPelsWidth, sh = dm.dmPelsHeight;
+    for (DWORD i = 0; known && i < 4096; i++) {
+        DEVMODEW m{};
+        m.dmSize = sizeof m;
+        if (!EnumDisplaySettingsW(mi.szDevice, i, &m)) break;
+        modes.push_back({(unsigned)m.dmPelsWidth, (unsigned)m.dmPelsHeight});
+        sw = std::max(sw, (unsigned)m.dmPelsWidth), sh = std::max(sh, (unsigned)m.dmPelsHeight);   // (its largest mode: its own)
+    }
+#else
+    if (const Screen* s = screen_opening()) sw = s->native.w, sh = s->native.h;
+#endif
+    for (const output_modes::Size& m : output_modes::offered(sw, sh, modes)) {
+        unsigned uw = 0, uh = 0;
+        if (!output_size_used(m.w, m.h, &uw, &uh)) continue;
+        if (std::none_of(sizes.begin(), sizes.end(), [&](const Out& o) { return o.w == uw && o.h == uh; })) sizes.push_back(Out{uw, uh});
+    }
+    logf("menu: the Output resolution offers %zu sizes of the screen's %zu display modes and the common ones (screen %ux%u)",
+         sizes.size(), modes.size(), sw, sh);
+}
+}   // namespace
+
 /// (Triforce, 11-22, the performance audit's PRESENT-46, after Source A's) A first start sized to the card, with
 /// RX_VK_FIRST_START_AUTO (off unless set: first_start.h): with no options file, RX_VK_LOW_SPEC not asked and no switch
 /// setting the Render resolution, a weak card (an integrated GPU, no mesh shaders, 4.5 GB of video memory or less) starts
@@ -6630,6 +8122,7 @@ void menu_first_start() {
     static bool done;
     if (done) return;
     done = true;
+    auto_start();   // ((Triforce) Auto (this PC) On: chosen again for new hardware)
     const int64_t asked = first_start::switch_mb(getenv("RX_VK_FIRST_START_AUTO"));
     const bool low_spec = getenv("RX_VK_LOW_SPEC") && atoi(getenv("RX_VK_LOW_SPEC")) != 0;
     if (!first_start::applies(!first_start_no_file, low_spec, getenv("HOS_DYNRES") != nullptr, asked)) return;
@@ -6661,7 +8154,8 @@ static int resolution_in_effect() {
 }
 bool resolution_auto() { return resolution_in_effect() == 0; }
 int resolution_scale() {
-    const float s = upscaler_rows::percent(resolution_in_effect()) / 100.0f;
+    // ((Triforce) 11-24: the Upscaler's own step for the saved scale, set_row)
+    const float s = upscaler_rows::percent(ur::snap(upscaler(), resolution_in_effect())) / 100.0f;
     return s > 0 ? (int)(twelfths(s) * 10000.0f / 12.0f + 0.5f) : 0;   // (the twelfth game_size labels)
 }
 
@@ -6682,6 +8176,7 @@ void menu_set_gpu_count(int count) {
 bool menu_is_open() { return open_now.load(std::memory_order_relaxed); }
 bool menu_embedded() { return open_now.load(std::memory_order_relaxed) && embed_open; }
 bool menu_game_options() { return game_options_shown(); }   // ((Triforce VR) the game's Options screen runs, our tabs over it)
+int menu_grass_distance() { return __atomic_load_n(&opts.grass_distance, __ATOMIC_RELAXED); }   // (the menu's thread writes it)
 // (the tools off on the Debug tab: flight, the free camera and heart protection put away; -1, heart protection never set, is the
 // host's own HOS_OOT_PROTECT_HEARTS)
 int menu_heart_protection() {
@@ -6690,6 +8185,7 @@ int menu_heart_protection() {
 }
 int menu_player_flight() { return cheats_on() ? player_flight.load(std::memory_order_relaxed) : -1; }
 int menu_free_camera() { return cheats_on() ? free_camera.load(std::memory_order_relaxed) : 0; }
+int menu_link_speed() { return cheats_on() ? link_speeds[std::clamp(link_speed.load(std::memory_order_relaxed), 0, kLinkSpeeds - 1)] : 100; }
 /// (Triforce: with the Debug tools turned off meanwhile, what a tool asked and the game's side had not yet taken is dropped,
 /// as flight, the free camera and heart protection are put away: the game's side takes it at Link's update, not while paused)
 int menu_take_cheat_action() {
@@ -6729,6 +8225,9 @@ constexpr int kSoundPageMotion = 7;   // (the Motion page is a tab no strip show
 constexpr int kSoundPageN64 = 10;
 static_assert(kSoundPageN64 != kModsPage && kSoundPageN64 != kModsRowPage && kSoundPageN64 != kSoundPageMotion,
               "the Remembered page's page, to the ear, is a number of its own");
+constexpr int kSoundPageSimTurf = 11;   // ((Triforce, 11-24) and the Simulated turf page, as the Remembered page)
+static_assert(kSoundPageSimTurf != kModsPage && kSoundPageSimTurf != kModsRowPage && kSoundPageSimTurf != kSoundPageMotion &&
+              kSoundPageSimTurf != kSoundPageN64, "the Simulated turf page's page, to the ear, is a number of its own");
 /// What the options show now, as far as their sounds go (menu_sound::State): menu_tick takes it before and after its input
 static menu_sound::State sound_state() {
     menu_sound::State s;
@@ -6736,9 +8235,10 @@ static menu_sound::State sound_state() {
     if (!s.open) return s;
     s.embedded = embed_open || game_options_shown();
     const bool n64_page = page == 0 && cur_tab == TAB_N64;   // ((Triforce, N64 Classic) the Remembered page)
-    const bool motion = page == 0 && sub_page(cur_tab) && !n64_page;   // (the Motion page, and the other pages rows open, as it)
-    s.page = motion ? kSoundPageMotion : n64_page ? kSoundPageN64 : page;
-    s.tab = motion || n64_page ? page_parent(cur_tab) : cur_tab;
+    const bool turf_page = page == 0 && cur_tab == TAB_SIM_TURF;   // ((Triforce, 11-24) the Simulated turf page)
+    const bool motion = page == 0 && sub_page(cur_tab) && !n64_page && !turf_page;   // (the Motion page, and the other pages rows open, as it)
+    s.page = motion ? kSoundPageMotion : n64_page ? kSoundPageN64 : turf_page ? kSoundPageSimTurf : page;
+    s.tab = motion || n64_page || turf_page ? page_parent(cur_tab) : cur_tab;
     auto hashed = [](const std::string& t) {
         int64_t h = 1469598103934665603LL;
         for (const char ch : t) h = (h ^ (unsigned char)ch) * 1099511628211LL;
@@ -6753,14 +8253,14 @@ static menu_sound::State sound_state() {
         else if (r.cheat >= 0) s.value = hashed(cheat_value(r.cheat));
     } else if (page == 1) {   // (Controls: its own rows' values, a control's bindings)
         const int i = csel - kTop;
-        s.cursor = csel * 2 + ccol;
+        s.cursor = csel * kCols + ccol;
         s.mode = listening ? menu_sound::kModeListen : menu_sound::kModeNone;
         if (i < 0) {
             const Row& r = rows[tab_row_to_global(TAB_PAGE, csel)];
             if (r.value) s.value = *r.value;
         } else if (i < kControls && can_bind()) {
             const int b = controls[i].button;
-            s.value = b < HOS_SW_N ? host->binding(HOS_BIND_PAD, b, 0) : 0;
+            s.value = keys_only(i) ? 0 : host->binding(HOS_BIND_PAD, b, 0);
             s.value = (s.value * 4099 + host->binding(HOS_BIND_KEY, b, 0)) * 4099 + host->binding(HOS_BIND_KEY, b, 1);
         }
     } else if (page == 3) {
@@ -6799,8 +8299,72 @@ int menu_mods_music() {
     if (open_now.load(std::memory_order_relaxed) && page == kModsPage) return 2;
     return mods_list_fresh() || mods_title_fading() ? 1 : 0;
 }
-int menu_text_wanted() { return mods_text_wanted.load(std::memory_order_relaxed) ? 1 : 0; }   // ((Triforce) the Mods screen's search)
+// ((Triforce) the HUD placement rows for host/hos_wide_ui.c (vk_replay.cpp's option): pack_placement above
+int menu_hud_option(int id) {
+    switch (id) {
+    case HOS_OPT_HUD_PLACEMENT: return opts.hud_placement;
+    case HOS_OPT_HUD_HEALTH: return opts.hud_placement ? pack_placement(opts.hud_health_x, opts.hud_health_y, opts.hud_health_scale) : HOS_HUD_DEFAULT_PLACEMENT;
+    case HOS_OPT_HUD_BUTTONS: return opts.hud_placement ? pack_placement(opts.hud_buttons_x, opts.hud_buttons_y, opts.hud_buttons_scale) : HOS_HUD_DEFAULT_PLACEMENT;
+    case HOS_OPT_HUD_MINIMAP: return opts.hud_placement ? pack_placement(opts.hud_minimap_x, opts.hud_minimap_y, opts.hud_minimap_scale) : HOS_HUD_DEFAULT_PLACEMENT;
+    default: return 0;
+    }
+}
+int menu_text_wanted() {   // ((Triforce) the Mods screen's search; the Output width and height rows' digits)
+    return mods_text_wanted.load(std::memory_order_relaxed) || size_text_wanted.load(std::memory_order_relaxed) ? 1 : 0;
+}
 int menu_bug_shot() { return bugshot_state(); }
+
+// ((Triforce) 11-24) A bug capture's settings changed from the defaults (HOS_OPT_BUG_SETTINGS, host/bug_capture.c's
+// capture.txt): the rows whose saved value is not the built-in default's (Options{}), as the menu shows them, a
+// "Name: value (default: value)" line each. Every row's default is a fixed value here (an Automatic or Auto is a value of
+// its own, not one worked out for this PC), so a default is never guessed. The hidden rows are written too: they hold what
+// the merged rows (HDR, Frame generation, ...) stand for. The Custom size's sides only while the Output resolution is
+// Custom (restart_inert); a microphone chosen by its name is not named (a device's name can be a person's). Written on the
+// capture's thread, as the host's other option reads are: nothing is changed
+std::mutex bug_settings_mu;
+std::string bug_settings_text;
+size_t bug_settings_at = 0;
+std::string changed_rows_text() {
+    static const Options defaults{};
+    std::string out;
+    int changed = 0;
+    const int* said[kRowsEnd];
+    int said_n = 0;
+    for (int i = 0; i < kRowsEnd; i++) {
+        const Row& r = rows[i];
+        const char* at = (const char*)r.value;
+        if (!r.value || !r.text || r.heading || at < (const char*)&opts || at >= (const char*)(&opts + 1)) continue;
+        if (restart_inert(r) || std::find(said, said + said_n, r.value) != said + said_n) continue;
+        const int was = *(const int*)((const char*)&defaults + (at - (const char*)&opts));
+        if (*r.value == was) continue;
+        said[said_n++] = r.value;
+        changed++;
+        out += r.name;
+        out += ": ";
+        out += r.value == &opts.mic && *r.value >= 2 ? "a microphone by its name" : r.text(*r.value);
+        out += " (default: ";
+        out += r.value == &opts.mic && was >= 2 ? "a microphone by its name" : r.text(was);
+        if (restart_changed(r)) out += "; takes effect after a restart";
+        out += ")\n";
+    }
+    if (!changed) out = "Every option is at its default.\n";
+    return out;
+}
+void menu_bug_settings_begin() {
+    std::string text = changed_rows_text();
+    std::lock_guard<std::mutex> lk(bug_settings_mu);
+    bug_settings_text = std::move(text);
+    bug_settings_at = 0;
+}
+int menu_take_bug_settings() {
+    std::lock_guard<std::mutex> lk(bug_settings_mu);
+    if (bug_settings_at >= bug_settings_text.size()) {
+        bug_settings_text.clear();
+        bug_settings_at = 0;
+        return 0;
+    }
+    return (unsigned char)bug_settings_text[bug_settings_at++];
+}
 
 void menu_note_present_sizes(uint32_t picture_w, uint32_t picture_h, uint32_t window_w, uint32_t window_h) {
     const auto c = [](uint32_t v) { return (uint64_t)std::min(v, 0xffffu); };
@@ -6835,7 +8399,7 @@ void menu_note_present_sizes(uint32_t picture_w, uint32_t picture_h, uint32_t wi
 void menu_note_frame(bool game_frame, int shown) {
     if (shown) shown_frames.fetch_add(shown, std::memory_order_relaxed);
     if (game_frame) game_frames.fetch_add(1, std::memory_order_relaxed);
-    if (game_frame && opts.show_fps == 2) {   // (Triforce: the performance overlay's frame times, while it is on Full only)
+    if (game_frame && fps_levels::measures(opts.show_fps)) {   // (Triforce: the frame times, on Full and the levels past On only)
         std::lock_guard lk(perf_mu);
         perf_stats::note(perf_ring, prof_now());
     }
@@ -6848,8 +8412,9 @@ void fullscreen_tick() {
     if (!main_window) return;
     static const bool env = getenv("HOS_FULLSCREEN") != nullptr;   // (a test's own choice: the row is left alone)
     if (env) return;
-    if (opts.fullscreen != applied) {
-        applied = opts.fullscreen;
+    static int applied_screen = 0;   // ((Triforce) the Fullscreen screen row: while fullscreen, a change moves the window there)
+    if (opts.fullscreen != applied || (applied && opts.fs_screen != applied_screen)) {
+        applied = opts.fullscreen, applied_screen = opts.fs_screen;
         settle = 60;
         PostMessageA(main_window, WM_APP + 7, (WPARAM)applied, 0);
         return;
@@ -6919,8 +8484,8 @@ const char* perf_upscaling_text(char* out, size_t n) {
 bool perf_fg_running() { return mkwvk::dlssg::multiplier() > 1 || framegen_on(); }
 /// (Triforce) The Frame generation setting's value on the panel: what makes the frames, by name, as NX2navi's (its
 /// perf_picture): "NVIDIA DLSS <n>x" while DLSS frame generation runs; while frame generation runs, AMD's FSR 4 library (with
-/// the version it runs, NX2navi's fg4_label) where the row is at AMD FSR 4 and the library can make the frame, "AMD FSR 3.1"
-/// where FSR 3.1 makes the 2x frame, else the renderer's own, "Triforce's own" with the row's value ("Triforce's own, 4x",
+/// the version it runs, NX2navi's fg4_label) where the row is at AMD FSR 4 and the library can make the frame, "AMD FSR 3.1, 4x"
+/// where FSR 3.1 made the last frames (the Frame generation by row), else the renderer's own, "Triforce's own" with the row's value ("Triforce's own, 4x",
 /// "Triforce's own, Auto"); "Off" while nothing makes frames (the row set where none can run too). AMD's library is never
 /// asked here (why_known, version: what is known)
 const char* perf_framegen_text(char* out, size_t n) {
@@ -6930,8 +8495,8 @@ const char* perf_framegen_text(char* out, size_t n) {
         const char* ver = fsr4fg::version();
         if (ver[0]) snprintf(out, n, "AMD FSR 4 library (%s)", ver);
         else snprintf(out, n, "AMD FSR 4 library");
-    } else if (fsr3fi::frames_wanted()) {
-        snprintf(out, n, "AMD FSR 3.1");
+    } else if (fsr3fi::frames_wanted() && framegen_maker() == kMakerFsr3) {   // ((Triforce) 11-24: who made the last set)
+        snprintf(out, n, "AMD FSR 3.1, %s", tx_framegen(opts.framegen));
     } else {
         snprintf(out, n, "Triforce's own, %s", tx_framegen(opts.framegen));
     }
@@ -7037,7 +8602,7 @@ static void perf_sample(double shown, double game) {
         const int holder = mkwvk::pace::owner();
         if (holder != mkwvk::pace::GAME) strncat(t, holder == mkwvk::pace::RTSS ? " (RivaTuner)" : " (NVIDIA Reflex)", sizeof t - strlen(t) - 1);
         set(4, t);
-        set(5, tx_onoff(opts.vsync));
+        set(5, tx_vsync(opts.vsync));
         set(6, shape_now(opts.ultrawide));   // ((Triforce) the Output resolution's own shape where it has one)
         unsigned ow = 0, oh = 0;
         t[0] = 0;
@@ -7062,7 +8627,14 @@ void perf_machine_start() {
     perf_machine::start(g, [](const char* line) { logf("vk: the performance overlay: %s", line); });
 }
 
+// ((Triforce) 11-24) what plays the controller used last, as the host wrote it back (menu_option_set)
+int menu_vibration_status_option() { return vibration_status_cache.load(std::memory_order_relaxed); }
+
 void menu_option_set(int id, int value) {
+    if (id == HOS_OPT_VIBRATION_STATUS) {   // ((Triforce) 11-24: what plays the controller used last, host/pad_sdl.c)
+        vibration_status_cache.store(value, std::memory_order_relaxed);
+        return;
+    }
     if (id >= HOS_OPT_MODS_X0 && id <= HOS_OPT_MODS_PITCH) {   // (Triforce: the Mods entry's list, host/oot_menu.c)
         mods_box[id - HOS_OPT_MODS_X0].store(value, std::memory_order_relaxed);
         return;
@@ -7166,6 +8738,12 @@ void menu_option_set(int id, int value) {
         if (link_age.exchange(value, std::memory_order_relaxed) != value && page == 0 && cur_tab == TAB_DEBUG) menu_refresh = true;
         return;
     }
+    if (id == HOS_OPT_BUG_SETTINGS) {   // ((Triforce) 11-24: a bug capture's settings changed from the defaults, read a byte at a time)
+        if (value) menu_bug_settings_begin();
+        return;
+    }
+    if (id == HOS_OPT_SIM_TURF_AREA_TEXT) return sim_turf_area_byte(value);   // ((Triforce, 11-24) the area, for the Simulated turf page
+    if (id == HOS_OPT_SIM_TURF_AREA) return sim_turf_area_end(value);         // (host/hos_main.c oot_inventory_refresh)
     if (id >= OOT_CHEAT_ITEM_BASE && id < OOT_CHEAT_ITEM_BASE + kItems) {   // (the game side's inventory counts)
         if (item_counts[id - OOT_CHEAT_ITEM_BASE].exchange(value, std::memory_order_relaxed) != value && page == 4)
             menu_refresh = true;
@@ -7198,6 +8776,95 @@ void menu_option_set(int id, int value) {
     if (id != 7) return;
     opts.mouse_sens = std::min(std::max(value, 10), 500);   // (the keys work while the menu is closed: it shows it when opened)
     save();
+}
+
+// ---- (Triforce) the control bridge's option_get and option_set (host/control.c; called only with HOS_CONTROL set) ----
+// The settings rows (a value, not a heading, a debug tool or a hidden saved value, shown on this PC: row_shown), found by
+// their key in triforce_options.ini (ini_key), which stays the same while rows come and go or are renamed. The bridge calls
+// these from its own thread: menu_mu keeps them apart from menu_tick (the presenting thread), which takes it each frame.
+// Recursive: a setter reached from inside menu_tick's frame on the same thread does not lock itself out
+std::recursive_mutex menu_mu;
+static bool bridge_row(int i) {
+    return rows[i].value && !rows[i].heading && rows[i].cheat < 0 && rows[i].tab != TAB_HIDDEN && row_shown(i);
+}
+static void bridge_fill(int i, MkwVkSetting* out) {
+    static const char* const tabs[] = {"display", "graphics", "audio", "controls", "system", "debug", "motion", "controls",
+                                       "display", "display", "controls",   // ((Triforce VR) VR Controls, 3D Settings, VR Settings, then Controls)
+                                       "graphics", "graphics", "hidden"};   // (N64 Classic's and Simulated turf's pages: Graphics)
+    static_assert(sizeof tabs / sizeof tabs[0] == TAB_HIDDEN + 1, "a name for each MenuTab");
+    const Row& r = rows[i];
+    *out = MkwVkSetting{};
+    snprintf(out->key, sizeof out->key, "%s", ini_key(r));
+    snprintf(out->name, sizeof out->name, "%s", r.name);
+    snprintf(out->tab, sizeof out->tab, "%s", r.tab >= 0 && r.tab <= TAB_HIDDEN ? tabs[r.tab] : "");
+    out->value = *r.value, out->lo = r.lo, out->hi = r.hi, out->step = r.step;
+    out->restart = r.restart, out->fixed = row_fixed(r.value);
+    snprintf(out->text, sizeof out->text, "%s", r.text ? r.text(out->value) : "");
+}
+// (the Upscaler row's questions, asked before menu_mu is taken: row_shown and row_fixed ask upscalers_available(), which
+// may wait for the libraries' start-up probe while it runs. Under menu_mu that would hold menu_tick, and the present with
+// it; this way only the bridge's thread waits, and once answered the questions return at once)
+static void bridge_probe_first() { (void)upscalers_available(), (void)dlss_why(); }
+/// A row whose choices are not in the order of their numbers (the output sizes, the Render resolution's steps, the Upscaler's
+/// engines, the merged rows' choices here), walked in the arrows' own order to the value asked for: one way, then the other,
+/// each way until at() holds, the row stops at an end (state() unchanged) or it comes round to where that way began. state():
+/// all a step changes; step(dir): one arrow press. false: no step reaches it (then stepped back towards where it began)
+template <class State, class At, class Step>
+static bool walk_to(State state, At at, Step step, int limit) {
+    const auto start = state();
+    for (const int dir : {1, -1}) {
+        const auto from = state();
+        for (int k = 0; k < limit && !at(); k++) {
+            const auto was = state();
+            step(dir);
+            if (state() == was || state() == from) break;
+        }
+        if (at()) return true;
+    }
+    for (int k = 0; k < limit && state() != start; k++) step(1);
+    return false;
+}
+/// The index-th settings row (an enumeration, for listing them; the index is not a name: rows come and go). 0: past the last
+int menu_setting(int index, MkwVkSetting* out) {
+    bridge_probe_first();
+    std::lock_guard<std::recursive_mutex> lk(menu_mu);
+    merged_sync();   // (the merged rows from the saved values, as menu_tick has them)
+    for (int i = 0, n = 0; i < kRows; i++)
+        if (bridge_row(i) && n++ == index) return bridge_fill(i, out), 1;
+    return 0;
+}
+/// The settings row whose ini key is key, set to value as the menu's Left and Right set it (set_row: cut to its range, a
+/// restart noted, kept in the options file). The rows the arrows step through a list of their own are walked to value
+/// (walk_to); a value none of their steps reach leaves them and the rest as they were. out: the row as it is now. 1 set, 0
+/// no such row, -1 nothing to choose on this PC (row_fixed), -2 no step of a list row reaches value here
+int menu_setting_set(const char* key, int value, MkwVkSetting* out) {
+    bridge_probe_first();
+    std::lock_guard<std::recursive_mutex> lk(menu_mu);
+    merged_sync();
+    int i = 0;
+    while (i < kRows && !(bridge_row(i) && !strcmp(ini_key(rows[i]), key))) i++;
+    if (i == kRows) return 0;
+    Row& r = rows[i];
+    if (row_fixed(r.value)) return bridge_fill(i, out), -1;
+    const int want = std::min(std::max(value, r.lo), r.value == &opts.pad_layout ? std::min(r.hi, 2) : r.hi);   // (3: Custom, shown only)
+    if (r.value == &opts.dlss || r.value == &opts.resolution || r.value == &opts.output_res || is_merged(r.value)) {
+        const Options opts_was = opts;
+        const Merged merged_was = merged;
+        const mr::State restart_was = restart_state;
+        const auto state = [&] { return std::array<int, 5>{*r.value, opts.dlss, opts.resolution, opts.output_res, opts.framegen}; };
+        if (!walk_to(state, [&] { return *r.value == want; }, [&](int dir) { set_row(r, *r.value + dir * r.step, dir, false); }, 64)) {
+            opts = opts_was, merged = merged_was, restart_state = restart_was;
+            menu_refresh = true;
+            bridge_fill(i, out);
+            return -2;
+        }
+        save();
+    } else if (want != *r.value) {
+        set_row(r, want, want > *r.value ? 1 : -1);
+    }
+    menu_refresh = true;
+    bridge_fill(i, out);
+    return 1;
 }
 
 /// (hookshot) the mouse on the inventory: a section tab chooses it, a card the item (a click selects it, it does not edit),
@@ -7249,6 +8916,10 @@ void cheat_press(int i, const bool* press, bool& changed) {
     }
     if (i == 5 && (press[3] || press[4])) {
         pouch_item = (pouch_item + kPouchItems + (press[4] ? 1 : -1)) % kPouchItems;
+        changed = true;
+    }
+    if (i == 14 && (press[3] || press[4])) {   // ((Triforce) Movement speed: it stops at 1x and at 3x)
+        link_speed.store(std::clamp(link_speed.load() + (press[4] ? 1 : -1), 0, kLinkSpeeds - 1));
         changed = true;
     }
     if (i == 6 && (press[3] || press[4])) {
@@ -7578,7 +9249,20 @@ void mods_tick(bool* press, bool tab_left, bool tab_right, bool mouse, bool move
     }
 }
 
+/// ((Triforce) 11-24) The Test microphone row's test, at each menu tick's end whichever way it ends: off unless the options
+/// show the Audio tab with the focus and a microphone chosen; the host told either way, its levels taken
+void mic_test_tick(bool focused) {
+    if (!focused || !open_now.load() || cur_tab != TAB_AUDIO || page != 0 || opts.mic == 0) mic_testing = false;
+    if (!mic_testing && !mic_test_state) return;   // (off and told so: the host is not asked each tick)
+    mic_levels[0] = mic_levels[1] = 0;
+    mic_test_state = host && host->mic_test ? host->mic_test(mic_testing, mic_levels) : 0;
+    if (!(mic_test_state & HOS_MIC_TEST_ON)) mic_testing = false, mic_test_state = 0;
+}
 void menu_tick() {
+    std::lock_guard<std::recursive_mutex> bridge_lk(menu_mu);   // ((Triforce) the control bridge's settings: menu_setting_set)
+    auto_tick();   // ((Triforce) Auto (this PC): a step its tuning asked for
+    if (sim_turf_tick(prof_now())) menu_refresh = true;   // ((Triforce, 11-24) the Simulated turf page: its rows' changes, the area)
+    menu_debug_rows(opts.descriptor_reuse, opts.sampler_cache);   // ((Triforce) the two Debug rows, taken in play: vk_draw.cpp)
     fullscreen_tick();
     merged_sync();   // ((Triforce, options_version 7) the merged rows from the saved values: a change made elsewhere shows)
     // (Triforce) the Mods entry under the game's list: the host's word that the cursor goes onto it (the game's Down, which the
@@ -7635,6 +9319,9 @@ void menu_tick() {
     if (!open_now.load() || page != kModsPage) {   // ((Triforce) no text taken off the Mods screen: none kept for it either)
         mods_text_wanted.store(false, std::memory_order_relaxed);
         std::lock_guard<std::mutex> g(mods_typed_mu);
+        // ((Triforce) but the Output width and height rows' digits, while one of them is selected: size_edit)
+        if (size_text_wanted.load(std::memory_order_relaxed) && size_typed.size() < 64)
+            size_typed.insert(size_typed.end(), mods_typed.begin(), mods_typed.end());
         mods_typed.clear();
     }
     const menu_sound::State sound_before = sound_state();   // ((Triforce) the options' own sounds: told at this tick's end)
@@ -7649,6 +9336,10 @@ void menu_tick() {
     DWORD pid = 0;
     if (fg) GetWindowThreadProcessId(fg, &pid);
     const bool mine = pid == GetCurrentProcessId();
+    struct MicTick {   // ((Triforce) 11-24: the Test microphone row's test, as this tick ends: mic_test_tick)
+        bool focused;
+        ~MicTick() { mic_test_tick(focused); }
+    } mic_tick{mine};
     bool press[K_N] = {};
     bool key_queued[K_N] = {};   // ((Triforce, 11-19) the host's queue had a press of it: the game's keys below)
     for (int i = 0; i < K_N; i++) {
@@ -7657,7 +9348,7 @@ void menu_tick() {
         key_queued[i] = mine && queued;
         // Read both keys even if one is disabled, so old presses cannot toggle the menu after a change.
         // (F1 always opens the menu; Menu shortcut's F1 only leaves Insert to an overlay)
-        const bool enabled = keys[i] != VK_INSERT || opts.menu_shortcut == 0;
+        const bool enabled = keys[i] != VK_INSERT || opts.menu_shortcut != 1;   // (Insert: all but F1 only)
         press[i] = enabled && (host && host->take_key_press ? mine && queued : down && !held[i]);
         held[i] = down;
         if (press[i]) pad_last = false;   // (the keys: their names in the prompts)
@@ -7705,7 +9396,16 @@ void menu_tick() {
     if (host && host->binding)   // (A and B as bound now: the Controls page or the Layout preset can change them)
         menu_keys::confirm_back(host->binding(HOS_BIND_PAD, HOS_SW_A, 0), host->binding(HOS_BIND_PAD, HOS_SW_B, 0), &pad_confirm,
                                 &pad_back);
+    {   // ((Triforce) per-control reset) the Controls page's Clear on a controller: the top face button, else the first free one
+        static const int order[4] = {HOS_PAD_NORTH, HOS_PAD_WEST, HOS_PAD_SOUTH, HOS_PAD_EAST};
+        pad_clear = HOS_PAD_NORTH;
+        for (int k = 3; k >= 0; k--)
+            if (order[k] != pad_confirm && order[k] != pad_back) pad_clear = order[k];
+    }
     if (pad(HOS_PAD_GUIDE) || chord_now) press[0] = true;
+    // (Menu shortcut's touchpad choices: a DualShock 4's or DualSense's touchpad click is F1, it opens and closes the menu as
+    // the key does, where the keys open it at all: menu_allowed below)
+    if (opts.menu_shortcut >= 3 && pad(HOS_PAD_TOUCHPAD)) press[6] = true;
     // ((Triforce, 11-19) the keys the player bound to the game's D-pad, its movement and its A, on the entries under the game's
     // list (Mods, Quit and its dialog): the keys that brought the game's cursor down the list (S, or the D-pad's 4, by default)
     // go on in the same way from Mods, and its A (E) chooses. They were the menu's own arrows and Enter alone there, and E,
@@ -7831,6 +9531,20 @@ void menu_tick() {
         }
         f7_held = f7_down;
     }
+    {   // ((Triforce, 11-24) F2: Evil HD on and off, the owner's "i want f2 to enable evil [hd] ... it updates in the options
+        // menu": the row's own value (opts.evil_hd), saved as the row is, said at the foot of the screen as F7 says N64 Classic.
+        // Texture detail Full still waits for the next start, as the row says
+        static bool f2_held = false;
+        const bool f2_down = mine && (GetAsyncKeyState(VK_F2) & 0x8000) != 0;
+        if (f2_down && !f2_held) {
+            opts.evil_hd = opts.evil_hd ? 0 : 1;
+            save();
+            snprintf(notice_text, sizeof notice_text, "Evil HD: %s", opts.evil_hd ? "On" : "Off");
+            notice_until = prof_now() + 2000000000LL;
+            logf("menu: F2: Evil HD %s", opts.evil_hd ? "on" : "off");
+        }
+        f2_held = f2_down;
+    }
     {   // (Triforce) F8, a bug capture. The window's key handler asks the host for it itself (host/display.c); where the host has
         // no queue of key presses (Linux) the key is read here, and asked for as the rows ask
         static bool f8_held = false;
@@ -7927,7 +9641,7 @@ void menu_tick() {
             const bool own = p == HOS_PAD_UP || p == HOS_PAD_DOWN || p == HOS_PAD_LEFT || p == HOS_PAD_RIGHT || p == HOS_PAD_GUIDE ||
                              p == HOS_PAD_BACK || p == HOS_PAD_START || p == pad_confirm || p == pad_back ||
                              p == HOS_PAD_LSHOULDER || p == HOS_PAD_RSHOULDER || p == HOS_PAD_LTRIGGER || p == HOS_PAD_RTRIGGER;
-            if (p >= 0 && p < HOS_PAD_N && !own && pad(p)) (side ? tab_right : tab_left) = true;
+            if (hos_pad_bindable(p) && !own && pad(p)) (side ? tab_right : tab_left) = true;
         }
     }
     // ((Triforce) the upscalers asked ahead once the game has a frame up (menu_ahead), and the Frame generation row set again once
@@ -7960,7 +9674,7 @@ void menu_tick() {
         bool go[2] = {script_tab < 0, script_tab > 0};
         for (int side = 0; side < 2 && host && host->binding; side++) {
             const int sw = side ? HOS_SW_R : HOS_SW_L, p = host->binding(HOS_BIND_PAD, sw, 0);
-            if (p >= 0 && p < HOS_PAD_N && (pad_press >> p & 1)) go[side] = true, pad_last = auto_pad = true;
+            if (hos_pad_bindable(p) && (pad_press >> p & 1)) go[side] = true, pad_last = auto_pad = true;
             if (game_lr[side]) go[side] = true, pad_last = false;
         }
         // ((Triforce) the mouse on our tabs over the game's header, as on the open menu's: a tab under it lit, a click on one shows
@@ -8040,11 +9754,32 @@ void menu_tick() {
     // (Triforce, 11-13: off by default now, overlay_allowed above. While the options are open, from inside the game's Options,
     // the keys still close them)
     static const bool menu_allowed = overlay_allowed();
+    // (Menu shortcut "Insert, F1 or Esc": Esc on a closed menu opens it, the keyboard's and RX_VK_MENU_SCRIPT's ESC alone (the
+    // gamepad's back is Esc only while it is open, above), and only where the keys open it at all (menu_allowed). The press
+    // that opened it does not go back a page below. No control can be bound to Esc (bindable_keys), so nothing in play
+    // changes; the window gives the captured mouse back on the close (host/display.c esc_had_capture))
+    // ((Triforce) 11-24) the ReShade comparison (reshade_menu.h): its bar takes the keys and the mouse alone. Up and down its rows,
+    // left and right its choices, confirm; back, Insert, F1 or the right button close it, the saved preset back. The options shut
+    // another way end it too
+    if (reshade_menu::comparing()) {
+        if (!open_now.load()) reshade_menu::end_comparison();
+        else {
+            const auto click = mouse && (ptr.pressed & HOS_MOUSE_LEFT) ? hits.at((float)mx, (float)my) : menu_hit::Hit{};
+            const bool cancel = press[0] || press[6] || press[5] || (mouse && (ptr.pressed & HOS_MOUSE_RIGHT));
+            changed |= reshade_menu::update_comparison(int(press[4]) - int(press[3]), int(press[2] || tab_right) - int(press[1] || tab_left),
+                                                       press[7], cancel, click);
+            for (int i = 0; i < K_N; i++) press[i] = false;
+            tab_left = tab_right = false, moved = false;
+            ptr.pressed = 0, ptr.wheel = 0;   // (nothing of them for the page under the bar)
+        }
+    }
+    const bool esc_opens = (opts.menu_shortcut == 2 || opts.menu_shortcut == 4) && menu_allowed && press[5] && !open_now.load();
+    if (esc_opens) press[5] = false;
     if ((press[0] || press[6]) && open_now.load() && page == 5) {
         later();
     } else if ((press[0] || press[6]) && open_now.load() && restart_ask()) {
         page = 5, ask_sel = 0, listening = 0, changed = true;
-    } else if ((press[0] || press[6]) && (menu_allowed || open_now.load())) {
+    } else if (((press[0] || press[6]) && (menu_allowed || open_now.load())) || esc_opens) {
         open_now = !open_now.load(), changed = true;
         page = 0, listening = 0;
         // (the layout row shows the controls as they are: host/nn_hid.c keeps them, the ini's pad_ lines, and a saved
@@ -8055,6 +9790,19 @@ void menu_tick() {
         if (open_now.load()) menu_ahead();   // (whether the Upscaler row can offer DLSS and FSR here: asked once, (Triforce) off this thread)
         if (open_now.load()) framegen_row_sync();   // (Triforce: and the Frame generation row AMD FSR 4, as known)
         if (open_now.load()) refresh_mics();   // (the microphones as they are now)
+        if (open_now.load()) refresh_outputs();   // ((Triforce) and the playback devices)
+        // ((Triforce) Right Ctrl held as it opens: the tuning bar, draw_tune_bar)
+        tune_mode = open_now.load() && mine && (GetAsyncKeyState(VK_RCONTROL) & 0x8000) != 0;
+    }
+    {   // ((Triforce) the tuning bar: Right Ctrl or the gamepad's left face button switches the options page to it and back, over
+        // play; gone with the menu. Not while a control waits for its key, nor inside the game's own Options screen)
+        static bool rctrl_held = false;
+        const bool rctrl = mine && (GetAsyncKeyState(VK_RCONTROL) & 0x8000) != 0, rctrl_press = rctrl && !rctrl_held;
+        rctrl_held = rctrl;
+        if (open_now.load()) read_mode_sizes();   // ((Triforce) the Output resolution's display modes, once, as the options first open
+        if (!open_now.load() || embed_open) tune_mode = false;
+        else if (page == 0 && !listening && !press[0] && !press[6] && (rctrl_press || pad(HOS_PAD_WEST)))
+            tune_mode = !tune_mode, changed = true, pad_last = !rctrl_press;
     }
     if (open_now.load() && page == 5) {   // (hookshot) the restart question: Later (the default) or Restart now
         if (mouse) {   // (a button under the cursor chosen, a click on it pressed, a right click is Later; no list: the wheel does nothing)
@@ -8076,31 +9824,61 @@ void menu_tick() {
         }
     } else if (open_now.load() && page == 1) {   // (hookshot) the Controls page
         if (!can_bind()) page = 0;
-        else if (listening) {
+        else if (control_confirmation.action != kAskNone) {   // ((Triforce) its question: Cancel or the change, as the restart question)
+            ControlConfirmation& q = control_confirmation;
+            if (mouse) {
+                const menu_hit::Hit hit = hits.at((float)mx, (float)my);
+                if (hit.part == menu_hit::kButton && (moved || ptr.pressed) && hit.index != q.choice) q.choice = hit.index, changed = true;
+                if ((ptr.pressed & HOS_MOUSE_LEFT) && hit.part == menu_hit::kButton) press[7] = true;
+                if (ptr.pressed & HOS_MOUSE_RIGHT) press[5] = true;
+            }
+            if (press[1] || press[2] || press[3] || press[4]) q.choice ^= 1, changed = true;
+            if (press[5] || (press[7] && q.choice == 0)) {
+                q = {};
+                changed = true;
+            } else if (press[7]) {
+                const ControlConfirmation done = q;
+                q = {};
+                if (done.action == kAskRebind) {   // (approved: the controls named; another since asks again)
+                    uint64_t now = 0;
+                    if (host->rebind_control(done.set, controls[done.row].button, done.slot, done.code, done.conflicts, &now))
+                        after_binding(done.set);
+                    else if (now) control_confirmation = {kAskRebind, done.row, done.set, done.slot, done.code, 0, now};
+                } else if (done.action == kAskResetRow) {
+                    if (host->reset_binding(controls[done.row].button)) blocked_reset_row = -1, after_binding(HOS_BIND_PAD);
+                    else blocked_reset_row = done.row;   // (another control has one of its defaults: its help says so)
+                } else {
+                    host->bind(HOS_BIND_PAD, -1, 0, 0);
+                    opts.pad_layout = 0;
+                    save();
+                }
+                changed = true;
+            }
+        } else if (listening) {
             if (press[5] || prof_now() > listen_end) listening = 0, changed = true;   // (Esc, or nothing for a while)
             else if (listening == 1) {
-                if (!listen_armed) listen_armed = (raw & ~(1u << HOS_PAD_GUIDE) & ((1u << HOS_PAD_N) - 1)) == 0;   // (not the stick's menu bits)
-                else if (const uint32_t p = pad_press & ~(1u << HOS_PAD_GUIDE)) {
+                if (!listen_armed) listen_armed = (raw & ~(1u << HOS_PAD_GUIDE) & HOS_PAD_BIND_MASK) == 0;   // (not the stick's menu bits)
+                // (the inputs a binding can take: not the sticks' menu bits nor the touchpad's, which bind refuses)
+                else if (const uint32_t p = pad_press & ~(1u << HOS_PAD_GUIDE) & HOS_PAD_BIND_MASK) {
                     int bit = 0;
                     while (!(p >> bit & 1)) bit++;
-                    host->bind(HOS_BIND_PAD, controls[csel - kTop].button, 0, bit);
-                    listening = 0, changed = true;
-                    opts.pad_layout = detect_pad_layout();
-                    save();
+                    listening = 0, changed = true;   // ((Triforce) its Input; asked first when another control has it)
+                    bind_or_ask(HOS_BIND_PAD, csel - kTop, ccol == kColAlt ? 1 : 0, bit);
                 }
             } else {
                 int down = 0;
                 for (int k : bindable_keys())
                     if (mine && (GetAsyncKeyState(k) & 0x8000)) {
+                        // ((Triforce) 11-24: an ocarina note takes no mouse button, host/nn_hid.c hos_bind: not listened for)
+                        if (note_row(csel - kTop) && (k == VK_LBUTTON || k == VK_RBUTTON || k == VK_MBUTTON || k == 0x05 || k == 0x06))
+                            continue;
                         down = k;
                         break;
                     }
                 if (!listen_armed) listen_armed = !down;
                 else if (down) {
-                    host->bind(HOS_BIND_KEY, controls[csel - kTop].button, 0, down);
-                    host->bind(HOS_BIND_KEY, controls[csel - kTop].button, 1, 0);
-                    listening = 0, changed = true;
-                    save();
+                    listening = 0, changed = true;   // ((Triforce) the one key; asked first when another control has it)
+                    bind_or_ask(HOS_BIND_KEY, csel - kTop, 0, down);
                 }
             }
         } else {
@@ -8112,7 +9890,7 @@ void menu_tick() {
                 const int at = option ? hit.index : kTop + hit.index;   // (the page's row: its own rows first)
                 if (on && (moved || ptr.pressed)) {
                     if (at != csel) csel = at, changed = true;
-                    if (hit.part == menu_hit::kCtlCell && !keys_only(hit.index) && ccol != hit.side) ccol = hit.side, changed = true;
+                    if (hit.part == menu_hit::kCtlCell && col_usable(hit.index, hit.side) && ccol != hit.side) ccol = hit.side, changed = true;
                 }
                 if (ptr.pressed & HOS_MOUSE_LEFT) {
                     if (option) press[hit.side < 0 ? 3 : 4] = true;   // (a value's halves: Left and Right; the name: Right)
@@ -8124,27 +9902,29 @@ void menu_tick() {
             }
             if (press[5]) page = 0, changed = true;
             const int n = kTop + kControls + 1, i = csel - kTop;   // (i: the control's, or reset's)
-            if (press[1]) csel = (csel + n - 1) % n, changed = true;
-            if (press[2]) csel = (csel + 1) % n, changed = true;
+            (void)n;   // ((Triforce) per-control reset: on the Reset column, Up and Down go to the controls with one)
+            if (press[1]) csel = next_control_selection(csel, ccol, -1), blocked_reset_row = -1, changed = true;
+            if (press[2]) csel = next_control_selection(csel, ccol, 1), blocked_reset_row = -1, changed = true;
             if (i < 0 && (press[3] || press[4] || press[7])) {   // (the page's own rows: Enter as Right)
                 Row& r = rows[tab_row_to_global(TAB_PAGE, csel)];   // (Custom is only what the bindings are: set_row skips it)
                 set_row(r, *r.value + (press[3] ? -r.step : r.step), press[3] ? -1 : 1);
                 changed = true;
             } else if (i >= 0) {
-                if ((press[3] || press[4]) && i < kControls && !keys_only(i)) ccol ^= 1, changed = true;
-                if (keys_only(i)) ccol = 1;   // (the stick's and the camera's directions: keys only)
-                if (press[7]) {
-                    if (i == kControls) {
-                        host->bind(HOS_BIND_PAD, -1, 0, 0);
-                        opts.pad_layout = 0;
-                        save();
-                    }
-                    else listening = ccol ? 2 : 1, listen_armed = false, listen_end = prof_now() + 6000000000LL;
+                if ((press[3] || press[4]) && i < kControls && (!keys_only(i) || col_usable(i, kColReset))) {   // ((Triforce) 11-24: the next usable column; a keys-only row's Reset too)
+                    do ccol = (ccol + kCols + (press[3] ? -1 : 1)) % kCols;
+                    while (!col_usable(i, ccol));
                     changed = true;
                 }
-                if ((press[8] || press[9]) && i < kControls) {
-                    if (ccol == 0) {
-                        host->bind(HOS_BIND_PAD, controls[i].button, 0, -1);
+                if (i < kControls && !col_usable(i, ccol)) ccol = keys_only(i) ? kColKeys : kColPad;   // (keys only; a note's one input)
+                if (press[7]) {   // ((Triforce) Reset to defaults and a control's Reset: asked first)
+                    if (i == kControls) control_confirmation = {kAskResetAll};
+                    else if (ccol == kColReset) control_confirmation = {kAskResetRow, i};
+                    else listening = ccol == kColKeys ? 2 : 1, listen_armed = false, listen_end = prof_now() + 6000000000LL;
+                    changed = true;
+                }
+                if ((press[8] || press[9] || pad(pad_clear)) && i < kControls && ccol != kColReset) {   // ((Triforce) a pad's Clear too)
+                    if (ccol != kColKeys) {
+                        host->bind(HOS_BIND_PAD, controls[i].button, ccol == kColAlt ? 1 : 0, -1);
                         opts.pad_layout = detect_pad_layout();
                     }
                     else for (int k = 0; k < 2; k++) host->bind(HOS_BIND_KEY, controls[i].button, k, 0);
@@ -8376,6 +10156,46 @@ void menu_tick() {
             // values change by a click on their arrows or halves, a slider's drag, Left and Right, A and Enter)
             if (ptr.wheel && drag_row < 0) wheel_rows[cur_tab] += ptr.wheel, changed = true;
         }
+        {   // ((Triforce) the Output width and height rows typed into (size_edit): before Back, which ends the typing first)
+            const int tc = tab_row_count(cur_tab), si = std::min(tab_selected[cur_tab], tc - 1);
+            Row* sr = tc > 0 && si >= 0 ? &rows[tab_row_to_global(cur_tab, si)] : nullptr;
+            const bool size_row = sr && (sr->value == &opts.output_width || sr->value == &opts.output_height) && !row_fixed(sr->value) &&
+                                  output_choice(opts.output_res) == OUTPUT_CUSTOM;
+            if (!size_row || (size_edit && size_edit != sr->value)) {
+                if (size_edit) changed = true;
+                size_edit = nullptr, size_text.clear();
+            }
+            std::vector<int> typed;
+            {
+                std::lock_guard<std::mutex> g(mods_typed_mu);
+                typed.swap(size_typed);
+            }
+            for (int cp : size_row ? typed : std::vector<int>()) {
+                if (cp >= '0' && cp <= '9') {
+                    if (!size_edit) size_edit = sr->value, size_text.clear();
+                    if (size_text.size() < 4) size_text += (char)cp;
+                    changed = true;
+                } else if (cp == 8 && size_edit) {
+                    if (!size_text.empty()) size_text.pop_back();
+                    changed = true;
+                } else if (cp == 127 && size_edit) {
+                    size_text.clear(), changed = true;
+                }
+            }
+            if (size_edit) {
+                if (press[7] && !size_text.empty()) {   // (Enter: the number, on the row's steps and in its range)
+                    int v = atoi(size_text.c_str());
+                    v = std::min(std::max(v / sr->step * sr->step, sr->lo), sr->hi);
+                    if (v != *sr->value) set_row(*sr, v, v > *sr->value ? 1 : -1);
+                    size_edit = nullptr, size_text.clear(), changed = true;
+                } else if (press[7] || press[5]) {   // (Enter with nothing typed, or Esc: as it was)
+                    size_edit = nullptr, size_text.clear(), changed = true;
+                }
+                press[1] = press[2] = press[3] = press[4] = press[5] = press[7] = press[8] = press[9] = false;
+                tab_left = tab_right = false;
+            }
+            size_text_wanted.store(size_row, std::memory_order_relaxed);
+        }
         if (press[5] && sub_page(cur_tab)) cur_tab = page_parent(cur_tab), press[5] = false, changed = true;   // (back)
         if (press[5] && pending) pending = nullptr, changed = true;   // (a Restart or Quit waiting for its second press: cancelled)
         else if (press[5] && sub_page(cur_tab)) cur_tab = page_parent(cur_tab), press[5] = false, changed = true;   // (back)
@@ -8425,10 +10245,20 @@ void menu_tick() {
         else if (press[7] && is_files_row(r)) files_open(false), press[7] = false, changed = true;
         else if (press[7] && is_motion_row(r)) cur_tab = TAB_MOTION, tab_selected[TAB_MOTION] = 0, press[7] = false, changed = true;
         else if (press[7] && row_page(r) >= 0) cur_tab = row_page(r), tab_selected[cur_tab] = 0, press[7] = false, changed = true;
+        else if (press[7] && r.name == kNfcTag) names_open(kNamesAmiibo), press[7] = false, changed = true;   // ((Triforce) 11-24)
+        else if (press[7] && reshade_menu::act(r.name)) press[7] = false, changed = true;   // ((Triforce) 11-24: Compare, Rescan)
+        // ((Triforce) 11-24) the Test microphone row: on and off again (mic_test_tick tells the host)
+        else if (press[7] && r.name == kTestMic) {
+            if (opts.mic != 0 && host && host->mic_test) mic_testing = !mic_testing;
+            press[7] = false, changed = true;
+        }
         // ((Triforce, 11-22, N64 Classic) Remembered settings opens its page; the page's two actions act on a press)
         else if (press[7] && is_n64_page_row(r)) cur_tab = TAB_N64, tab_selected[TAB_N64] = 0, press[7] = false, changed = true;
         // (its press kept: the sound's confirm, kDecide. The row has no value, and nothing after this takes press[7] for it)
         else if (press[7] && n64_action(r)) n64_act(n64_action(r)), changed = true;
+        // ((Triforce, 11-24) Simulated turf opens its page; the page's Reset current area acts on a press (its press kept, as above)
+        else if (press[7] && is_sim_turf_page_row(r)) cur_tab = TAB_SIM_TURF, tab_selected[TAB_SIM_TURF] = 0, press[7] = false, changed = true;
+        else if (press[7] && is_sim_turf_reset_row(r)) sim_turf_reset(), changed = true;
         else if (press[7] && !r.value && can_bind()) page = 1, csel = 0, ccol = 0, changed = true;
         if ((press[3] || press[4] || press[7]) && r.value) {   // (Enter, or A, as Right)
             if (press[7]) press[4] = true;
@@ -8481,6 +10311,7 @@ void menu_tick() {
         const bool now_open = open_now.load();
         if (!now_open) {
             if (drag_row >= 0) save();   // (a slider let go off the window: kept now)
+            sim_turf_flush();   // ((Triforce, 11-24) the Simulated turf page's file: written now, if it waits)
             if (!in_game_options) hover_tab = -1;   // ((Triforce) on the game's own tab, the tabs' own: above)
             drag_row = -1, mouse_read = false;
             pending = nullptr;
@@ -8511,6 +10342,7 @@ void menu_tick() {
             if (opts.framegen >= 1 || mkwvk::dlssg::multiplier() > 1) snprintf(fps_sub, sizeof fps_sub, "%.0f", game);
             else fps_sub[0] = 0;
             if (opts.show_fps == 2) perf_sample(shown, game);   // (Triforce: the Full overlay's lines)
+            if (fps_levels::shows_time(opts.show_fps)) fps_detail_sample();   // ((Triforce) the levels between On and Full
         }
     }
 }

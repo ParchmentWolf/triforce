@@ -49,3 +49,7 @@ itself: draw it on black, the lines that stay are kept under it.
 
 When a face's picture changes, its `parts` must follow it (the lines end on them): the pictures' pixels, `(x, y, r)` for each
 control, see `_parts` in `nx2/prompt_faces.py`.
+
+The ps4, ps5, xbox and steamdeck faces have a hand-drawn picture here (`<face>/Controller_Pro.png`, the PlayStation faces one
+DualSense), drawn in the game's greys; their `parts` in `nx2/prompt_faces.py` are those pictures' own, so every leader line,
+`ControllerGuide_Pro_00` to `_04`, is still drawn by the router to them and follows the controls.

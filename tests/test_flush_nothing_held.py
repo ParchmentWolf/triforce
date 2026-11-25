@@ -69,8 +69,14 @@ struct CountingMutex {
     std::mutex m;
     std::atomic<long> locks{0};
     void lock() { locks.fetch_add(1); m.lock(); }
+    bool try_lock() { if (!m.try_lock()) return false; locks.fetch_add(1); return true; }
     void unlock() { m.unlock(); }
 };
+namespace rec {   // ((Triforce) Threaded rendering's recorder, off: no part to wait for (vk_recorder.h)
+enum Bound { B_QUEUE_LOCK };
+inline bool settle_parts(Bound, uint64_t = UINT64_MAX) { return true; }
+struct Settled { Settled() {} };
+}
 struct { CountingMutex present_mu; } dev;
 struct { std::vector<int> cbs; } pend;
 int flush_reason;
@@ -175,17 +181,19 @@ def main():
         fail("vk_replay.cpp has no pend_held")
     decl = src[src.index("std::atomic<bool> pend_held{false};"):]
     decl = decl[:decl.index(block(decl, "bool pend_held_on() {")) + len(block(decl, "bool pend_held_on() {"))]
-    flush = block(src, "void queue_flush_for(int why) {") + "\n" + block(src, "void queue_flush_poll() {")
+    flush = block(src, "void queue_flush_for(int why, uint64_t settle_ns = UINT64_MAX) {") + "\n" + block(src, "void queue_flush_poll() {")
     for name in ("queue_flush_for", "queue_flush_poll"):
         body = block(src, "void %s(" % name)
-        if body.index("pend_held.load(std::memory_order_acquire)") > body.index("std::lock_guard lk(dev.present_mu);"):
+        # ((Triforce) queue_flush_for takes the lock through a unique_lock: Threaded rendering's recorder may find it held)
+        lock = "std::lock_guard lk(dev.present_mu);" if "std::lock_guard lk(dev.present_mu);" in body else "std::unique_lock lk(dev.present_mu, std::defer_lock);"
+        if body.index("pend_held.load(std::memory_order_acquire)") > body.index(lock):
             fail("%s: the look is not before the lock" % name)
     locked = block(src, "void queue_flush_locked() {")
     in_order(locked, ["pend.cbs.clear()", "pend_held.store(false, std::memory_order_release);"], "queue_flush_locked")
     sub = block(src, "void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at = 0, bool part = false) {")
     in_order(sub, ["seq = ++rec_seq;", "const auto register_recording = [&] {", "std::lock_guard mk(rec_map_mu);",
                    "fin_rec.submitted(rec_open_values, seq, !part);", "};",
-                   "const bool batching = batch_on(), registered_late = batching && pend_held_on();",
+                   "const bool batching = batch_on(), registered_late = batching && pend_held_on() && !post;",
                    "if (!registered_late) register_recording();", "std::lock_guard lk(dev.present_mu);", "if (batch_on()) {",
                    "for (uint32_t i = 0; i < n; i++) pend.cbs.push_back(cb[i]);", "pend.recs++;",
                    "pend_held.store(true, std::memory_order_release);", "if (registered_late) register_recording();",

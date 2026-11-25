@@ -8,14 +8,19 @@ needs and no more:
   - once, when it starts: every attribute of the lifter but NOT_SENT (the entries, the PLT stubs, the jump tables, the names, the
     patches after instructions: 4 MB pickled), the functions that set the lifter's class up as this process did (poll.install),
     and where the counters live;
-  - with each run of consecutive functions: those functions' bodies as the discovery left them and the texts of their
-    instructions as write() translated them (about 3 MB and 3.5 MB a run: 148 runs of 2000 functions were 425 and 513 MB).
+  - with each run of consecutive functions: those functions' bodies as the discovery left them (about 3 MB a run).
 
-A worker emits its run with the lifter's own emit_function and sends back the texts, the names each calls and what the run added
-to the counters. The lift's process takes the runs in order and hands write() the functions one by one, as if it had made them:
-the C is the one-process C, byte for byte (tests/test_spawn_emit.py on authored code; the game's own lift was compared file by
-file). Nothing a worker computes is taken from anywhere but these two messages, so discovery is done once and is not assumed to
-repeat itself.
+A worker translates its run's instructions itself, as a64_lift.Lifter.write does for all of them (each distinct word once, per pc
+where its text reads the pc: run_texts), emits the run with the lifter's own emit_function and sends back the texts, the names
+each calls, what the run added to the counters and the FPX shapes its instructions use (a64_fpx.h's helpers: the lift's process
+writes that header from every run's, fill_fpx in nx2/chunks.py). The lift's process takes the runs in order and hands write() the
+functions one by one, as if it had made them: the C is the one-process C, byte for byte (tests/test_spawn_emit.py on authored code;
+the game's own lift was compared file by file). Nothing a worker computes is taken from anywhere but these two messages, so
+discovery is done once and is not assumed to repeat itself.
+
+(Triforce, 11-24) The lift's process no longer translates every instruction for itself on this path (nx2/chunks.py no_texts: ~15 s
+and 1-2 GB, before, only to send the texts on), and the processes start when write() is called, before the coverage report, so
+they work while the lift's process makes it (emit(): the first runs are asked for at once).
 
 Measured on a 16-thread PC (the game: 294,523 functions, 17.6 million instructions, 185 runs): write()'s emit loop takes 46 s in
 one process, 37 s of it in emit_function, and 13 s with 8 processes (21 s with 3, on a PC that was not idle). What is left is
@@ -44,7 +49,8 @@ import a64_lift
 
 # (the lifter's attributes a worker is not sent: the image and the functions (each run brings its own), write()'s stand-in for
 # emit_function, which exists only in the lift's process, and what only the discovery reads)
-NOT_SENT = ("img", "funcs", "emit_function", "eh_starts", "_preds")
+NOT_SENT = ("img", "funcs", "emit_function", "eh_starts", "_preds",
+            "_op_entries")   # ((Triforce) nx2/walk.py's shared entries of the discovery's plain ops: a million, read by no emit)
 RUN_FUNCS = 2000      # (a run: at most this many functions,
 RUN_INSNS = 120000    # and no more once it holds this many instructions: 2000 functions are 120,000 on average, a few are 20,000 each)
 AHEAD = 2             # (runs asked for beyond one a worker: none waits while the lift's process writes a chunk)
@@ -72,26 +78,42 @@ def plan(order, size, most_funcs=None, most_size=None):
     return runs
 
 
-def texts_of(funcs, es, texts):
-    """The instruction texts the emit of the functions es reads, out of all of them: a64_lift's emit_function, dead_flags and
-    dirty_regs look a plain instruction's text up by its word, or by the word and its address where the text depends on the
-    address (pc_relative), and no other kind's"""
+def run_texts(bodies, fpx):
+    """The instruction texts the emit of the functions in bodies ({e: (body, labels)}) reads, made as a64_lift.Lifter.write makes
+    them for every function: a64_lift's emit_function, dead_flags and dirty_regs look a plain instruction's text up by its word,
+    or by the word and its address where the text depends on the address (pc_relative), and no other kind's. Each is translated
+    once, by a64emit.translate and a64_lift.op_text as they stand (nx2/insn.py's, nx2/vecfp.py's, nx2/fastvec.py's: this
+    process ran nx2/lift.py's module level as the lift's did). The FPX shapes the texts use are added to fpx"""
+    import a64emit
     relative = a64_lift.pc_relative
-    need = {}
-    for e in es:
-        for pc, (k, w) in funcs[e][0].items():
+    keys = {}
+    for body, _ in bodies.values():
+        for pc, (k, w) in body.items():
             if k[0] == "op":
-                key = (w, pc) if relative(w) else w
-                if key not in need:
-                    need[key] = texts[key]
-    return need
+                keys.setdefault((w, pc) if relative(w) else w, (pc, w))
+    order = list(keys)
+    tx, fl = a64emit.translate([keys[x] for x in order])
+    op_text = a64_lift.op_text
+    return dict(zip(order, zip((op_text(t, fpx) for t in tx), fl)))
 
 
 def emit_print(cls):
     """What the class's emit_function is made of: its own name and, through the closures, the names of the functions it wraps
     (poll.install keeps the one before it in its closure). A worker whose class has another emit_function than the lift's
     process (a wrapper installed there and not named in `setup`) would write other C, without a word: it compares this first"""
-    out, todo, seen = [], [getattr(cls, "emit_function", None)], set()
+    return chain(getattr(cls, "emit_function", None))
+
+
+def lift_print(cls):
+    """(Triforce) What a worker's emit and texts are made of: emit_print, and the same for the lifter's dead_flags and for the
+    translator (a64emit.translate) and a64_lift.op_text, which a worker now calls itself (run_texts)"""
+    import a64emit
+    return [emit_print(cls), chain(getattr(cls, "dead_flags", None)), chain(a64emit.translate), chain(a64_lift.op_text)]
+
+
+def chain(f):
+    """f's own name and, through the closures, the names of the functions it wraps"""
+    out, todo, seen = [], [f], set()
     while todo:
         f = todo.pop()
         f = getattr(f, "__func__", f)
@@ -166,10 +188,12 @@ def _start(blob):
         setup, cls, state, counters, want = pickle.loads(blob)
         for f in setup:
             f()
-        got = emit_print(cls)
-        if got != want:
-            raise RuntimeError("the lifter's emit_function here is %s, the lift's process has %s: what set it up there must be "
-                               "named in `setup` (nx2/chunks.py write)" % (" over ".join(got), " over ".join(want)))
+        got = lift_print(cls)
+        for what, mine, theirs in zip(("the lifter's emit_function", "the lifter's dead_flags", "the translator (a64emit.translate)",
+                                       "a64_lift.op_text"), got, want):
+            if mine != theirs:
+                raise RuntimeError("%s here is %s, the lift's process has %s: what set it up there must be named in `setup` "
+                                   "(nx2/chunks.py write)" % (what, " over ".join(mine), " over ".join(theirs)))
         L = cls.__new__(cls)
         vars(L).update(state)
         _mine = (L, [vars(L)[k] if m == "L" else getattr(importlib.import_module(m), k) for m, k in counters])
@@ -177,19 +201,21 @@ def _start(blob):
         _mine = traceback.format_exc()
 
 
-def _emit_run(bodies, texts):
-    """A run's functions emitted: [(e, text, refs)], and each counter's keys with what this run added (every key the counter
-    holds, in its order: the lift's process adds them in the runs' order, so its counters get their keys in the order one
-    process gives them)"""
+def _emit_run(bodies):
+    """A run's functions emitted: [(e, text, refs)], each counter's keys with what this run added (every key the counter holds,
+    in its order: the lift's process adds them in the runs' order, so its counters get their keys in the order one process gives
+    them), and (Triforce) the FPX shapes of the run's instructions (run_texts)"""
     if not isinstance(_mine, tuple):
         raise RuntimeError("a process of the emit could not be set up:\n%s" % _mine)
     L, counters = _mine
+    fpx = set()
+    texts = run_texts(bodies, fpx)
     L.funcs = bodies
     for c in counters:
         for k in c:
             c[k] = 0
     out = [(e,) + tuple(L.emit_function(e, texts)) for e in bodies]
-    return out, [list(c.items()) for c in counters]
+    return out, [list(c.items()) for c in counters], fpx
 
 
 # ---- in the lift's process ----------------------------------------------------------------------------------------------------
@@ -199,7 +225,7 @@ class Workers:
 
     def __init__(self, jobs, L, counters=(), setup=()):
         blob = pickle.dumps((list(setup), type(L), {k: v for k, v in vars(L).items() if k not in NOT_SENT},
-                             [where(L, c) for c in counters], emit_print(type(L))), pickle.HIGHEST_PROTOCOL)
+                             [where(L, c) for c in counters], lift_print(type(L))), pickle.HIGHEST_PROTOCOL)
         self.jobs = max(1, min(int(jobs), MOST))
         self.pool = concurrent.futures.ProcessPoolExecutor(max_workers=self.jobs, mp_context=multiprocessing.get_context("spawn"),
                                                            initializer=_start, initargs=(blob,))
@@ -210,11 +236,13 @@ class Workers:
         except BrokenProcessPool as e:   # (a process died since the last answer: the pool takes nothing more)
             raise SystemExit(GONE % (call[0], e)) from None
 
-    def each(self, fn, calls, wait=None):
+    def each(self, fn, calls, wait=None, primed=False):
         """fn(*args) in the processes for every (what, args) of calls, the results in the calls' order. calls is read as the
         processes come free (AHEAD more than there are), so what it makes for a call is not held for all of them at once.
         A call that raises, a process that dies and one that gives no answer for `wait` seconds (WAIT) end it with SystemExit
-        and what was said, and with the processes ended; so does leaving it before its end"""
+        and what was said, and with the processes ended; so does leaving it before its end.
+        (Triforce) primed: the first calls are asked for at the first next(), which gives None, so the processes start (they are
+        started as calls come) and work while the caller does something else before it takes the answers"""
         pending, calls, done = collections.deque(), iter(calls), False
         try:
             while True:
@@ -224,6 +252,10 @@ class Workers:
                         calls = None
                     else:
                         pending.append(self._ask(fn, call))
+                if primed:
+                    primed = False
+                    yield None
+                    continue
                 if not pending:
                     done = True
                     return
@@ -287,22 +319,61 @@ class Workers:
         pool.shutdown(wait=True, cancel_futures=True)
 
 
-def emit(workers, L, order, texts, counters, need=texts_of, runs=None):
-    """(e, text, refs) for every function of order, in order, emitted by the workers; counters (the dicts Workers was given)
-    get each run's additions. need(funcs, es, texts): the texts a run is sent; runs: the runs, when not plan()'s"""
+class Emitted:
+    """emit()'s (e, text, refs), an iterator; fpx: the FPX shapes of the runs taken so far (all of them once it is read to its
+    end); close() ends what it asked for when it is not read to its end (the processes are ended then, as each() does)"""
+
+    def __init__(self, answers, counters):
+        self.fpx = set()
+        self._answers = answers
+        self._frozen = True
+        self._made = self._take(answers, counters)
+
+    def _take(self, answers, counters):
+        for out, counts, shapes in answers:
+            for c, added in zip(counters, counts):
+                for k, v in added:
+                    c[k] = c.get(k, 0) + v
+            self.fpx |= shapes
+            yield from out
+        self._thaw()
+
+    def _thaw(self):
+        if self._frozen:
+            self._frozen = False
+            gc.unfreeze()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._made)
+
+    def close(self):
+        try:
+            self._made.close()
+            self._answers.close()
+        finally:
+            self._thaw()
+
+
+def emit(workers, L, order, counters, runs=None):
+    """(e, text, refs) for every function of order, in order, emitted by the workers (an Emitted); counters (the dicts Workers
+    was given) get each run's additions; runs: the runs, when not plan()'s. (Triforce) The first runs are asked for now: the
+    processes start and translate them while the lift's process goes on (nx2/chunks.py write: the coverage report, then the
+    lifter's write())"""
     funcs = L.funcs
     if runs is None:
         runs = plan(order, lambda e: len(funcs[e][0]))
 
     def calls():
         for es in runs:
-            yield ("the emit of f_%08x to f_%08x" % (es[0], es[-1]), ({e: funcs[e] for e in es}, need(funcs, es, texts)))
+            yield ("the emit of f_%08x to f_%08x" % (es[0], es[-1]), ({e: funcs[e] for e in es},))
     gc.freeze()   # (the lift's millions of objects out of the collector's sight while the runs' short-lived ones come and go)
+    answers = workers.each(_emit_run, calls(), primed=True)
     try:
-        for out, counts in workers.each(_emit_run, calls()):
-            for c, added in zip(counters, counts):
-                for k, v in added:
-                    c[k] = c.get(k, 0) + v
-            yield from out
-    finally:
+        next(answers)
+    except BaseException:
         gc.unfreeze()
+        raise
+    return Emitted(answers, counters)

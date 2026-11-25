@@ -42,6 +42,9 @@ FIXTURE = r'''#include <algorithm>
 int replay_threads_at_start = replay_threads::kDefaultRow;
 int stand_in_automatic = 0;   /* (vk_replay.cpp's asks the device and the processors: replay_threads::automatic, checked below) */
 int replay_threads_automatic() { return stand_in_automatic; }
+/* ((Triforce) Threaded rendering's render thread: none here, the row decides as before) */
+bool threaded_render_thread() { return false; }
+bool async_on() { return false; }
 int told = 0;   /* (the log's line at the start: one for each way the count is chosen) */
 static void logf(const char* f, ...) { told += std::strstr(f, "vk: replay helper threads: ") == f; }
 @OF@
@@ -130,8 +133,11 @@ def main():
     # an options file's own value is taken as it is: no version of the file turns a 0 into the default
     init = function(menu, "void menu_init() {")
     check("opts.replay_threads =" not in init, "menu_init changes the Replay helper threads an options file names")
-    # the log's line at the start, for each way the count is chosen, and how to turn the threads off
-    check(top.count("par_threads_told(") == 3 and 'logf("vk: replay helper threads: ' in function(replay, "int par_threads_told(int threads, const char* by) {"),
+    # the log's line at the start, for each way the count is chosen, and how to turn the threads off ((Triforce) and Threaded
+    # rendering's render thread, which has none: after both switches, before the row)
+    th = top.index("if (threaded_render_thread() && async_on())")
+    check(order[1] < th < order[2], "par_threads_max: Threaded rendering's render thread is not asked after the switches, before the row")
+    check(top.count("par_threads_told(") == 4 and 'logf("vk: replay helper threads: ' in function(replay, "int par_threads_told(int threads, const char* by) {"),
           "par_threads_max no longer says at the start what was chosen by a switch or the row")
     check("replay_threads_at_start = opts.replay_threads;" in function(menu, "void menu_init() {"),
           "menu_init does not keep the Replay helper threads the game started with")
@@ -166,7 +172,7 @@ def main():
           "RX_VK_EVENT_EARLY has a row, or is gone from vk_replay.cpp")
     # the Debug tab draws a row of more than two values as a choice (its Developer rows were Off and On alone). ((Triforce,
     # 11-17) The tab is drawn by draw_options' own loop now: only a row of On and Off is halves there)
-    draw = function(menu, "void draw_options(")
+    draw = function(menu, "void draw_options(") + function(menu, "float row_value_cell(")   # ((Triforce) its value cells
     check("} else if (r.text == tx_onoff && !fixed) {" in draw and "choice_cell(c, va, vb, r.text(*r.value), selected, left, right, fixed);" in draw
           and "if (cur_tab == TAB_DEBUG) listed = debug_list(list);" in draw,
           "the Debug tab draws the Replay helper threads row as Off and On halves")

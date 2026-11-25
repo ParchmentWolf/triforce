@@ -481,7 +481,7 @@ def check_source():
     steps = (VK / "cache_set_files.h").read_text(encoding="utf-8")
 
     # (once the device is made, before anything opens a cache: mkwvk_init, right after create_device)
-    init = function(main, "const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {")
+    init = function(main, "static const MkwVkRenderer* init_body(const MkwVkHost* h) {")   # (mkwvk_init's work, behind its catch: cxx_escape.h)
     made = "if (!create_instance() || !pick_device() || !create_device()) return nullptr;"
     check(made in init and "cache_set_init();" in init, "mkwvk_init does not decide the caches' kept set")
     check(init.index(made) < init.index("cache_set_init();") < init.index("table.version"),
