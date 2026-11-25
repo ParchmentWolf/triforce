@@ -5537,14 +5537,29 @@ struct Decoded {
     // sharp: what is seen from afar stays the game's. Each half the one before, or the list stops there)
     std::vector<Decoded> more;
 };
+// ((Triforce, 11-25) his v0.8.0 stutter: every decoded file stayed in RAM for good (private 15.7 -> 28 GB, the PC 1.6 GB free).
+// Now a decoded file is held only until its image is made (take), or kKeepFrames when no look takes it; the decoder waits
+// while kRamCap of them are held; the images made in one present stay under kMakeBudget of staging; and the views of the
+// textures whose file came go stale together every kFlipEvery presents, not at each file (each flip renews the descriptors))
+constexpr uint64_t kRamCap = 768ull << 20;
+constexpr uint64_t kMakeBudget = 96ull << 20;
+constexpr uint64_t kFlipEvery = 8;
+constexpr uint64_t kKeepFrames = 240;
+constexpr uint64_t kRetryFrames = 600;   // (a texture the budget turned away: asked again no sooner)
+struct Held {
+    std::shared_ptr<Decoded> d;
+    uint64_t bytes = 0, frame = 0;   // (its RAM; the present it came at)
+};
 std::mutex mu;
 std::condition_variable cv;
 std::deque<uint64_t> queue;
-std::unordered_set<uint64_t> index, asked;
-std::unordered_map<uint64_t, std::shared_ptr<Decoded>> done;
+std::unordered_set<uint64_t> index, asked;   // (asked: being decoded or held in done; out of both once taken or let go)
+std::unordered_map<uint64_t, Held> done;
 std::vector<std::pair<Texture*, uint32_t>> waiting;   // (textures whose file is being decoded: their views go stale when it is)
-std::atomic<uint64_t> done_count{0};
+std::vector<std::pair<Texture*, uint32_t>> retry;     // (textures whose image waits for a later present's kMakeBudget)
+std::atomic<uint64_t> done_count{0}, done_bytes{0}, frame_no{0};
 uint64_t bytes = 0;   // (the pack's images' video memory; the replay thread's)
+uint64_t made_now = 0;   // (the staging of the images made in this present; the replay thread's)
 std::string folder;
 bool on() {
     static const bool v = [] {
@@ -5571,7 +5586,7 @@ bool on() {
                 uint64_t k;
                 {
                     std::unique_lock lk(mu);
-                    cv.wait(lk, [] { return !queue.empty(); });
+                    cv.wait(lk, [] { return !queue.empty() && done_bytes.load(std::memory_order_relaxed) < kRamCap; });
                     k = queue.front();
                     queue.pop_front();
                 }
@@ -5611,9 +5626,15 @@ bool on() {
                         break;
                     d->more.push_back(std::move(l));
                 }
+                uint64_t held = d->rgba.size();
+                for (const auto& l : d->more) held += l.rgba.size();
                 {
                     std::lock_guard lk(mu);
-                    done[k] = d;
+                    asked.insert(k);   // (held: not asked again; let go after kKeepFrames if no look takes it)
+                    Held& h = done[k];
+                    done_bytes -= h.bytes;
+                    h = {d, held, frame_no.load(std::memory_order_relaxed)};
+                    done_bytes += held;
                 }
                 done_count.fetch_add(1, std::memory_order_release);
             }
@@ -5626,30 +5647,69 @@ bool log_on() {
     static const bool v = getenv("RX_VK_TEX_PACK_LOG") != nullptr;
     return v;
 }
+/// (mu held) a decoded file let go: out of RAM, and asked again if a texture wants it later
+void let_go_locked(uint64_t k) {
+    asked.erase(k);
+    const auto it = done.find(k);
+    if (it == done.end()) return;
+    done_bytes -= it->second.bytes;
+    done.erase(it);
+    cv.notify_all();
+}
+/// The decoded file, out of the held ones: its image is made from it now (nullptr: not held, let go before)
 std::shared_ptr<Decoded> take(uint64_t k) {
     std::lock_guard lk(mu);
     const auto it = done.find(k);
-    return it == done.end() ? nullptr : it->second;
+    if (it == done.end()) return nullptr;
+    std::shared_ptr<Decoded> d = std::move(it->second.d);
+    let_go_locked(k);
+    return d;
+}
+void let_go(uint64_t k) {
+    std::lock_guard lk(mu);
+    let_go_locked(k);
 }
 void ask(uint64_t k) {
     std::lock_guard lk(mu);
     if (!asked.insert(k).second) return;
     queue.push_back(k);
-    cv.notify_one();
+    cv.notify_all();
 }
-void forget(Texture* tex) {   // (a texture that goes while its file is decoded)
+/// A texture wants its file: decoded (3) if it is held, else asked and waiting (2)
+void want(Texture* tex) {
+    tex->pack_state = 2;
+    ask(tex->pack_key);
     std::lock_guard lk(mu);
-    for (size_t i = 0; i < waiting.size(); i++)
-        if (waiting[i].first == tex) waiting[i] = waiting.back(), waiting.pop_back(), i--;
+    if (done.count(tex->pack_key)) tex->pack_state = 3;
+    else waiting.push_back({tex, tex->id});
 }
-/// (texture_frame) the waiting textures whose file is decoded now: their views go stale, so their next look makes the pack's image
+/// A decoded texture whose image waits for a later present (this one's kMakeBudget is spent)
+void later(Texture* tex) {
+    tex->pack_state = 2;
+    std::lock_guard lk(mu);
+    retry.push_back({tex, tex->id});
+}
+void forget(Texture* tex) {   // (a texture that goes while its file is decoded, or while its image waits)
+    std::lock_guard lk(mu);
+    for (auto* list : {&waiting, &retry})
+        for (size_t i = 0; i < list->size(); i++)
+            if ((*list)[i].first == tex) (*list)[i] = list->back(), list->pop_back(), i--;
+}
+/// (texture_frame) every kFlipEvery presents: the waiting textures whose file is decoded now and those put off to a later
+/// present go stale together, so their next look makes the pack's image; files no look took in kKeepFrames are let go
 void frame() {
-    static uint64_t seen = 0;
-    const uint64_t n = done_count.load(std::memory_order_acquire);
-    if (n == seen) return;
-    seen = n;
+    const uint64_t f = frame_no.fetch_add(1, std::memory_order_relaxed) + 1;
+    made_now = 0;
+    if (f % kFlipEvery) return;
     bool any = false;
     std::lock_guard lk(mu);
+    for (const auto& r : retry)
+        if (r.first->id == r.second && r.first->pack_state == 2) {
+            r.first->pack_state = 3;
+            views_gone.went(r.first->id);
+            any = true;
+        }
+    retry.clear();
     for (size_t i = 0; i < waiting.size(); i++) {
         Texture* t = waiting[i].first;
         if (t->id != waiting[i].second || !done.count(t->pack_key)) continue;
@@ -5657,6 +5717,15 @@ void frame() {
         views_gone.went(t->id);
         any = true;
         waiting[i] = waiting.back(), waiting.pop_back(), i--;
+    }
+    for (auto it = done.begin(); it != done.end();) {
+        if (f - it->second.frame > kKeepFrames) {
+            done_bytes -= it->second.bytes;
+            asked.erase(it->first);
+            it = done.erase(it);
+            cv.notify_all();
+        } else
+            ++it;
     }
     if (any) destroy_gen++;
 }
@@ -5700,20 +5769,37 @@ VkImageView pack_view(Texture* tex, VkFormat f, uint32_t level0, uint32_t nlevel
             tex->pack_state = 1;
             return VK_NULL_HANDLE;
         }
-        tex->pack_state = 2;
-        texpack::ask(tex->pack_key);
-        std::lock_guard lk(texpack::mu);
-        if (texpack::done.count(tex->pack_key)) tex->pack_state = 3;
-        else texpack::waiting.push_back({tex, tex->id});
+        texpack::want(tex);
     }
+    // ((Triforce, 11-25) 4: its image did not fit kPackBudget, its file let go: asked again once there is room)
+    const uint64_t want_need = (uint64_t)fw * tex_pack::kScale * fh * tex_pack::kScale * 4 * 4 / 3;
+    if (tex->pack_state == 4 && texpack::frame_no.load(std::memory_order_relaxed) >= tex->pack_retry_at &&
+        texpack::bytes + want_need <= texpack::kPackBudget)
+        texpack::want(tex);
     if (tex->pack_state != 3) return VK_NULL_HANDLE;
     if (!tex->hd) {
+        if (texpack::bytes + want_need > texpack::kPackBudget) {
+            static std::atomic<int> told{0};
+            if (told.fetch_add(1) < 4) logf("vk: texture pack: its %llu MB of video memory are used: the game's own textures from here",
+                                            (unsigned long long)(texpack::bytes >> 20));
+            texpack::let_go(tex->pack_key);   // (not held in RAM meanwhile)
+            tex->pack_state = 4, tex->pack_retry_at = texpack::frame_no.load(std::memory_order_relaxed) + texpack::kRetryFrames;
+            return VK_NULL_HANDLE;
+        }
+        if (texpack::made_now && texpack::made_now + want_need > texpack::kMakeBudget) {   // (the next presents': no spike)
+            texpack::later(tex);
+            return VK_NULL_HANDLE;
+        }
         const auto d = texpack::take(tex->pack_key);
-        if (!d || d->w != (int)(fw * tex_pack::kScale) || d->h != (int)(fh * tex_pack::kScale)) {
+        if (!d) {   // (let go before a look took it: decoded again)
+            texpack::want(tex);
+            return VK_NULL_HANDLE;
+        }
+        if (d->w != (int)(fw * tex_pack::kScale) || d->h != (int)(fh * tex_pack::kScale)) {
             static std::atomic<int> told{0};
             if (told.fetch_add(1) < 16)
                 logf("vk: texture pack: %016llx is %dx%d, not twice %ux%u: the game's own", (unsigned long long)tex->pack_key,
-                     d ? d->w : 0, d ? d->h : 0, fw, fh);
+                     d->w, d->h, fw, fh);
             tex->pack_state = 1;
             return VK_NULL_HANDLE;
         }
@@ -5721,12 +5807,6 @@ VkImageView pack_view(Texture* tex, VkFormat f, uint32_t level0, uint32_t nlevel
         uint32_t levels = 1;
         while (levels < tex->levels + tex->skip + 1 && (std::max(w, h) >> levels)) levels++;
         const uint64_t need = (uint64_t)w * h * 4 * 4 / 3;
-        if (texpack::bytes + need > texpack::kPackBudget) {
-            static std::atomic<int> told{0};
-            if (told.fetch_add(1) < 4) logf("vk: texture pack: its %llu MB of video memory are used: the game's own textures from here",
-                                            (unsigned long long)(texpack::bytes >> 20));
-            return VK_NULL_HANDLE;
-        }
         VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ci.imageType = VK_IMAGE_TYPE_2D, ci.format = VK_FORMAT_R8G8B8A8_UNORM;
         ci.extent = {w, h, 1}, ci.mipLevels = levels, ci.arrayLayers = 1, ci.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -5784,11 +5864,13 @@ VkImageView pack_view(Texture* tex, VkFormat f, uint32_t level0, uint32_t nlevel
         full_barrier(cmd, "barrier (Evil HD's texture pack: made)");
         tex->hd_levels = levels, tex->hd_bytes = need;
         texpack::bytes += need;
+        texpack::made_now += staged;
         static std::atomic<int> made{0};
         const int m = made.fetch_add(1) + 1;
         if (m <= 8 || !(m & (m - 1)))
-            logf("vk: texture pack: %d made so far (%016llx, %ux%u from %ux%u; %llu MB in all)", m,
-                 (unsigned long long)tex->pack_key, w, h, fw, fh, (unsigned long long)(texpack::bytes >> 20));
+            logf("vk: texture pack: %d made so far (%016llx, %ux%u from %ux%u; %llu MB in all; decoded files held %llu MB)", m,
+                 (unsigned long long)tex->pack_key, w, h, fw, fh, (unsigned long long)(texpack::bytes >> 20),
+                 (unsigned long long)(texpack::done_bytes.load(std::memory_order_relaxed) >> 20));
     }
     // (the game's level L is the pack's L + 1: the pack's level0 = the game's image level + its skip, one level more on top)
     const uint32_t l0 = std::min(level0 + tex->skip, tex->hd_levels - 1);
@@ -5826,8 +5908,14 @@ void texpack_tick() {
     const int now = evil_hd_now();
     if (was >= 0 && now != was) {
         bool any = false;
-        for (auto& kv : textures)
-            if (kv.second && (kv.second->hd || kv.second->pack_state == 3)) views_gone.went(kv.second->id), any = true;
+        const uint64_t before = texpack::bytes;
+        for (auto& kv : textures) {
+            if (!kv.second || !(kv.second->hd || kv.second->pack_state == 3)) continue;
+            views_gone.went(kv.second->id), any = true;
+            // ((Triforce, 11-25) off: the pack's images go, their video memory with them; on again, each is decoded again)
+            if (!now && kv.second->hd) texpack_gone(*kv.second), kv.second->pack_state = 3;
+        }
+        if (!now && before) logf("vk: texture pack: Evil HD off: its %llu MB of video memory let go", (unsigned long long)(before >> 20));
         if (any) destroy_gen++;
     }
     was = now;
