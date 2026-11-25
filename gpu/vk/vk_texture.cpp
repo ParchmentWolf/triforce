@@ -1084,17 +1084,21 @@ VkImageView make_view(Texture* tex, VkImageViewType type, VkFormat f, VkImageAsp
 ///   0  not at all: the pass is left out, the volumes stay zero and trees are bare at mid distance.
 /// NVIDIA's Pascal and older (device IDs below 0x1e00: GTX 10 series, GTX 900) take the usage and the per-slice views, then
 /// lose the device on the first draw or even a clear into one (a GTX 1080 and a GTX 1070, driver 581.80, at the area load
-/// after the opening cutscene and at every save load): 2 there, where it was 0. RX_VK_BC3D_TARGET=0, 1 or 2: that way
+/// after the opening cutscene and at every save load): 2 there, where it was 0. ((Triforce, 11-25) And AMD's Windows driver for
+/// RDNA 1 and 2 (vk_vendor.h amd_older_compiler): its raw views draw wrong values into the volumes, and the effects that read
+/// them showed bright rainbow lights on the walls (an RX 6900 XT, driver 26.11.2, Goron City; the player's own
+/// RX_VK_BC3D_TARGET=2 fixed it). RX_VK_BC3D_TARGET=0, 1 or 2: that way
 int bc3d_way() {
     static const int way = [] {
         const char* e = getenv("RX_VK_BC3D_TARGET");
         const bool old_nvidia = dev.props.vendorID == 0x10de && dev.props.deviceID < 0x1e00;
-        const int v = e && *e ? std::clamp(atoi(e), 0, 2) : old_nvidia ? 2 : 1;
+        const bool amd_older = dev.amd_older_compiler;
+        const int v = e && *e ? std::clamp(atoi(e), 0, 2) : old_nvidia || amd_older ? 2 : 1;
         if (v != 1)
-            logf("vk: 3D BC images are drawn into %s (%s; NVIDIA before Turing loses the device on raw views of them; "
-                 "RX_VK_BC3D_TARGET=1: raw views, 2: block attachments, 0: not at all)",
+            logf("vk: 3D BC images are drawn into %s (%s; NVIDIA before Turing loses the device on raw views of them, AMD's driver "
+                 "for RDNA 1 and 2 draws wrong values through them; RX_VK_BC3D_TARGET=1: raw views, 2: block attachments, 0: not at all)",
                  v ? "through uncompressed block attachments of their own" : "not at all: the noise pass is left out",
-                 e && *e ? "RX_VK_BC3D_TARGET" : "NVIDIA device id below 0x1e00");
+                 e && *e ? "RX_VK_BC3D_TARGET" : old_nvidia ? "NVIDIA device id below 0x1e00" : "AMD's driver for RDNA 1 and 2");
         return v;
     }();
     return way;

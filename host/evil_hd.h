@@ -44,6 +44,19 @@
 enum { EVIL_HD_FOLIAGE_COUNT = 8 };
 #define EVIL_HD_FOLIAGE_DEFAULTS 0x83f0fd38ULL   /* (main+0x3eefd38: the eight defaults, in this order) */
 static const float evil_hd_foliage_game[EVIL_HD_FOLIAGE_COUNT] = {40.0f, 60.0f, 35.0f, 30.0f, 40.0f, 135.0f, 10.0f, 45.0f};
+/* ((Triforce, 11-25, a player's report with the measurements: "Evil HD 4x: Kokiri Forest bushes and Lost Woods tree leaves
+   flicker") The most two of them go to: the ornaments (Kokiri Forest's cuttable bushes and flowers) flickered at 140 m (4x)
+   and 105 m (3x) and were steady at 70 and 75 m; the low trees' shoot leaves (the Lost Woods' leaves overhead) flickered at
+   120 m and were steady at 30 and 70 m. The game's own areas set them no farther than 75 m (Hyrule Castle's ornaments) and
+   70 m (Zora's Domain's shoot leaves): the foliage system seems to have room for about that many of them. The other six
+   showed no flicker at 4x and keep the whole factor. 0: no bound */
+static const float evil_hd_foliage_most[EVIL_HD_FOLIAGE_COUNT] = {0.0f, 0.0f, 75.0f, 70.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+/* One distance at a factor: the game's times it, kept to its most */
+static inline float evil_hd_foliage_one(int i, float factor) {
+    const float v = factor == 1.0f ? evil_hd_foliage_game[i] : evil_hd_foliage_game[i] * factor;
+    return evil_hd_foliage_most[i] > 0.0f && v > evil_hd_foliage_most[i] && evil_hd_foliage_game[i] <= evil_hd_foliage_most[i]
+               ? evil_hd_foliage_most[i] : v;
+}
 
 /* Whether Evil HD is on: the row's value, or HOS_EVIL_HD's when it is set to 0 or 1 (anything else: the row's) */
 static inline int evil_hd_on(int row, const char *asked) {
@@ -76,9 +89,9 @@ static inline float evil_hd_factor(int row, const char *mode, const char *dist) 
     return evil_hd_on(row, mode) ? evil_hd_dist_factor(dist) : 1.0f;
 }
 
-/* The game's eight foliage defaults, each times the factor, into out (the factor 1: the game's own exactly) */
+/* The game's eight foliage defaults, each times the factor (kept to evil_hd_foliage_most), into out (the factor 1: the game's own exactly) */
 static inline void evil_hd_foliage(float factor, float out[EVIL_HD_FOLIAGE_COUNT]) {
-    for (int i = 0; i < EVIL_HD_FOLIAGE_COUNT; i++) out[i] = factor == 1.0f ? evil_hd_foliage_game[i] : evil_hd_foliage_game[i] * factor;
+    for (int i = 0; i < EVIL_HD_FOLIAGE_COUNT; i++) out[i] = evil_hd_foliage_one(i, factor);
 }
 
 /* Whether the eight floats at the defaults' place are a version of them this rule knows: the game's own, or the game's
@@ -87,7 +100,7 @@ static inline int evil_hd_foliage_known(const float have[EVIL_HD_FOLIAGE_COUNT])
     const float f = have[0] / evil_hd_foliage_game[0];
     if (!(f >= 1.0f && f <= EVIL_HD_DIST_MOST)) return 0;
     for (int i = 0; i < EVIL_HD_FOLIAGE_COUNT; i++) {
-        const float want = evil_hd_foliage_game[i] * f, d = have[i] - want;
+        const float want = evil_hd_foliage_one(i, f), d = have[i] - want;
         if (d > want * 1e-4f || d < -want * 1e-4f) return 0;
     }
     return 1;

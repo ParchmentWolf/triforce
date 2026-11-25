@@ -22,7 +22,8 @@ Offsets are as emulators and Atmosphere read them: they count the NSO's 0x100-by
 .pchtxt offset after its "@flag offset_shift" is added). A file is applied whole or not at all: one that is cut short,
 that cannot be read, or that writes outside the module's three segments (.text, .rodata, .data) is refused. That
 leaves out code caves, patches that put new code into the empty space after .text: the translator has not been tried on
-them.
+them. A mod is applied whole or not at all too: when one of its patch files is refused, so are its others (one of them
+may branch into the code the refused one adds).
 
 What a build did is kept in the game folder, triforce_code_mods.txt (RECORD, write_record): the next build, an update
 (--update) among them, reads the mods folder again, builds the same patches in again and says which of the last build's
@@ -50,6 +51,10 @@ RECORD_HEAD = ("# The code patches (.ips, .pchtxt) this game was built with: nx2
 
 class Refused(ValueError):
     """A patch file that is not applied; the text says why"""
+
+
+class OtherBuild(Refused):
+    """A patch file for another build of the game: mods carry one per game version, so it does not hold the mod's others back"""
 
 
 # ---- the formats: [(offset in the module's image, bytes)] in the file's order
@@ -317,6 +322,11 @@ def read_patch(rel, data):
     return build, writes
 
 
+def mod_of(rel):
+    """The mod a patch file is of: its path under the mods folder up to /exefs/ (patch_files)"""
+    return rel.rsplit("/exefs/", 1)[0]
+
+
 def check_writes(module, writes):
     """Refused when a write is not whole inside one of the module's segments"""
     for offset, data in writes:
@@ -337,6 +347,8 @@ def apply(exefs, mods_root, say=print):
     modules = load_modules(exefs)
     game = ", ".join("%s %s" % (m.name, m.build_id.rstrip("0")[:40] or "0") for m in modules.values())
     entries, owner = [], {}   # (owner: {(module, offset): the entry whose byte is there})
+    checked = []   # ((entry, module, writes) of each file that can be applied on its own)
+    other_build = set()   # (the entries refused only for being another build's: they hold no other file back)
     for rel, path in files:
         entry = {"state": "refused", "path": rel, "fnv": "0" * 16, "size": 0, "module": "", "changed": 0, "why": ""}
         entries.append(entry)
@@ -350,7 +362,7 @@ def apply(exefs, mods_root, say=print):
             named, writes = read_patch(rel, data)
             module = next((m for m in modules.values() if same_build(named, m.build_id)), None)
             if module is None:
-                raise Refused("it is for build %s, which is not this game's code (%s)" % (named.lower()[:40], game))
+                raise OtherBuild("it is for build %s, which is not this game's code (%s)" % (named.lower()[:40], game))
             try:
                 module.load()
             except (OSError, ValueError) as e:
@@ -359,6 +371,23 @@ def apply(exefs, mods_root, say=print):
         except Refused as e:
             entry["why"] = str(e)
             say("code mods: %s is not applied: %s" % (rel, e))
+            if isinstance(e, OtherBuild):
+                other_build.add(id(entry))
+            continue
+        checked.append((entry, module, writes))
+    # ((Triforce, 11-25) a mod's patch files go in together or not at all: a player's "Classic Projectile Targeting" had
+    # one file for main, built in, that branches into the code its other file puts in subsdk0's code cave, refused; the
+    # game then branched to nothing and crashed at its start, "FATAL: branch to a non-function", at every build)
+    refused_in, ok = {}, {id(entry) for entry, _, _ in checked}
+    for entry in entries:
+        if id(entry) not in ok and id(entry) not in other_build:
+            refused_in.setdefault(mod_of(entry["path"]), entry["path"])
+    for entry, module, writes in checked:
+        rel = entry["path"]
+        first = refused_in.get(mod_of(rel))
+        if first is not None:
+            entry["why"] = "another patch of the same mod is not applied (%s): a mod's patches go in together or not at all" % first
+            say("code mods: %s is not applied: %s" % (rel, entry["why"]))
             continue
         entry["state"], entry["module"] = "applied", module.name
         over = {}

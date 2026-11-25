@@ -446,6 +446,8 @@ void vk_timeline_wait_from(uint64_t v, int who);
 // ((Triforce) RX_VK_LATE_QUEUE: the highest timeline value on the queue; a wait for a sent one (no flush; false: not reached in 1 s);
 // the late pages' fixes applied (dev.present_mu held; queue_flush_locked does it first); vk_memory.cpp's side
 uint64_t vk_timeline_signal_sent();
+/// ((Triforce, 11-23) whether the replay's submits are held (RX_VK_BATCH: on by default with RADV): vk_memory.cpp late_queue_on
+bool vk_batch_holds();
 bool vk_timeline_wait_sent(uint64_t v);
 void late_fix_flush_locked();
 void vk_late_queue_stats(int64_t* waits, int64_t* wait_ns, int64_t* timeouts);

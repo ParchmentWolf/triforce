@@ -8,7 +8,7 @@
 // else on the PC, and nothing of the game runs during the preparation: there the other half of the processors stood idle
 // through a wait of minutes (165 s with 12 workers on a 24-thread PC). NX2navi prepares on every processor it is given.
 //
-// So: every processor, 64 at most, unless the process was started above normal priority (half, as before). Nothing
+// So: every processor (three quarters of them since 11-25, below), 64 at most, unless the process was started above normal priority (half, as before). Nothing
 // bounded the memory a worker takes: each holds one program's translation at a time and the driver's compiler for one
 // pipeline, and how much the driver's part is has not been measured here (the compute programs go first, so every worker
 // is in the driver's compiler at once when the preparation begins). So the workers past half are given only what RAM is
@@ -45,9 +45,14 @@ inline constexpr unsigned kAmdOlderMost = 8;
 
 /// cpus: the logical processors; ram_free: the physical memory free now, 0 when it is not known; above_normal: the process
 /// was started above normal priority; asked: RX_VK_PREPARE_THREADS, 0 or less when it is not set
+/// ((Triforce, 11-25) the most by default: three quarters of the processors, never fewer than half. Two players' PCs in one day
+/// with every processor busy for the whole preparation after 0.8's update: one at 100 °C, one switched itself off. The quarter
+/// left keeps the PC's own work and its fans ahead; RX_VK_PREPARE_THREADS still asks for any number)
+inline unsigned three_quarters(unsigned cpus) { return std::max(half(cpus), std::clamp(cpus - cpus / 4, 1u, 64u)); }
+
 inline unsigned count(unsigned cpus, uint64_t ram_free, bool above_normal, int asked) {
     if (asked > 0) return (unsigned)std::min(asked, 64);
-    const unsigned least = half(cpus), most = std::clamp(cpus, 1u, 64u);
+    const unsigned least = half(cpus), most = three_quarters(cpus);
     if (above_normal || !ram_free) return least;
     return (unsigned)std::clamp<uint64_t>(ram_free / kRamAWorker, least, most);
 }
