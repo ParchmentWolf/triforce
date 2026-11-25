@@ -55,6 +55,8 @@ namespace mr7 = merged_rows;
 /* MERGED */
 int saves = 0;
 void save() { ++saves; }
+namespace fps_levels { inline int step(int v, int) { return v; } }   /* ((Triforce) the FPS counter's levels and Auto (this PC): set_row's, not reached here */
+void auto_row_set(const int*) {}
 void apply_pad_layout(int) {}
 bool row_fixed(const int*) { return false; }
 int upscaler() { return 0; }
@@ -71,6 +73,15 @@ void restart_values(int*) {}
 struct { void note(const int*) {} } restart_state;
 bool can_mic() { return false; }
 void mic_chosen() {}
+int output_pick;   // (the Output device row: its device is told to the host, not run here)
+bool output_forced() { return false; }
+void output_chosen() {}
+void prompts_at_once(const Row&) {}
+namespace reshade_menu {   // ((Triforce) the ReShade preset rows: their files and presets are the renderer's, not run here
+int user_pick;
+void preset_chosen() {}
+void user_picked() {}
+}
 struct { unsigned w, h; } remembered_custom{};
 bool output_step(int, bool) { return false; }
 const char* tx_framegen_row(int) { return ""; }

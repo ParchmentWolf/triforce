@@ -67,7 +67,7 @@ class PackedRomfsTest(unittest.TestCase):
         src = (ROOT / "nx2" / "make_game.py").read_text(encoding="utf-8")
         self.assertIn("refuse_packed_romfs(a.romfs)   # (Setup passes", src)                 # the check
         self.assertIn("refuse_packed_romfs(romfs)   # (a folder built from NX2navi's", src)  # an update
-        self.assertIn("refuse_packed_romfs(a.romfs)\n        refuse_dump_links(a.exefs)", src)  # the build from folders
+        self.assertIn("refuse_packed_romfs(a.romfs)\n        check_romfs_folder(a.romfs)", src)  # the build from folders
         shell = (ROOT / "setup" / "Shell.cs").read_text(encoding="utf-8")
         self.assertIn('"--exefs", ExefsPath.Text, "--romfs", RomfsPath.Text', shell)
 

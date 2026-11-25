@@ -168,7 +168,7 @@ def main():
                      "void occ_draw_colour(VkCommandBuffer cmd) {", "void occ_draw_begin(VkCommandBuffer cmd) {"],
             "vk_replay.cpp: the report's breakdown, the line or the hook is missing")
     body = block(draw, "void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {")
-    ordered(body, ["uint16_t writes;", "writes = draw_hazards(cmd, p, s, at);", "begin_pass(cmd, at);",
+    ordered(body, ["uint16_t writes, samples = 0;", "writes = draw_hazards(cmd, p, s, at, samples);", "begin_pass(cmd, at);",
                    "if (occ_live && ps.open && (writes & 0xFF)) occ_draw_colour(cmd);\n    if (occ_live && ps.open) occ_draw_begin(cmd);"],
             "draw does not tell a colour draw to the count right before a query may begin")
     need(body.count("occ_draw_colour(") == 1, "draw tells a colour draw to the count in more than one place")

@@ -35,6 +35,9 @@ GUEST = re.compile(r"\b(GP|A64_MEM|HZ_PTR|hos_guest_range|G8P|G16P|G32P|G64P)\b"
 # (file, function, call): why its buffer or pages are never guest memory. Reviewed one by one (2026-11-15)
 ALLOWED = {
     ("achievements.c", "read_text", "fread"): "into a buffer it mallocs",
+    ("mkw_glue.c", "stack_on_touch", "VirtualAlloc"): "a thread's own stack, the 64 KB below its limit: never guest memory",
+    ("mkw_glue.c", "stack_on_touch", "VirtualFree"): "the 1 MB of the host's own kept for a stack that never grew",
+    ("mkw_glue.c", "hos_commit_init", "VirtualAlloc"): "that 1 MB, the host's own, at the start",
     ("achievements.c", "earned_save", "fwrite"): "from a static buffer of its own, the earned achievements' text",
     ("bug_capture.c", "read_part", "fread"): "into a buffer it mallocs",
     ("save_files.c", "files_read", "fread"): "into a static buffer of its own, triforce_files.txt's text",
@@ -42,11 +45,15 @@ ALLOWED = {
     ("save_files.c", "card_of", "fread"): "into a buffer on its stack, a file's triforce_card.txt",
     ("save_files.c", "card_keep", "fwrite"): "from a buffer on its stack, this file's triforce_card.txt",
     ("nn_fs.c", "hos_fs_rom_file", "ReadFile"): "a RomFS file for the menu sounds (host/menu_sound.c), into a buffer it mallocs",
+    ("oot_damaged_files.c", "starts_as_zstd", "ReadFile"): "a texture's first four bytes, into a buffer on its stack",
     ("bug_capture.c", "write_file", "fwrite"): "the report's own files: the options file and a log read into host memory",
     ("discord_rpc.c", "ipc_write", "WriteFile"): "Discord's pipe: a JSON message the host built",
     ("discord_rpc.c", "ipc_read", "ReadFile"): "Discord's pipe: into the host's buffer",
     ("discord_rpc.c", "ipc_write", "send"): "Discord's socket (Linux): a JSON message the host built",
     ("discord_rpc.c", "ipc_read", "recv"): "Discord's socket (Linux): into the host's buffer",
+    ("oot_heart_containers.c", "read_all", "fread"): "a RomFS map file into the host's own malloc'd buffer (the Discord thread)",
+    ("nn_nfp.c", "area_load", "fread"): "a figure's application area file into a buffer on the host's stack",
+    ("nn_nfp.c", "area_save", "fwrite"): "a figure's application area from a buffer on the host's stack",
     ("hos_main.c", "reserve_large", "VirtualAlloc"): "the guest window's large pages, reserved at the start before any "
                                                      "renderer runs",
     ("hos_main.c", "reserve_guest", "VirtualAlloc"): "the guest window's reservation at the start, before any renderer runs",

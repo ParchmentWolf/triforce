@@ -309,7 +309,8 @@ def checks(t):
     # DLSS: RCAS over its picture before the HUD, into the output and the picture before the bloom
     chain = function(temporal, "bool chain(VkCommandBuffer cmd, int mode, Engine& engine, const Camera& cam,", last=True)
     check("fsr3::rcas(cmd, s.output.view, s.sharp.view, s.output.width, s.output.height, temporal_sharpness())" in chain and
-          "if (ur::is_dlss(mode) && temporal_sharpness() > 0.0f && sharpen_rules::lone_rcas(pre != nullptr, scene_rgba16f) &&"
+          "const bool own_rcas = ur::is_dlss(mode) || ur::is_xess(mode);" in chain and
+          "if (own_rcas && temporal_sharpness() > 0.0f && sharpen_rules::lone_rcas(pre != nullptr, scene_rgba16f) &&"
           in chain and "const bool scene_rgba16f = in_format == VK_FORMAT_R16G16B16A16_SFLOAT;" in chain,
           "DLSS's picture is not sharpened before the HUD, or RCAS alone runs over linear HDR light")
     check("chain_rgba16f.store(scene_rgba16f ? 1 : 0" in chain, "the chain does not say whether its colour was RGBA16F")
@@ -318,12 +319,12 @@ def checks(t):
     check("upscale_lod_note(rw, rh, ow);" in chain, "the chain does not note its sizes for the texture LOD bias")
     sharpens = function(temporal, "bool temporal_sharpens_3d() {")
     check("if (fsr3_wanted()) return fsr3::sharpens();" in sharpens and "if (ur::is_fsr4(mode)) return true;" in sharpens and
-          "if (ur::is_dlss(mode)) return fsr3::rcas_ok() && sharpen_rules::lone_rcas(pre_wanted(mode), chain_hdr_scene());"
+          "if (ur::is_dlss(mode) || ur::is_xess(mode)) return fsr3::rcas_ok() && sharpen_rules::lone_rcas(pre_wanted(mode), chain_hdr_scene());"
           in sharpens and sharpens.rstrip().endswith("return false;\n}"),
           "temporal_sharpens_3d does not say which upscalers sharpen before the HUD")
     check('getenv("RX_VK_SHARPEN_3D")' in function(temporal, "float temporal_sharpness() {"), "no RX_VK_SHARPEN_3D")
     # the window pass
-    scale = function(framegen, "VkImage framegen_scale(")
+    scale = function(framegen, "VkImage scale_picture(")   # ((Triforce) 11-24: framegen_scale is scale_picture, then the colour vision pass
     check("const int sharp = sharpen_rules::window_sharpness(opts.sharpness, temporal_sharpens_3d());" in scale and
           "opts.sharpness / 100.0f" not in scale and "if (!opts.upscale && !sharp && !wide.side) return VK_NULL_HANDLE;" in scale,
           "the window pass sharpens what the upscaler sharpened before the HUD")

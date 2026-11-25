@@ -478,6 +478,11 @@ bool decode(const std::string& bytes, int max_w, std::vector<unsigned char>& rgb
     return ok;
 }
 
+}  // namespace
+bool decode_picture(const std::string& bytes, int max_w, std::vector<unsigned char>& rgba, int* w, int* h) {
+    return decode(bytes, max_w, rgba, w, h);
+}
+namespace {
 // ---- files ----
 bool is_dir(const std::string& p) {
     const DWORD a = GetFileAttributesW(wide(p).c_str());

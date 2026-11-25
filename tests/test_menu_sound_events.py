@@ -211,7 +211,7 @@ ROW = r'''#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); std::exit(1); } } while (0)
-enum MenuTab { TAB_AUDIO };
+enum MenuTab { TAB_AUDIO, TAB_SIM_TURF };   // (TAB_SIM_TURF: ini_row leaves its rows out of the file)
 @OPTIONS@
 static int output_choice(int v) { return v; }
 @ROW_STRUCT@;
@@ -285,9 +285,14 @@ def main():
     check("constexpr int kSoundPageN64 = 10;" in menu, "vk_menu.cpp: the Remembered page has no page of its own to the ear (10)")
     state = block(menu, "static menu_sound::State sound_state() {")
     check("const bool n64_page = page == 0 && cur_tab == TAB_N64;" in state and
-          "s.page = motion ? kSoundPageMotion : n64_page ? kSoundPageN64 : page;" in state and
-          "cur_tab == TAB_N64 ? (int)TAB_GRAPHICS : cur_tab" in state,
+          "s.page = motion ? kSoundPageMotion : n64_page ? kSoundPageN64 : turf_page ? kSoundPageSimTurf : page;" in state and
+          "cur_tab == TAB_N64 || cur_tab == TAB_SIM_TURF ? (int)TAB_GRAPHICS : cur_tab" in state,
           "sound_state: the Remembered page is not its own page under Graphics' tab")
+    # ((Triforce, 11-24) the Simulated turf page likewise, a page of its own to the ear, and its Reset's press kept for the sound)
+    check("constexpr int kSoundPageSimTurf = 11;" in menu and
+          "const bool turf_page = page == 0 && cur_tab == TAB_SIM_TURF;" in state and
+          "else if (press[7] && is_sim_turf_reset_row(r)) sim_turf_reset(), changed = true;" in tick,
+          "the Simulated turf page is not its own page to the ear, or its Reset takes its press")
     check("else if (press[7] && n64_action(r)) n64_act(n64_action(r)), changed = true;" in tick and
           "else if (press[7] && is_n64_page_row(r)) cur_tab = TAB_N64," in tick,
           "menu_tick: Copy Faithful and Reset to defaults do not keep their press for the sound (decide)")
@@ -314,7 +319,7 @@ def main():
         .replace("@TEXT@", block(menu, "const char* tx_percent(int v) {") + "\n" +
                  re.search(r"const char\* tx_menu_sounds\(int v\) \{[^\n]*\}", menu).group(0)) \
         .replace("@ROW@", row.group(0)) \
-        .replace("@INI@", "bool is_merged(const int*) { return false; }   /* ((Triforce, options_version 7) no merged row here */\n" + block(menu, "bool ini_row(") + "\n" + block(menu, "const char* ini_key(")) \
+        .replace("@INI@", "bool is_merged(const int*) { return false; }   /* ((Triforce, options_version 7) no merged row here */\nint output_pick;   /* (the Output device row) */\n" + block(menu, "bool ini_row(") + "\n" + block(menu, "const char* ini_key(")) \
         .replace("@LOOP@", loop)
     with tempfile.TemporaryDirectory(prefix="menu-sound-events-") as tmp:
         run(a.cxx, EVENTS.replace("@ROOT@", ROOT.as_posix()), "events.cpp", tmp, [] if os.name == "nt" else ["-pthread"])

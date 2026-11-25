@@ -19,7 +19,7 @@ def main():
     begin = source.index("void present_image(")
     marker = "    const PresentAspect aspect{" if "    const PresentAspect aspect{" in source[begin:] else "    const bool preserve_stretch ="
     start = source.index(marker, begin)
-    end = source.index("    if (src && framelog_on())", start)
+    end = source.index("    // ((Triforce) RX_VK_FRAMELOG_WINDOW=1, with the frame log:", start)
     draw = source[start:end]
     trace = ""
     if "    // Geometry trace:" in source[end:]:

@@ -33,6 +33,10 @@ using VkBuffer = int;
 using VkCommandBuffer = int;
 VkBuffer guest_pages_buffer = 7;
 std::atomic<bool> par_active{false};
+// ((Triforce) RX_VK_GP_TABLE's cover, which the cut part feeds and these checks do not use: off)
+std::atomic<bool> table_cover_on{false};
+void table_mark_changed(uint64_t, uint64_t) {}
+void table_flushed_keep() {}
 int updates = 0;
 void vkCmdUpdateBuffer(VkCommandBuffer, VkBuffer b, uint64_t offset, uint64_t bytes, const void* data) {
     require(b == guest_pages_buffer && offset % 8 == 0 && bytes % 8 == 0, "an update of the table, in whole entries");

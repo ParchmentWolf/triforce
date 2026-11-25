@@ -17,7 +17,11 @@ list of the title's 60 x 60 marks a row is hit across the line and in the gaps b
 focus down a row with the setter, without the pad. On the R button's item choice (a carousel) the wheel presses the
 D-pad's right (down) and left (up), a notch each, one after another, and the mouse is not freed (it stays the
 camera's). With the cursor hidden (R held counts as the pad in use) the wheel still moves a list, and moving the mouse
-points at nothing. Once frames go on with no menu holding the mouse, the window is told at once.
+points at nothing. A left press on a panel page is a click at its release, and none when the button was let go
+while the pointer was away (another window in front). Once frames go on with no menu holding the mouse, the window is
+told at once. (Triforce) A replay (HOS_INPUT_PLAY) gives the recording's menu choices, not the mouse's: a focus only to a
+button in the screen's list (a guest address from a file: never handed to the game's setter otherwise), an item key only
+to one of Key Items' items and the page's setter; any other is counted as not met.
 (Triforce) The game's Options screen has the mouse with no focused button found, and as the screen that came last when its
 address held another screen before (another vtable). Its rows' kinds are read from the screen's three lists of widgets (the
 button from a widget through the game's look-up f_80df5410, a fake here): a click on a plate is A, on a toggle's value Left
@@ -65,6 +69,14 @@ enum { HOS_MODS_LIST_SHOWN = 1, HOS_MODS_LIST_LAST_FOCUSED = 2, HOS_MODS_LIST_TI
 enum { HOS_OPT_MODS_ALPHA = 162 };
 """
 
+# (included first in both files: the key state the menu reads is the fixture's)
+KEYS_H = r"""
+#pragma once
+#include <windows.h>
+SHORT fake_key_state(int vk);
+#define GetAsyncKeyState fake_key_state
+"""
+
 FIXTURE = r"""
 #include "hos.h"
 #include "../gpu/vk/vk_api.h"
@@ -86,6 +98,10 @@ void hos_oot_menu_tick(Ctx *c, uint64_t screen);
 static int ptr_x = 1920, ptr_y = 1080, wheel_next;
 static uint32_t pressed_next;
 static int pointer_hidden;   /* (the cursor hidden while the pad is in use: the wheel only) */
+static int pointer_away;   /* (outside the window, or another window in front: no pointer) */
+/* the left button held, as GetAsyncKeyState reads it (KEYS_H puts this in its place: not the desk's own mouse) */
+static int left_held;
+SHORT fake_key_state(int vk) { return vk == VK_LBUTTON && left_held ? (SHORT)0x8000 : 0; }
 static int menu_frees, menu_gone;   /* (the game's menus' mouse: freed for a menu's frame; their close told) */
 void hos_mouse_game_menu(void) { menu_frees++; }
 void hos_mouse_game_menu_gone(void) { menu_gone++; }
@@ -102,14 +118,44 @@ int hos_mouse_wheel_take(void) { const int w = wheel_next; wheel_next = 0; retur
 int hos_mouse_game_pointer(int *x, int *y, int *w, int *h, uint32_t *pressed, int *wheel) {
     *x = ptr_x, *y = ptr_y, *w = 3840, *h = 2160, *pressed = pressed_next, *wheel = wheel_next;
     pressed_next = 0, wheel_next = 0;
-    return pointer_hidden ? 2 : 1;
+    if (pointer_away) *pressed = 0, *wheel = 0;
+    return pointer_away ? 0 : pointer_hidden ? 2 : 1;
 }
 /* ((Triforce, 11-22) N64 Classic's TV's curve (rx_backend.c): no TV here, the point as it is */
 void rx_screen_point(int *x, int *y, int w, int h) { (void)x, (void)y, (void)w, (void)h; }
 static char taps[1024];
 void hos_hid_tap(const char *press) { strncat(taps, press, sizeof taps - strlen(taps) - 2), strcat(taps, ";"); }
+/* ((Triforce) the Skip title screen row, host/oot_autoload.c: Off here, the menus as a player has them) */
+int hos_oot_autoload_wants(void) { return 0; }
+int hos_oot_autoload_menu(uint64_t vt, int focused_entry) { (void)vt, (void)focused_entry; return 0; }
 void hos_hid_stick(int lx, int ly, int rx, int ry, int hold_ms) { (void)lx, (void)ly, (void)rx, (void)ry, (void)hold_ms; }
 void hos_hid_drag(int dx, int dy, int right) { (void)dx, (void)dy, (void)right; }
+/* ((Triforce) host/input_movie.c: what the mouse asked of the game is offered to a recording; a replay's choices are
+   movie_q's, given to their screen while movie_playing, each said met or not) */
+#include "input_movie.h"
+static int movie_focus, movie_items;
+void hos_input_movie_menu(int kind, uint64_t screen, uint64_t button, const char *key) {
+    (void)screen, (void)button, (void)key;
+    if (kind == 1) movie_focus++;
+    else movie_items++;
+}
+static int movie_playing, movie_met, movie_missed, movie_qn, movie_qi;
+static MovieMenu movie_q[8];
+static void movie_queue(uint64_t screen, int kind, uint64_t button, const char *key) {
+    MovieMenu *m = &movie_q[movie_qn++];
+    memset(m, 0, sizeof *m);
+    m->screen = screen, m->kind = (uint8_t)kind, m->button = button;
+    if (key) snprintf(m->key, sizeof m->key, "%s", key);
+}
+int hos_input_movie_menu_take(uint64_t screen, MovieMenu *out) {
+    while (movie_qi < movie_qn) {
+        const MovieMenu *m = &movie_q[movie_qi++];
+        if (m->screen == screen) return *out = *m, 1;
+    }
+    return 0;
+}
+void hos_input_movie_menu_done(int met) { if (met) movie_met++; else movie_missed++; }
+int hos_input_movie_playing(void) { return movie_playing; }
 static uint64_t focus_asked, focus_screen;
 static int focus_calls;
 /* (a focus change reported from another of the game's threads while the setter runs: the hook there must not wait for
@@ -134,7 +180,11 @@ static void focus_setter(Ctx *c) {
 static uint64_t get64(uint64_t a);
 /* (Triforce) the game's look-up of an Options row's button from its widget's pane (f_80df5410): here the pane's first word */
 static void find_button(Ctx *c) { c->x[0] = get64(c->x[0]); }
-A64Fn a64_lookup(uint64_t addr) { return addr == 0x8088ffc0ULL ? focus_setter : addr == 0x80df5410ULL ? find_button : NULL; }
+static int item_calls;   /* ((Triforce) Key Items' setter, f_833fda00: the page's refresh from its key buffer) */
+static void item_setter(Ctx *c) { (void)c, item_calls++; }
+A64Fn a64_lookup(uint64_t addr) {
+    return addr == 0x8088ffc0ULL ? focus_setter : addr == 0x80df5410ULL ? find_button : addr == 0x833fda00ULL ? item_setter : NULL;
+}
 
 static uint64_t alloc(size_t n) { const uint64_t a = heap_top; heap_top += (n + 15) & ~(size_t)15; return a; }
 static void put64(uint64_t a, uint64_t v) { memcpy(GP(a), &v, 8); }
@@ -342,6 +392,28 @@ int main(void) {
     frame(choice, -300, 0);
     CHECK(!strcmp(taps, "0.000:RIGHT/60;"));
 
+    /* A panel page's click is at the release. Key Items: the left button pressed on the R sign and let go there is R */
+    const uint64_t key_items = screen_new(0x84c07798ULL);
+    reset();
+    pressed_next = HOS_MOUSE_LEFT, left_held = 1;
+    frame(key_items, 950, 1000);
+    left_held = 0;
+    frame(key_items, 950, 1000);
+    CHECK(!strcmp(taps, "0:R/75;"));
+    /* pressed there, then another window in front (Alt-Tab) and the button let go there: back on the page, no click */
+    reset();
+    pressed_next = HOS_MOUSE_LEFT, left_held = 1;
+    frame(key_items, 950, 1000);
+    pointer_away = 1;
+    frame(key_items, 950, 1000);
+    left_held = 0;
+    frame(key_items, 950, 1000);
+    pointer_away = 0;
+    frame(key_items, 950, 1000);
+    frame(key_items, 950, 1000);
+    CHECK(taps[0] == 0);
+    clock_ns += 2000000000LL;   /* (2 s on: Key Items' screen is gone before the next ones) */
+
     /* (Triforce) The game's Options screen, at the address another screen ran at before (another vtable), opened over a list
        that still runs with its focus (first seen after that other screen): the Options came last, and the mouse is its own
        with no focused button found. Its rows as it lays them out (1824 x 124 about x -730, 170 apart from y 674), their
@@ -521,6 +593,34 @@ int main(void) {
     clock_ns += 300000000LL;
     frame(opts, 0, 0);
     CHECK(game_options_said == 1);
+
+    /* ((Triforce) A replay: a screen with a button and Key Items' key buffer (+760, its room at +768, browsing: +840 0).
+       The recording's choices: a focus to its button; to an address that is no button of it, and to another screen's
+       button (a file's guest addresses); an item key that is none of Key Items', and one that is. Only the button and the
+       item reach the game's setters, the other three are not met; the mouse's own pointing does nothing meanwhile) */
+    clock_ns += 2000000000LL;
+    const uint64_t replay = screen_new(0x84c0baa8ULL);
+    const uint64_t ra = button_new(replay, 400, 400, 200, 200);
+    {
+        const uint64_t buf = alloc(64);
+        put64(replay + 760, buf);
+        const int32_t room = 64, browsing = 0;
+        memcpy(GP(replay + 768), &room, 4), memcpy(GP(replay + 840), &browsing, 4);
+    }
+    movie_playing = 1;
+    movie_queue(replay, 1, ra, NULL);
+    movie_queue(replay, 1, 0x7777000ULL, NULL);
+    movie_queue(replay, 1, r1, NULL);
+    movie_queue(replay, 2, 0, "Item_Bogus");
+    movie_queue(replay, 2, 0, "Item_Medal_Light");
+    reset();
+    item_calls = 0;
+    frame(replay, -500, 210);   /* (over nothing of its: the mouse is not the replay's) */
+    CHECK(focus_calls == 1 && focus_asked == ra && focus_screen == replay);
+    CHECK(item_calls == 1 && !strcmp((const char *)GP(get64(replay + 760)), "Item_Medal_Light"));
+    CHECK(movie_met == 2 && movie_missed == 3);
+    CHECK(movie_focus >= 1 && movie_items == 1);   /* (the setters offer what they gave to a recording) */
+    movie_playing = 0;
     if (!fails) printf("PASS\n");
     return fails != 0;
 }
@@ -542,6 +642,9 @@ void hos_log(const char *fmt, ...) { (void)fmt; }
 static int told, told_id, told_value;
 void rx_option_set(int id, int value) { told++, told_id = id, told_value = value; }
 void hos_hid_tap(const char *press) { (void)press; }   /* ((Triforce, 11-22) benchmark mode's presses, both halves': off here) */
+void hos_input_clear_toggles(void) {}   /* ((Triforce) 11-24: host/nn_hid.c's, which the other half's focus hook calls) */
+int hos_oot_autoload_wants(void) { return 0; }   /* ((Triforce) the Skip title screen row: Off here) */
+int hos_oot_autoload_menu(uint64_t vt, int focused_entry) { (void)vt, (void)focused_entry; return 0; }
 void hos_oot_menu_focus(Ctx *c, uint64_t screen, uint64_t pane, uint64_t lr);
 void hos_oot_menu_tick(Ctx *c, uint64_t screen);
 int hos_oot_options_front(void);
@@ -661,9 +764,12 @@ class OotMenuMouseTests(unittest.TestCase):
             shutil.copy(ROOT / "host" / "guest_bounds.h", tmp / "host" / "guest_bounds.h")   # (set_item_key's buffer check)
             (tmp / "host" / "hos_bench.h").write_text(HOS_BENCH_H, encoding="utf-8")   # ((Triforce, 11-19) benchmark mode: off here)
             shutil.copy(ROOT / "host" / "oot_title_movie.h", tmp / "host" / "oot_title_movie.h")   # (oot_menu_screen_tick)
+            (tmp / "host" / "keys.h").write_text(KEYS_H, encoding="utf-8")
+            shutil.copy(ROOT / "host" / "input_movie.h", tmp / "host" / "input_movie.h")   # ((Triforce) MovieMenu: a replay's choices)
             (tmp / "host" / "t.c").write_text(FIXTURE + MENU_TICK, encoding="utf-8")
             binary = tmp / "t.exe"
             build = subprocess.run([compiler, "-std=gnu11", "-Wall", "-O1", "-g", "-D_WIN32_WINNT=0x0601",
+                                    "-include", str(tmp / "host" / "keys.h"),
                                     str(tmp / "host" / "t.c"), str(tmp / "host" / "oot_menu.c"), "-o", str(binary)],
                                    text=True, capture_output=True)
             self.assertEqual(build.returncode, 0, build.stderr)

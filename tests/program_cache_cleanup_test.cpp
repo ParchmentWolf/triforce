@@ -94,6 +94,13 @@ FILE* disk_out = nullptr;
 FILE* disk_idx = nullptr;
 std::mutex disk_mu;
 std::unordered_map<uint64_t, std::vector<DiskRecord>> disk_records;
+// ((Triforce) the records read in already, as vk_shader.cpp keeps them for the prediction)
+std::unordered_map<uint64_t, std::vector<DiskRecord>> disk_taken;
+void disk_note_taken(uint64_t key, const std::vector<DiskRecord>& recs) {
+    if (recs.empty()) return;
+    auto& taken = disk_taken[key];
+    taken.insert(taken.end(), recs.begin(), recs.end());
+}
 std::atomic<int64_t> st_cache_hits{0};
 // ((Triforce) vk_shader.cpp's count of programs translated again after a cache of other translations was thrown away, for the
 // log: none was here. tests/test_program_carry.py has the carry)
@@ -110,6 +117,11 @@ const std::vector<uint32_t>* renodx_replacement(uint32_t) { return nullptr; }
 void exact_note(VkShaderModule, const std::vector<uint32_t>&) {}
 void lanes_note(VkShaderModule, const std::vector<uint32_t>&) {}   // (PIPE-52: make_module's note of a module's Subgroup barriers)
 void size_note(VkShaderModule, const std::vector<uint32_t>&) {}    // (PIPE-56: its OpPhi and OpFunctionCall counts)
+// ((Triforce) make_module's module made inside the driver fault guard, for the program translate_into names: here the stub above)
+thread_local uint64_t module_program = 0;
+int extern_guarded_shader_module(const VkShaderModuleCreateInfo* ci, VkShaderModule* m, uint64_t) {
+    return vkCreateShaderModule(dev.device, ci, nullptr, m);
+}
 void size_move(VkShaderModule, VkShaderModule) {}
 // (Triforce, RX_VK_SPV_PACK: vk_shader.cpp's packing of a ready program's stages. Off here, as with RX_VK_SPV_PACK=0:
 // every stage keeps its module, which is what this test counts. tests/test_spv_store.py has the packing)
@@ -149,6 +161,12 @@ void readahead_drop(std::vector<std::unique_ptr<Program>>& variants) {   // (as 
 }
 // ((Triforce) the sessions' order, program_order.h: off here; tests/test_program_order.py has it)
 bool order_on() { return false; }
+void programs_load_wait(uint64_t) {}   // (vk_programs.cpp: no load at create here)
+bool light_computes() { return false; }
+struct { uint64_t loads = 0, load_ns = 0; } thread_local use_counters;   // (vk_programs.h's census: counted, not read here)
+struct { uint64_t play_loads = 0, play_load_ns = 0; } census;
+std::atomic<bool> programs_in_play{false};
+std::unique_ptr<Program> read_light(FILE*, std::mutex*, uint64_t, const DiskRecord&) { return nullptr; }
 void order_note(uint64_t) {}
 void readahead_why(uint64_t) {}
 #include <chrono>

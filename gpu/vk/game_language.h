@@ -30,6 +30,13 @@ constexpr Language kLanguages[] = {
     {"ja", "Japanese"},               {"ko", "Korean"},          {"zh-Hans", "Chinese (Simplified)"}, {"zh-Hant", "Chinese (Traditional)"},
 };
 constexpr int kCount = sizeof kLanguages / sizeof kLanguages[0];
+/// Each language by its own name, in kLanguages' order: what the Game language row shows, in any menu language (vk_imgui.cpp
+/// merges in a font of the letters the menu's fonts lack: Русский, 日本語 ...)
+constexpr const char* kOwnNames[] = {
+    "English (US)", "English (UK)", "Français (France)", "Français (Canada)", "Deutsch", "Italiano", "Español (España)",
+    "Español (Latinoamérica)", "Português (Brasil)", "Nederlands", "Polski", "Русский", "日本語", "한국어", "简体中文", "繁體中文",
+};
+static_assert(sizeof kOwnNames / sizeof kOwnNames[0] == kCount, "a name for each of the game's languages");
 constexpr int kDefault = 0;   // (English (US): the host's answer when the file chooses nothing)
 inline unsigned bit(int language) { return 1u << language; }
 

@@ -82,13 +82,13 @@ def main():
                                   "mirror_spare::destroyed(sparse_ct, dead_mirrors.front().sparse_bytes, sparse_ms_since(destroy_t0));",
                                   "vma_piece_free(a);")]
     check(at == sorted(at), "the sparse buffer's destroy is not timed around the call alone, or not counted with its size")
-    check("uint64_t sparse_bytes = 0; };" in mem and "p.mpieces ? p.hi - p.lo : 0});" in mem,
+    check("uint64_t sparse_bytes = 0;" in mem and "p.mpieces ? p.hi - p.lo : 0});" in mem,
           "the mirror's span is not kept for the reaper: the pool's own fields are cleared by then")
     free = block(mem, "void mirror_free(Pool& p) {")
     check(free.index("dead_mirrors.push_back(") < free.index("p.mpieces = false"), "the span is read after the pool's mirror state is cleared")
     make = block(mem, "bool mirror_make(Pool& pool) {")
     at = [make.index(p) for p in ("const auto create_t0 = std::chrono::steady_clock::now();",
-                                  "const VkResult sparse_made = vkCreateBuffer(dev.device, &bi, nullptr, &sb);",
+                                  "sparse_made = vkCreateBuffer(dev.device, &bi, nullptr, &sb);",
                                   "mirror_spare::created(sparse_ct, n, sparse_ms_since(create_t0));")]
     check(at == sorted(at), "the sparse buffer's create is not timed around the call alone, or not counted")
     check("vk: mirrors' sparse buffers so far: %llu made" in mem and "of the creates had a freed" in mem, "the counts are not in the log")

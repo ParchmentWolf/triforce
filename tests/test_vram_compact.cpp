@@ -108,6 +108,14 @@ int main() {
     CHECK(!hold_met(5600 * MB, 100 * MB, 400 * MB, 5000 * MB));   // (100 MB still to go)
     CHECK(hold_met(5600 * MB, 200 * MB, 400 * MB, 5000 * MB));
     CHECK(hold_met(300 * MB, 200 * MB, 200 * MB, 0));             // (more chosen than the textures hold, their sum having drifted)
+    // an allowance the driver gives as the count itself is past (AMD's Windows driver): a tenth under the count
+    CHECK(past_allowance(5940 * MB, 5940 * MB) == 5940 * MB - 5940 * MB / 10);   // (an RX 6600 in Hyrule Field)
+    CHECK(past_allowance(6600 * MB, 6600 * MB + 8 * MB) < 6600 * MB);           // (within kAtCount over the count)
+    CHECK(past_allowance(6600 * MB + 8 * MB, 6600 * MB) < 6600 * MB);           // (within kAtCount under it)
+    CHECK(past_allowance(5300 * MB, 6500 * MB) == 6500 * MB);                   // (an allowance over the count: as it is)
+    CHECK(past_allowance(7602 * MB, 6982 * MB) == 6982 * MB);                   // (under the count, past already: as it is)
+    CHECK(past_allowance(5000 * MB, 0) == 0);                                   // (unknown: as it is)
+    CHECK(past_allowance(0, 0) == 0);
     std::printf("PASS: the compaction's rules\n");
     return 0;
 }

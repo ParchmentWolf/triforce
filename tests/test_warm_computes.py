@@ -33,8 +33,10 @@ def check_source():
     start = draw.index("bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {")
     prepare = draw[start:draw.index("\n}\n", start)]
     need("vk_draw.cpp: prepare_run()", prepare,
-         ['warm_computes::listed_only(getenv("RX_VK_WARM_COMPUTES"), dev.props.vendorID)',
-          "cs_listed_only ? computes_read() : std::unordered_set<uint64_t>{}",
+         # ((Triforce, 11-24) the switch as Compile shaders gives it where it is not set: tests/test_compile_level.py)
+         ['const char* cs_rule = compile_level::computes(compile_level_now(), getenv("RX_VK_WARM_COMPUTES"));',
+          "warm_computes::listed_only(cs_rule, dev.props.vendorID)",
+          "!cs_listed_only ? std::unordered_set<uint64_t>{} : cs_most ? computes_named(true) : computes_read()",
           "warm_computes::build(cs_listed_only, cs_listed.empty(), cs_listed.count(p.key) != 0)",
           "vk: the preparation left %zu compute variants"])
     warm = prepare[prepare.index("const auto warm_compute = [&](Program& p) {"):]

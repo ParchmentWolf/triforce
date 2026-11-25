@@ -15,9 +15,56 @@ def host_march():
             if pf(40):
                 return "x86-64-v3"
             return "x86-64-v2" if pf(38) else "x86-64"
-        flags = open("/proc/cpuinfo").read().split("flags", 1)[1].split(chr(10), 1)[0].split()
+        with open("/proc/cpuinfo") as f:
+            flags = f.read().split("flags", 1)[1].split(chr(10), 1)[0].split()
         if all(f in flags for f in want):
             return "x86-64-v3"
         return "x86-64-v2" if all(f in flags for f in ("sse4_2", "popcnt", "ssse3")) else "x86-64"
     except Exception:
         return "x86-64-v3"
+
+
+def host_mtune():
+    """Tuning target for the host CPU (znver2 for the Steam Deck's APUs, 0405 and 0932: Zen 2 cores, which -march=x86-64-v3
+    alone leaves tuned for a generic CPU), or an empty string. RX_STEAMDECK=1 says so by hand; RX_MTUNE, read by build.py,
+    still chooses"""
+    if os.environ.get("RX_STEAMDECK") == "1":
+        return "znver2"
+    if os.name != "nt":
+        try:
+            with open("/proc/cpuinfo") as f:
+                info = f.read()
+            if "Custom APU 0405" in info or "Custom APU 0932" in info:
+                return "znver2"
+        except Exception:
+            pass
+    return ""
+
+
+def native_cpu(cc, flags):
+    """((Triforce) HOOKSHOT_NATIVE_CPU) What clang makes of -march=native here, from `clang -###`: its -target-cpu, -tune-cpu and
+    -target-feature list, as "<cpu>_<tune>_<sha1 of the features>" (e.g. "znver4_znver4_3f1c09a2b4"). The flag itself names
+    no CPU, so an object key made from it would stay the same when the CPU changes (a new CPU, the disk in another PC);
+    build.py puts this name in the flags instead. None if clang doesn't say."""
+    import hashlib
+    import subprocess
+    try:
+        quiet = {"creationflags": 0x08000000} if os.name == "nt" else {}   # (CREATE_NO_WINDOW: no console from the launcher)
+        out = subprocess.run([cc] + flags + ["-###", "-x", "c", "-c", os.devnull, "-o", os.devnull],
+                             capture_output=True, text=True, timeout=60, **quiet).stderr
+    except Exception:
+        return None
+    words = [w.strip('"') for w in out.split()]
+    cpu = tune = ""
+    feats = []
+    for i, w in enumerate(words[:-1]):
+        if w == "-target-cpu":
+            cpu = words[i + 1]
+        elif w == "-tune-cpu":
+            tune = words[i + 1]
+        elif w == "-target-feature":
+            feats.append(words[i + 1])
+    if not cpu or cpu == "native":
+        return None
+    feats = hashlib.sha1(" ".join(sorted(feats)).encode(), usedforsecurity=False).hexdigest()[:10]
+    return "%s_%s_%s" % (cpu, tune or cpu, feats)

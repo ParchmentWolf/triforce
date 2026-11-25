@@ -20,6 +20,7 @@
    frames and level). */
 #include "hos.h"
 #include "hos_sdl.h"
+#include "mic_gain.h"   /* ((Triforce) the Microphone gain row's rule) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,7 +30,7 @@
 
 #define MIC_MAGIC 0x4D494349u   /* "MICI": the high word of our handle in the game's InputStreamType */
 #define MAX_STREAMS 4
-#define MAX_DEVICES 16
+#define MAX_DEVICES 64
 #define QUIET_NS 2000000000LL   /* a microphone that gives nothing this long is taken as gone */
 #define RETRY_NS 3000000000LL   /* a chosen microphone that is not there: tried again after this, */
 #define RETRY_MAX_NS 60000000000LL   /* twice as long each time up to this */
@@ -53,6 +54,10 @@ typedef struct {
     int64_t retry_ns, retry_wait;   /* (the wanted microphone not open: when to try again, and the wait after that) */
     int64_t silence_from_ns, silence_made;   /* (silence: counted from here, frames of it made) */
     int failures;                /* (in a row, since it last gave sound: logged at the first) */
+    /* ((Triforce) 11-24) the Test microphone row's level (hos_mic_test): the loudest sample before and after the Microphone
+       gain row, in thousandths of full scale, over the last 150 ms; when it last had samples, and until when it clipped */
+    int input_peak, output_peak;
+    int64_t level_ns, level_window_ns, clip_until;
 } Source;
 
 typedef struct {
@@ -66,7 +71,11 @@ typedef struct {
 } InStream;
 
 static InStream streams[MAX_STREAMS];
-static Source sources[MAX_STREAMS];
+/* ((Triforce) 11-24) one source more than streams: the Test microphone row's (a 48 kHz mono reader of its own, test_stream,
+   which is no stream of the game's) has one even when every stream of the game reads another format */
+static Source sources[MAX_STREAMS + 1];
+static InStream test_stream;
+static int testing;   /* (test_stream is attached: under lock) */
 static SRWLOCK lock = SRWLOCK_INIT;        /* the streams and the sources (the game's threads) */
 static SRWLOCK list_lock = SRWLOCK_INIT;   /* the device list (the menu's thread too): never held while listing them */
 static uint32_t dev_ids[MAX_DEVICES];
@@ -123,7 +132,19 @@ static void push(InStream *s, const uint8_t *in, int n) {   /* (into the stream'
 }
 static void push_all(const Source *src, const uint8_t *in, int n) {
     for (int i = 0; i < MAX_STREAMS; i++)
-        if (streams[i].used && streams[i].started && &sources[streams[i].source] == src) push(&streams[i], in, n);
+        if (streams[i].used && streams[i].started && streams[i].source >= 0 && &sources[streams[i].source] == src)
+            push(&streams[i], in, n);
+}
+/* ((Triforce) 11-24) the Test microphone row's level of a block read: its loudest sample before the gain (in) and after
+   (out, the samples as the game gets them), thousandths of full scale, held over 150 ms; a sample at full scale either side
+   shows clipping for a second. Only while the test runs: the game's own reads are as they were */
+static void mic_level(Source *src, const uint8_t *before, const uint8_t *after, int bytes, int clipped, int64_t now) {
+    const int in = mic_peak_permille(src->format, before, bytes), out = mic_peak_permille(src->format, after, bytes);
+    if (now - src->level_window_ns > 150000000LL) src->input_peak = src->output_peak = 0, src->level_window_ns = now;
+    if (in > src->input_peak) src->input_peak = in;
+    if (out > src->output_peak) src->output_peak = out;
+    if (bytes > 0) src->level_ns = now;
+    if (clipped || in >= 1000 || out >= 1000) src->clip_until = now + 1000000000LL;
 }
 
 /* a device's name is the wanted one: the same, or its start when the wanted one is the menu's kept name (cut at kMicNameKept
@@ -159,6 +180,8 @@ static void close_mic(Source *src, int64_t now) {
         src->silence_from_ns = now, src->silence_made = 0;   /* (silence from here) */
     }
     src->mic = NULL, src->standin = 0;
+    src->level_ns = src->level_window_ns = src->clip_until = 0;
+    src->input_peak = src->output_peak = 0;
 }
 static void use(Source *src, void *mic, int standin, int64_t now) {   /* (a microphone opened: in place of the one before) */
     close_mic(src, now);
@@ -300,10 +323,12 @@ static void pump(Source *src) {
     if (src->mic) {
         int most = 0;   /* (the largest stream's capacity: more than that backlog is dropped before it reaches them) */
         for (int i = 0; i < MAX_STREAMS; i++)
-            if (streams[i].used && streams[i].started && &sources[streams[i].source] == src) {
+            if (streams[i].used && streams[i].started && streams[i].source >= 0 && &sources[streams[i].source] == src) {
                 const int bytes = streams[i].capacity * streams[i].frame_bytes;
                 if (bytes > most) most = bytes;
             }
+        const int test_here = testing && test_stream.source == (int)(src - sources);   /* ((Triforce) the test reads it) */
+        if (test_here && most < src->rate / 10 * src->frame_bytes) most = src->rate / 10 * src->frame_bytes;
         uint8_t buf[4096];
         const int chunk = (int)sizeof buf - (int)sizeof buf % src->frame_bytes;
         int heard = 0, avail = hos_sdl_mic_available(src->mic);
@@ -312,9 +337,17 @@ static void pump(Source *src) {
             if (got <= 0) break;
             drop -= got, avail -= got, heard = 1;
         }
+        int hos_mic_gain(void);   /* (host/mic_gain.c: the Microphone gain row, percent; 100 its own) */
+        const int gain = avail > 0 ? hos_mic_gain() : 100;
         while (avail > 0) {
             const int got = hos_sdl_mic_read(src->mic, buf, avail < chunk ? avail - avail % src->frame_bytes : chunk);
             if (got <= 0) break;
+            if (test_here) {   /* ((Triforce) the level before and after the gain, for the Test microphone row) */
+                static uint8_t before[4096];
+                memcpy(before, buf, (size_t)got);
+                const int clipped = mic_gain_apply(src->format, buf, got, gain);
+                mic_level(src, before, buf, got, clipped, now);
+            } else mic_gain_apply(src->format, buf, got, gain);   /* (at 100 nothing is read or written: mic_gain.h) */
             push_all(src, buf, got), heard = 1;
             avail -= got;
         }
@@ -344,7 +377,7 @@ static void pump(Source *src) {
     }
 }
 static void pump_all(void) {
-    for (int i = 0; i < MAX_STREAMS; i++)
+    for (int i = 0; i < MAX_STREAMS + 1; i++)
         if (sources[i].used) {
             choose(&sources[i]);
             pump(&sources[i]);
@@ -361,9 +394,15 @@ static InStream *stream_of(uint64_t obj) {
 }
 static void attach(InStream *s) {   /* (the source of its format, made when there is none) */
     int free_at = -1;
-    for (int i = 0; i < MAX_STREAMS; i++) {
+    for (int i = 0; i < MAX_STREAMS + 1; i++) {
         const Source *src = &sources[i];
         if (src->used && src->format == s->format && src->channels == s->channels && src->rate == s->rate) {
+            /* ((Triforce) the first stream of the game on the test's source: what the test read before is not handed on) */
+            if (s != &test_stream && testing && test_stream.source == i && src->users == 1) {
+                choose(&sources[i]);
+                pump(&sources[i]);
+                if (sources[i].mic) hos_sdl_mic_clear(sources[i].mic);
+            }
             s->source = i, sources[i].users++;
             return;
         }
@@ -383,6 +422,46 @@ static void detach(InStream *s) {
     if (--src->users > 0) return;
     close_mic(src, hos_now_ns());
     memset(src, 0, sizeof *src);
+}
+/* ((Triforce) 11-24) The Insert menu's Test microphone row (MkwVkHost mic_test), once a menu tick while the Audio tab shows:
+   enabled 1 reads the chosen microphone (the Microphone row's) through a reader of its own, 48 kHz mono, as the game's
+   streams would, through the Microphone gain row; 0 lets it go (the game's own streams go on as they were). Under the
+   streams' lock, as every read of the game's: one reader drains a source. Nothing is played or written. levels[0] and
+   levels[1]: the loudest sample before and after the gain over the last 150 ms, thousandths of full scale. The answer:
+   HOS_MIC_TEST_* bits (gpu/vk/vk_api.h) */
+/* (gpu/vk/vk_api.h HOS_MIC_TEST_*'s values: this file is compiled alone by tests/test_audio_in.py) */
+enum { HOS_MIC_TEST_ON = 1, HOS_MIC_TEST_OPEN = 2, HOS_MIC_TEST_STANDIN = 4, HOS_MIC_TEST_FRESH = 8, HOS_MIC_TEST_CLIP = 16,
+       HOS_MIC_TEST_OFF = 32 };
+int hos_mic_test(int enabled, int *levels) {
+    AcquireSRWLockExclusive(&lock);
+    AcquireSRWLockShared(&list_lock);
+    const int off = sel_mode <= 0;
+    ReleaseSRWLockShared(&list_lock);
+    if (!enabled || off) {
+        if (testing) detach(&test_stream);
+        testing = 0;
+    } else if (!testing) {
+        memset(&test_stream, 0, sizeof test_stream);
+        test_stream.source = -1;
+        test_stream.format = FMT_PCM16, test_stream.channels = 1, test_stream.rate = 48000, test_stream.frame_bytes = 2;
+        attach(&test_stream);
+        testing = 1;
+    }
+    int state = off ? HOS_MIC_TEST_OFF : 0;
+    if (levels) levels[0] = levels[1] = 0;
+    if (testing) {
+        pump_all();
+        const Source *src = &sources[test_stream.source];
+        const int64_t now = hos_now_ns();
+        state |= HOS_MIC_TEST_ON | (src->mic ? HOS_MIC_TEST_OPEN : 0) | (src->standin ? HOS_MIC_TEST_STANDIN : 0);
+        if (src->level_ns && now - src->level_ns <= 250000000LL) {
+            state |= HOS_MIC_TEST_FRESH;
+            if (levels) levels[0] = src->input_peak, levels[1] = src->output_peak;
+        }
+        if (src->clip_until > now) state |= HOS_MIC_TEST_CLIP;
+    }
+    ReleaseSRWLockExclusive(&lock);
+    return state;
 }
 static void note_read(InStream *s, const uint8_t *p, int frames) {
     s->frames_read += frames;

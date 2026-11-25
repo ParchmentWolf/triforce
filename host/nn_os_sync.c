@@ -22,7 +22,7 @@ typedef struct Obj {
     /* mutex / rwlock */
     HosThread *owner;
     int count, readers;
-    int mwait;   /* mutex: threads asleep on it (or about to be): unlock wakes only then */
+    int mwait;   /* mutex (and an event with HOS_EVENT_ATOMIC): threads asleep on it (or about to be): unlock wakes only then */
     /* event / timer */
     int signaled, autoclear;
     int64_t due_ns, period_ns;
@@ -38,6 +38,7 @@ typedef struct Obj {
        (cv_mixed: waiters with more than one: no handoff) */
     int reserved;
     int cv_waiting, cv_owed, cv_mixed;
+    int cv_in;   /* ((Triforce, 11-24) the waiters in under cv->lk (cv_enter); cv_waiting counts them from before the lock) */
     struct Obj *cv_mutex, *cv_owed_mutex[8];
     /* multi-wait holder: its event; multi-wait: linked holders */
     uint64_t event;
@@ -389,7 +390,8 @@ static int wait_until(Obj *o, int64_t deadline) {
     if (!deadline) return hos_cv_sleep(&o->cv, &o->lk, INFINITE), 1;
     int64_t left = deadline - hos_now_ns();
     if (left <= 0) return 0;
-    hos_cv_sleep(&o->cv, &o->lk, (DWORD)((left + 999999) / 1000000));
+    const uint64_t ms = ((uint64_t)left + 999999) / 1000000;   /* ((Triforce) a timeout past 49 days: not INFINITE, not cut short */
+    hos_cv_sleep(&o->cv, &o->lk, ms >= INFINITE ? INFINITE - 1 : (DWORD)ms);
     return 1;
 }
 
@@ -409,21 +411,44 @@ static int mw_watched_at_locked(uint64_t key) {
         if (mw_watched[i].key == key) return i;
     return -1;
 }
+/* ((Triforce) HOS_EVENT_ATOMIC=1, off unless set: an event's state is one atomic word, set, taken and cleared without its
+   lock, and a signal wakes only sleepers counted in (mwait), one where one sleeps; a change pokes the multi-waits only when
+   the object's bucket of the watched keys below is not empty, without taking mw_lock. Measured elsewhere as part of a
+   series for the Market's frame stalls: workers waited on the event's lock and a virtual core behind every signal. Read once) */
+static volatile LONG event_atomic_on = -1;   /* (-1 until read: event_atomic; WaitAny's scan reads it as it stands, event_peek) */
+static int event_atomic(void) {
+    LONG v = __atomic_load_n(&event_atomic_on, __ATOMIC_RELAXED);
+    if (v < 0) {
+        const char *e = getenv("HOS_EVENT_ATOMIC");
+        v = e && *e && atoi(e) != 0;
+        __atomic_store_n(&event_atomic_on, v, __ATOMIC_RELAXED);
+        if (v) hos_log("sync: events set, taken and cleared without their lock (HOS_EVENT_ATOMIC=1)");
+    }
+    return (int)v;
+}
+/* (HOS_EVENT_ATOMIC) a key's watchers counted by bucket, for poke_multiwait's look without mw_lock: 0 in its bucket, no
+   multi-wait links it. Written under mw_lock, once a key is first watched and once it is no longer */
+static unsigned mw_watch_buckets[256];
+static unsigned mw_watch_bucket(uint64_t key) { return (unsigned)((key * 0x9E3779B97F4A7C15ULL) >> 56); }
 static void mw_watch_add_locked(uint64_t key) {
     const int i = mw_watched_at_locked(key);
     if (i >= 0) { mw_watched[i].n++; return; }
     if (mw_nwatched == mw_capwatched) {
         MwWatched *w = (MwWatched *)realloc(mw_watched, (mw_capwatched ? mw_capwatched * 2 : 16) * sizeof *w);
-        if (!w) { mw_watch_incomplete = 1; return; }
+        if (!w) { __atomic_store_n(&mw_watch_incomplete, 1, __ATOMIC_SEQ_CST); return; }
         mw_watched = w;
         mw_capwatched = mw_capwatched ? mw_capwatched * 2 : 16;
     }
     mw_watched[mw_nwatched].key = key, mw_watched[mw_nwatched].n = 1;
     mw_nwatched++;
+    __atomic_add_fetch(&mw_watch_buckets[mw_watch_bucket(key)], 1, __ATOMIC_SEQ_CST);
 }
 static void mw_watch_remove_locked(uint64_t key) {
     const int i = mw_watched_at_locked(key);
-    if (i >= 0 && --mw_watched[i].n <= 0) mw_watched[i] = mw_watched[--mw_nwatched];
+    if (i >= 0 && --mw_watched[i].n <= 0) {
+        mw_watched[i] = mw_watched[--mw_nwatched];
+        __atomic_sub_fetch(&mw_watch_buckets[mw_watch_bucket(key)], 1, __ATOMIC_SEQ_CST);
+    }
 }
 /* o: the object that changed. Only an object some holder links into a multi-wait can make a WaitAny ready, so the
    others no longer wake every WaitAny: each event, semaphore or queue change anywhere woke them all, and OoT's three
@@ -433,7 +458,10 @@ static void mw_watch_remove_locked(uint64_t key) {
 static void poke_multiwait(Obj *o) {
     static int all = -1;
     if (all < 0) all = getenv("HOS_MW_WAKE") && !strcmp(getenv("HOS_MW_WAKE"), "all");
-    if (!InterlockedCompareExchange(&mw_waiting, 0, 0)) return;
+    if (!__atomic_load_n(&mw_waiting, __ATOMIC_SEQ_CST)) return;
+    if (!all && o && event_atomic() && !__atomic_load_n(&mw_watch_incomplete, __ATOMIC_SEQ_CST) &&
+        !__atomic_load_n(&mw_watch_buckets[mw_watch_bucket(o->key)], __ATOMIC_SEQ_CST))
+        return;   /* (HOS_EVENT_ATOMIC: no multi-wait links a key of its bucket) */
     AcquireSRWLockExclusive(&mw_lock);
     const int wake = all || mw_watch_incomplete || !o || mw_watched_at_locked(o->key) >= 0;
     ReleaseSRWLockExclusive(&mw_lock);
@@ -449,12 +477,41 @@ static int64_t spin_ns(void) {
         ns = (e ? atoll(e) : 40) * 1000;   /* ((Triforce, 11-21) 40 us, was 20: a spin now gives its core to a waiter that asks
                                               (hos_vcore_asked), so a longer one blocks nobody. Lab A/B 79.7 -> 80.4, every round) */
     }
+    /* ((Triforce) HOS_SPIN_OTHER_US=<us>, off unless set: the threads the frame does not wait on (hos_thread_serial: not the
+       game thread nor the presentation thread) spin that long at most, the frame's serial threads HOS_SPIN_US. A sleeper runs
+       again ~7-8 us after its signal, so a much longer spin mostly burns its thread's time: elsewhere 5 us for the job workers
+       and the actor executors cut the process's CPU a frame 3.3 % at the same fps (16 threads), and cost 1.6 % fps with 6.
+       Off here: the 40 us above was measured with the core given up during the spin) */
+    static int64_t other = -2;
+    if (other == -2) {
+        const char *o = getenv("HOS_SPIN_OTHER_US");
+        other = o && *o ? atoll(o) * 1000 : -1;
+        if (other > ns) other = ns;
+    }
+    if (other >= 0) {
+        HosThread *self = hos_self();
+        if (!self || !hos_thread_serial(self)) return other;
+    }
     return ns;
 }
+/* HOS_SPIN_ALWAYS, read at the first spin: spin_adaptive is -1 until then. Threads spinning for the first time at once:
+   one reads it under spin_adaptive_lock, the others wait there for its value; after that, one atomic load per spin. (It
+   was a function's plain static, read and written by every thread that spun for the first time: a data race, though all
+   stored the same value) */
+static int spin_adaptive = -1;
+static SRWLOCK spin_adaptive_lock = SRWLOCK_INIT;
 static int spin_begin(Obj *o, int *misses) {
     if (spin_ns() <= 0) return 0;
-    static int adaptive = -1;
-    if (adaptive < 0) adaptive = getenv("HOS_SPIN_ALWAYS") == NULL;
+    int adaptive = __atomic_load_n(&spin_adaptive, __ATOMIC_RELAXED);
+    if (adaptive < 0) {
+        AcquireSRWLockExclusive(&spin_adaptive_lock);
+        adaptive = __atomic_load_n(&spin_adaptive, __ATOMIC_RELAXED);
+        if (adaptive < 0) {
+            adaptive = getenv("HOS_SPIN_ALWAYS") == NULL;
+            __atomic_store_n(&spin_adaptive, adaptive, __ATOMIC_RELAXED);
+        }
+        ReleaseSRWLockExclusive(&spin_adaptive_lock);
+    }
     *misses = __atomic_load_n(&o->spin_misses, __ATOMIC_RELAXED);
     return !(adaptive && *misses >= 4 && (__atomic_add_fetch(&o->spin_waits, 1, __ATOMIC_RELAXED) & 31));
 }
@@ -531,6 +588,7 @@ static int mutex_take_owed(Obj *m, HosThread *self) {   /* (the woken waiter the
 static void mutex_give(Obj *m) {   /* (the owner's count already 0) */
     __atomic_exchange_n(&m->owner, (HosThread *)NULL, __ATOMIC_SEQ_CST);
     if (__atomic_load_n(&m->mwait, __ATOMIC_SEQ_CST)) {
+        HOS_CHAIN(HOS_CHAIN_SIGNAL, m->key);
         AcquireSRWLockExclusive(&m->lk);
         ReleaseSRWLockExclusive(&m->lk);
         /* (all of them while one is owed it: woken alone, another sleeper would fail its take and sleep again) */
@@ -544,11 +602,13 @@ static void mutex_lock_owed(Obj *m, uint64_t guest, int owed) {
     if (!owed) { mutex_lock(m, guest, NULL); return; }
     HosThread *self = hos_self();
     if (mutex_take_owed(m, self)) { m->count = 1; return; }
+    HOS_CHAIN(HOS_CHAIN_WAIT, m->key);
     AcquireSRWLockExclusive(&m->lk);
     __atomic_add_fetch(&m->mwait, 1, __ATOMIC_SEQ_CST);
     while (!mutex_take_owed(m, self)) hos_cv_sleep(&m->cv, &m->lk, 2000);
     __atomic_sub_fetch(&m->mwait, 1, __ATOMIC_SEQ_CST);
     ReleaseSRWLockExclusive(&m->lk);
+    HOS_CHAIN(HOS_CHAIN_WOKE, m->key);
     m->count = 1;
 }
 static int handoff_on(void) {   /* HOS_NO_HANDOFF=1: the old way (any thread may take a mutex a signal's waiter is owed) */
@@ -556,17 +616,27 @@ static int handoff_on(void) {   /* HOS_NO_HANDOFF=1: the old way (any thread may
     if (v < 0) v = getenv("HOS_NO_HANDOFF") ? 0 : 1;
     return v;
 }
+/* ((Triforce, 11-24) a waiter counted in for SignalConditionVariable's early return, BEFORE it takes cv->lk (and while it
+   still holds the guest mutex): a signal that reads 0 then came before this waiter started to wait. Counted in under
+   cv->lk, in cv_enter, a signal made without the guest mutex could read 0 while the waiter held cv->lk between its
+   generation read and the count, and return without the wake the full signal (which waits for cv->lk) gives that
+   waiter. cv_leave counts it out. The handoff's own count is cv_in, kept under cv->lk: a waiter counted in here but
+   not yet in is owed nothing (it reads the new generation and does not sleep), so no mutex is reserved for it */
+static void cv_count_in(Obj *cv) {
+    __atomic_add_fetch(&cv->cv_waiting, 1, __ATOMIC_SEQ_CST);
+}
 /* a waiter in: (cv->lk held) */
 static void cv_enter(Obj *cv, Obj *m) {
-    if (cv->cv_waiting && cv->cv_mutex != m) cv->cv_mixed = 1;
-    if (!cv->cv_waiting) cv->cv_mixed = 0;
+    if (cv->cv_in && cv->cv_mutex != m) cv->cv_mixed = 1;
+    if (!cv->cv_in) cv->cv_mixed = 0;
     cv->cv_mutex = m;
-    __atomic_add_fetch(&cv->cv_waiting, 1, __ATOMIC_SEQ_CST);
+    cv->cv_in++;
 }
 /* a waiter out (cv->lk held): whether a signal reserved its mutex m for it. A reservation made on another mutex (a
    waiter with a different one came in after the signal) is given back: never left owed to nobody */
 static int cv_leave(Obj *cv, Obj *m) {
-    __atomic_sub_fetch(&cv->cv_waiting, 1, __ATOMIC_SEQ_CST);
+    cv->cv_in--;
+    __atomic_sub_fetch(&cv->cv_waiting, 1, __ATOMIC_SEQ_CST);   /* (counted in by cv_count_in) */
     if (cv->cv_owed <= 0) return 0;
     Obj *r = cv->cv_owed_mutex[--cv->cv_owed];
     if (r == m) return 1;
@@ -575,7 +645,7 @@ static int cv_leave(Obj *cv, Obj *m) {
 }
 /* a signal (cv->lk held): the mutex reserved for the waiter it wakes */
 static void cv_reserve(Obj *cv) {
-    if (!handoff_on() || cv->cv_mixed || !cv->cv_mutex || cv->cv_waiting <= cv->cv_owed || cv->cv_owed >= 8) return;
+    if (!handoff_on() || cv->cv_mixed || !cv->cv_mutex || cv->cv_in <= cv->cv_owed || cv->cv_owed >= 8) return;
     cv->cv_owed_mutex[cv->cv_owed++] = cv->cv_mutex;
     __atomic_add_fetch(&cv->cv_mutex->reserved, 1, __ATOMIC_SEQ_CST);
 }
@@ -590,6 +660,8 @@ static void mutex_lock(Obj *m, uint64_t guest, Ctx *c) {
     if (trace_ms < 0) { const char *e = getenv("HOS_MUTEX_TRACE"); trace_ms = e ? atoi(e) : 0; }
     HosThread *holder = __atomic_load_n(&m->owner, __ATOMIC_RELAXED);
     const int64_t t0 = trace_ms && holder ? hos_now_ns() : 0;
+    const int chain = hos_chain_on;   /* ((Triforce) HOS_CHAIN: a wait that blocks) */
+    if (chain) hos_chain_note(HOS_CHAIN_WAIT, m->key, c ? c->x[30] : 0);
     AcquireSRWLockExclusive(&m->lk);
     __atomic_add_fetch(&m->mwait, 1, __ATOMIC_SEQ_CST);
     {   /* (EvilOOT, 11-07: a wait of over 10 s says who holds the mutex, once per wait: the freeze after Load) */
@@ -606,6 +678,7 @@ static void mutex_lock(Obj *m, uint64_t guest, Ctx *c) {
     }
     __atomic_sub_fetch(&m->mwait, 1, __ATOMIC_SEQ_CST);
     ReleaseSRWLockExclusive(&m->lk);
+    if (chain) hos_chain_note(HOS_CHAIN_WOKE, m->key, c ? c->x[30] : 0);
     m->count = 1;
     if (t0) {
         const int64_t waited = hos_now_ns() - t0;
@@ -692,22 +765,29 @@ HLE(_ZN2nn2os23SignalConditionVariableEPNS0_21ConditionVariableTypeE) {
     Obj *cv = obj(ARG(0), K_COND);
     if (watched_cv(ARG(0))) watch_log("signal", watch_mutex(), ARG(0), c, NULL);
     /* TICK-062 B1, HOS_CV_SIGNAL_FAST=1: a signal with no waiter changes nothing a later wait can see, so it returns before
-       taking cv->lk. No wake is lost: (1) a waiter registers (cv_waiting++, seq_cst) under cv->lk BEFORE it releases the guest
-       mutex (mutex_release_all) and before it sleeps, and reads cv->gen before registering. (2) A signal the guest orders
-       after a wait's registration (it took the mutex the waiter released, or any release/acquire chain from it) reads
-       cv_waiting with a seq_cst load after that, so it sees >= 1 and takes the slow path below, exactly as before. (3) A
-       signal not ordered with the registration (no mutex, truly concurrent) may read 0: that is the signal ordered before the
-       wait, which the slow path also loses (it bumps gen before the waiter reads gen, so the waiter sleeps on). (4) With no
+       taking cv->lk. No wake is lost: (1) a waiter registers (cv_count_in: cv_waiting++, seq_cst) BEFORE it takes cv->lk,
+       reads cv->gen, releases the guest mutex (mutex_release_all) and sleeps. (2) A signal the guest orders after a wait's
+       registration (it took the mutex the waiter released, or any release/acquire chain from it) reads cv_waiting with a
+       seq_cst load after that, so it sees >= 1 and takes the slow path below, exactly as before. (3) A signal not ordered
+       with the registration (no mutex, truly concurrent) may read 0: it is ordered before the count-in, and so before the
+       waiter's read of gen, where the slow path loses it too (it bumps gen before the waiter reads gen, so the waiter
+       sleeps on). ((Triforce, 11-24) the count-in was under cv->lk, after the read of gen: such a signal could read 0 while
+       the waiter held cv->lk between the two, where the slow path waits for the lock and wakes that waiter.) (4) With no
        waiter the slow path only bumps gen (compared only as a delta by waiters that registered later) and cv_reserve (a no-op
-       with cv_waiting <= cv_owed, owed being 0 with no waiter) and wakes nobody. The wake order of waiters is untouched. */
+       with cv_in <= cv_owed, owed being 0 with no waiter) and wakes nobody. The wake order of waiters is untouched. */
     static int fast = -1;
     if (fast < 0) fast = !(getenv("HOS_CV_SIGNAL_FAST") && atoi(getenv("HOS_CV_SIGNAL_FAST")) == 0);   /* ((Triforce) on by default since 11-21, lab +5.8%; =0: off */
     if (fast && !__atomic_load_n(&cv->cv_waiting, __ATOMIC_SEQ_CST)) return;
+    HOS_CHAIN(HOS_CHAIN_SIGNAL, cv->key);
     AcquireSRWLockExclusive(&cv->lk);
     cv_reserve(cv);
     cv->gen++;
-    ReleaseSRWLockExclusive(&cv->lk);
+    /* ((Triforce) the one wake made under cv->lk: it goes to a waiter that was in before this signal. Made after the unlock,
+       a waiter that came in meanwhile (it needs cv->lk to come in) could take it, find its generation unchanged and sleep
+       again, while the waiter the signal was for, and the mutex reserved for it, slept on: the host's wake order is not the
+       order of entry) */
     WakeConditionVariable(&cv->cv);
+    ReleaseSRWLockExclusive(&cv->lk);
 }
 HLE(_ZN2nn2os21WaitConditionVariableEPNS0_21ConditionVariableTypeEPNS0_9MutexTypeE) {
     Obj *cv = obj(ARG(0), K_COND), *m = obj(ARG(1), K_MUTEX);
@@ -718,14 +798,17 @@ HLE(_ZN2nn2os21WaitConditionVariableEPNS0_21ConditionVariableTypeEPNS0_9MutexTyp
         if (i < 8) watch_cvs[i] = ARG(0);
         watch_log("cv wait", ARG(1), ARG(0), c, m);
     }
+    cv_count_in(cv);
     AcquireSRWLockExclusive(&cv->lk);
     uint64_t gen = cv->gen;
     cv_enter(cv, m);
     /* release the guest mutex fully while holding the condvar's lock: a signal cannot slip in between */
     const int count = mutex_release_all(m);
+    HOS_CHAIN(HOS_CHAIN_WAIT, cv->key);
     while (cv->gen == gen) hos_cv_sleep(&cv->cv, &cv->lk, INFINITE);
     const int owed = cv_leave(cv, m);
     ReleaseSRWLockExclusive(&cv->lk);
+    HOS_CHAIN(HOS_CHAIN_WOKE, cv->key);
     if (w) watch_log(owed ? "cv woken, owed the mutex" : "cv woken", ARG(1), ARG(0), c, m);
     mutex_lock_owed(m, ARG(1), owed);
     m->count = count;
@@ -735,10 +818,34 @@ HLE(_ZN2nn2os21WaitConditionVariableEPNS0_21ConditionVariableTypeEPNS0_9MutexTyp
 /* ---- events (EventType, LightEventType, SystemEventType share this) ------------------------------------------ */
 static void event_init(uint64_t key, int signaled, int clear_mode) {
     Obj *e = fresh(key, K_EVENT);
-    e->signaled = signaled;
     e->autoclear = clear_mode == 1;   /* EventClearMode_AutoClear = 1, ManualClear = 0 */
+    __atomic_store_n(&e->signaled, !!signaled, __ATOMIC_RELEASE);
+    (void)event_atomic();   /* (the switch read here, before any WaitAny can link the event: event_peek reads it as it stands) */
+}
+/* (HOS_EVENT_ATOMIC) set: taken (an auto-clear one cleared by the one compare-and-swap that wins it), for event_wait and
+   WaitAny's scan alike; a manual one stays set until it is cleared */
+static int event_take_atomic(Obj *e) {   /* (no call but atomics: WaitAny's scan reaches it under mw_lock) */
+    if (!__atomic_load_n(&e->signaled, __ATOMIC_SEQ_CST)) return 0;
+    if (!e->autoclear) return 1;
+    return InterlockedCompareExchange((volatile LONG *)&e->signaled, 0, 1) == 1;
 }
 static void event_signal(Obj *e) {
+    HOS_CHAIN(HOS_CHAIN_SIGNAL, e->key);
+    if (event_atomic()) {   /* (HOS_EVENT_ATOMIC: set, then only the sleepers counted in woken, under the lock they sleep with) */
+        if (wake_lat_on()) __atomic_store_n(&e->sig_ns, hos_now_ns(), __ATOMIC_RELAXED);
+        if (__atomic_exchange_n(&e->signaled, 1, __ATOMIC_SEQ_CST)) return;   /* (set already: its waiters were told then) */
+        if (__atomic_load_n(&e->mwait, __ATOMIC_SEQ_CST)) {
+            /* (a sleeper counts itself in under lk, then looks again: taking lk here orders this wake after its sleep began. One
+               sleeper: woken alone; several (they may be held to other virtual cores): all, and the compare-and-swap of an
+               auto-clear event awards it to one) */
+            AcquireSRWLockExclusive(&e->lk);
+            if (__atomic_load_n(&e->mwait, __ATOMIC_RELAXED) == 1) WakeConditionVariable(&e->cv);
+            else WakeAllConditionVariable(&e->cv);
+            ReleaseSRWLockExclusive(&e->lk);
+        }
+        poke_multiwait(e);
+        return;
+    }
     AcquireSRWLockExclusive(&e->lk);
     e->signaled = 1;
     if (wake_lat_on()) e->sig_ns = hos_now_ns();
@@ -747,6 +854,10 @@ static void event_signal(Obj *e) {
     poke_multiwait(e);
 }
 static void event_clear(Obj *e) {
+    if (event_atomic()) {
+        __atomic_store_n(&e->signaled, 0, __ATOMIC_SEQ_CST);
+        return;
+    }
     AcquireSRWLockExclusive(&e->lk);
     e->signaled = 0;
     ReleaseSRWLockExclusive(&e->lk);
@@ -789,9 +900,42 @@ static void wake_lat_note(int how, int64_t lat_ns) {   /* how: 0 ready, 1 spun, 
     ReleaseSRWLockExclusive(&lk);
 }
 
+static int event_take_atomic(Obj *e);
+static int event_wait_atomic(Obj *e, int64_t timeout_ns, int try_only) {   /* (HOS_EVENT_ATOMIC: event_wait's other way) */
+    if (event_take_atomic(e)) {
+        if (!try_only && wake_lat_on()) wake_lat_note(0, 0);
+        return 1;
+    }
+    if (try_only) return 0;
+    const int64_t now = timeout_ns > 0 ? hos_now_ns() : 0;
+    const int64_t deadline = timeout_ns > 0 ? (timeout_ns > INT64_MAX - now ? INT64_MAX : now + timeout_ns) : 0;
+    spin_until_set(e, &e->signaled);
+    int got = event_take_atomic(e), slept = 0;
+    int64_t signaled_at = 0;
+    if (!got) {
+        AcquireSRWLockExclusive(&e->lk);
+        __atomic_add_fetch(&e->mwait, 1, __ATOMIC_SEQ_CST);   /* (counted in, then looked at again: event_signal) */
+        while (!(got = event_take_atomic(e))) {
+            if (timeout_ns > 0) {
+                if (!wait_until(e, deadline)) break;
+            } else {
+                hos_cv_sleep(&e->cv, &e->lk, INFINITE);
+            }
+            slept = 1;
+        }
+        if (got && slept && wake_lat_on()) signaled_at = __atomic_load_n(&e->sig_ns, __ATOMIC_RELAXED);
+        __atomic_sub_fetch(&e->mwait, 1, __ATOMIC_SEQ_CST);
+        ReleaseSRWLockExclusive(&e->lk);
+    }
+    if (got && wake_lat_on()) wake_lat_note(slept ? 2 : 1, slept ? hos_now_ns() - signaled_at : 0);
+    return got;
+}
 static int event_wait(Obj *e, int64_t timeout_ns, int try_only) {
+    if (event_atomic()) return event_wait_atomic(e, timeout_ns, try_only);
     int64_t deadline = timeout_ns > 0 ? hos_now_ns() + timeout_ns : 0;
     const int was_set = e->signaled > 0;
+    const int chain = !try_only && !was_set && hos_chain_on;   /* ((Triforce) HOS_CHAIN) */
+    if (chain) hos_chain_note(HOS_CHAIN_WAIT, e->key, 0);
     if (!try_only) spin_until_set(e, &e->signaled);
     int slept = 0;
     AcquireSRWLockExclusive(&e->lk);
@@ -805,12 +949,14 @@ static int event_wait(Obj *e, int64_t timeout_ns, int try_only) {
     if (got && !try_only && wake_lat_on()) wake_lat_note(slept ? 2 : spun ? 1 : 0, slept ? hos_now_ns() - e->sig_ns : 0);
     if (got && e->autoclear) e->signaled = 0;
     ReleaseSRWLockExclusive(&e->lk);
+    if (chain) hos_chain_note(HOS_CHAIN_WOKE, e->key, 0);
     return got;
 }
 
 /* event_wait(e, 0, 1) without its spin, sleep and wake-latency note: for WaitAny's scan, which holds mw_lock and
    may make no scheduling point (vcore checkpoint, yield, sleep) there. Set: taken (cleared when auto-clear) */
 static int event_peek(Obj *e) {
+    if (__atomic_load_n(&event_atomic_on, __ATOMIC_RELAXED) == 1) return event_take_atomic(e);   /* (HOS_EVENT_ATOMIC, read at event_init) */
     AcquireSRWLockExclusive(&e->lk);
     const int got = e->signaled;
     if (got && e->autoclear) e->signaled = 0;
@@ -1038,13 +1184,17 @@ static void sema_init(uint64_t key, int initial, int max) {
     s->sem_max = max;
 }
 static void sema_acquire(Obj *s) {
+    const int chain = s->sem <= 0 && hos_chain_on;
+    if (chain) hos_chain_note(HOS_CHAIN_WAIT, s->key, 0);
     spin_until_set(s, &s->sem);
     AcquireSRWLockExclusive(&s->lk);
     while (s->sem <= 0) hos_cv_sleep(&s->cv, &s->lk, INFINITE);
     s->sem--;
     ReleaseSRWLockExclusive(&s->lk);
+    if (chain) hos_chain_note(HOS_CHAIN_WOKE, s->key, 0);
 }
 static void sema_release(Obj *s, int n) {
+    HOS_CHAIN(HOS_CHAIN_SIGNAL, s->key);
     AcquireSRWLockExclusive(&s->lk);
     s->sem += n;
     if (s->sem_max && s->sem > s->sem_max) s->sem = s->sem_max;
@@ -1082,6 +1232,7 @@ static void queue_trace(Obj *q, uint64_t v, const char *what) {
 /* mode: 0 send (back), 1 jam (front). try: do not block. Returns 1 if done. */
 static int queue_put(Obj *q, uint64_t v, int jam, int try_only) {
     queue_trace(q, v, jam ? "jam" : "send");
+    HOS_CHAIN(HOS_CHAIN_SIGNAL, q->key);
     {   /* (Triforce, 11-14) HOS_FT: every message sent, by its queue */
         int hos_ft_on(void);
         double hos_ft_ms(void);
@@ -1109,12 +1260,18 @@ static int queue_put(Obj *q, uint64_t v, int jam, int try_only) {
 static int queue_get(Obj *q, uint64_t *out, int take, int64_t timeout_ns) {
     int64_t deadline = timeout_ns > 0 ? hos_now_ns() + timeout_ns : 0;
     const int was_set = q->qlen > 0;
+    const int chain = timeout_ns != 0 && !was_set && hos_chain_on;   /* ((Triforce) HOS_CHAIN) */
+    if (chain) hos_chain_note(HOS_CHAIN_WAIT, q->key, 0);
     if (timeout_ns != 0) spin_until_set(q, &q->qlen);
     int slept = 0;
     AcquireSRWLockExclusive(&q->lk);
     const int spun = !was_set && q->qlen;
     while (!q->qlen) {
-        if (timeout_ns == 0 || (timeout_ns > 0 && !wait_until(q, deadline))) { ReleaseSRWLockExclusive(&q->lk); return 0; }
+        if (timeout_ns == 0 || (timeout_ns > 0 && !wait_until(q, deadline))) {
+            ReleaseSRWLockExclusive(&q->lk);
+            if (chain) hos_chain_note(HOS_CHAIN_WOKE, q->key, 0);
+            return 0;
+        }
         if (timeout_ns < 0) hos_cv_sleep(&q->cv, &q->lk, INFINITE);
         slept = 1;
     }
@@ -1125,6 +1282,7 @@ static int queue_get(Obj *q, uint64_t *out, int take, int64_t timeout_ns) {
         q->qlen--;
     }
     ReleaseSRWLockExclusive(&q->lk);
+    if (chain) hos_chain_note(HOS_CHAIN_WOKE, q->key, 0);
     if (take) {
         WakeAllConditionVariable(&q->cv);
         poke_multiwait(q);
@@ -1295,13 +1453,15 @@ HLE(_ZN2nn2os21UnlinkMultiWaitHolderEPNS0_19MultiWaitHolderTypeE) {
 static uint64_t wait_any(uint64_t multiwait, int64_t timeout_ns) {
     Obj *mw = obj(multiwait, K_MULTIWAIT);
     int64_t deadline = timeout_ns > 0 ? hos_now_ns() + timeout_ns : 0;
+    const int chain = timeout_ns != 0 && hos_chain_on;   /* ((Triforce) HOS_CHAIN; outside mw_lock) */
+    if (chain) hos_chain_note(HOS_CHAIN_WAIT, multiwait, 0);
     AcquireSRWLockExclusive(&mw_lock);
     InterlockedIncrement(&mw_waiting);
-    uint64_t found = 0;
+    uint64_t found = 0, found_watch = 0;
     for (;;) {
         int64_t wake = deadline ? deadline : INT64_MAX;
         for (int i = 0; i < mw->nlinks && !found; i++) {
-            if (holder_ready(mw->links[i])) found = mw->links[i]->key;
+            if (holder_ready(mw->links[i])) found = mw->links[i]->key, found_watch = holder_watch(mw->links[i]);
             else if (mw->links[i]->sem_max == H_TIMER) {
                 const int64_t due = obj_nockpt(mw->links[i]->event, K_TIMER)->due_ns;
                 if (due && due < wake) wake = due;
@@ -1315,6 +1475,7 @@ static uint64_t wait_any(uint64_t multiwait, int64_t timeout_ns) {
     }
     InterlockedDecrement(&mw_waiting);
     ReleaseSRWLockExclusive(&mw_lock);
+    if (chain) hos_chain_note(HOS_CHAIN_WOKE, found_watch ? found_watch : multiwait, 0);   /* (the object that ended it) */
     return found;
 }
 HLE(_ZN2nn2os7WaitAnyEPNS0_13MultiWaitTypeE) { RET(wait_any(ARG(0), -1)); }
@@ -1384,16 +1545,19 @@ HLE(_ZN2nn2os17TryWaitTimerEventEPNS0_14TimerEventTypeE) {
 HLE(_ZN2nn2os26TimedWaitConditionVariableEPNS0_21ConditionVariableTypeEPNS0_9MutexTypeENS_8TimeSpanE) {
     Obj *cv = obj(ARG(0), K_COND), *m = obj(ARG(1), K_MUTEX);
     int64_t deadline = hos_now_ns() + ((int64_t)ARG(2) > 0 ? (int64_t)ARG(2) : 0);
+    cv_count_in(cv);
     AcquireSRWLockExclusive(&cv->lk);
     uint64_t gen = cv->gen;
     cv_enter(cv, m);
     const int count = mutex_release_all(m);
     int signaled = 1;
+    HOS_CHAIN(HOS_CHAIN_WAIT, cv->key);
     while (cv->gen == gen) {
         if (!wait_until(cv, deadline) || hos_now_ns() >= deadline) { signaled = cv->gen != gen; break; }
     }
     const int owed = cv_leave(cv, m);
     ReleaseSRWLockExclusive(&cv->lk);
+    HOS_CHAIN(HOS_CHAIN_WOKE, cv->key);
     mutex_lock_owed(m, ARG(1), owed);
     m->count = count;
     RET(signaled);
@@ -1434,7 +1598,8 @@ HLE(_ZN2nn2os22StartOneShotTimerEventEPNS0_14TimerEventTypeENS_8TimeSpanE) {
 }
 /* GenerateRandomBytes(void*, size_t) */
 HLE(_ZN2nn2os19GenerateRandomBytesEPvm) {
-    uint8_t *p = (uint8_t *)GP(ARG(0));
+    uint8_t *p = (uint8_t *)hos_guest_range(ARG(0), ARG(1));   /* ((Triforce) the whole buffer in guest memory) */
+    if (!p) return;
     static volatile LONG64 state = 0x9E3779B97F4A7C15LL;
     for (uint64_t i = 0; i < ARG(1); i++) {
         const uint64_t x = (uint64_t)InterlockedAdd64(&state, 0x9E3779B97F4A7C15LL);

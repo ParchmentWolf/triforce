@@ -345,7 +345,20 @@ static void query_memory(uint64_t out, uint64_t addr) {
     else if (addr >= hos_image_base && addr < hos_image_end) { base = hos_image_base; size = hos_image_end - base; state = 0x03; perm = 5; }   /* Code */
     else if (addr >= HOS_HEAP_BASE && addr < HOS_HEAP_BASE + hos_heap_size) { base = HOS_HEAP_BASE; size = hos_heap_size; state = 0x05; perm = 3; }   /* Normal */
     else if (addr >= HOS_SYSTEM_BASE && addr < HOS_SYSTEM_END) { base = HOS_SYSTEM_BASE; size = HOS_SYSTEM_END - HOS_SYSTEM_BASE; state = 0x05; perm = 3; }
-    else { base = addr & ~0xFFFULL; size = 0x1000; }   /* Free: one page, enough for callers probing an address */
+    else if (addr >= HOS_GUEST_SPACE) { base = HOS_GUEST_SPACE; size = 0 - HOS_GUEST_SPACE; state = 0x10; }   /* Inaccessible: past the address space, to its end, as the kernel answers */
+    else {   /* Free: the whole gap, from the end of the region before addr to the start of the one after it, as the kernel
+                answers (free blocks are merged). A walk over the address space region by region, base + size each step,
+                reaches every mapping in a few steps; at one page a step it never got past the system region */
+        const uint64_t lo[] = {HOS_SYSTEM_BASE, hos_image_base, HOS_HEAP_BASE, stack};
+        const uint64_t hi[] = {HOS_SYSTEM_END, hos_image_end, HOS_HEAP_BASE + hos_heap_size, stack + stack_size};
+        uint64_t end = HOS_GUEST_SPACE;
+        for (int i = 0; i < 4; i++) {
+            if (hi[i] <= lo[i]) continue;
+            if (hi[i] <= addr && hi[i] > base) base = hi[i];
+            if (lo[i] > addr && lo[i] < end) end = lo[i];
+        }
+        size = end - base;
+    }
     memset(GP(out), 0, 0x28);
     G64(out) = base;
     G64(out + 8) = size;
@@ -387,6 +400,7 @@ void a64_svc(Ctx *c, uint32_t imm) {
     case 0x07:   /* ExitProcess */
         hos_log("svcExitProcess");
         hos_log_flush();
+        { void hos_crash_clean_end(void); hos_crash_clean_end(); }   /* ((Triforce) a clean end: host/hos_crash_record.c */
         ExitProcess(0);
         return;
     case 0x0C: { /* GetThreadPriority(-, handle) -> (result, priority) */
@@ -467,7 +481,9 @@ void a64_svc(Ctx *c, uint32_t imm) {
     case 0x27: { /* OutputDebugString(str, size) */
         uint64_t n = c->x[1] > 4096 ? 4096 : c->x[1];
         char buf[4097];
-        memcpy(buf, GP(c->x[0]), n);
+        const void *from = hos_guest_range(c->x[0], n);   /* ((Triforce) guest memory only, not the host's, into the log) */
+        if (!from) n = 0;
+        else memcpy(buf, from, n);
         buf[n] = 0;
         hos_log("debug: %s", buf);
         c->x[0] = R_OK;

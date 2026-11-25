@@ -31,6 +31,8 @@ static partial class Tests
         yield return Sync("tools: unpack the whole zip, refuse unsafe names", ToolsUnpack);
         yield return Sync("tools: base list and parts", ToolsParts);
         yield return ("tools: update from the fake server with progress", ToolsUpdate);
+        yield return ("texture pack: download, stop and go on, hashes, names, replace, remove", TexturePackInstall);
+        yield return ("texture pack: the real pack end to end (TEXPACK_E2E)", TexturePackRealPack);
         yield return Sync("build: @@ protocol from a recorded transcript", Protocol);
         yield return Sync("build: estimates from history and without", Estimates);
         yield return Sync("build: time left, slow first part of the shaders then fast", EtaSlowStart);
@@ -491,6 +493,11 @@ static partial class Tests
         var o = Report.NoName(text, @"C:\Users\Ann", @"C:\Users\ANN~1");
         Equal(@"%USERPROFILE%\AppData\x and %USERPROFILE%//Games and C:\Users\Anna\y and %USERPROFILE%\Temp", o, "the account's folder read as %USERPROFILE%");
         Equal("b\nc", Report.Tail("a\nb\nc\n\n", 2).Replace("\r", ""), "tail");
+        // ((Triforce) 11-24) the switches set, by their names alone, in order; the PC's threads and RAM
+        Equal("Switches set: HOOKSHOT_JOBS, HOS_LOG_FILE, RX_VK_AA (their values are left out)",
+              Report.Switches(new[] { "PATH", "RX_VK_AA", "HOS_LOG_FILE", "HOOKSHOT_JOBS", "RX_", "USERNAME", "RX_VK_AA" }), "the switches set");
+        Equal("Switches set: none", Report.Switches(new[] { "PATH", "TEMP" }), "no switch set");
+        Check(Report.Pc().StartsWith("PC: " + Environment.ProcessorCount + " threads"), "the PC's threads");
     }
 
     static void LanguagesTest()

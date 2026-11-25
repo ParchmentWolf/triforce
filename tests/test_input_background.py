@@ -15,6 +15,12 @@ scaled while the walk key is held, and the script's and the pad's are not (tests
 (Triforce) The "options-back" case: our options' tabs inside the game's own Options screen left with the mouse's right button
 held tap the game's Back, as the pad's B and Esc do.
 
+The "menu-side-buttons" case: while one of the game's menus has the mouse, its side buttons stay their controls' (Mouse 4
+on A confirms a choice); free in play they are none.
+
+The "held-input" case: an input held down is the player's input (the game menus' cursor hides by it) when it goes down, not
+at every read while it stays down, so the mouse's hover works while ZL is held for the ocarina's song sheet.
+
 python -I -B tests/test_input_background.py [--cc gcc]
 """
 import argparse
@@ -30,7 +36,8 @@ RUN_ALL_ARGS = ["--cc", "gcc"]
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("foreground", "script-background", "headless", "noactivate", "live-background",
          "no-script-background", "exclusive-foreground", "exclusive-background", "pads-env", "pads-menu", "pads-off",
-         "frame-hold", "live-frame", "reuse-frame", "wall", "zero", "empty", "no-window", "walk", "options-back")
+         "frame-hold", "live-frame", "reuse-frame", "wall", "zero", "empty", "no-window", "walk", "options-back",
+         "held-input", "menu-side-buttons", "deck-mouse")
 
 
 def block(text, marker):
@@ -78,11 +85,16 @@ def main():
     constants += block(api, "enum { HOS_KEY_MOVE_UP") + ";\n"   # (the keys-only controls)
     # (the gamepads' inputs by position and the two sets of controls: read_input asks which pad input B is bound to)
     constants += block(api, "enum { HOS_PAD_SOUTH") + ";\n" + block(api, "enum { HOS_BIND_PAD") + ";\n"
+    constants += block(api, "enum { HOS_PAD_LS_UP") + ";\n"   # (the sticks' bits among the pads': a stick the Insert menu had waits)
+    # ((Triforce) 11-24: the rear paddles, inputs a binding can take)
+    constants += block(api, "enum { HOS_PAD_RPADDLE1") + ";\n"
+    constants += re.search(r"^#define hos_pad_bindable\(hos_pad_input_\)[^\n]*", api, re.M).group(0) + "\n"
     constants += block(api, "enum { HOS_OPT_CHEAT_HEARTS") + ";\n"
     constants += block(api, "enum { HOS_OPT_RUMBLE_CURVE") + ";\n"   # (the walk key's row and its scale, which read_input asks for)
     # ((Triforce) the Mods entry under the game's lists: npad_states keeps Down from the game there, and all while Mods has the cursor)
     constants += block(api, "enum { HOS_OPT_MODS_LIST") + ";\n" + block(api, "enum { HOS_MODS_PRESS_UP") + ";\n"
     constants += block(api, "enum { HOS_OPT_TEXT_CHAR") + ";\n"   # ((Triforce) the live file's "!type", the search's text)
+    constants += block(api, "enum { HOS_OPT_HOLD_TOGGLE") + ";\n"   # ((Triforce) 11-24: hold-to-toggle's rows, which npad_states asks for)
     for name in ("STATE_SIZE", "NPAD_NO1", "ATTR_CONNECTED"):
         matches = re.findall(r"^#define " + name + r"\s+[^\n]+", hid, re.M)
         assert len(matches) == 1, name
@@ -90,8 +102,12 @@ def main():
     start = hid.index("typedef struct { int64_t start_ms, end_ms;")
     script = block(hid, "static void scripted_input(")
     end = hid.index(script) + len(script)
-    cheat_state = re.search(r"^static uint64_t flight_input;\nstatic uint64_t free_camera_axes;\nstatic int free_camera_height;", hid, re.M).group(0)
+    cheat_state = re.search(r"^static uint64_t flight_input;\nstatic uint64_t free_camera_axes;\nstatic int free_camera_height;\n"
+                            r"static int move_stick_held;", hid, re.M).group(0)
+    # ((Triforce, 11-24) the no-clip flight's Jump: host/flight_jump.h, the game's option not read yet, as at the start)
+    cheat_state += "\n" + (ROOT / "host/flight_jump.h").read_text(encoding="utf-8")
     cheat_spies = """
+volatile int hos_oot_jump_swapped = -1;
 volatile int hos_oot_live_action;
 volatile uint64_t hos_npad_buttons;   /* (nn_hid.c's own, beside npad_states: the buttons the game was given, for the mods' cheats) */
 int hos_oot_flight_shortcut_ready(void) { CHECK(!"unexpected cheat readiness query"); return 0; }
@@ -104,23 +120,35 @@ void rx_option_set(int id, int value) { (void)id; (void)value; CHECK(!"unexpecte
 static void host_taps(void) {}
 static void host_stick_read(int32_t stick[4]) { (void)stick; }
 static void host_drag_read(int32_t stick[4]) { (void)stick; }
-static void player_used(void) {}
+static int player_stamps;   /* (the input the game menus' cursor hides by: the "held-input" case counts them) */
+static void player_used(void) { player_stamps++; }
 void hos_amiibo_poll(void) {}
 int hos_oot_mods_down(void) { return 0; }   /* ((Triforce) host/oot_menu.c: no game list's last button has the cursor here) */
 static void device_used(int device) { (void)device; }   /* ((Triforce) the device used last, for the button prompts: not looked at */
 static void mods_input(uint64_t *buttons, int32_t stick[4]) { (void)buttons, (void)stick; }   /* (and no Mods entry's input) */
 int hos_bench_input_only(void) { return 0; }   /* ((Triforce) host/hos_bench.c: benchmark mode off */
+/* ((Triforce) host/control.c: the control bridge off (HOS_CONTROL unset), its presses none */
+static int hos_control_input(uint64_t *buttons, int32_t stick[4]) { (void)buttons, (void)stick; return 0; }
 """
-    actual = "\n".join((cheat_state, cheat_spies, host_spies, block(hid, "static int key("), block(hid, "static int kmap_down("),
+    # ((Triforce) 11-24: hold-to-toggle's rule and its state as nn_hid.c has them, beside its bindings; every row off here)
+    toggle_at = hid.index("static volatile LONG toggle_reset;")
+    toggle_state = ("typedef long LONG;\nstatic LONG InterlockedExchange(volatile LONG *p, LONG v) { const LONG o = *p; *p = v; return o; }\n" +
+                    (ROOT / "host/hold_toggle.h").read_text(encoding="utf-8") + "\n" +
+                    hid[toggle_at:hid.index("\n", hid.index("void hos_input_clear_toggles(void) {", toggle_at)) + 1])
+    actual = "\n".join((cheat_state, cheat_spies, host_spies, toggle_state, block(hid, "static int key("), block(hid, "static int kmap_down("),
         block(hid, "static int game_in_front("), hid[start:end], block(hid, "static void stick_max("),
         block(hid, "static int pads_in_background("),
         # (the bound keys' helpers read_input calls: a mouse button counts only while the mouse is captured)
         block(hid, "static int mouse_vk_slot("), re.search(r"^static int mouse_armed\[5\];", hid, re.M).group(0),
         block(hid, "static void mouse_buttons_arm("),
         # (the walk key: no control's key while it is the walk key, and the movement keys' stick while it is held)
-        re.search(r"^static int walk_vk;", hid, re.M).group(0), block(hid, "static int bound_down("),
+        re.search(r"^static int walk_vk;", hid, re.M).group(0), block(hid, "static int is_hud_row("),
+        block(hid, "static uint64_t hud_pad_mask("), block(hid, "static int bound_down("),
+        block(hid, "static void hud_shortcut("),   # ((Triforce) the Toggle HUD row: unbound here)
         block(hid, "static int walk_key_code("), block(hid, "static void walk_keys("),
-        block(hid, "static int flight_jump_shortcut("), read, block(hid, "static void npad_states(")))
+        # ((Triforce) 11-24: the ocarina's note layer, which read_input runs first and npad_states asks last)
+        block(hid, "static void oc_notes("), block(hid, "static uint64_t oc_pad_word("),
+        block(hid, "static uint64_t flight_jump(void) {"), block(hid, "static int flight_jump_shortcut("), read, block(hid, "static void npad_states(")))
     glue = (ROOT / "host/mkw_glue.c").read_text(encoding="utf-8")
     actual += "\n" + "\n".join(block(glue, "uint64_t " + name + "(")
                                   for name in ("hos_title_input", "hos_frame_step_buttons"))
@@ -147,7 +175,7 @@ int hos_bench_input_only(void) { return 0; }   /* ((Triforce) host/hos_bench.c: 
              "-I" + str(folder), str(ROOT / "tests/input_background_test.c"), "-o", str(exe)])
         for case in ((a.case,) if a.case else CASES):
             case_env = dict(env)
-            if case not in ("live-background", "no-script-background", "live-frame", "reuse-frame"):
+            if case not in ("live-background", "no-script-background", "live-frame", "reuse-frame", "held-input", "menu-side-buttons", "deck-mouse"):
                 case_env["HOS_INPUT_SCRIPT"] = "0:A+LUP/200"
             if case in ("frame-hold", "live-frame", "reuse-frame"):
                 case_env["HOS_INPUT_FRAME_CLOCK"] = "1"

@@ -52,6 +52,8 @@ int main(void) {
     /* the states */
     CHECK(oot_sprint_kind(1) == OOT_SPRINT_MOVE && oot_sprint_kind(13) == OOT_SPRINT_MOVE && oot_sprint_kind(68) == OOT_SPRINT_MOVE, "Walk, Jump, Clamber move");
     CHECK(oot_sprint_kind(35) == OOT_SPRINT_KEEP && oot_sprint_kind(253) == OOT_SPRINT_KEEP, "Slide, StepOn keep");
+    CHECK(oot_sprint_kind(99) == OOT_SPRINT_KEEP && oot_sprint_kind(21) == OOT_SPRINT_KEEP && oot_sprint_kind(22) == OOT_SPRINT_KEEP &&
+          oot_sprint_kind(188) == OOT_SPRINT_KEEP, "a roll and a turn keep");
     CHECK(oot_sprint_kind(40) == OOT_SPRINT_WAIT, "Wait waits");
     CHECK(oot_sprint_kind(0) == OOT_SPRINT_STOP && oot_sprint_kind(-1) == OOT_SPRINT_STOP && oot_sprint_kind(999) == OOT_SPRINT_STOP, "anything else stops");
 

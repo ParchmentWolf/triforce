@@ -152,8 +152,8 @@ def check_sources(menu, api, replay, readme):
     entries = [e for e in entries if e[1] not in headings]
     names = [e[1] for e in entries]
     # ((Triforce, options_version 7) in their own group on the System tab, Saves & reports, after the Audio tab's rows)
-    at = names.index("Microphone")
-    check(tuple(names[at + 1:at + 1 + len(ALL_ROWS)]) == ALL_ROWS, "the save rows do not stand directly after Microphone: %r" % names[at + 1:at + 5])
+    at = names.index("Bottles")   # ((Triforce) 11-24: the Audio tab's last row, the Controller speaker group's last)
+    check(tuple(names[at + 1:at + 1 + len(ALL_ROWS)]) == ALL_ROWS, "the save rows do not stand directly after the Audio tab's rows: %r" % names[at + 1:at + 5])
     check(table.index('MENU_HEADING(TAB_SYSTEM, "Saves & reports"),') < table.index('{TAB_SYSTEM, "%s"' % ALL_ROWS[0]),
           "the save rows are not under their group's heading")
     for tab, name, value in entries[at + 1:at + 1 + len(ALL_ROWS)]:
@@ -166,7 +166,7 @@ def check_sources(menu, api, replay, readme):
     press = tick.index("else if (press[7] && share_row(r)) share_press(share_row(r)), press[7] = false, changed = true;")
     check(tick.index("if (r.cheat >= 0) cheat_press(") < press < tick.index("else if (press[7] && !r.value && can_bind()) page = 1"),
           "a press on a save row is not taken before the rows that open a page")
-    draw = block(menu, "void draw_options(ui::Ctx& c) {")
+    draw = block(menu, "void draw_options(ui::Ctx& c) {") + block(menu, "float row_value_cell(")   # ((Triforce) its value cells
     check('ends ? r.name : share_row(r) ? share_label(share_row(r)) : "Open"' in draw, "a save row's label is not drawn in its value's place")
     check("if (share_row(selr)) prompt_list[0] = {ui::kConfirm, share_label(share_row(selr))};" in draw, "the guides do not say what a press on a save row does")
     check("share_row(selr) ? share_line(share_row(selr)) : std::string()" in draw and "if (!share_hint.empty()) hint = share_hint.c_str();" in draw,

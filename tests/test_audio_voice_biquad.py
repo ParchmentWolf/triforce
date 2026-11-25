@@ -47,6 +47,12 @@ static void release_wb(Voice *voice, uint64_t buffer) { (void)voice; (void)buffe
 """]
     actual.extend(helper.block(source, marker) for marker in (
         "static void put_handle(", "static int get_handle(", "static int voice_index(", "static Voice *voice_of("))
+    # (the update queue's apply also owns the Aux effects' state: their declarations and reset, as the file has them)
+    aux_start = source.index("typedef struct {", source.index("/* ---- Aux: the game supplies the processing"))
+    aux = [next(line for line in source.splitlines() if line.startswith("#define MAX_EFFECTS")),
+           source[aux_start:source.index("static int aux_on(void) {", aux_start)],
+           helper.block(source, "static void aux_ring_reset("), helper.block(source, "static void aux_reset(")]
+    actual.extend(aux)
     actual.extend([queue, helper.block(source, "static void apply("), helper.block(source, "static void submit("),
                    helper.block(source, "static void commit("), helper.block(runtime, "A64_WEAK void a64_unimplemented(")])
     actual.append(helper.block(source, "HLE(" + LEGACY + ")"))

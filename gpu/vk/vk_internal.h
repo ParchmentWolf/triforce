@@ -31,16 +31,65 @@ namespace mkwvk {
 extern std::vector<std::string> gpu_device_names;
 extern const MkwVkHost* host;
 void logf(const char* fmt, ...);
+// (Triforce) A line at another level than info, as host/hos.h's hos_log_at: "[trace] " (and error, warn, debug) leads its text,
+// which the host writes after its thread's tag. Within the renderer: the host's log callback is unchanged (no API change)
+enum LogLevel : int { log_error, log_warn, log_info, log_debug, log_trace };
+void logf_at(LogLevel level, const char* fmt, ...);
 // (Triforce, lab) RX_VK_FT=<present>, RX_VK_FT_N=<n>: the steps the renderer takes in those frames, by the clock of the host,
 // in the plain mode too (vk_replay.cpp; the other half is HOS_FT, nvn_native.c; reader perf/night/ft.py)
 bool vk_ft_on();
 void recorder_auto(bool on);   // ((Triforce) vk_replay.cpp: the recorder thread's default, vk_recorder.h g_auto_thread)
+// ((Triforce) Threaded rendering, threaded_rendering.h: vk_main.cpp resolves the row and RX_VK_THREADED once, at the device's pick.
+// threaded_render_thread: its render thread (async_on, RX_VK_ASYNC unset); threaded_recorder_thread: its recorder thread
+// (RX_VK_RECORDER unset); threaded_on: either, the design's other pieces with them (the recorder by part, the parts at the
+// game's pass ends, the present thread, the next image ahead). All false with the row Off, the default)
+bool threaded_render_thread();
+bool threaded_recorder_thread();
+bool threaded_on();
 void vk_ft(const char* fmt, ...);
 void queue_flush_locked();   // (vk_replay.cpp, RX_VK_BATCH: held submits out; dev.present_mu held)
 void queue_flush();          // (the same, taking dev.present_mu)
 // (hookshot) held submits out, then vkDeviceWaitIdle with the present queue's lock taken too (dev.present_mu held): the device's
 // every queue is synchronized by the host around it
 void device_wait_idle_locked();
+// (Triforce) why the swapchain is SDR though the Insert menu's HDR is on (Device::hdr_sdr_why): no VK_EXT_swapchain_colorspace;
+// HDR off in Windows' display settings; HDR on there but the driver lists no HDR10 surface; the display lists none and the
+// system's setting is not known (Linux, or a Windows that doesn't say). hdr_sdr_count: how many, for the log's and the
+// menu's line for each
+enum HdrSdrWhy : int { hdr_sdr_none, hdr_sdr_no_extension, hdr_sdr_os_off, hdr_sdr_driver, hdr_sdr_unknown, hdr_sdr_count };
+
+/// ((Triforce) Threaded rendering's recorder, RX_VK_RECORDER_PARTS) What a queue's lock tells the recorder thread (vk_recorder.h
+/// queue_lock_event, installed by vk_replay.cpp; null: nothing, as in the checks): 0 before the lock is taken (lock(), not
+/// try_lock()), 3 when it is held by another and the thread blocks for it, 1 once it is taken, 2 before it is let go
+inline void (*queue_lock_hook)(int phase, bool settles) = nullptr;
+/// ((Triforce) A queue's lock: a std::mutex that says when it is taken and let go (queue_lock_hook, which does nothing without
+/// RX_VK_RECORDER_PARTS). With it the recorder thread makes a part's submit under dev.present_mu itself: a thread about to take
+/// that lock first waits until the parts handed to the recorder are submitted (settles: the queue's order), and a thread holding
+/// any queue lock never waits for a recorder that waits for it (vk_recorder.h queue_escaped)
+struct QueueMutex {
+    std::mutex m;
+    const bool settles = true;
+    QueueMutex() = default;
+    explicit QueueMutex(bool s) : settles(s) {}
+    void lock() {
+        if (queue_lock_hook) queue_lock_hook(0, settles);
+        if (!m.try_lock()) {
+            if (queue_lock_hook) queue_lock_hook(3, settles);
+            m.lock();
+        }
+        if (queue_lock_hook) queue_lock_hook(1, settles);
+    }
+    /// (no wait for the parts: a try is not to block. Its caller waits for them itself where the queue's order needs it)
+    bool try_lock() {
+        if (!m.try_lock()) return false;
+        if (queue_lock_hook) queue_lock_hook(1, settles);
+        return true;
+    }
+    void unlock() {
+        if (queue_lock_hook) queue_lock_hook(2, settles);
+        m.unlock();
+    }
+};
 
 struct Device {
     VkInstance instance = VK_NULL_HANDLE;
@@ -68,22 +117,35 @@ struct Device {
          // ((Triforce) VK_KHR_fragment_shading_rate with pipelineFragmentShadingRate, native mesh shaders and
          // RX_VK_FOLIAGE_SHADOW_VRS not off: the far cascades' foliage at 2 x 2, foliage_shadow.h)
          foliage_rate = false;
+    bool float_atomic_add = false;   // (Triforce) VK_EXT_shader_atomic_float's shaderBufferFloat32AtomicAdd: the translator's float adds
     bool eds3_polygon = false, eds3_clamp = false, eds3_blend = false, eds3_a2c = false;
     bool swapchain_colorspace = false;   // (hookshot) VK_EXT_swapchain_colorspace: HDR10 surfaces are listed
     bool hdr = false;                    // (hookshot) the swapchain is HDR10 (ST 2084, Rec. 2020): framegen_hdr writes it
+    // (Triforce) why it is SDR with HDR on, for the log and the menu's hint: written by create_swapchain and read by the menu on
+    // the presenting thread both (menu_record), as hdr is
+    HdrSdrWhy hdr_sdr_why = hdr_sdr_none;
     bool mesh_fallback = false;   // (hookshot) no VK_EXT_mesh_shader: task and mesh programs as compute shaders (vk_shader.cpp)
     bool task_mesh_fallback = false;
+    // ((Triforce) AMD's Windows driver for RDNA 2: the workaround takes mesh-only programs too. vk_main.cpp create_device)
+    bool mesh_only_fallback = false;
     bool uses_mesh_fallback(bool has_task) const {
-        return mesh_fallback || (task_mesh_fallback && has_task);
+        return mesh_fallback || (task_mesh_fallback && (has_task || mesh_only_fallback));
     }
     VkPhysicalDeviceVulkan12Features vk12{};
     VkPhysicalDeviceVulkan13Features vk13{};
+    VkPhysicalDeviceFloatControlsProperties float_controls{};   // ((Triforce) the float execution modes shaders may declare: make_profile)
+    VkShaderStageFlags subgroup_stages = 0;   // ((Triforce) subgroupSupportedStages: the stages subgroup operations may be used in)
     VkShaderStageFlags sg32_stages = 0;   // (stages that run at 32 lanes when asked: the size the translated programs assume)
+    uint32_t max_workgroup_subgroups = 0;   // ((Triforce) maxComputeWorkgroupSubgroups: a workgroup held to 32 lanes has at most 32 times this)
+    uint32_t max_mesh_groups = UINT32_MAX;   // ((Triforce) the workgroups {x, 1, 1} a native mesh draw may ask for: vk_draw.cpp sim_turf_max_records)
+    uint32_t subgroup_min = 0;            // ((Triforce) the fewest lanes a stage can be held to: fallback_lanes.h)
     uint32_t subgroup_size = 32, subgroup_max = 32;   // (the lanes a stage not pinned runs at, and the most it can have)
     VkDriverId driver_id{};
     bool radv_gcn = false;   // ((Triforce, 11-22, MEM-23) RADV on a GCN 1 to 4 GPU: vk_vendor.h radv_gcn, set in create_device)
     VendorFixes fixes{};   // (hookshot) the vendor and driver workarounds this device needs (vk_vendor.h; vk_main.cpp create_device)
+    bool amd_older_compiler = false;   // ((Triforce) AMD's Windows driver for RDNA 1 and 2, vk_vendor.h: the mesh fallback's strict multiplies)
     uint32_t max_push_descriptors = 0;
+    uint32_t max_vertex_divisor = 0;   // (maxVertexAttribDivisor, with dev.vertex_divisor)
     // no window (HOS_HEADLESS): presents go to an image of their own, which RX_VK_SHOTS can write out
     bool offscreen = false;
     // the window
@@ -96,16 +158,27 @@ struct Device {
     VkFormat swap_view_format = VK_FORMAT_UNDEFINED;   // (their format: the UNORM one of an sRGB swapchain when it can be)
     bool swap_mutable = false;   // (VK_KHR_swapchain_mutable_format: an sRGB swapchain's images viewed as UNORM)
     std::vector<VkSemaphore> swap_rendered;   // present waits belong to acquired images, not frame slots
-    std::mutex present_mu;   // (the swapchain: presents and resizes)
+    QueueMutex present_mu;   // (the swapchain: presents and resizes; (Triforce) the replay queue's submits: QueueMutex)
     std::atomic<uint64_t> swap_resize{0};   // (a new window size, width << 32 | height: the next present makes the swapchain)
     uint64_t swap_generation = 0;   // ((Triforce) one more for each swapchain made: an image present_image holds belongs to one)
     // (hookshot) a queue of a compute family for vkQueuePresentKHR alone (vk_main.cpp create_device; RX_VK_PRESENT_QUEUE=0 / 1).
     // VK_NULL_HANDLE: presents go on `queue` under present_mu. Its own lock: taken after present_mu, never before it
     VkQueue present_queue = VK_NULL_HANDLE;
-    std::mutex present_queue_mu;
+    QueueMutex present_queue_mu{false};
     uint32_t present_family = 0;   // (present_queue's family, the swapchain's images shared with it)
 };
 extern Device dev;
+
+/// (Triforce) Whether a stage of this many invocations runs at 32 lanes (pin_subgroup, profile_pinned, profile_graphics): one
+/// the GPU pins, and for a stage with a workgroup (compute, task, mesh) 32-lane subgroups that cover it, at most
+/// requiredSubgroupSize * maxComputeWorkgroupSubgroups invocations (VUID-VkPipelineShaderStageCreateInfo-pNext-02756), a
+/// limit the spec sets no minimum for. The default, 64: a task or mesh workgroup has 63 threads at most (a 6-bit count), and
+/// the mesh fallback runs the same workgroups as compute shaders
+inline bool pins_32(VkShaderStageFlags stage, uint64_t invocations = 64) {
+    if (!(dev.sg32_stages & stage)) return false;
+    const VkShaderStageFlags workgroup = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT;
+    return !(stage & workgroup) || invocations <= 32ull * dev.max_workgroup_subgroups;
+}
 
 /// (hookshot) Where a storage buffer binding starts: the address rounded down to this, the shaders' offsets counted from there
 /// (vk_shader.cpp make_profile / host_info, the translator's ssbo_align_mask; vk_draw.cpp's descriptor writer). At least 16
@@ -127,6 +200,14 @@ struct BufferRef {
     }
 };
 bool memory_init();                                   // vk_memory.cpp
+/// ((Triforce) vk_memory.cpp memory_table_cover, RX_VK_GP_TABLE) a storage buffer's pages in the guest page table: they already gave
+/// its memory, were made to, were made to over another binding's this submission, or cannot be: outside the table's windows (or no
+/// address), or the binding reads a copy rather than a pool's memory or its mirror's
+enum class TableCover : uint8_t { Held, Written, Conflict, Outside, Copy };
+TableCover memory_table_cover(uint64_t gpu, uint64_t n, uint64_t address);
+void memory_table_cover_on();     // ((Triforce) the cover's bookkeeping kept from now on: vk_coopmat.cpp, RX_VK_GP_TABLE)
+void page_table_census_log(const char* when);   // ((Triforce) the guest pools outside the page table's windows, page_table_census.h)
+void page_table_check_close();   // ((Triforce, vk_draw.cpp) RX_VK_GP_TABLE's last line, the GPU waited for with =2)
 bool pools_mirrored();   // ((Triforce, upstream #2464) vk_memory.cpp mirror_on: the buffer pools have VRAM mirrors)
 // ((Triforce) The PC's RAM and what the process holds (vk_memory.cpp, mem_parts.h). memory_ram_watch: once a present (it asks
 // every 60 presents, and every 600 has the memory line written on a thread of its own); the answers are those of its last look)
@@ -170,6 +251,14 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written);
 /// (Evil Hookshot) the binds that follow come from a compute program's storage buffers (1) or not (0): vk_memory.cpp's mirror trials
 void memory_bind_from_compute(bool on);
 BufferRef stream_copy(const void* src, uint64_t n);   // vk_draw.cpp: bytes in the recording's stream, as a binding
+/// Authored constants in the recording's stream: never recycled until its recording completes.
+/// Fill mapped, then flush memory through binding.offset + binding.size before GPU use.
+struct UniformUpload {
+    BufferRef binding;
+    uint8_t* mapped = nullptr;
+    VmaAllocation memory = nullptr;
+};
+UniformUpload uniform_upload(uint64_t size);   // empty: no recording or no room; no history consumed
 /// Changes when a read binding remembered earlier must be looked up again (a pool left, a mirror was made, a new submission)
 uint64_t gpu_bind_stamp();
 /// Around each submission's recording: mirrors wanted since the last one are made (begin), what the GPU wrote into
@@ -186,13 +275,14 @@ void memory_end_submission(VkCommandBuffer cmd);
 // to have its pages' state changed (host/rx_backend.c hos_guest_io_begin, import_pool), and that call is over (held: what
 // the first returned)
 void memory_lazy_submitted();
+bool memory_lazy_running();   // ((Triforce) vk_memory.cpp: the lazy write-back runs (Threaded rendering's recorder: vk_replay.cpp submit_recording))
 bool memory_lazy_io_begin(const void* p, uint64_t n);
 void memory_lazy_io_end(bool held);
 /// The game made a memory pool (gpu address, bytes): imported in the background, before it is used
 /// RX_VK_CHECKPOINTS: the draws the GPU reached, logged once the device is lost (vk_draw.cpp)
 void checkpoints_report();
 /// The device is lost: that report once, then the process ends (vk_replay.cpp)
-[[noreturn]] void device_lost();
+[[noreturn]] void device_lost(const char* why = nullptr);   // (why: the FATAL line, when it is not that the driver returned VK_ERROR_DEVICE_LOST: a hang it never reported, gpu_hang_watch_start)
 /// VK_AMD_buffer_marker's buffer, for RX_VK_CHECKPOINTS on a device without the NV checkpoints (vk_draw.cpp)
 void buffer_markers_init();
 void coopmat_init();   // vk_coopmat.cpp (once the device is made)
@@ -281,6 +371,7 @@ void memory_capture_stats(MemoryCaptureStats* s);
 /// The replay of the next submit: its capture (false: none, the pages are collected now as before)
 bool memory_take_capture(uint64_t value, uint64_t completed);
 bool memory_capture_now(uint64_t value, uint64_t completed);   // (hookshot: made and taken at once)
+uint64_t memory_captures_begun();   // (how many captures have been begun so far; any thread: vk_replay.cpp cpu_signal_uncaptured)
 /// The submission the replay records next (bindings note it: a pool's mirror is in use until it is done)
 void memory_recording_value(uint64_t value, uint64_t completed);
 /// RX_VK_TEX_CAPTURE (on with the capture; =0 off): the storage of a texture uploaded from guest memory joins the
@@ -332,8 +423,22 @@ void memory_rb_recording_begun();   // (hookshot) at a recording's start, on its
 void memory_rb_segments_begin(uint64_t base, uint64_t n);   // (and a parallel replay's segments: their order, base on)
 /// (hookshot) a range a program may write in the mirror that is not bound as written (not copied back): memory_rb_refresh
 void memory_note_gpu_write(uint64_t gpu, uint64_t size);
+/// ((Triforce) RX_VK_UB_SNAPSHOT's guard, vk_memory.cpp) the GPU writes this thread's recordings have noted that guest memory
+/// may not have yet: the submission being recorded's, in all its parts, and earlier submissions' until the GPU has done them.
+/// Begun at a submission's start (not at a part's); asked by uniform_range for a uniform range (0 none, 1 in the submission
+/// being recorded, 2 in an earlier one the GPU has not done)
+void memory_gpu_writes_begin();
+int memory_gpu_written(uint64_t guest, uint64_t size);
+bool memory_gpu_writes_any();
+/// (vk_draw.cpp) whether uniform buffers are copied into the stream as submitted (RX_VK_UB_SNAPSHOT; every Intel GPU)
+bool uniform_snapshot_on();
 /// (vk_replay.cpp) The GPU's progress on the recordings' timeline, and a wait for it to reach v
 uint64_t vk_timeline_completed();
+/// (vk_replay.cpp) The value the timeline reaches only after every recording made so far is done on the GPU (0: never)
+uint64_t vk_retirement_value();
+bool memory_direct_wb();   // ((Triforce) vk_memory.cpp: RX_VK_DIRECT_WB=1, off unless set)
+/// (vk_replay.cpp) The renderer cannot go on: its FATAL line, the host's log written out, the process ended (exit code 3)
+[[noreturn]] void vk_fatal(const char* why);
 void vk_timeline_wait(uint64_t v);
 /// ((Triforce, 11-22, the performance audit's SYNC-122) the same wait for a caller other than a capture's take: who is
 /// wb_rec_wait.h's Caller (1 a read of a page put off, 2 a binding of one); its held part is counted under it
@@ -382,9 +487,38 @@ extern uint64_t test_card_ballast;   // (vk_vma.cpp, RX_VK_TEST_CARD_MB: 0 outsi
 /// (vk_memory.cpp) The card's video memory in bytes: its largest device-local heap, less RX_VK_TEST_CARD_MB's ballast
 uint64_t device_vram_bytes();
 void vma_blocks_ahead_check();   // (vk_vma.cpp: the blocks made ahead given back while VRAM is short; every 600 presents)
-/// (textures: from the textures' own pool, the one image_compact_* moves allocations in: vk_texture.cpp's compaction)
+/// (Triforce) What an image of this create info needs (size, alignment, memory types), without making one; false where the
+/// driver cannot say or the image must have memory of its own (vkGetDeviceImageMemoryRequirements, Vulkan 1.3)
+bool image_requirements(const VkImageCreateInfo& ci, VkMemoryRequirements* mr);
+/// An image's requirements, asked of the driver once however often they are read (vk_texture.cpp create: the take by size, the
+/// size class and create_image's check of the render targets' pools' memory type)
+struct ImageNeed {
+    const VkImageCreateInfo* ci;
+    VkMemoryRequirements mr{};
+    int8_t asked = -1;
+    const VkMemoryRequirements* get() {
+        if (asked < 0) asked = image_requirements(*ci, &mr) ? 1 : 0;
+        return asked > 0 ? &mr : nullptr;
+    }
+};
+/// (textures: from the textures' own pool, the one image_compact_* moves allocations in: vk_texture.cpp's compaction; need: the
+/// image's requirements where the caller asked already, read for the render targets' pools' memory type)
 bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated = false, bool target = false,
-                  bool textures = false);
+                  bool textures = false, ImageNeed* need = nullptr);
+// ((Triforce, RX_VK_TARGET_REUSE_MEMORY) a render target's image on the memory of a pooled one: vk_texture.cpp pool_take_memory)
+/// What target_pool::fits reads of an allocation: its size, its offset in its memory object, its memory type, and whether it is
+/// to be taken as memory of its own (anything but a share of the render targets' blocks, which create_image tags)
+bool allocation_fit_info(VmaAllocation allocation, uint64_t* bytes, uint64_t* offset, uint32_t* memory_type, bool* dedicated);
+/// The size of the render targets' blocks (RX_VK_TARGET_BLOCK_MB): an image larger is not in them
+uint64_t target_block_bytes();
+/// The memory types in VRAM (DEVICE_LOCAL), as a mask
+uint32_t device_local_types();
+/// A render target of the pooled kind on an allocation of its size class (target_pool::class_bytes) in the targets' blocks, so a
+/// later image of the class fits it; false where it cannot be (no pool, over a block, a small target, refused: made as before)
+bool create_image_in_class(ImageNeed& need, VkImage& image, VmaAllocation& allocation);
+/// A new image bound at the start of an allocation another image held (vmaCreateAliasingImage); that one must be past its last
+/// use. The allocation stays the caller's: destroy_image frees it with the new image
+bool create_aliasing_image(const VkImageCreateInfo& ci, VmaAllocation allocation, VkImage& image);
 // (hookshot) the textures' pool compacted: VMA's defragmentation, a pass at a time (vk_texture.cpp's compact_step)
 struct ImageMove {
     VmaAllocation src;   // (the allocation to move: it stays the texture's, and points at the new place once the pass ends)
@@ -457,6 +591,9 @@ bool precompile_wanted();                     // vk_draw.cpp
 void precompile_run(void (*progress)(size_t done, size_t total));
 void texture_pipelines_unprepared();         // ((Triforce) vk_draw.cpp: no precompile: the cache read, the converters made)
 VkResult shared_cache_compute(const VkComputePipelineCreateInfo* ci, VkPipeline* out);   // (vk_draw.cpp: through that cache)
+/// (vk_draw.cpp) One of the renderer's own compute pipelines made with no cache; asked once more without the driver's
+/// optimizer where the driver refuses the optimized build (compute_plain_wanted)
+VkResult bare_compute_pipeline(const VkComputePipelineCreateInfo* ci, VkPipeline* out);
 void texture_pipelines_warm();                // ((Triforce) vk_texture.cpp: the texture converters' pipelines, before the game)
 bool prepare_run(void (*progress)(size_t done, size_t total), bool background);
 bool pcache_carry_rebuild();   // ((Triforce) after prepare_run: the carried pipeline cache over its cap, a fresh one: pcache_carry.h)
@@ -468,6 +605,13 @@ void predict_background();   // (Triforce: the predicted pipelines predict_run d
 void frame_shown_note(int draws);   // (Triforce, 11-14: a frame was shown with this many draws; the builder rests in play)
 void predict_plan_ensure();  // (Triforce: its plan, made before the precompile when an older build prepared this install)
 void predict_run(void (*progress)(size_t done, size_t total));   // (after a prepare_run that prepared: the notes' predictions)
+bool predict_before_title(bool prepared);   // ((Triforce, 11-24) whether predict_run runs now: Compile shaders, compile_level.h)
+/// ((Triforce, 11-24, vk_draw.cpp) The --prepare-shaders run's journal (prepare_journal.h): an entry has been inside the driver
+/// for longer than one gets, and its line is written: the run ends with prepare_journal::kExitEntryLimit (vk_main.cpp)
+bool prepare_journal_overdue();
+/// ((Triforce, 11-24, vk_draw.cpp) A run started again past a shader the run before died in (--prepare-from): the run before
+/// is taken off the precompile's crash markers
+void prepare_restart_forgive();
 /// (hookshot) The window was closed while the shaders were prepared: prepare_run and precompile_run take nothing more and return,
 /// what is done kept (the program cache, the driver's) and not counted as a start that ended inside them
 void prepare_stop();
@@ -535,7 +679,7 @@ struct ProfThread {
     int open, k;     // (the PROF_HOT scopes open, and the outermost one's weight: 0 not timed)
     int64_t exact;   // (the nanoseconds PROF / PROF_EXACT timed on this thread so far)
 };
-inline thread_local ProfThread prof_t;
+inline constinit thread_local ProfThread prof_t{};
 struct ProfScope {
     int phase;   // (-1: PROF_EXACT, no phase of its own)
     int64_t t0, x0;

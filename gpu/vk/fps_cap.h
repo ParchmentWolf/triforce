@@ -9,6 +9,10 @@ namespace mkwvk::fps_cap {
 /// The row's value for Monitor's rate (frame_rate_cap= in the options file): after 60, 90, 120, 144, 165 and 240 (0 to
 /// 5); 45, 40 and 30 are -1 to -3
 constexpr int kMonitor = 6;
+/// The row's value for Uncapped, after Monitor's rate (7): the game runs as fast as the PC makes its frames, still at real
+/// time. The host paces it by kUncappedFps, a millisecond (host/nn_vi.c fps_cap_of)
+constexpr int kUncapped = 7;
+constexpr int kUncappedFps = 1000;
 /// The caps the game's pacing and its time step take (host/nn_vi.c): a display under 30 Hz or over 240 gets the nearest
 constexpr int kLowest = 30, kHighest = 240;
 

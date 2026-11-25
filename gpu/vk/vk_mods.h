@@ -57,6 +57,9 @@ struct InstallState {
 
 /// Whether this build can browse and install (Windows: yes; Linux: not yet)
 bool available();
+/// ((Triforce, 11-24) Evil HD's texture pack, vk_texture.cpp) A PNG, JPEG or WebP in memory as RGBA8, no wider than max_w
+/// (Windows' WIC, as the page's pictures; false elsewhere)
+bool decode_picture(const std::string& bytes, int max_w, std::vector<unsigned char>& rgba, int* w, int* h);
 /// The page opened: the first page of the list asked for when there is none yet (again after a failure); a search left
 /// behind ended. Returns the textures (ImTextureData*) of the pictures of a list emptied, for the menu to let go
 std::vector<void*> open();

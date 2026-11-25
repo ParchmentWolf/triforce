@@ -3,8 +3,9 @@
    at 0x80794368), and the Ultrawide HUD row's setting.
 
    The Insert menu's "Ultrawide HUD" row (ultrawide_hud= in the options file): 0 the middle, as before; 1 the screen's
-   edges. HOS_WIDE_HUD=<0|1> over it. Read once, at the start: the edge-anchored HUD panes
-   are moved in the layouts as the game loads them (host/prompts.c build_layouts asks hos_wide_hud_out).
+   edges. HOS_WIDE_HUD=<0|1> over it. ((Triforce) Screen edges is host/hos_wide_ui.c's, read at each present there. With
+   that file off (HOS_WIDE_UI=0) it is read once, at the start, here: the edge-anchored HUD panes are moved in the layouts
+   as the game loads them (host/prompts.c build_layouts asks hos_wide_hud_out).)
    Lab switches: HOS_WIDE_LOG=1 names each screen class the first time its projection is set (its address and where it
    was put); HOS_WIDE_SHIFT=<class in hex>=<l|r|m>,... moves whole layouts to a side, to find out what a class draws. */
 #include "hos.h"
@@ -31,9 +32,12 @@ static int edges_on(void) {
     return v;
 }
 
-/* host/prompts.c build_layouts: how far out the side panes of the layouts go (oot_hud_out), 0 when they stay */
+/* host/prompts.c build_layouts: how far out the side panes of the layouts go (oot_hud_out), 0 when they stay. ((Triforce)
+   Screen edges is host/hos_wide_ui.c's now, live, from the HUD's panes as the game places them: the layouts are moved as
+   they load only with that file off, HOS_WIDE_UI=0, as before it) */
 float hos_wide_hud_out(void) {
-    return edges_on() ? oot_hud_out(hos_wide_squeeze) : 0.0f;
+    int hos_wide_ui_off(void);
+    return edges_on() && hos_wide_ui_off() ? oot_hud_out(hos_wide_squeeze) : 0.0f;
 }
 
 static void read_forced(void) {

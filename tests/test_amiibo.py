@@ -11,9 +11,14 @@ them; the file names taken; the readers' states (none before a figure is chosen,
 looks, mounted, read, lifted off a second later, one touch a choice, taken away); and the game's own task, as its code
 has it, run against them: it waits in the search state with no figure and ends with the figure's data with one.
 
+Also (Triforce): a Flipper Zero NFC file (.nfc) read as the tag's bytes, cut short anywhere; and the application area a
+game may keep on a figure: made, opened by its access ID, set, flushed, kept in a file of its own (never the dump),
+closed when the figure is lifted off.
+
 Reads the source for what cannot be run without the game: every SDK function answers as the lift's stub did (0, nothing
 written) for a handle that is not a listed reader's; the file is opened by a checked name inside the amiibo folder and
-at most 1025 bytes of it are read; nothing names or opens a key; the choice is taken at the pad read; the option ids.
+its read is bounded; the only file written is the area's, under the amiibo folder's "areas", by the serial number;
+nothing names or opens a key; the choice is taken at the pad read; the option ids.
 
     python -I -B tests/test_amiibo.py [--cc gcc]
 """
@@ -36,6 +41,13 @@ FUNCTIONS = (
     "_ZN2nn3nfp13StopDetectionERKNS0_12DeviceHandleE", "_ZN2nn3nfp10GetTagInfoEPNS0_7TagInfoERKNS0_12DeviceHandleE",
     "_ZN2nn3nfp5MountERKNS0_12DeviceHandleENS0_9ModelTypeENS0_11MountTargetE",
     "_ZN2nn3nfp12GetModelInfoEPNS0_9ModelInfoERKNS0_12DeviceHandleE")
+# ((Triforce) the application area's, for a game that keeps data on a figure: answered for a figure of ours only)
+AREA_FUNCTIONS = (
+    "_ZN2nn3nfp19OpenApplicationAreaERKNS0_12DeviceHandleEj", "_ZN2nn3nfp18GetApplicationAreaEPvPmRKNS0_12DeviceHandleEm",
+    "_ZN2nn3nfp18SetApplicationAreaERKNS0_12DeviceHandleEPKvm",
+    "_ZN2nn3nfp21CreateApplicationAreaERKNS0_12DeviceHandleERKNS0_25ApplicationAreaCreateInfoE",
+    "_ZN2nn3nfp23RecreateApplicationAreaERKNS0_12DeviceHandleERKNS0_25ApplicationAreaCreateInfoE",
+    "_ZN2nn3nfp5FlushERKNS0_12DeviceHandleE")
 
 
 def check(ok, why):
@@ -61,10 +73,20 @@ def check_source():
     sys.path.insert(0, str(ROOT / "nx2"))
     import standalone
     have = standalone.implemented()
-    for name in FUNCTIONS:
+    for name in FUNCTIONS + AREA_FUNCTIONS:
         check("imp_" + name in have, "host/ has no " + name)
     code = nfp[nfp.index("#include"):]
-    check(len(re.findall(r"^HLE\(", code, re.M)) == len(FUNCTIONS), "host/nn_nfp.c has other SDK functions than the game's request makes")
+    check(len(re.findall(r"^HLE\(", code, re.M)) == len(FUNCTIONS + AREA_FUNCTIONS),
+          "host/nn_nfp.c has other SDK functions than the game's request and the application area's")
+    for name in AREA_FUNCTIONS:   # (a figure of ours only: 0 and nothing written for any other handle)
+        text = body(nfp, name)
+        check("reader_of(ARG(" in text or "area_create(c, " in text, name + " does not ask whose handle it is")
+        for write in re.findall(r"^[^\n]*(?:memcpy\(out|G64\(ARG|area_save\()[^\n]*$", text, re.M):
+            check("reader >= 0" in write or "if (save)" in write, name + " writes for a handle that is not a reader's: " + write.strip())
+    create = nfp[nfp.index("static uint32_t area_create("):]
+    create = create[:create.index("\n}\n")]
+    check("reader >= 0 && info ? nfp_area_create(" in create and "if (save) area_save(&tag, bytes)" in create,
+          "CreateApplicationArea makes or writes an area for a handle that is not a reader's")
     # a handle that is not a listed reader's: 0 and nothing written, as the lift's stub answers
     for name in FUNCTIONS[4:]:
         text = body(nfp, name)
@@ -83,9 +105,15 @@ def check_source():
     load = nfp[nfp.index("static int load_dump("):nfp.index("void hos_amiibo_poll(")]
     check("if (!amiibo_name_ok(name) || !hos_share_game_dir(dir, sizeof dir)) return NFP_SAID_NO_FILE;" in load
           and 'snprintf(path, sizeof path, "%s/amiibo/%s", dir, name);' in load, "the dump is not opened by a checked name inside the amiibo folder")
-    check("uint8_t data[AMIIBO_FILE_MAX + 1];" in load and "fread(data, 1, sizeof data, f)" in load and "amiibo_parse(data, n, tag)" in load,
+    check("static uint8_t data[AMIIBO_NFC_MAX + 1], pages[540];" in load and "fread(data, 1, sizeof data, f)" in load and
+          "amiibo_parse(data, n, tag)" in load and "n <= AMIIBO_NFC_MAX && amiibo_flipper((const char *)data, n, pages)" in load,
           "the dump's read is not bounded")
-    check(nfp.count("fopen(") == 1 and "fwrite" not in nfp and "fopen" not in header, "host/nn_nfp.c opens another file than the dump, or writes one")
+    # ((Triforce) the dump is only read: the one file written is the area's, in the amiibo folder's areas, by its serial number)
+    area = nfp[nfp.index("static int area_path("):nfp.index("void hos_amiibo_poll(")]
+    check(nfp.count("fopen(") == 3 and nfp.count('fopen(path, "rb")') == 2 and nfp.count("fwrite(") == 1 and "fopen" not in header,
+          "host/nn_nfp.c opens other files than the dump and the area's, or writes another")
+    check('snprintf(path, cap, "%s/amiibo/areas/%s", dir, name);' in area and "amiibo_area_name(tag, name);" in area and
+          'fopen(path, "wb")' in area and "fwrite(bytes, 1, NFP_AREA_FILE, f)" in area, "the area is written somewhere else than its own file")
     for text, where in ((code, "host/nn_nfp.c"), (header[header.index("#pragma once"):], "host/amiibo.h")):
         stripped = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
         check(not re.search(r"key|retail|hmac|aes|decrypt\w*\(", stripped, re.I), where + " has code that names a key or decrypts")
@@ -99,6 +127,11 @@ def check_source():
     check("availability_event = 0;" in body(nfp, FUNCTIONS[1]), "the game's event is kept after Finalize")
     check("enum { HOS_OPT_DEBUG_ASK = 115, HOS_OPT_DEBUG_TEXT, HOS_OPT_DEBUG_SAID, HOS_OPT_AMIIBO_ASK, HOS_OPT_AMIIBO_SAID };" in api,
           "gpu/vk/vk_api.h: the option ids 115 to 119")
+    # (the System tab's NFC group: the same Scan amiibo page for every player, not only with the Debug tab's tools on)
+    menu = (ROOT / "gpu/vk/vk_menu.cpp").read_text(encoding="utf-8")
+    if not re.search(r'MENU_HEADING\(TAB_SYSTEM, "NFC"\),\s*\{TAB_SYSTEM, kNfcTag, nullptr,', menu) or \
+            "else if (press[7] && r.name == kNfcTag) names_open(kNamesAmiibo)" not in menu:
+        raise SystemExit("FAIL: vk_menu.cpp: the System tab's NFC tag row does not open the Scan amiibo page")
     print("PASS: the SDK's functions answer as before until a figure is chosen, and no key is read")
 
 

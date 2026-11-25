@@ -55,6 +55,11 @@ static volatile LONG ask_next;   /* (what a row asked: the worker takes it) */
    2 no frame is ever shown */
 static int shot_mode, shot_asked, shot_polls, shot_dropped;
 static char shot_file[MAX_PATH + 64];
+/* ((Triforce) 11-24) the menu's settings changed from the defaults (HOS_OPT_BUG_SETTINGS), a byte a question; none from a
+   renderer that has not the text (the "nopicture" capture's: an older renderer) */
+static const char settings_text[] = "Field of view: 110% (default: 100%)\nText size: 125% (default: Off)\n";
+static const char *settings_at;
+static int settings_none;
 int rx_option(int id, int otherwise) {
     if (id == HOS_OPT_SHARE_ASK) return (int)InterlockedExchange(&ask_next, 0);
     if (id == HOS_OPT_BUG_SHOT) {
@@ -65,9 +70,11 @@ int rx_option(int id, int otherwise) {
         if (f) fputs("the frame's picture", f), fclose(f);
         return 2;
     }
+    if (id == HOS_OPT_BUG_SETTINGS) return settings_at && *settings_at ? (unsigned char)*settings_at++ : (settings_at = NULL, 0);
     return id == 1 ? 0 : otherwise;
 }
 void rx_option_set(int id, int value) {
+    if (id == HOS_OPT_BUG_SETTINGS && value) settings_at = settings_none ? NULL : settings_text;
     if (id == HOS_OPT_BUG_SHOT) {
         if (value) shot_asked++, shot_polls = 0;
         else shot_dropped++;
@@ -99,6 +106,7 @@ void hos_oot_live_crawl(const char *line) {
 }
 
 #include "../host/bug_capture.c"
+#include "../host/log_redact.c"   /* ((Triforce) 11-24: the log's copy leaves the home folder and the user's name out, as it is) */
 
 /* ---- a save of three files, one in a slot folder, all written with one tag (as tests/test_save_tx.py's) ---- */
 static void put(const char *dir, const char *name, const char *text) {
@@ -412,6 +420,7 @@ int main(int argc, char **argv) {
         snprintf(shot_file, sizeof shot_file, "%s\\captures\\frame-pending.png", game);
         shot_mode = !strcmp(mode, "nopicture") ? 1 : !strcmp(mode, "noframes") ? 2 : 0;
         f8_bound = !strcmp(mode, "bound");
+        settings_none = !strcmp(mode, "nopicture");
         link_in_play = strcmp(mode, "title") != 0;
         CHECK(game_mount() != NULL);
         for (int i = 0; i < 14; i++) {   /* (1.4 s of play at 60 frames a second, as the worker counts it) */

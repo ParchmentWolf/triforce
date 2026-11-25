@@ -176,3 +176,35 @@ body.kb .cp-sv.held.kf { outline: 4px double var(--gold-hi) !important; box-shad
 .cp-foot { display: flex; justify-content: space-between; align-items: baseline; margin-top: 20px; font-size: 14px; }
 .cp-foot em { font-family: 'Cormorant Garamond', Georgia, serif; font-style: italic; font-weight: 600; font-size: 17px; color: var(--gold-hi); }
 .cp-foot .lnk { font-weight: 600; color: var(--gold); cursor: pointer; }
+
+/* ((Triforce, 11-25) Evil HD on the home screen: under the save's picture, in its frame's lines; the switch lit in the theme's
+   own colour when on (the gold variables follow the colour chosen in Settings) */
+.evilhd { position: absolute; left: 672px; top: 470px; width: 544px; height: 66px; display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 0 22px 0 24px; box-sizing: border-box; cursor: pointer;
+  background: linear-gradient(90deg, rgba(10, 9, 8, .78), rgba(10, 9, 8, .52)); border: 1px solid rgba(var(--gold-rgb), .38); transition: border-color .2s, box-shadow .2s; }
+.evilhd::before { content: ''; position: absolute; inset: 4px; border: 1px solid rgba(var(--gold-rgb), .14); pointer-events: none; }
+.evilhd:hover, .evilhd.kf { border-color: rgba(var(--gold-rgb), .7); }
+.evilhd .eh-txt { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.evilhd .eh-txt b { font-family: 'Cormorant Garamond', Georgia, serif; font-style: italic; font-weight: 700; font-size: 25px; line-height: 1; color: var(--text); letter-spacing: .01em; transition: color .2s, text-shadow .2s; }
+.evilhd .eh-txt span { font-size: 13px; color: var(--text2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.evilhd .eh-sw { position: relative; flex: none; width: 64px; height: 30px; border-radius: 15px; background: rgba(10, 9, 8, .85); border: 1px solid rgba(var(--gold-rgb), .5); transition: background .2s, box-shadow .2s; }
+.evilhd .eh-sw i { position: absolute; top: 3px; left: 3px; width: 22px; height: 22px; border-radius: 50%; background: var(--text3); transition: left .2s, background .2s; }
+.evilhd.on { border-color: rgba(var(--gold-rgb), .7); box-shadow: 0 0 28px rgba(var(--gold-glow-rgb), .18); }
+.evilhd.on .eh-txt b { color: var(--gold-hi); text-shadow: 0 0 18px rgba(var(--gold-glow-rgb), .55); }
+.evilhd.on .eh-sw { background: linear-gradient(180deg, rgb(var(--gold-hi-rgb)), rgb(var(--gold-low-rgb))); box-shadow: 0 0 16px rgba(var(--gold-glow-rgb), .5); border-color: rgba(var(--gold-hi-rgb), .9); }
+.evilhd.on .eh-sw i { left: 37px; background: var(--ink); }
+.evilhd.off { cursor: default; opacity: .6; }
+#s-home.nopic .evilhd { top: 118px; }
+/* ((Triforce, 11-25) the Remastered textures row under the switch: Evil HD's texture pack, its download and progress) */
+.ehpack { position: absolute; left: 672px; top: 544px; width: 544px; height: 44px; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 0 12px 0 24px; box-sizing: border-box;
+  background: rgba(10, 9, 8, .55); border: 1px solid rgba(var(--gold-rgb), .22); }
+.ehpack .ehp-txt { display: flex; align-items: baseline; gap: 12px; min-width: 0; }
+.ehpack .ehp-txt b { font-family: 'Cormorant Garamond', Georgia, serif; font-style: italic; font-weight: 700; font-size: 18px; color: var(--text); white-space: nowrap; }
+.ehpack .ehp-txt span { font-size: 12.5px; color: var(--text2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ehpack .ehp-btn { flex: none; height: 28px; padding: 0 16px; font: 600 13px Commissioner, sans-serif; letter-spacing: .04em; color: var(--gold-hi); background: transparent;
+  border: 1px solid rgba(var(--gold-rgb), .55); cursor: pointer; transition: background .2s, color .2s; }
+.ehpack .ehp-btn:hover, .ehpack .ehp-btn.kf { background: rgba(var(--gold-rgb), .16); }
+.ehpack.have .ehp-txt b { color: var(--gold-hi); }
+.ehpack .ehp-bar { position: absolute; left: 0; right: 0; bottom: -1px; height: 2px; background: transparent; }
+.ehpack .ehp-bar i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, rgb(var(--gold-low-rgb)), rgb(var(--gold-hi-rgb))); box-shadow: 0 0 10px rgba(var(--gold-glow-rgb), .6); transition: width .4s; }
+#s-home.nopic .ehpack { top: 192px; }
+@media (prefers-reduced-motion: reduce) { .evilhd, .evilhd * { transition: none !important; } }

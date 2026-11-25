@@ -14,8 +14,14 @@
    The page is told what became of the figure (HOS_OPT_AMIIBO_SAID, NFP_SAID_*).
 
    Only what a tag keeps in the clear is read from a dump (the serial number and which figure it is), so no key is
-   needed, none is looked for and none is read. The game's own code asks for nothing else (host/amiibo.h); the SDK's
-   functions for a figure's owner, nickname and saved data stay the stubs they were. */
+   needed, none is looked for and none is read. A dump is a tag's bytes (.bin) or a Flipper Zero's NFC file of them
+   (.nfc). The game's own code asks for nothing else (host/amiibo.h); the SDK's functions for a figure's owner and
+   nickname stay the stubs they were.
+
+   ((Triforce) The application area, the data a game keeps on a figure (this game's request opens none): for a figure of
+   ours it is answered from a file of Triforce's own, the amiibo folder's areas/<serial number>.area (amiibo_area_*),
+   written when a game makes one or flushes it. The player's dump is never written. For a handle that is not a listed
+   reader's these answer as the stubs did. */
 #include "hos.h"
 #include "amiibo.h"
 #include "../gpu/vk/vk_api.h"
@@ -133,24 +139,133 @@ HLE(_ZN2nn3nfp12GetModelInfoEPNS0_9ModelInfoERKNS0_12DeviceHandleE) {
     RET(result);
 }
 
+/* ---- ((Triforce) the application area (host/amiibo.h nfp_area_*), for a figure of ours: its file written outside the lock ---- */
+static void area_save(const AmiiboTag *tag, const uint8_t bytes[NFP_AREA_FILE]);
+/* OpenApplicationArea(DeviceHandle const&, unsigned access_id) */
+HLE(_ZN2nn3nfp19OpenApplicationAreaERKNS0_12DeviceHandleEj) {
+    AcquireSRWLockExclusive(&nfp_lock);
+    const int reader = reader_of(ARG(0));
+    const uint32_t result = reader >= 0 ? nfp_area_open(&nfp, reader, hos_now_ns(), (uint32_t)ARG(1)) : 0;
+    ReleaseSRWLockExclusive(&nfp_lock);
+    RET(result);
+}
+/* GetApplicationArea(void* out, size_t* size, DeviceHandle const&, size_t max) */
+HLE(_ZN2nn3nfp18GetApplicationAreaEPvPmRKNS0_12DeviceHandleEm) {
+    uint8_t data[NFP_AREA_SIZE];
+    uint64_t size = 0;
+    AcquireSRWLockExclusive(&nfp_lock);
+    const int reader = reader_of(ARG(2));
+    const uint32_t result = reader >= 0 ? nfp_area_get(&nfp, reader, hos_now_ns(), data, ARG(3), &size) : 0;
+    ReleaseSRWLockExclusive(&nfp_lock);
+    void *out = reader >= 0 && !result && ARG(0) ? hos_guest_range(ARG(0), ARG(3) < NFP_AREA_SIZE ? ARG(3) : NFP_AREA_SIZE) : NULL;
+    if (reader >= 0 && out) memcpy(out, data, ARG(3) < NFP_AREA_SIZE ? (size_t)ARG(3) : NFP_AREA_SIZE);
+    if (reader >= 0 && !result && ARG(1)) G64(ARG(1)) = size;
+    RET(result);
+}
+/* SetApplicationArea(DeviceHandle const&, void const* data, size_t size) */
+HLE(_ZN2nn3nfp18SetApplicationAreaERKNS0_12DeviceHandleEPKvm) {
+    const uint64_t size = ARG(2) < NFP_AREA_SIZE ? ARG(2) : NFP_AREA_SIZE;
+    const uint8_t *data = ARG(1) ? hos_guest_range(ARG(1), size) : NULL;
+    AcquireSRWLockExclusive(&nfp_lock);
+    const int reader = reader_of(ARG(0));
+    const uint32_t result = reader >= 0 ? nfp_area_set(&nfp, reader, hos_now_ns(), data, data ? size : 0) : 0;
+    ReleaseSRWLockExclusive(&nfp_lock);
+    RET(result);
+}
+/* CreateApplicationArea and RecreateApplicationArea(DeviceHandle const&, ApplicationAreaCreateInfo const&): the info's
+   access ID at 0, its first data's address at 8 and size at 16 */
+static uint32_t area_create(Ctx *c, int again) {
+    const uint8_t *info = ARG(1) ? hos_guest_range(ARG(1), 24) : NULL;
+    uint32_t id = 0, size = 0;
+    uint64_t at = 0;
+    if (info) memcpy(&id, info, 4), memcpy(&at, info + 8, 8), memcpy(&size, info + 16, 4);
+    const uint64_t take = size < NFP_AREA_SIZE ? size : NFP_AREA_SIZE;
+    const uint8_t *data = at ? hos_guest_range(at, take) : NULL;
+    uint8_t bytes[NFP_AREA_FILE];
+    AmiiboTag tag;
+    int save = 0;
+    AcquireSRWLockExclusive(&nfp_lock);
+    const int reader = reader_of(ARG(0));
+    const uint32_t result = reader >= 0 && info ? nfp_area_create(&nfp, reader, hos_now_ns(), id, data, data ? take : 0, again, &save) : 0;
+    if (save) amiibo_area_bytes(&nfp.area, bytes), tag = nfp.tag;
+    ReleaseSRWLockExclusive(&nfp_lock);
+    if (save) area_save(&tag, bytes), hos_log("nfp: a game made its application area on the figure (amiibo/areas)");
+    return result;
+}
+HLE(_ZN2nn3nfp21CreateApplicationAreaERKNS0_12DeviceHandleERKNS0_25ApplicationAreaCreateInfoE) {
+    const uint32_t result = area_create(c, 0);
+    RET(result);
+}
+HLE(_ZN2nn3nfp23RecreateApplicationAreaERKNS0_12DeviceHandleERKNS0_25ApplicationAreaCreateInfoE) {
+    const uint32_t result = area_create(c, 1);
+    RET(result);
+}
+/* Flush(DeviceHandle const&): what was set written to the tag, here its area's file */
+HLE(_ZN2nn3nfp5FlushERKNS0_12DeviceHandleE) {
+    uint8_t bytes[NFP_AREA_FILE];
+    AmiiboTag tag;
+    int save = 0;
+    AcquireSRWLockExclusive(&nfp_lock);
+    const int reader = reader_of(ARG(0));
+    const uint32_t result = reader >= 0 ? nfp_flush(&nfp, reader, hos_now_ns(), &save) : 0;
+    if (save) amiibo_area_bytes(&nfp.area, bytes), tag = nfp.tag;
+    ReleaseSRWLockExclusive(&nfp_lock);
+    if (save) area_save(&tag, bytes);
+    RET(result);
+}
+
 /* The dump "name" of the game folder's amiibo folder: NFP_SAID_WAITING when it is a figure's (*tag filled), else
-   NFP_SAID_NO_FILE or NFP_SAID_REFUSED. At most AMIIBO_FILE_MAX bytes of it are read */
+   NFP_SAID_NO_FILE or NFP_SAID_REFUSED. At most AMIIBO_FILE_MAX bytes of a tag's bytes are read, AMIIBO_NFC_MAX of a
+   Flipper NFC file. (Called under hos_amiibo_poll's own lock: the buffers are static) */
 static int load_dump(const char *name, AmiiboTag *tag) {
     char dir[600], path[900];
-    uint8_t data[AMIIBO_FILE_MAX + 1];
+    static uint8_t data[AMIIBO_NFC_MAX + 1], pages[540];
     if (!amiibo_name_ok(name) || !hos_share_game_dir(dir, sizeof dir)) return NFP_SAID_NO_FILE;
     snprintf(path, sizeof path, "%s/amiibo/%s", dir, name);
     FILE *f = fopen(path, "rb");
     if (!f) return NFP_SAID_NO_FILE;
-    const size_t n = fread(data, 1, sizeof data, f);   /* (one byte more than a dump may have: a longer file is refused) */
+    const size_t n = fread(data, 1, sizeof data, f);   /* (one byte more than a file may have: a longer file is refused) */
     fclose(f);
-    const int why = amiibo_parse(data, n, tag);
+    /* ((Triforce) a Flipper NFC file: its pages as the tag's bytes; anything else, the tag's bytes as they are) */
+    const int flipper = n <= AMIIBO_NFC_MAX && amiibo_flipper((const char *)data, n, pages) == sizeof pages;
+    const int why = flipper ? amiibo_parse(pages, sizeof pages, tag) : amiibo_parse(data, n, tag);
     if (why != AMIIBO_OK) {
-        hos_log("nfp: amiibo/%s is not taken: %s", name, why == AMIIBO_BAD_SIZE ? "not the size of a figure's dump (532, 540 or 572 bytes)"
+        hos_log("nfp: amiibo/%s is not taken: %s", name, why == AMIIBO_BAD_SIZE ? "not the size of a figure's dump (532, 540 or 572 bytes, or a Flipper .nfc file of one)"
                                                                                    : "it does not hold a figure's serial number and number");
         return NFP_SAID_REFUSED;
     }
     return NFP_SAID_WAITING;
+}
+
+/* ---- ((Triforce) the application area's file: the amiibo folder's areas/<serial number>.area (host/amiibo.h). Read when a
+   figure is chosen; written, whole, when a game makes its area or flushes it. Never the player's dump ---- */
+static int area_path(const AmiiboTag *tag, char *path, size_t cap, int make_dir) {
+    char dir[600], name[20];
+    if (!hos_share_game_dir(dir, sizeof dir)) return 0;
+    amiibo_area_name(tag, name);
+    if (make_dir) {
+        snprintf(path, cap, "%s/amiibo/areas", dir);
+        CreateDirectoryA(path, NULL);   /* (the amiibo folder is there: the dump was read from it) */
+    }
+    snprintf(path, cap, "%s/amiibo/areas/%s", dir, name);
+    return 1;
+}
+static void area_load(const AmiiboTag *tag, NfpArea *area) {
+    char path[700];
+    uint8_t bytes[NFP_AREA_FILE + 1];
+    if (!area_path(tag, path, sizeof path, 0)) return;
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    const size_t n = fread(bytes, 1, sizeof bytes, f);
+    fclose(f);
+    if (amiibo_area_parse(bytes, n, area)) hos_log("nfp: the figure's application area (a game's data on it) is read from amiibo/areas");
+}
+static void area_save(const AmiiboTag *tag, const uint8_t bytes[NFP_AREA_FILE]) {
+    char path[700];
+    FILE *f = area_path(tag, path, sizeof path, 1) ? fopen(path, "wb") : NULL;
+    const int ok = f && fwrite(bytes, 1, NFP_AREA_FILE, f) == NFP_AREA_FILE;
+    if (f && fclose(f)) f = NULL;
+    if (!ok || !f) hos_log("nfp: the figure's application area could not be kept (%s)", path);
 }
 
 /* The Scan amiibo page's choice, taken at the game's pad read (host/nn_hid.c; every 50 ms at most): a file's name, or
@@ -177,6 +292,7 @@ void hos_amiibo_poll(void) {
         AcquireSRWLockExclusive(&nfp_lock);
         if (loaded == NFP_SAID_WAITING) {
             if (nfp_choose(&nfp, &tag)) event = availability_event;
+            area_load(&tag, &nfp.area);   /* ((Triforce) a game's data kept for this figure, if any) */
         } else {
             nfp_take_away(&nfp);
             nfp.said = loaded;

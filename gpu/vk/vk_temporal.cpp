@@ -1,5 +1,5 @@
 // (hookshot) A temporal upscaler in place of OoT's gameplay upscale network: the frame chain (vk_temporal.h), shared by the
-// engines that draw with it, NVIDIA DLSS (vk_dlss.cpp) and AMD FSR 4 (vk_fsr4.cpp).
+// engines that draw with it, NVIDIA DLSS (vk_dlss.cpp), AMD FSR 4 (vk_fsr4.cpp) and ((Triforce) Intel XeSS (vk_xess.cpp).
 // The chain is hckrman101's, from their NVIDIA DLSS (#841): the camera, the inputs pass, the actor motion and the jitter's
 // state, moved here from vk_dlss.cpp unchanged in what they do, so that DLSS and FSR share them.
 //
@@ -32,7 +32,8 @@
 // reason in the log when it changes.
 //
 // The Insert menu's Upscaler row (opts.dlss, upscaler_rows.h) chooses the engine; RX_VK_DLSS=1 / 2 (DLSS, DLAA) or
-// RX_VK_FSR4=1 / 2 (FSR 4, its native anti-aliasing) over it, and =0 takes that engine out for the run. AMD FSR 3.1
+// RX_VK_FSR4=1 / 2 (FSR 4, its native anti-aliasing) or ((Triforce) RX_VK_XESS=1 / 2 (Intel XeSS, its Native AA) over it,
+// and =0 takes that engine out for the run. AMD FSR 3.1
 // (vk_fsr3.cpp, the row's value 3, 6 for its Native AA, or RX_VK_FSR=1 / 2) has inputs of its own (vk_fsr3_inputs.cpp):
 // while it upscales, this chain stands aside, but for ((Triforce, FSR3-03) temporal_motion_wanted) what moves by itself:
 // the draws store their positions as for an engine, and the chain draws them again into FSR's motion (fsr3_motion:
@@ -63,6 +64,7 @@
 #include "framegen_rows.h"   // ((Triforce) pose_of, camera_cut: a camera cut starts a new history)
 #include "fsr3_math.h"       // ((Triforce, FSR4-10) jitter_phases: AMD's jitter length, for FSR 4 too)
 #include "stream_order.h"
+#include "temporal_jitter.h"   // ((Triforce) the host's jitter, one whole sample
 #include "temporal_rules.h"   // ((Triforce, FSR4-1, FSR4-2) Retry, native_at)
 #include "sharpen_rules.h"    // ((Triforce, S1, S8) the Sharpness row as the engines', the texture LOD bias)
 #include "upscaler_rows.h"
@@ -70,7 +72,10 @@
 #include "vk_draw.h"
 #include "vk_fsr3.h"   // (fsr3_wanted: AMD FSR 3.1 upscales with inputs of its own)
 #include "vk_fsr3_inputs.h"   // ((Triforce, FSR3-03) its inputs' Frame and scene sizes: temporal_fsr3_motion)
+#include "vk_fsr3fi.h"   // ((Triforce) frames_wanted: AMD FSR 3.1's frame interpolation asked, temporal_fg_motion)
 #include "vk_fsr4.h"
+#include "vk_xess.h"     // ((Triforce) Intel XeSS, the chain's third engine)
+#include "xess_rules.h"  // (RX_VK_XESS as it is read)
 #include "vk_menu.h"
 #include "vk_renodx.h"   // (renodx_built: temporal_scene_format)
 #include "vk_n64.h"      // ((Triforce, N64 Classic) its 3D pass takes the gameplay upscale while it is on: temporal_mode)
@@ -84,6 +89,7 @@
 #include "shaders/dlss_out_hdr_comp_spv.h"
 #include "shaders/dlss_prep_hdr_comp_spv.h"
 #include "shaders/dlss_prep_comp_spv.h"
+#include "reshade/fx_runtime.h"   // ((Triforce) reshade::depth_requested: the scene's depth for a ReShade preset that reads it)
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
 namespace mkwvk {
@@ -101,32 +107,44 @@ int env_switch(const char* name) {   // (-1: unset)
 namespace {
 int env_dlss() { static const int v = env_switch("RX_VK_DLSS"); return v; }   // (read at the first ask, as the others)
 int env_fsr4() { static const int v = env_switch("RX_VK_FSR4"); return v; }
+int env_xess() { static const int v = xess_rules::env_mode(getenv("RX_VK_XESS")); return v; }   // ((Triforce) Intel XeSS)
+/// ((Triforce) An engine of this chain: DLSS / DLAA, FSR 4 / its native AA, Intel XeSS / its Native AA
+bool chain_engine(int v) { return ur::is_dlss(v) || ur::is_fsr4(v) || ur::is_xess(v); }
+/// Whether the chosen engine runs here (its library's answer)
+bool engine_runs(int v) {
+    return (!ur::is_dlss(v) || dlss_why() == DLSS_OK) && (!ur::is_fsr4(v) || fsr4_why() == FSR_OK) &&
+           (!ur::is_xess(v) || xess_why() == XESS_OK);
+}
 bool stood_in(int mode);          // ((Triforce, FSR4-1) below: the engine off after failures, the game's upscale in its place)
 void rearm_on_choice(int choice);  // (and a fresh choice on the Upscaler row trying it anew)
 }  // namespace
 
 bool temporal_env_chosen() {
-    // (only where the engine asked for runs: else a saved FSR 3.1 stays, not the game's own. DLSS before FSR 4, as below)
+    // (only where the engine asked for runs: else a saved FSR 3.1 stays, not the game's own. DLSS before FSR 4 before XeSS,
+    // as below)
     if (env_dlss() > 0) return dlss_why() == DLSS_OK;
-    return env_fsr4() > 0 && fsr4_why() == FSR_OK;
+    if (env_fsr4() > 0) return fsr4_why() == FSR_OK;
+    return env_xess() > 0 && xess_why() == XESS_OK;
 }
 
 int temporal_mode() {
-    const int dlss = env_dlss(), fsr4 = env_fsr4();
+    const int dlss = env_dlss(), fsr4 = env_fsr4(), xess = env_xess();
     int v = opts.dlss;
     rearm_on_choice(v);
     if (dlss > 0) v = dlss >= 2 ? ur::DLAA : ur::DLSS;   // (2 and up: DLAA, as RX_VK_DLSS was clamped before)
     else if (fsr4 > 0) v = fsr4 >= 2 ? ur::FSR4_AA : ur::FSR4;
+    else if (xess > 0) v = xess >= 2 ? ur::XESS_AA : ur::XESS;
     // ((Triforce, 11-22, N64 Classic) while its 3D pass draws the gameplay upscale, the game's own as far as the chain is
     // concerned (n64_rules.h upscaler): no jitter, no motion, no feature drawn. The row and the switches keep their values
     v = n64_rules::upscaler(n64_in_front(), v);
     // (FSR 3.1, the row's 3, is not an engine of this chain: the game's own as far as it is concerned. Nor anything while
     // FSR 3.1 upscales: one upscaler at a time, and one camera jitter. A switch above goes over the row's FSR 3.1 too
     // (fsr3_wanted asks temporal_env_chosen); RX_VK_FSR=1 goes over them)
-    if (!ur::is_dlss(v) && !ur::is_fsr4(v)) return ur::GAME;
+    if (!chain_engine(v)) return ur::GAME;
     if (fsr3_wanted()) return ur::GAME;
     if (ur::is_dlss(v) && dlss_why() != DLSS_OK) return ur::GAME;
     if (ur::is_fsr4(v) && fsr4_why() != FSR_OK) return ur::GAME;
+    if (ur::is_xess(v) && xess_why() != XESS_OK) return ur::GAME;   // ((Triforce) Intel XeSS)
     // ((Triforce, FSR4-1) off after failing again and again: the game's own, which the Upscaler row and the rows after it
     // then say. Not while it waits to try again: the hooks that feed the chain stay on for the retry)
     if (stood_in(v)) return ur::GAME;
@@ -134,12 +152,13 @@ int temporal_mode() {
 }
 
 int temporal_stood_in() {
-    const int dlss = env_dlss(), fsr4 = env_fsr4();
+    const int dlss = env_dlss(), fsr4 = env_fsr4(), xess = env_xess();
     int v = opts.dlss;
     if (dlss > 0) v = dlss >= 2 ? ur::DLAA : ur::DLSS;
     else if (fsr4 > 0) v = fsr4 >= 2 ? ur::FSR4_AA : ur::FSR4;
-    if ((!ur::is_dlss(v) && !ur::is_fsr4(v)) || fsr3_wanted()) return ur::GAME;
-    if ((ur::is_dlss(v) && dlss_why() != DLSS_OK) || (ur::is_fsr4(v) && fsr4_why() != FSR_OK)) return ur::GAME;
+    else if (xess > 0) v = xess >= 2 ? ur::XESS_AA : ur::XESS;
+    if (!chain_engine(v) || fsr3_wanted()) return ur::GAME;
+    if (!engine_runs(v)) return ur::GAME;
     return stood_in(v) ? v : ur::GAME;
 }
 bool temporal_wanted() { return temporal_mode() != ur::GAME; }
@@ -172,8 +191,8 @@ bool temporal_sharpens_3d() {
     const int mode = temporal_mode();
     if (ur::is_fsr4(mode)) return true;      // (FSR 4's own, in its dispatch: vk_fsr4.cpp)
     // (AMD's RCAS over DLSS's picture, in the chain below: ((Triforce) the tone mapped picture alone, sharpen_rules.h
-    // lone_rcas; over linear HDR light the window pass sharpens)
-    if (ur::is_dlss(mode)) return fsr3::rcas_ok() && sharpen_rules::lone_rcas(pre_wanted(mode), chain_hdr_scene());
+    // lone_rcas; over linear HDR light the window pass sharpens. Intel XeSS's too: it has no sharpening of its own)
+    if (ur::is_dlss(mode) || ur::is_xess(mode)) return fsr3::rcas_ok() && sharpen_rules::lone_rcas(pre_wanted(mode), chain_hdr_scene());
     return false;
 }
 
@@ -205,6 +224,15 @@ struct Camera {
     bool valid = false;
 };
 
+/// ((Triforce) A ReShade preset's DEPTH input (reshade/fx_runtime.cpp): the scene's depth target as the camera's draw named it,
+/// kept apart from the camera above, which the upscale takes each frame before the preset runs, and kept with the Upscaler at
+/// the game's own too (temporal_note_scene_draw). Its creation number and texture_destroyed_count when taken: there_still)
+struct ReshadeDepth {
+    Texture* texture = nullptr;
+    uint32_t width = 0, height = 0, id = 0;
+    uint64_t noted = 0, frame = 0;
+};
+
 /// An engine as the chain keeps it: started once, failed for good once (not there, or its shaders not made)
 struct Engine {
     const TemporalEngine* e = nullptr;
@@ -220,7 +248,7 @@ int64_t now_ns() {
 
 struct State {
     std::mutex mu;
-    Engine engines[2];               // (DLSS, FSR: engine_of)
+    Engine engines[3];               // (DLSS, FSR 4, (Triforce) Intel XeSS: engine_of)
     const TemporalEngine* drawing = nullptr;   // (the engine that drew last: another one starts a new history)
     Image color, depth, motion, output;
     Image sharp;   // ((Triforce, S1) DLSS's picture through AMD's RCAS: the Sharpness row before the HUD
@@ -278,6 +306,8 @@ struct State {
     // (the gameplay upscale's output, as last seen: the scene sizes the upscaler can take follow from it,
     // temporal_scene_size. Read on the game's draws without the lock)
     std::atomic<uint32_t> out_w{0}, out_h{0};
+    ReshadeDepth reshade_depth;   // ((Triforce) a ReShade preset's depth, this frame's scene's)
+    std::atomic<uint32_t> reshade_w{0}, reshade_h{0};   // ((Triforce) the picture the preset runs on: the scene sizes it takes)
     std::atomic<uint64_t> last_frame{0};   // (the frame an engine last drew: read on the game's thread too)
     float last_jitter[2]{};   // (its camera's jitter: the frame before's, for the next one)
     float last_vp[16]{};      // (its camera's view-projection: the frame before's)
@@ -286,8 +316,9 @@ struct State {
     std::chrono::steady_clock::time_point last_pose_time{};
     bool have_pose = false;
     uint64_t cuts = 0;
-    std::atomic<uint32_t> jitter_w{0}, jitter_h{0};   // (the scene's size while an engine draws: the host's jitter's scale)
-    std::atomic<uint32_t> jitter_phases{8};           // (its sequence's length, for the engine's scale: dlss_jitter_phases)
+    // ((Triforce) the scene's size while an engine draws, the host's jitter's scale, and its sequence's length for the engine's
+    // scale (dlss_jitter_phases): one sample, whole (temporal_jitter.h)
+    TemporalJitter jitter;
     std::unordered_map<VkImage, VkImageView> depth_views;
     uint64_t depth_views_gen = 0;
     const char* reason = nullptr;
@@ -311,7 +342,17 @@ struct State {
         uint32_t at = 0, nbones = 0;   // (bytes into its buffer: the origin, then the bones from at + 16)
         uint64_t frame = 0;
         int buf = 0;                   // (which of pose_buffers)
+        bool placed = false;           // ((Triforce) read at the draw: its place is known, and the next frame pairs by it)
+        float place[3]{};              // (dlss_actor::place_of)
     };
+    // ((Triforce) copies of one model paired by place, pair_copies: when the frame before's were taken, for the reach; and
+    // the stored draws' frame before's copies with a place, by key)
+    std::chrono::steady_clock::time_point pairs_time{};
+    struct PlacedBefore {
+        uint64_t key = 0;
+        float place[3]{};
+    };
+    std::vector<PlacedBefore> placed_before;
     std::unordered_map<uint64_t, Pose> poses;
     std::unordered_map<uint64_t, uint32_t> model_bones;   // (by model: the bones its vertices use, 0 when unreadable)
     struct PoseBuffer {
@@ -335,6 +376,8 @@ struct State {
         uint32_t first = 0, count = 0;
         float jitter[2]{};      // (its own camera's, when own: dlss_actor::camera_jitter; else the scene's is used)
         bool own = false;
+        bool placed = false;    // ((Triforce) a skinned draw's place, read at its draw (note_skinned_place): pair_copies)
+        float place[3]{};
     };
     // (the camera read last for a stored draw, most draws of a frame having the same one)
     uint64_t capture_camera = 0, capture_camera_view = 0;
@@ -390,7 +433,10 @@ struct State {
     uint64_t engines_made = 0;  // (prepare's new histories: a feature or context made again, each a stall in play)
     float status_jitter[2]{};   // (the last evaluation's jitter, in render pixels, and whether it had motion)
     bool status_motion = false;
-    struct Dead { uint64_t frame; std::function<void()> free; };
+    // (value: vk_retirement_value when let go. The frames counted are the replay's: where nothing waits for the present ring
+    // (no window, HOS_HEADLESS) only the recording ring bounds how far behind the GPU is, many frames when a frame has few
+    // recordings, so 4 frames on did not prove the GPU done with it. Freed once both have passed; never at 0)
+    struct Dead { uint64_t frame; uint64_t value; std::function<void()> free; };
     std::vector<Dead> dead;   // (what work in flight may still use: freed a few frames on)
     uint64_t asked = 0;       // (the frame an upscale last asked for an engine: temporal_idle)
     std::atomic<bool> holding{false};   // (an engine's state, images or frees still to do: temporal_idle has something to let go)
@@ -402,8 +448,10 @@ State& st() {
     return s;
 }
 
-/// (Triforce, FSR4-1) The chain's slot of an Upscaler value's engine, without making it (DLSS and DLAA: 0; FSR 4: 1)
-Engine& slot_of(int mode) { return st().engines[ur::is_fsr4(mode) ? 1 : 0]; }
+/// (Triforce, FSR4-1) The chain's slot of an Upscaler value's engine (DLSS and DLAA: 0; FSR 4: 1; (Triforce) Intel XeSS: 2)
+int slot_index(int mode) { return ur::is_fsr4(mode) ? 1 : ur::is_xess(mode) ? 2 : 0; }
+/// The same slot, without making its engine
+Engine& slot_of(int mode) { return st().engines[slot_index(mode)]; }
 /// Off after kFailMax failures in a row, or failed for good: the game's upscale stands in (temporal_mode says GAME)
 bool stood_in(int mode) {
     const Engine& k = slot_of(mode);
@@ -415,9 +463,9 @@ void rearm_on_choice(int choice) {
     if (seen.load(std::memory_order_relaxed) == choice) return;
     const int was = seen.exchange(choice, std::memory_order_relaxed);
     if (was < 0 || was == choice) return;
-    for (int i = 0; i < 2; i++)
+    for (int i = 0; i < 3; i++)
         if (st().engines[i].retry.rearm())
-            logf("vk: upscaler: the Upscaler row set again: %s tried anew", i ? "AMD FSR 4" : "NVIDIA DLSS");
+            logf("vk: upscaler: the Upscaler row set again: %s tried anew", i == 2 ? "Intel XeSS" : i ? "AMD FSR 4" : "NVIDIA DLSS");
 }
 
 /// The gameplay upscale's output size, as it is seen: the scene sizes the upscaler can take (temporal_scene_size). Until the
@@ -428,11 +476,13 @@ void note_output(const Texture* out, uint32_t level) {
     s.out_h.store(std::max(1u, out->height >> level), std::memory_order_relaxed);
 }
 
-/// The chain's slot for the engine of an Upscaler value (DLSS and DLAA: DLSS's; FSR 4 and its native AA: FSR's)
+/// The chain's slot for the engine of an Upscaler value (DLSS and DLAA: DLSS's; FSR 4 and its native AA: FSR's; (Triforce)
+/// Intel XeSS and its Native AA: XeSS's)
 Engine& engine_of(int mode) {
     State& s = st();
-    Engine& k = s.engines[ur::is_fsr4(mode) ? 1 : 0];
-    if (!k.e) k.e = ur::is_fsr4(mode) ? fsr4_engine() : dlss_engine();
+    const int slot = slot_index(mode);
+    Engine& k = s.engines[slot];
+    if (!k.e) k.e = slot == 1 ? fsr4_engine() : slot == 2 ? xess_engine() : dlss_engine();
     return k;
 }
 const char* name_of(int mode) {
@@ -441,6 +491,8 @@ const char* name_of(int mode) {
     case ur::DLAA: return "NVIDIA DLAA";
     case ur::FSR4: return "AMD FSR 4";
     case ur::FSR4_AA: return "AMD FSR 4 Native AA";
+    case ur::XESS: return "Intel XeSS";
+    case ur::XESS_AA: return "Intel XeSS Native AA";
     default: return "the game's own";
     }
 }
@@ -453,7 +505,7 @@ bool fail(const char* why) {   // (the network runs: why, when it changes and ev
     return false;
 }
 
-void later(std::function<void()> f) { st().dead.push_back({texture_frame_no(), std::move(f)}); }
+void later(std::function<void()> f) { st().dead.push_back({texture_frame_no(), vk_retirement_value(), std::move(f)}); }
 void drop_image(Image& im);
 
 /// (Triforce, FSR4-1) The engine's creation or evaluation failed (why): what it made is let go, and the chain's images,
@@ -480,9 +532,9 @@ bool fail_again(Engine& k, const char* why) {
 bool waiting(const Engine& k) { return k.retry.waiting(now_ns()); }
 void free_dead(bool all) {
     State& s = st();
-    const uint64_t now = texture_frame_no();
+    const uint64_t now = texture_frame_no(), done = vk_timeline_completed();
     for (size_t i = 0; i < s.dead.size();) {
-        if (all || now - s.dead[i].frame > 4) {
+        if (all || (now - s.dead[i].frame > 4 && s.dead[i].value && done >= s.dead[i].value)) {
             s.dead[i].free();
             s.dead[i] = std::move(s.dead.back());
             s.dead.pop_back();
@@ -661,6 +713,106 @@ MotionMode motion_mode() {
 }
 
 using ActorPush = dlss_actor::Push;
+
+/// ((Triforce) the chain's barriers between its own passes (draw_engine): a full barrier (full_barrier), or with
+/// RX_VK_TEMPORAL_NARROW=1 one that waits only for the stages and writes of the pass before (src), for everything after.
+/// The barrier before the chain (the scene's draws, and an event's write held for it) and the one after the engine's
+/// evaluation (its library's own work) stay full either way. Off by default: a speed change measured elsewhere (mostly in
+/// an FSR 3.1 path Triforce does not have), not here
+void chain_barrier(VkCommandBuffer cmd, VkPipelineStageFlags2 src, VkAccessFlags2 src_access) {
+    static const bool narrow = env_switch("RX_VK_TEMPORAL_NARROW") > 0;
+    if (!narrow) return full_barrier(cmd);
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask = src, b.srcAccessMask = src_access;
+    b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.memoryBarrierCount = 1, di.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &di);
+}
+// ---- (Triforce) copies of one model paired by place, not by draw order ----
+// The game draws some models more than once a frame (the four Gossip Stones by the Temple of Time: one skinned model drawn
+// four times, by two models, in another order from frame to frame), and a draw was paired with the frame before's by its
+// n-th draw of its model (dlss_actor::key): a stone took its neighbour's pose (or stored positions) as its own frame
+// before, and its motion pointed at the neighbour: frame generation drew a stone part way to the next one, doubled or
+// smeared. A skinned draw's place (its origin plus its bones' mean translation, read as the draw was submitted) now pairs
+// the copies of its model (dlss_actor::pair_by_place), for both motion sources: the bones (actor_motion) and the stored
+// positions (capture_motion, the default), whose skinned draws have their place read at the draw for it
+// (note_skinned_place). A draw without a place (not skinned, or not readable) pairs by its n-th as before, unless that one
+// of the frame before is already another's by place. A copy of a model that had copies with a place the frame before, and
+// none within the reach, gets the camera's motion for that frame.
+// RX_VK_DLSS_ACTOR_PLACE=0: by draw order alone, as before. RX_VK_DLSS_ACTOR_REACH=<world units a second> (60): how far a
+// copy may move and still pair with itself, times the time between the two frames (1/60 to 1/30 s): at most 2 units at the
+// default, under the stones' 2.3 spacing (past it, draw order pairs a row of stones each with its neighbour again).
+bool place_pairing() {
+    static const bool on = env_switch("RX_VK_DLSS_ACTOR_PLACE") != 0;
+    return on;
+}
+
+/// This upscale's reach (dlss_actor::place_reach), the time since the last one's taken
+float pairs_reach(State& s) {
+    static const float speed = [] {
+        const char* e = getenv("RX_VK_DLSS_ACTOR_REACH");
+        if (!e || !*e) return 60.0f;
+        char* end = nullptr;
+        const float v = strtof(e, &end);
+        const bool ok = end != e && !*end && std::isfinite(v) && v >= 0.0f;
+        logf("vk: actor motion: copies of a model pair within %g world units a second (RX_VK_DLSS_ACTOR_REACH=%s%s)",
+             ok ? (double)v : 60.0, e, ok ? "" : ": not a number of 0 or more, so the default");
+        return ok ? v : 60.0f;
+    }();
+    const auto taken = std::chrono::steady_clock::now();
+    const double between = s.pairs_time == std::chrono::steady_clock::time_point{}
+                               ? 1.0 / 60.0 : std::chrono::duration<double>(taken - s.pairs_time).count();
+    s.pairs_time = taken;
+    return dlss_actor::place_reach(speed, between);
+}
+
+/// Which of the frame before's draws each of this frame's pairs with. keys[i]: this frame's draw's key (dlss_actor::key),
+/// placed[i] and places[i * 3]: its place when it has one (left out: not of the scene's depth, so not paired); then: the
+/// frame before's draws with a place. Out: look[i], the frame before's key to take (has[i] 0: none, the camera's motion)
+void pair_copies(const std::vector<uint64_t>& keys, const std::vector<char>& placed, const std::vector<float>& places,
+                 const std::vector<State::PlacedBefore>& then, float reach, std::vector<uint64_t>& look,
+                 std::vector<char>& has) {
+    const size_t n = keys.size();
+    look.assign(keys.begin(), keys.end());
+    has.assign(n, 1);
+    if (!place_pairing()) return;
+    struct Copies {
+        std::vector<dlss_actor::Placed> now, then;
+        std::vector<size_t> draw;   // (now's: its index)
+        std::vector<uint64_t> key;  // (then's: its key)
+    };
+    std::unordered_map<uint64_t, Copies> models;
+    for (const auto& p : then) {
+        Copies& c = models[p.key >> 8];
+        c.then.push_back({{p.place[0], p.place[1], p.place[2]}, (int)(p.key & 0xff)});
+        c.key.push_back(p.key);
+    }
+    if (models.empty()) return;   // (none had a place the frame before: by draw order, as before)
+    std::vector<char> decided(n, 0);
+    std::vector<uint64_t> by_place(n, 0);
+    std::vector<char> paired(n, 0);
+    std::unordered_map<uint64_t, char> taken;   // (the frame before's draws paired by place: not another's by n-th too)
+    for (size_t i = 0; i < n; i++) {
+        if (!placed[i]) continue;
+        const auto m = models.find(keys[i] >> 8);
+        if (m == models.end()) continue;   // (its model had no copy with a place the frame before: by its n-th)
+        m->second.now.push_back({{places[i * 3], places[i * 3 + 1], places[i * 3 + 2]}, (int)(keys[i] & 0xff)});
+        m->second.draw.push_back(i);
+        decided[i] = 1;
+    }
+    for (const auto& [model, c] : models) {
+        if (c.now.empty()) continue;
+        const std::vector<int> pairs = dlss_actor::pair_by_place(c.now, c.then, reach);
+        for (size_t a = 0; a < pairs.size(); a++)
+            if (pairs[a] >= 0) by_place[c.draw[a]] = c.key[pairs[a]], paired[c.draw[a]] = 1, taken[c.key[pairs[a]]] = 1;
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (decided[i]) look[i] = by_place[i], has[i] = paired[i];
+        else has[i] = !taken.count(keys[i]);
+    }
+}
 
 /// The redraws' layout, once: the cameras' buffer and the scene's depth (pushed), and the vertex stage's push constants (the
 /// bones' Push, the stored positions' CapturePush in its first bytes). False: none, the motion stays the camera's
@@ -889,7 +1041,23 @@ int actor_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, co
         if (trace) logf("vk: dlss-trace actor left out: prog %016llx vb %llx n%d bones %llx: %s", (unsigned long long)k.k.program,
                         (unsigned long long)k.k.vbuf, k.k.count, (unsigned long long)k.k.bones, why);
     };
-    for (const auto& k : skins) {
+    // ((Triforce) which of the frame before's each pairs with: copies of a model by place, pair_copies)
+    std::vector<uint64_t> keys(skins.size()), look;
+    std::vector<char> placed(skins.size(), 0), has;
+    std::vector<float> places(skins.size() * 3, 0.0f);
+    std::vector<State::PlacedBefore> then;
+    for (const auto& [key, p] : old)
+        if (p.placed && p.frame == to.last) then.push_back({key, {p.place[0], p.place[1], p.place[2]}});
+    for (size_t i = 0; i < skins.size(); i++) {
+        const State::Skin& k = skins[i];
+        keys[i] = k.key;
+        if (k.k.depth != cam.depth || k.pose.size() != dlss_actor::kPoseHead + (size_t)k.nbones * 48) continue;
+        dlss_actor::place_of(k.pose.data(), k.pose.data() + dlss_actor::kPoseHead, k.nbones, &places[i * 3]);
+        placed[i] = 1;
+    }
+    pair_copies(keys, placed, places, then, pairs_reach(s), look, has);
+    for (size_t i = 0; i < skins.size(); i++) {
+        const State::Skin& k = skins[i];
         if (k.k.depth != cam.depth) {
             left(k, "another depth target than the scene's");
             continue;
@@ -928,13 +1096,14 @@ int actor_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, co
             // (the camera: the scene's, as before)
             std::memcpy(here.map + at + 16, cam.view, sizeof cam.view), std::memcpy(here.map + at + 64, cam.proj, sizeof cam.proj);
         }
-        s.poses[k.key] = {at, k.nbones, now, s.pose_at};
+        s.poses[k.key] = {at, k.nbones, now, s.pose_at, placed[i] != 0, {places[i * 3], places[i * 3 + 1], places[i * 3 + 2]}};
         const uint32_t mine = at;
         at += (bytes + 15) & ~15u;
-        const auto it = old.find(k.key);
+        const auto it = has[i] ? old.find(look[i]) : old.end();
         if (!history || it == old.end() || it->second.frame != to.last || it->second.nbones != k.nbones) {
             s.actor_skipped++;
-            left(k, !history ? "no history" : it == old.end() ? "not drawn the frame before (its key)"
+            left(k, !history ? "no history" : !has[i] ? "no copy of its model the frame before within the reach (by place)"
+                    : it == old.end() ? "not drawn the frame before (its key)"
                     : it->second.frame != to.last ? "its pose is older than the frame before" : "another bone count the frame before");
             continue;
         }
@@ -1031,6 +1200,22 @@ int capture_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, 
     s.captured_frame = texture_frame_no();
     for (const auto& c : caps)
         if (c.k.depth == cam.depth) s.captured_before.put(c.key, c);
+    // ((Triforce) which of the frame before's each pairs with: copies of a skinned model by place, pair_copies)
+    std::vector<uint64_t> keys(caps.size()), look;
+    std::vector<char> placed(caps.size(), 0), has;
+    std::vector<float> places(caps.size() * 3, 0.0f);
+    std::vector<State::PlacedBefore> then;
+    if (old_ok) then = std::move(s.placed_before);
+    s.placed_before.clear();
+    for (size_t i = 0; i < caps.size(); i++) {
+        const State::Captured& c = caps[i];
+        keys[i] = c.key;
+        if (c.k.depth != cam.depth || !c.placed) continue;
+        placed[i] = 1;
+        for (int a = 0; a < 3; a++) places[i * 3 + a] = c.place[a];
+        s.placed_before.push_back({c.key, {c.place[0], c.place[1], c.place[2]}});
+    }
+    pair_copies(keys, placed, places, then, pairs_reach(s), look, has);
     // (RX_VK_DLSS_TRACE=<frames>: on vk_draw.cpp's traced frames, each stored draw left out here and why)
     static const int trace_every = env_switch("RX_VK_DLSS_TRACE");
     const uint64_t now = texture_frame_no();
@@ -1047,15 +1232,17 @@ int capture_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, 
     };
     std::vector<Redraw> draws;
     draws.reserve(caps.size());
-    for (const auto& c : caps) {
+    for (size_t i = 0; i < caps.size(); i++) {
+        const State::Captured& c = caps[i];
         if (c.k.depth != cam.depth) {
             left(c, "another depth target than the scene's");
             continue;
         }
-        const State::Captured* const was = old_ok ? s.captured_before.before(c.key) : nullptr;
+        const State::Captured* const was = old_ok && has[i] ? s.captured_before.before(look[i]) : nullptr;
         if (!was) {
             s.actor_skipped++;
-            left(c, !old_ok ? "no history" : "not drawn the frame before (its key)");
+            left(c, !old_ok ? "no history" : !has[i] ? "no copy of its model the frame before within the reach (by place)"
+                    : "not drawn the frame before (its key)");
             continue;
         }
         // (its indices where the game has them, as this recording binds them: the same as it drew with)
@@ -1288,20 +1475,37 @@ void temporal_note_scene_draw(const Texture* color0, uint32_t width, uint32_t he
     // (only a size the gameplay upscale's output can come from: 1 to 3 times smaller. A smaller target with a camera (the
     // pause screen's model views, a reflection) is never the scene; one this size that is not either is left by the checks
     // below: the format, the camera's own size and perspective, the largest in the frame, and the upscale's input)
-    if (!color0 || !depth || !camera || camera_size < 0x230 || !temporal_scene_size(width, height)) return;
-    // (AMD FSR 3.1 before the bloom keeps the camera here too: the point is found from the scene's target)
-    if (!temporal_scene_format(color0->format) || !(temporal_wanted() || pre_wanted(ur::GAME))) return;
+    // ((Triforce, 11-23) Evil HD's ambient occlusion with no upscaler: the upscale's output is never seen, so any size; the
+    // largest of the frame with its own camera still wins below)
+    const bool ao_only = evil_hd_now() && !temporal_wanted() && !pre_wanted(ur::GAME);
+    if (!color0 || !depth || !camera || camera_size < 0x230) return;
+    // ((Triforce) a ReShade preset that reads the depth (reshade/fx_runtime.cpp), whatever the Upscaler: the scene by the same
+    // checks, at a size its picture can come from (that picture's, as the preset last ran on it). Without one, as before)
+    const bool fx = reshade::depth_requested.load(std::memory_order_relaxed) &&
+                    dlss_checks::scene_size_fits(width, height, st().reshade_w.load(std::memory_order_relaxed),
+                                                 st().reshade_h.load(std::memory_order_relaxed));
+    if (!temporal_scene_size(width, height) && !fx && !ao_only) return;
+    // (AMD FSR 3.1 before the bloom keeps the camera here too: the point is found from the scene's target; and while Evil HD
+    // is on: its ambient occlusion reads the depth, vk_aa.cpp ao_after)
+    const bool own = (temporal_wanted() || pre_wanted(ur::GAME) || evil_hd_now()) &&
+                     (!fx || ao_only || temporal_scene_size(width, height));
+    if (!temporal_scene_format(color0->format) || !(own || fx)) return;
     State& s = st();
     std::lock_guard lk(s.mu);
     const uint64_t now = texture_frame_no();
-    if (s.cam.valid && s.cam.frame == now && (uint64_t)width * height <= (uint64_t)s.cam.width * s.cam.height)
-        return;   // (the largest one of the frame wins)
+    // (the largest one of the frame wins)
+    const bool own_take = own && !(s.cam.valid && s.cam.frame == now && (uint64_t)width * height <= (uint64_t)s.cam.width * s.cam.height);
+    const ReshadeDepth& fd = s.reshade_depth;
+    const bool fx_take = fx && !(fd.texture && fd.frame == now && (uint64_t)width * height <= (uint64_t)fd.width * fd.height);
+    if (!own_take && !fx_take) return;
     float c[0x230 / 4];
     if (!memory_read_as_submitted(camera, c, sizeof c)) return;
     // (the target's size at 0x120; the projection at 0x70, its w row (0, 0, -1, 0) at 0xa0)
     if (c[0x120 / 4] != (float)width || c[0x124 / 4] != (float)height || c[0xa0 / 4] != 0.0f || c[0xa4 / 4] != 0.0f ||
         c[0xa8 / 4] != -1.0f || c[0xac / 4] != 0.0f)
         return;
+    if (fx_take) s.reshade_depth = {depth, width, height, depth->id, texture_destroyed_count(), now};
+    if (!own_take) return;
     Camera& k = s.cam;
     std::memcpy(k.current, c + 0x30 / 4, sizeof k.current);
     std::memcpy(k.view, c, sizeof k.view), std::memcpy(k.proj, c + 0x70 / 4, sizeof k.proj);
@@ -1315,6 +1519,91 @@ void temporal_note_scene_draw(const Texture* color0, uint32_t width, uint32_t he
     upscale_lod_scene(width, height);   // ((Triforce, S8) this frame's scene size for the texture LOD bias: vk_draw.cpp)
 }
 
+/// ((Triforce) reshade/fx_runtime.cpp) The scene's depth for a ReShade preset that reads it, as a depth-only view: this frame's
+/// (or the one before's: a present between replay batches moves the frame on), still there, single-sampled, sampleable and of
+/// the picture's shape. Null otherwise: the preset then does not run that frame. Says why once per reason
+VkImageView temporal_reshade_depth(uint32_t width, uint32_t height) {
+    State& s = st();
+    s.reshade_w.store(width, std::memory_order_relaxed), s.reshade_h.store(height, std::memory_order_relaxed);
+    std::lock_guard lk(s.mu);
+    const ReshadeDepth& scene = s.reshade_depth;
+    static const char* previous = nullptr;
+    const auto missing = [](const char* reason) -> VkImageView {
+        if (reason != previous) previous = reason, logf("vk: ReShade: waiting for the gameplay depth (%s)", reason);
+        return VK_NULL_HANDLE;
+    };
+    if (!scene.texture || texture_frame_no() - scene.frame > 1) return missing("no scene this frame");
+    if (!there_still(scene.id, scene.noted)) return missing("its depth target went");
+    Texture* depth = scene.texture;
+    if (!depth->image || !(depth->usage & VK_IMAGE_USAGE_SAMPLED_BIT) || !(depth->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) ||
+        depth->samples != VK_SAMPLE_COUNT_1_BIT || depth->width != scene.width || depth->height != scene.height)
+        return missing("its depth target cannot be sampled");
+    if (!dlss_checks::scene_size_fits(scene.width, scene.height, width, height) ||
+        std::abs(double(scene.width) / width - double(scene.height) / height) > 0.02)
+        return missing("the depth does not cover the picture");
+    const VkImageView view = depth_view(depth);
+    if (!view) return missing("no depth-only view");
+    depth->last_frame = texture_frame_no();
+    depth->last_value = std::max(depth->last_value, vk_retirement_value());
+    return view;
+}
+
+namespace {
+std::atomic<uint64_t> sun_frame{0};          // (the frame the sun was last read in; 0 never)
+std::atomic<uint32_t> sun_bits[3] = {0, 0, 0};   // (its direction, as float bits)
+}  // namespace
+void temporal_note_cascade(uint64_t camera, uint64_t camera_size, uint32_t width, uint32_t layer) {
+    // (once a frame: the light's view is the same for every cascade draw of a frame)
+    const uint64_t now = texture_frame_no();
+    if (!camera || camera_size < 0x70 || sun_frame.load(std::memory_order_relaxed) == now) return;
+    float c[28];
+    if (!memory_read_as_submitted(camera, c, sizeof c)) return;
+    // (a rotation: three rows of length 1, at right angles; else not the light's view, as the full-screen draws' blocks are)
+    const auto dot3 = [&](int i, int j) { return c[i * 4] * c[j * 4] + c[i * 4 + 1] * c[j * 4 + 1] + c[i * 4 + 2] * c[j * 4 + 2]; };
+    for (int i = 0; i < 3; i++)
+        if (std::fabs(dot3(i, i) - 1.0f) > 0.01f) return;
+    if (std::fabs(dot3(0, 1)) > 0.01f || std::fabs(dot3(0, 2)) > 0.01f || std::fabs(dot3(1, 2)) > 0.01f) return;
+    // (and the light's projection after it (rows 3 to 6) an orthographic one, its last row (0, 0, 0, 1): the sun's, a
+    // direction; a lantern's or a spotlight's shadow map is a perspective one, (0, 0, -1, 0) there, and is not the sun)
+    if (c[24] != 0.0f || c[25] != 0.0f || c[26] != 0.0f || c[27] != 1.0f) return;
+    for (int k = 0; k < 3; k++) { uint32_t u; memcpy(&u, &c[8 + k], 4); sun_bits[k].store(u, std::memory_order_relaxed); }
+    const uint64_t was = sun_frame.exchange(now, std::memory_order_relaxed);
+    static std::atomic<int> told{0};
+    if (!was || (told.load(std::memory_order_relaxed) < 40 && now % 600 == 0)) {
+        told.fetch_add(1, std::memory_order_relaxed);
+        logf("vk: Evil HD: the sun's direction (%.3f, %.3f, %.3f) from the shadow cascades (%u, layer %u, frame %llu)", (double)c[8],
+             (double)c[9], (double)c[10], width, layer, (unsigned long long)now);
+    }
+}
+
+bool temporal_ao_camera(uint32_t width, uint32_t height, TemporalAoCamera* out) {
+    State& s = st();
+    std::lock_guard lk(s.mu);
+    const Camera cam = s.cam;
+    // (this frame's camera or the last one's: the parallel replay can record the composition before the scene's draws are told)
+    if (!cam.depth || !cam.frame || texture_frame_no() - cam.frame > 1 || !there_still(cam)) return false;
+    if (cam.width != width || cam.height != height || cam.depth->width != width || cam.depth->height != height ||
+        !(cam.depth->usage & VK_IMAGE_USAGE_SAMPLED_BIT) || cam.depth->samples != VK_SAMPLE_COUNT_1_BIT ||
+        !(cam.depth->aspect & VK_IMAGE_ASPECT_DEPTH_BIT))
+        return false;
+    fsr3_math::Camera c;
+    if (!fsr3_math::camera_from_projection(cam.proj, c)) return false;
+    const VkImageView v = depth_view(cam.depth);
+    if (!v) return false;
+    out->depth = v;
+    // (camera_from_projection gives the factors for FSR's reversed copy when the game's runs the other way: undone here, the
+    // shader flipping d instead)
+    out->a = c.device_to_view_depth[0], out->b = c.device_to_view_depth[1], out->flip = c.flip_depth;
+    out->inv_p00 = c.device_to_view_depth[2], out->inv_p11 = c.device_to_view_depth[3];
+    out->near_z = c.near_plane, out->far_z = c.far_plane;
+    memcpy(out->view, cam.view, sizeof out->view), memcpy(out->proj, cam.proj, sizeof out->proj);
+    const uint64_t seen = sun_frame.load(std::memory_order_relaxed);
+    // (the game redraws its sun shadows only now and then where nothing moves: the direction kept for 30 s, it turns slowly)
+    out->sun_ok = seen && texture_frame_no() - seen < 1800;
+    for (int k = 0; k < 3; k++) { const uint32_t u = sun_bits[k].load(std::memory_order_relaxed); memcpy(&out->sun[k], &u, 4); }
+    return true;
+}
+
 bool temporal_scene_size(uint32_t width, uint32_t height) {
     const State& s = st();
     // ((Triforce, FSR3-03) or, while AMD FSR 3.1 upscales, the scene its own inputs take (vk_fsr3_inputs.cpp scene_size): in
@@ -1325,17 +1614,21 @@ bool temporal_scene_size(uint32_t width, uint32_t height) {
            (fsr3_wanted() && fsr3_inputs::scene_size(width, height));
 }
 
-uint32_t temporal_jitter_size(int axis) {
-    // (RX_VK_DLSS_JITTER=0: none. 0 too once no engine has drawn for a while: the camera as the game has it)
+MkwVkJitter temporal_jitter_sample() {
+    // (RX_VK_DLSS_JITTER=0: none. None too once no engine has drawn for a while: the camera as the game has it)
     static const bool off = env_switch("RX_VK_DLSS_JITTER") == 0;
     State& s = st();
     const int mode = temporal_mode();
-    if (off || mode == ur::GAME) return 0;
+    if (off || mode == ur::GAME) return {};
     const uint64_t last = s.last_frame.load(std::memory_order_relaxed);
-    if (s.engines[ur::is_fsr4(mode) ? 1 : 0].failed.load(std::memory_order_relaxed) || !last || texture_frame_no() - last > 30)
-        return 0;
-    if (axis == 2) return s.jitter_phases.load(std::memory_order_relaxed);
-    return axis ? s.jitter_h.load(std::memory_order_relaxed) : s.jitter_w.load(std::memory_order_relaxed);
+    if (s.engines[slot_index(mode)].failed.load(std::memory_order_relaxed) || !last || texture_frame_no() - last > 30)
+        return {};
+    return s.jitter.read(texture_frame_no());
+}
+
+uint32_t temporal_jitter_size(int axis) {
+    const MkwVkJitter sample = temporal_jitter_sample();
+    return axis == 2 ? sample.phases : axis ? sample.height : sample.width;
 }
 
 int temporal_status(char* b, size_t n) {
@@ -1409,8 +1702,51 @@ void temporal_idle() {
     s.holding = !s.dead.empty();
 }
 
+// ((Triforce) the place of the skinned draw being recorded on this thread, for its stored positions (temporal_capture_draw
+// takes it for the same draw, which vk_draw.cpp describes after skin_check): pair_copies)
+struct SkinPlace {
+    bool ok = false;
+    uint64_t stream_pos = 0, vbuf = 0, program = 0;
+    int count = 0;
+    float place[3]{};
+};
+static thread_local SkinPlace skin_place;
+
+/// (Triforce) The stored positions' motion: a skinned draw's place read as the draw was submitted (its origin at the object's
+/// 0x40 and the bones its vertices use), for its stored draw to pair with its model's copies by (pair_copies)
+static void note_skinned_place(const SkinnedDraw& k) {
+    skin_place.ok = false;
+    if (!place_pairing() || !temporal_capture_wanted()) return;
+    if (!k.depth || !k.bones || k.bones_size < 48 || !k.object || k.object_size < 0x4c) return;
+    State& s = st();
+    uint32_t nbones = 0;
+    {
+        std::lock_guard lk(s.mu);
+        const uint64_t model = dlss_actor::key(k.vbuf, k.ibuf, k.count, k.base_vertex, k.program, 0);
+        auto mb = s.model_bones.find(model);
+        if (mb == s.model_bones.end()) {
+            if (s.model_bones.size() > 4096) s.model_bones.clear();
+            mb = s.model_bones.emplace(model, bones_used(k)).first;
+        }
+        nbones = (uint32_t)std::min<uint64_t>(mb->second, std::min<uint64_t>(k.bones_size / 48, 280));
+    }
+    if (!nbones) return;
+    thread_local std::vector<uint8_t> bones;
+    bones.resize((size_t)nbones * 48);
+    uint8_t origin[12];
+    if (!memory_read_as_submitted(k.object + 0x40, origin, sizeof origin) ||
+        !memory_read_as_submitted(k.bones, bones.data(), bones.size()))
+        return;
+    dlss_actor::place_of(origin, bones.data(), nbones, skin_place.place);
+    skin_place.stream_pos = k.stream_pos, skin_place.vbuf = k.vbuf, skin_place.program = k.program, skin_place.count = k.count;
+    skin_place.ok = true;
+}
+
 const char* temporal_note_skinned_draw(const SkinnedDraw& k) {
-    if (motion_mode() == kMotionCapture) return "its stored positions are drawn instead";
+    if (motion_mode() == kMotionCapture) {
+        note_skinned_place(k);
+        return "its stored positions are drawn instead";
+    }
     if (motion_mode() != kMotionBones || !temporal_motion_wanted()) return "actor motion off";
     if (!k.depth || !k.bones || k.bones_size < 48 || !k.object || k.object_size < 0x4c) return "no object buffer";
     State& s = st();
@@ -1451,11 +1787,19 @@ const char* temporal_note_skinned_draw(const SkinnedDraw& k) {
 // ((Triforce, FSR3-03) AMD FSR 3.1 too, which is no engine of the chain (temporal_mode() is GAME while it upscales): its
 // inputs get the same redraws, temporal_fsr3_motion and pre_fsr3. Before, no draw stored its positions while FSR 3.1 drew,
 // and what moves by itself had the camera's motion there: Link, the others and what the game moves trailed)
-bool temporal_motion_wanted() { return temporal_wanted() || fsr3_wanted(); }
+bool temporal_motion_wanted() { return temporal_wanted() || fsr3_wanted() || temporal_fg_motion(); }
+// ((Triforce) 11-24) And AMD FSR 3.1's frame interpolation (the Frame generation by row) with no engine drawing and no FSR 3.1
+// upscaling: its inputs are made at the gameplay upscale's dispatch all the same (vk_fsr3.cpp fsr3_upscale), and the same
+// redraws give what moves by itself its own motion there. Before, it had the camera's motion alone with the game's own upscaler
+bool temporal_fg_motion() { return temporal_mode() == ur::GAME && !fsr3_wanted() && fsr3fi::frames_wanted() != 0; }
 bool temporal_capture_wanted() { return motion_mode() == kMotionCapture && temporal_motion_wanted(); }
 
 void temporal_capture_draw(const CaptureDraw& k, CaptureSlot* out) {
     *out = {};
+    // ((Triforce) the place its skinned draw had, when this is that draw: note_skinned_place)
+    const bool placed = skin_place.ok && skin_place.stream_pos == k.stream_pos && skin_place.vbuf == k.vbuf &&
+                        skin_place.program == k.program && skin_place.count == k.count;
+    skin_place.ok = false;
     if (!k.depth || k.count <= 0 || !temporal_capture_wanted()) return;
     State& s = st();
     std::lock_guard lk(s.mu);
@@ -1533,6 +1877,10 @@ void temporal_capture_draw(const CaptureDraw& k, CaptureSlot* out) {
     State::Captured c;
     c.k = k, c.key = dlss_actor::key(k.vbuf, k.ibuf, k.count, k.base_vertex, k.program, nth);
     c.address = b.address + s.capture_used, c.first = first, c.count = n;
+    if (placed) {
+        c.placed = true;
+        for (int a = 0; a < 3; a++) c.place[a] = skin_place.place[a];
+    }
     // (the jitter of the camera it is drawn with, as submitted: read again when the address or the captures' view changes)
     if (k.camera && k.camera_size >= 0xb0) {
         const uint64_t view = memory_capture_view();
@@ -1565,7 +1913,7 @@ bool pre_wanted(int mode) {
         const int e = env_switch("RX_VK_DLSS_PRE");
         return e >= 0 ? e != 0 : upscale_pre_at_start != 0;
     }();
-    return on && (ur::is_dlss(mode) || ur::is_fsr4(mode) || fsr3_pre_wanted());
+    return on && (chain_engine(mode) || fsr3_pre_wanted());
 }
 
 /// The upscale's dispatch in a frame the engine drew before the bloom: the tone mapped picture into its output, nothing
@@ -1625,7 +1973,7 @@ bool pre_dispatch(VkCommandBuffer cmd, int mode, Texture* in, VkImageView in_vie
     if (learn && pre_wanted(mode)) {   // (it did not: what the first draw after the scene was, for the next frame)
         if (s.pre_candidate.program && !(s.pre_candidate == s.pre_key)) {
             logf("vk: %s: before the game's bloom and tone mapping from the next frame: the first draw after the scene is "
-                 "program %016llx into %ux%u, format %d (frame %llu)", ur::is_dlss(mode) || ur::is_fsr4(mode) ? name_of(mode) : "AMD FSR 3.1",
+                 "program %016llx into %ux%u, format %d (frame %llu)", chain_engine(mode) ? name_of(mode) : "AMD FSR 3.1",
                  (unsigned long long)s.pre_candidate.program, s.pre_candidate.width, s.pre_candidate.height,
                  (int)s.pre_candidate.format, (unsigned long long)texture_frame_no());
             s.pre_key = s.pre_candidate;
@@ -1926,7 +2274,7 @@ bool chain(VkCommandBuffer cmd, int mode, Engine& engine, const Camera& cam, con
         }
     }
     s.last_pose = pose, s.last_pose_time = pose_time, s.have_pose = true;
-    const bool reset = !last || now - last > 2 || present_held_last() || cut;
+    bool reset = !last || now - last > 2 || present_held_last() || cut;
     struct {
         float reproject[16];
         float jitter[2];
@@ -1945,6 +2293,7 @@ bool chain(VkCommandBuffer cmd, int mode, Engine& engine, const Camera& cam, con
     std::memcpy(previous, s.last_vp, sizeof previous);
     dlss_math::unjitter(previous, s.last_jitter);
     const bool motion = !reset && dlss_math::reprojection(cam.current, previous, pc.reproject);
+    if (!motion) reset = true;   // (without a valid reprojection, prior history has no mapping to this camera)
     pc.jitter[0] = cam.jitter[0], pc.jitter[1] = cam.jitter[1];
     pc.size[0] = (int32_t)rw, pc.size[1] = (int32_t)rh, pc.flags = (motion ? 1 : 0) | (show_motion ? 2 : 0) | (pre ? 16 : 0);
 
@@ -1967,18 +2316,21 @@ bool chain(VkCommandBuffer cmd, int mode, Engine& engine, const Camera& cam, con
     };
     full_barrier(cmd);   // (the scene's colour and depth, written before)
     prep();
-    full_barrier(cmd);
+    chain_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT);   // (prep's images)
     // (what moves by itself: the draws drawn again over the camera's motion from the positions they stored, with their own;
     // or the skinned draws from their bones (RX_VK_DLSS_ACTORS=bones))
     const RedrawTarget into{s.motion.view, last, s.last_jitter};   // (the chain's own motion, its history the engine's)
     const int actors = motion_mode() == kMotionCapture
                            ? capture_motion(cmd, cam, previous, pc.reproject, rw, rh, dview, motion, captures, into)
                            : actor_motion(cmd, cam, previous, pc.reproject, rw, rh, dview, motion, into);
-    if (actors) full_barrier(cmd);
+    if (actors)   // (the redraws into the motion: its attachment, and the poses' copies before them)
+        chain_barrier(cmd, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                               VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                      VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
     if ((show_motion && actors) || show_own) {   // (RX_VK_DLSS_DEBUG=motion: the motion as it is now, the actors' in it)
         pc.flags = show_own ? 4 | 8 : 4;
         prep();
-        full_barrier(cmd);
+        chain_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT);
     }
     TemporalFrame f;
     f.color = s.color.shown(), f.depth = s.depth.shown(), f.motion = s.motion.shown(), f.output = s.output.shown();
@@ -1999,18 +2351,19 @@ bool chain(VkCommandBuffer cmd, int mode, Engine& engine, const Camera& cam, con
     upscale_lod_note(rw, rh, ow);   // ((Triforce, S8) the texture LOD bias for the next frames' scene: vk_draw.cpp)
     // ((Triforce, S1) the Sharpness row before the HUD: NVIDIA DLSS and DLAA have no sharpening of their own here, so their
     // picture goes through AMD FSR 3.1's RCAS pass at the row's value, as FSR 3.1's own does (FSR 4 sharpens in its own
-    // dispatch). Where it cannot run (vk_fsr3.h fsr3::rcas_ok) the picture stays as it is, and the window pass sharpens it.
+    // dispatch; (Triforce) Intel XeSS has none of its own either, and goes through the same). Where it cannot run (vk_fsr3.h fsr3::rcas_ok) the picture stays as it is, and the window pass sharpens it.
     // ((Triforce) Nor over linear HDR light, before the bloom or RenoDX's RGBA16F scene: RCAS's limiter takes 1.0 for the
     // peak (sharpen_rules.h lone_rcas); there too the window pass sharpens, temporal_sharpens_3d saying so)
     VkImageView picture = s.output.view;
     const bool scene_rgba16f = in_format == VK_FORMAT_R16G16B16A16_SFLOAT;
     chain_rgba16f.store(scene_rgba16f ? 1 : 0, std::memory_order_relaxed);
-    if (ur::is_dlss(mode) && temporal_sharpness() > 0.0f && !sharpen_rules::lone_rcas(pre != nullptr, scene_rgba16f) &&
+    const bool own_rcas = ur::is_dlss(mode) || ur::is_xess(mode);
+    if (own_rcas && temporal_sharpness() > 0.0f && !sharpen_rules::lone_rcas(pre != nullptr, scene_rgba16f) &&
         !s.told_sharp_hdr)
         s.told_sharp_hdr = true, logf("vk: %s: its picture is linear HDR here (%s), which AMD's RCAS alone does not take: the "
                                       "Sharpness row sharpens at the window", engine.e->name,
                                       pre ? "before the bloom" : "RenoDX's RGBA16F scene");
-    if (ur::is_dlss(mode) && temporal_sharpness() > 0.0f && sharpen_rules::lone_rcas(pre != nullptr, scene_rgba16f) &&
+    if (own_rcas && temporal_sharpness() > 0.0f && sharpen_rules::lone_rcas(pre != nullptr, scene_rgba16f) &&
         make_image(cmd, s.sharp, VK_FORMAT_R16G16B16A16_SFLOAT, s.output.width, s.output.height) &&
         fsr3::rcas(cmd, s.output.view, s.sharp.view, s.output.width, s.output.height, temporal_sharpness())) {
         picture = s.sharp.view;
@@ -2077,8 +2430,8 @@ bool chain(VkCommandBuffer cmd, int mode, Engine& engine, const Camera& cam, con
     std::memcpy(s.last_vp, cam.current, sizeof s.last_vp);
     // ((Triforce, FSR4-10) AMD FSR 4 by AMD's own rule, as FSR 3.1 (fsr3_math.h): 71 or 72 at Ultra Performance, where
     // NVIDIA's stops at 64)
-    s.jitter_w = rw, s.jitter_h = rh;
-    s.jitter_phases = ur::is_fsr4(mode) ? fsr3_math::jitter_phases(rw, dw) : (uint32_t)dlss_jitter_phases(rw, rh, dw, dh);
+    s.jitter.publish(rw, rh, ur::is_fsr4(mode) ? fsr3_math::jitter_phases(rw, dw) : (uint32_t)dlss_jitter_phases(rw, rh, dw, dh),
+                     now);
     if (s.reason) logf("vk: %s draws the upscale again (frame %llu)", engine.e->name, (unsigned long long)now);
     s.reason = nullptr;
     // (RX_VK_DLSS_DEBUG=alternate, a test's reference: every other frame the game's own upscale over the engine's, which still
@@ -2153,7 +2506,7 @@ Texture* temporal_pre_tonemap(VkCommandBuffer cmd) {
     const Camera cam = s.cam;
     Texture* scene = const_cast<Texture*>(cam.color);
     // (AMD FSR 3.1: not one of the chain's engines, its own inputs and passes: pre_fsr3)
-    const bool f3 = !ur::is_dlss(mode) && !ur::is_fsr4(mode);
+    const bool f3 = !chain_engine(mode);
     Engine* const engine = f3 ? nullptr : &engine_of(mode);
     // (anything unexpected: nothing here, and the upscale's dispatch draws as before, on the tone mapped picture)
     if (!cam.valid || !scene || (engine && (!engine->e || engine->failed || waiting(*engine))) || !there_still(cam))

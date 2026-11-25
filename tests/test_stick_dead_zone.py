@@ -2,8 +2,10 @@
 triforce_options.ini), issue 752.
 
 Both pad paths, SDL (host/pad_sdl.c) and XInput (host/nn_hid.c), cut each axis at XInput's 7849 (~24%), a lot on a
-worn or a precise stick. They now cut through one function, host/nn_hid.c's hos_stick_axis, whose threshold is the
-row's (option 11): Default (7849, the same output as before for every input), 5%, 10%, 15%, 20%, 30%.
+worn or a precise stick. The threshold is the row's (option 11), host/nn_hid.c's hos_stick_axis: Default (7849, the same
+output as before for every input along an axis), 5%, 10%, 15%, 20%, 30%. Each stick is cut as a pair at that radius
+(hos_filter_stick): inside the circle both axes are 0, outside both pass as they are, so a diagonal keeps its direction
+where the cut axis by axis snapped it towards an axis ((12000, -4000) became (12000, 0)).
 The function, pad_sdl.c's stick_value and the menu's row, label and ini parsing are compiled alone (gcc, g++) and
 checked over every int16 input. Both paths now cut through hos_stick_axis_own, which is hos_stick_axis for a stick with
 no dead zone of its own (the Left and Right stick dead zone rows at "As Stick dead zone", their default): checked here
@@ -64,13 +66,16 @@ def main():
 
     check(not re.search(r"HOS_OPT_\w+ = 11\b", api), "a HOS_OPT_ enum also takes option 11")
     check("int32_t hos_stick_axis(" in hid, "nn_hid.c has no hos_stick_axis")
-    pads = block(hid, "static void pads_read(")
-    check("rx_option(11, 0)" in pads and "hos_stick_axis_own(thumb[i], zone, own[i >> 1])" in pads,
-          "XInput's sticks do not go through hos_stick_axis_own with the row's zone (option 11)")
+    pads = block(hid, "static void xinput_poll(")   # (XInput's read, on its own thread; pads_read takes its last reading)
+    check("rx_option(11, 0)" in pads and "hos_filter_stick(thumb[0], thumb[1], zone, own[0], v);" in pads
+          and "hos_filter_stick(thumb[2], thumb[3], zone, own[1], v + 2);" in pads,
+          "XInput's sticks are not cut as pairs (hos_filter_stick) with the row's zone (option 11)")
     check("7849" not in pads, "XInput's sticks still cut at 7849 themselves")
     poll = block(sdl, "static void pads_poll")
     check("rx_option(11, 0)" in poll, "SDL's sticks do not read the row (option 11)")
-    check(poll.count("stick_value(") == 4, "SDL's four axes do not all go through stick_value")
+    check("hos_filter_stick(raw[0], raw[1], z, own[0], v);" in poll and "hos_filter_stick(raw[2], raw[3], z, own[1], v + 2);" in poll,
+          "SDL's sticks are not cut as pairs (hos_filter_stick) with the row's zone")
+    check(poll.count("stick_value(") == 1, "SDL's rest rule does not ask stick_value for each axis by itself")
     value = block(sdl, "static int32_t stick_value(")
     check("hos_stick_axis_own(" in value and "7849" not in value, "pad_sdl.c's stick_value cuts on its own")
     own = block(hid, "int32_t hos_stick_axis_own(")
@@ -96,7 +101,18 @@ def main():
 #include <stdio.h>
 #include <stdlib.h>
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); exit(1); } } while (0)
-''' + block(hid, "int32_t hos_stick_axis(") + "\n" + own + "\n" + block(sdl, "static int32_t stick_value(") + r'''
+''' + "\n".join((block(hid, "int32_t hos_stick_axis("), own, block(sdl, "static int32_t stick_value("),
+                 block(hid, "void hos_filter_stick("))) + r'''
+/* (a stick as a pair: what hos_filter_stick must give) */
+static void expect(int16_t x, int16_t y, int zone, int stick_own, int32_t want_x, int32_t want_y) {
+    int32_t stick[2];
+    hos_filter_stick(x, y, zone, stick_own, stick);
+    if (stick[0] != want_x || stick[1] != want_y) {
+        fprintf(stderr, "FAIL: zone %d, own %d: (%d, %d) became (%ld, %ld), wanted (%ld, %ld)", zone, stick_own, x, y,
+                (long)stick[0], (long)stick[1], (long)want_x, (long)want_y);
+        exit(1);
+    }
+}
 /* (before issue 752: nn_hid.c's XInput cut, and pad_sdl.c's, which flips first) */
 static int32_t old_xinput(int16_t t) { const int a = t < -32767 ? -32767 : t; return (a > 7849 || a < -7849) ? a : 0; }
 static int32_t old_sdl(int16_t v, int flip) {
@@ -123,7 +139,49 @@ int main(void) {
     for (int z = 0; z < 6; z++)
         CHECK(hos_stick_axis(t[z], z) == 0 && hos_stick_axis(t[z] + 1, z) == t[z] + 1 && hos_stick_axis(-t[z], z) == 0 &&
               hos_stick_axis(-t[z] - 1, z) == -t[z] - 1 && hos_stick_axis(-32768, z) == -32767);
-    printf("stick: Default is the old cut for all 65536 inputs, both paths; 5 other thresholds exact\n");
+    /* ---- the stick as a pair: a circle of the same radius ---- */
+    for (int z = 0; z < 6; z++) {
+        /* along an axis every input gives what the cut of one axis gives, with the other axis at rest */
+        for (int32_t i = -32768; i <= 32767; i++) {
+            const int32_t want = hos_stick_axis((int16_t)i, z);
+            expect((int16_t)i, 0, z, -1, want, 0);
+            expect(0, (int16_t)i, z, -1, 0, want);
+        }
+        const int16_t inside = (int16_t)(t[z] / 2), diagonal = (int16_t)(3 * t[z] / 4);
+        expect(inside, (int16_t)-inside, z, -1, 0, 0);
+        expect(diagonal, diagonal, z, -1, diagonal, diagonal);   /* (each under the axis's cut, the push outside the circle) */
+        expect((int16_t)-diagonal, diagonal, z, -1, -diagonal, diagonal);
+        expect(diagonal, (int16_t)-diagonal, z, -1, diagonal, -diagonal);
+        expect((int16_t)-diagonal, (int16_t)-diagonal, z, -1, -diagonal, -diagonal);
+        expect(-32768, -32768, z, -1, -32767, -32767);
+        expect(23170, -23170, z, -1, 23170, -23170);   /* (full tilt on a diagonal keeps its whole magnitude) */
+        expect(-32767, 32767, z, -1, -32767, 32767);
+    }
+    expect(12000, 4000, 0, -1, 12000, 4000);   /* (the smaller part used to be cut to 0) */
+    expect(12000, -4000, 0, -1, 12000, -4000);
+    expect(32767, 3000, 0, -1, 32767, 3000);   /* (full tilt five degrees off an axis is no longer that axis) */
+    expect(2949, 3932, 3, -1, 0, 0);           /* (a 3-4-5 triangle exactly on the radius 4915) */
+    expect(2949, 3933, 3, -1, 2949, 3933);
+    for (int k = 0; k < 4; k++) {              /* (a zone out of range: Default) */
+        expect(7849, 0, bad[k], -1, 0, 0);
+        expect(7849, 1, bad[k], -1, 7849, 1);
+    }
+    /* a stick's own zone (percent) is the radius, whatever the row says; 0 cuts nothing; past 50 is 50 */
+    for (int p = 0; p <= 50; p++) {
+        const int32_t r = (p * 32767 + 50) / 100;
+        for (int32_t i = -32768; i <= 32767; i += 13) {
+            const int32_t want = hos_stick_axis_own((int16_t)i, 0, p);
+            expect((int16_t)i, 0, 0, p, want, 0);
+            expect(0, (int16_t)i, 5, p, 0, want);
+        }
+        expect((int16_t)r, 0, 0, p, 0, 0);
+        expect((int16_t)r, 1, 0, p, r, 1);
+    }
+    expect(1, -1, 0, 0, 1, -1);
+    expect(0, 0, 0, 0, 0, 0);
+    expect(16384, 0, 0, 77, 0, 0);
+    expect(12000, 12000, 0, 77, 12000, 12000);
+    printf("stick: Default is the old cut for all 65536 inputs along an axis, both paths; 5 other thresholds exact; a pair is cut by a circle and keeps its direction\n");
     return 0;
 }
 '''

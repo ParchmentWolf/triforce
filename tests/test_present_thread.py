@@ -168,15 +168,15 @@ def check_source():
     vk = ROOT / "gpu/vk"
     replay = (vk / "vk_replay.cpp").read_text(encoding="utf-8")
     image = block(replay, "void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view) {")
-    out = block(replay, "static void present_out(const PresentOut& o, std::unique_lock<std::mutex>& qk, bool on_thread) {")
+    out = block(replay, "static void present_out(const PresentOut& o, std::unique_lock<QueueMutex>& qk, bool on_thread) {")
     # the present before out first, under present_image's lock, before anything of the swapchain is read
     check(before(image, "std::lock_guard lk(present_image_mu);", "present_thread_settle();", "dev.swap_resize.exchange(0",
                  "create_swapchain(width, height)", "vkAcquireNextImageKHR("),
           "present_image does not wait for the present before as its first step under its lock")
     # everything the picture is made of recorded and submitted on the presenting thread, before the hand-off
     check(before(image, "vkWaitForFences(dev.device, 1, &f.done", "vkAcquireNextImageKHR(", "blit_crop_to_rect(f.cmd",
-                 "if (src && framelog_on())", "menu_record(f.cmd, index", "dlssg::frame(f.cmd", "vkEndCommandBuffer(f.cmd)",
-                 "reflex_submit_ends();", "res = vkQueueSubmit2(dev.queue, 1, &si, f.done);", "const PresentOut out{index, smooth_mine};",
+                 "if (src && framelog_on() && !log_window)", "menu_record(f.cmd, index", "dlssg::frame(f.cmd", "vkEndCommandBuffer(f.cmd)",
+                 "reflex_submit_ends();", "res = vkQueueSubmit2(dev.queue, 1, &si, f.done);", "const PresentOut out{index, smooth_mine, check_ticket, present_check_frame, dev.swap_generation, f.done};",
                  "if (present_thread_wanted()) {", "qk.unlock();\n        return present_thread_hand(out);", "present_out(out, qk, false);"),
           "the blit, the overlays, the copies or Reflex's submit marker are not all on the queue before the hand-off")
     check(image.rstrip().endswith("present_out(out, qk, false);\n}"), "present_image does more after the present's last step")
@@ -188,7 +188,7 @@ def check_source():
     oo = out[out.index("if (res == VK_ERROR_OUT_OF_DATE_KHR || res == VK_SUBOPTIMAL_KHR) {"):]
     check(before(oo, "if (on_thread) {", "dev.swap_resize.compare_exchange_strong(none,", "return;", "create_swapchain("),
           "the present thread makes the swapchain itself, or does not leave it to the next present as a resize")
-    smooth = block(replay, "void smooth_present(std::unique_lock<std::mutex>& qk) {")
+    smooth = block(replay, "void smooth_present(std::unique_lock<QueueMutex>& qk) {")
     check("if (qk.owns_lock()) qk.unlock();" in smooth and smooth.count("qk.unlock()") == 1,
           "the pacing's wait lets go of a lock the present thread never took")
     # the rule and the switch
@@ -198,9 +198,10 @@ def check_source():
           "const bool on = present_thread_on() || (!never && acquire_ahead_wanted());" in wanted,
           "the present thread is not limited to the game's pictures without frame generation, DLSS frame generation or Anti-Lag 2")
     on = block(replay, "bool present_thread_on() {")
-    check('getenv("RX_VK_PRESENT_THREAD")' in on and "e && *e && atoi(e) == 1" in on, "RX_VK_PRESENT_THREAD is not off unless =1 (off by default since 11-16)")
+    # ((Triforce) unset: Threaded rendering's say, off by default)
+    check('getenv("RX_VK_PRESENT_THREAD")' in on and "e && *e ? atoi(e) == 1 : threaded_on()" in on, "RX_VK_PRESENT_THREAD is not off unless =1 (off by default since 11-16)")
     main = block(replay, "void present_thread_main() {")
-    check(before(main, "present_hand.take();", "smooth_mine = o.smooth;", "std::unique_lock<std::mutex> qk(dev.present_mu, std::defer_lock);",
+    check(before(main, "present_hand.take();", "smooth_mine = o.smooth;", "std::unique_lock<QueueMutex> qk(dev.present_mu, std::defer_lock);",
                  "present_out(o, qk, true);", "smooth_mine = false;", "present_hand.done();"),
           "the present thread does not run present_out as the presenting thread's, without the queue's lock, and then say so")
     # only present_image acquires and makes the swapchain in play, only present_out presents

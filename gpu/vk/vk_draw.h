@@ -88,6 +88,7 @@ void end_pass(VkCommandBuffer cmd);
 /// (Triforce) RX_VK_SPLIT_BARRIER (barrier_rules.h, vk_replay.cpp maybe_split): before a part's split ends the pass, whether one
 /// is open (not with the parallel replay); its targets and what its draws sampled and wrote kept for pass_carry_resume
 bool pass_carry_take();
+bool draw_pass_open();   // ((Triforce) Threaded rendering's parts, vk_replay.cpp maybe_split: this thread's render pass open)
 /// The pass pass_carry_take kept, begun again on cmd (the next part's) with its targets behind vk_texture.cpp pass_resume_barrier,
 /// with what its draws sampled and wrote: draw_hazards and clear_after_draws go on as in one pass. go: false drops it (the split
 /// went the old way, with full barriers)
@@ -169,6 +170,9 @@ uint64_t ub_generation();
 /// A background thread (shader translation, pipeline builds) reads guest memory from the captures only, never the stream's
 /// uniform updates: that list is the replay's, which grows and is pruned while such a thread runs
 void ub_thread_off();
+/// ((Triforce) the Debug tab's Descriptor reuse and Sampler cache rows as the menu has them: they apply in play (vk_menu.cpp
+/// menu_tick, each frame). RX_VK_DESC_SLOTGEN and RX_VK_SAMPLER_CACHE hold them for a run
+void menu_debug_rows(int descriptor_reuse, int sampler_cache);
 /// The pipeline cache to disk (force: whatever was built since the last save; else only after a few new ones)
 void pipeline_cache_save(bool force);
 /// (Triforce) Once a present, on its thread: the fast-linked pipelines whole builds have replaced are destroyed once no draw

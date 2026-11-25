@@ -2,9 +2,10 @@
 
 NX2navi's lstick_deadzone and rstick_deadzone: a worn stick can have a larger dead zone than the other, and a good one a
 smaller. Each row is "As Stick dead zone" by default (-1: that row decides for the stick, as it did for both before), then
-0% to 50%. host/nn_hid.c's hos_stick_axis_own cuts an axis at its stick's own zone, per axis like the Stick dead zone row
-and at the same places (its 5% is that row's 5%), and both pad paths go through it: SDL's (host/pad_sdl.c stick_value)
-and XInput's (pads_read).
+0% to 50%. host/nn_hid.c's hos_stick_axis_own cuts an axis at its stick's own zone, at the same places as the Stick dead
+zone row (its 5% is that row's 5%); both pad paths cut each stick as a pair at that radius (hos_filter_stick, so a push
+keeps its direction: tests/test_stick_dead_zone.py), SDL's (host/pad_sdl.c) and XInput's (xinput_poll), and SDL's rest
+rule still asks for each axis by itself (stick_value).
 
 host/pad_sdl.c lets an axis steer only once it was seen at rest. With a zone of 0 an axis is never exactly at rest, so
 for a stick with a zone of its own an axis inside the default dead zone counts as at rest too (stick_rests): a stick
@@ -260,15 +261,18 @@ def main():
     replay, menu, header = read("gpu", "vk", "vk_replay.cpp"), read("gpu", "vk", "vk_menu.cpp"), read("gpu", "vk", "vk_menu.h")
 
     # ---- both pad paths cut each stick at its own zone ----
-    xinput = block(hid, "static void pads_read(")
+    xinput = block(hid, "static void xinput_poll(")   # (XInput's read, on its own thread; pads_read takes its last reading)
     check("const int own[2] = {hos_stick_own(0), hos_stick_own(1)};" in xinput
-          and "v[i] = hos_stick_axis_own(thumb[i], zone, own[i >> 1]);" in xinput,
+          and "hos_filter_stick(thumb[0], thumb[1], zone, own[0], v);" in xinput
+          and "hos_filter_stick(thumb[2], thumb[3], zone, own[1], v + 2);" in xinput,
           "XInput's sticks are not cut at their own dead zones (thumb 0 and 1 the left stick's, 2 and 3 the right's)")
     poll = re.sub(r"\s+", " ", block(pad, "static void pads_poll"))
     check("const int own[2] = {hos_stick_own(0), hos_stick_own(1)};" in poll, "SDL's sticks do not read their own dead zones")
-    check("int32_t v[4] = {stick_value(raw[0], 0, z, own[0]), stick_value(raw[1], 1, z, own[0]), "
-          "stick_value(raw[2], inv_x, z, own[1]), stick_value(raw[3], inv_y ? 0 : 1, z, own[1])};" in poll,
-          "SDL's four axes are not cut at their stick's own dead zone (the left stick's two, then the right's)")
+    check("hos_filter_stick(raw[0], raw[1], z, own[0], v); hos_filter_stick(raw[2], raw[3], z, own[1], v + 2); "
+          "v[1] = -v[1], v[3] = -v[3];" in poll,
+          "SDL's sticks are not cut as pairs at their own dead zone (the left stick's two axes, then the right's; y up)")
+    check("const int32_t alone = stick_value(raw[k], k & 1, z, own[k >> 1]);" in poll,
+          "the rest rule does not ask for each axis by itself, cut at its stick's own dead zone")
     check("const int16_t raw[4] = {hos_sdl_pad_axis(gc, AX_LX), hos_sdl_pad_axis(gc, AX_LY), hos_sdl_pad_axis(gc, AX_RX), "
           "hos_sdl_pad_axis(gc, AX_RY)};" in poll, "raw is not the four axes as SDL gives them, in v's order")
     src = pad
@@ -306,7 +310,7 @@ def main():
                          ("/* TX_OWN */", block(menu, "const char* tx_own_dead_zone(")),
                          ("/* THE_ROWS */", rows[0].group(0) + "\n" + rows[1].group(0)),
                          ("/* STOPS */", block(menu, "bool stops_at_ends(")),
-                         ("/* INI_KEY */", "bool is_merged(const int*) { return false; }   /* ((Triforce, options_version 7) no merged row here */\n" + block(menu, "bool ini_row(") + "\n" + block(menu, "const char* ini_key(")),
+                         ("/* INI_KEY */", "bool is_merged(const int*) { return false; }   /* ((Triforce, options_version 7) no merged row here */\nint output_pick;   /* (the Output device row) */\n" + block(menu, "bool ini_row(") + "\n" + block(menu, "const char* ini_key(")),
                          ("/* LOAD_LOOP */", loop)):
         cxx = cxx.replace(marker, text)
     c = C

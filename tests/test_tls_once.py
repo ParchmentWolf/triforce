@@ -25,7 +25,7 @@ DESCRIPTORS = ["void build_descriptors(const NvnState& s, const Program& p, bool
                "bool bind_descriptors(VkCommandBuffer cmd, VkPipelineBindPoint bp, const Program& p) {"]
 PASSES = ["void begin_pass(VkCommandBuffer cmd, const Targets& at) {",
           "void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, bool mesh) {",
-          "uint16_t draw_hazards(VkCommandBuffer cmd, const Program& p, const NvnState& s, const Targets& at) {",
+          "uint16_t draw_hazards(VkCommandBuffer cmd, const Program& p, const NvnState& s, const Targets& at, uint16_t& samples) {",
           "void end_pass(VkCommandBuffer cmd) {", "void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {"]
 
 

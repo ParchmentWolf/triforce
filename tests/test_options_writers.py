@@ -66,6 +66,7 @@ namespace merged_rows = mkwvk::merged_rows;
 #include <sstream>
 #include <string>
 enum { HOS_SW_N = 1, HOS_KEY_N = 2 };
+enum { HOS_KEY_OC_NOTE_L = 2, HOS_KEY_OC_NOTE_X = 2 };   /* ((Triforce) 11-24: the ocarina's note rows: past this stand-in's two) */
 enum { HOS_BIND_PAD, HOS_BIND_KEY };
 struct Row { const char* name; int* value; };
 int va = 0, vb = 0, vc = 0;

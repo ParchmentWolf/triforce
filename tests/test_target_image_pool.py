@@ -55,7 +55,8 @@ class TargetImagePoolTests(unittest.TestCase):
         get = block(self.tex, "Texture* texture_get(const nvn_tex* t, bool for_sampling)")
         self.assertIn("create(k, t, fi.format, fi.astc, bw, bh, bpb, !for_sampling)", get)
         make = block(self.tex, "Texture* create(const Key& key")
-        self.assertIn("create_image(ci, x.image, x.allocation, false, as_target && !is_bc(x.format) && !is_astc(x.format))", make)
+        self.assertIn("create_image(ci, x.image, x.allocation, false, as_target && !is_bc(x.format) && !is_astc(x.format), false, "
+                      "&need)", make)
         vma = (ROOT / "gpu" / "vk" / "vk_vma.cpp").read_text(encoding="utf-8")
         image = block(vma, "bool create_image(const VkImageCreateInfo& ci")
         self.assertIn("target && target_images_pool() ? target_images_pool() : images_pool()", image)

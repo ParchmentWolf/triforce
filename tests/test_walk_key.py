@@ -206,7 +206,10 @@ def main():
     check(binds is not None and defaults is not None, "nn_hid.c's controls and their default keys were not found")
     controls = [s.strip().strip('"') for s in binds.group(1).split(",")]
     keys_of = [[k.strip() for k in entry.split(",")] for entry in re.findall(r"\{([^{}]*)\}", defaults.group(1))]
-    check(len(controls) == len(keys_of) == 24, "the controls and their default keys do not pair up")
+    # ((Triforce) 11-24: 24 controls with keys out of the box, then the ocarina's five note rows and Toggle HUD, with none)
+    check(len(controls) == len(keys_of) == 30, "the controls and their default keys do not pair up")
+    check(controls[24:] == ["note_l", "note_r", "note_a", "note_y", "note_x", "toggle_hud"] and keys_of[24:] == [["0"]] * 6,
+          "the rows after the 24 controls are not the five note rows and Toggle HUD, unset")
     replaces = []
     for name, vk, _ in KEYS:
         has = [controls[i] for i, keys in enumerate(keys_of) if vk in keys]
@@ -269,7 +272,7 @@ def main():
                          ("/* HN_WALK */", hints.group(0)),
                          ("/* THE_ROWS */", key_row.group(0) + "\n" + scale_row.group(0)),
                          ("/* STOPS */", block(menu, "bool stops_at_ends(")),
-                         ("/* INI_KEY */", "bool is_merged(const int*) { return false; }   /* ((Triforce, options_version 7) no merged row here */\n" + block(menu, "bool ini_row(") + "\n" + block(menu, "const char* ini_key(")),
+                         ("/* INI_KEY */", "bool is_merged(const int*) { return false; }   /* ((Triforce, options_version 7) no merged row here */\nint output_pick;   /* (the Output device row) */\n" + block(menu, "bool ini_row(") + "\n" + block(menu, "const char* ini_key(")),
                          ("/* LOAD_LOOP */", loop),
                          ("/* NAMES */", ", ".join('"%s"' % k[0] for k in KEYS)),
                          ("/* REPLACES */", ", ".join('"%s"' % r if r else "nullptr" for r in replaces))):

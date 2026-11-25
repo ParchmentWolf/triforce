@@ -8,7 +8,9 @@ from Font2/Scalable/External.*.bfotf (dialogue, the control hints, menus): A B X
 and Minus at E04B and E04C, the stick presses at E056 and E057, the d-pad at E060..E063. Each written font has one icon per pad
 input at U+F700 + HOS_PAD_* (gpu/vk/vk_api.h), and each of those Switch buttons' code points in a cmap segment of its own: the
 game (host/prompts.c) points each one at the icon of the pad input bound to that button when it serves the font, so the icons
-follow the controls, changed ones too. (Triforce) The keyboard face (the keyboard and mouse; nx2/prompt_keys.py draws it, from
+follow the controls, changed ones too. (Triforce) Each controller face's font also has every controller face's icons
+(faces_font: FACE_BASE, BIND_BASE), the same glyphs in each, so the game points the font it has at another face or new
+controls while it runs (host/prompts.c's live part). The keyboard face (the keyboard and mouse; nx2/prompt_keys.py draws it, from
 nothing but a font of the repository's) has an icon per key that can be bound instead, at U+F700 + its key code, and what is
 said of a pad input below is a key code's there.
 
@@ -27,7 +29,8 @@ rsizetable.zs is the game's table with the font's entry raised to fit the larges
 
 (Triforce) The title screen's Options entry ("Options / ZELDA NOTES Setting") the same way: <out>/mals/<language>.product.110
 .sarc.zs is each language's messages with that entry made the game's word for Options, its separator and TITLE_TEXT, and the
-host serves the one of the language the game runs in (title_messages).
+host serves the one of the language the game runs in (title_messages). The same file has the texts that name the
+console in the PC's words (PC_TEXTS: the ocarina's microphone hint says your microphone, not the console's), at the same size.
 
 A .bfotf is an OpenType font behind an 8-byte header and XORed per little-endian word: the header is the magic 0x18029a7f and the
 font's size (big-endian), each XORed with the same key as the font. The .zs files are zstd frames made with the dictionary zs.zsdic
@@ -155,20 +158,38 @@ def cmap4(mapping, single):
     return struct.pack(">HHHHIHHI", 0, 2, 0, 3, 20, 3, 1, 20) + sub
 
 
-def face_font(otf, face):
-    """the game's font (decrypted) with this face's icons: a pad icon per input at PAD_BASE + its number, and the Switch buttons'
-    code points on the default controls' icons"""
+# ((Triforce) the button prompts changed while the game runs, host/prompts.c's live part) Every controller face's font has every
+# controller face's icons (LIVE_FACES, HOS_PROMPT_*'s order up to the keyboard's), so a new face or new controls are a change of
+# the cmap of the font the game has (the same glyphs, the same size): face n's icon of pad input i at FACE_BASE + FACE_CODES x n
+# + i, its d-pad icons (STATIC) at FACE_BASE + FACE_CODES x n + STATIC_AT.., and a code of its own for each Switch button b on
+# each pad input i of each face at BIND_BASE + (n x 16 + b) x 17 + i, which a text's button codes are rewritten to (the game
+# keeps a code's glyph once drawn: a new icon gets a code never drawn with another). All in the Private Use Area the game's font
+# leaves free (checked: face_font)
+LIVE_FACES = ["switch"] + [f for f in FACES if not FACES[f].get("keys")]
+FACE_BASE = 0xF800
+FACE_CODES = 32
+STATIC_AT = 24
+BIND_BASE = 0xF000
+_FACES_CACHE = {}
+
+
+def faces_font(otf):
+    """(Triforce) the game's font (decrypted) with every controller face's icons added (LIVE_FACES), once for each game font:
+    (the font's bytes, {code: glyph name} of the codes added, {face: [its glyph per pad input]}, {face: {STATIC code: glyph}})"""
+    key = hash(otf)
+    if key in _FACES_CACHE:
+        return _FACES_CACHE[key]
     from fontTools.pens.boundsPen import BoundsPen
     from fontTools.pens.t2CharStringPen import T2CharStringPen
     from fontTools.pens.transformPen import TransformPen
     from fontTools.ttLib import TTFont
-    from fontTools.ttLib.tables.DefaultTable import DefaultTable
 
     game = TTFont(io.BytesIO(otf))
     gset, cmap = game.getGlyphSet(), dict(game.getBestCmap())
     top = game["CFF "].cff.topDictIndex[0]
     chars = top.CharStrings
     order = list(game.getGlyphOrder())
+    hmtx = game["hmtx"]
 
     def bounds(glyphset, name):
         p = BoundsPen(glyphset)
@@ -180,68 +201,103 @@ def face_font(otf, face):
         chars.charStrings[name] = len(chars.charStringsIndex) - 1
         top.charset.append(name)
         order.append(name)
-        game["hmtx"].metrics[name] = (width, 0)
+        hmtx.metrics[name] = (width, 0)
+        return name
 
-    if face == "switch":
-        icon = {p: cmap[SWITCH_ICON[p]] for p in PADS}
-        for i, p in enumerate(PADS):
-            src = chars[icon[p]]
-            src.decompile()
-            add(f"pad_{p}", src, game["hmtx"][icon[p]][0])
-    else:
-        f = FACES[face]
-        prefix, names = f["prefix"], f["icons"]
-        kenney = TTFont(os.path.join(KENNEY, f["font"]))
-        kset = kenney.getGlyphSet()
+    def copy(name, target):
+        src = chars[target]
+        src.decompile()
+        return add(name, src, hmtx[target][0])
 
-        def kname(s):
-            return s[1:] if s.startswith("/") else prefix + s
+    assert BIND_BASE + len(LIVE_FACES) * len(SWITCH) * len(PADS) <= PAD_BASE
+    assert FACE_BASE + FACE_CODES * len(LIVE_FACES) <= 0x10000 and len(PADS) <= STATIC_AT and STATIC_AT + len(STATIC) <= FACE_CODES
+    placed, pads, statics = {}, {}, {}
+    for n, face in enumerate(LIVE_FACES):
+        base = FACE_BASE + FACE_CODES * n
+        if face == "switch":   # (the game's own icons, a glyph of their own each as the other faces' are)
+            pads[face] = [copy(f"pad_{face}_{p}", cmap[SWITCH_ICON[p]]) for p in PADS]
+            statics[face] = {c: cmap[c] for c in STATIC if c in cmap}
+        else:
+            f = FACES[face]
+            prefix, names = f["prefix"], f["icons"]
+            kenney = TTFont(os.path.join(KENNEY, f["font"]))
+            kset = kenney.getGlyphSet()
 
-        def draw(target, kn):
-            """the Kenney glyph scaled into the box of the game's glyph `target` (as a square around its centre); a wide one (the
-            Menu and View pills on the square Plus and Minus) as high as the box, up to WIDE times as wide, the glyph widened"""
-            gb, kb = bounds(gset, target), bounds(kset, kn)
-            side = max(gb[2] - gb[0], gb[3] - gb[1])
-            s = min(side * WIDE / (kb[2] - kb[0]), side / (kb[3] - kb[1]))
-            over = max(0, s * (kb[2] - kb[0]) - side)
-            dx = (gb[0] + gb[2] + over) / 2 - s * (kb[0] + kb[2]) / 2
-            dy = (gb[1] + gb[3]) / 2 - s * (kb[1] + kb[3]) / 2
-            width = game["hmtx"][target][0] + round(over)
-            pen = T2CharStringPen(width, gset)
-            kset[kn].draw(TransformPen(pen, (s, 0, 0, s, dx, dy)))
-            cs = chars[target]
-            return pen.getCharString(private=cs.private, globalSubrs=cs.globalSubrs), width
+            def kname(s):
+                return s[1:] if s.startswith("/") else prefix + s
 
-        for p in PADS:
-            kn = kname(names[p]) if p in names else None
-            if kn not in kset:   # (no such button on this face, the PlayStation's PS button: the game's own icon)
-                kn = None
-            target = cmap[SWITCH_ICON[p]]
-            if kn:
-                add(f"pad_{p}", *draw(target, kn))
-            else:
-                src = chars[target]
-                src.decompile()
-                add(f"pad_{p}", src, game["hmtx"][target][0])
-        for c, s in STATIC.items():
-            kn = prefix + s
-            if c in cmap and kn in kset:
-                cs, _ = draw(cmap[c], kn)
-                chars[cmap[c]] = cs
+            def draw(target, kn):
+                """the Kenney glyph scaled into the box of the game's glyph `target` (as a square around its centre); a wide one
+                (the Menu and View pills on the square Plus and Minus) as high as the box, up to WIDE times as wide, the glyph
+                widened"""
+                gb, kb = bounds(gset, target), bounds(kset, kn)
+                side = max(gb[2] - gb[0], gb[3] - gb[1])
+                s = min(side * WIDE / (kb[2] - kb[0]), side / (kb[3] - kb[1]))
+                over = max(0, s * (kb[2] - kb[0]) - side)
+                dx = (gb[0] + gb[2] + over) / 2 - s * (kb[0] + kb[2]) / 2
+                dy = (gb[1] + gb[3]) / 2 - s * (kb[1] + kb[3]) / 2
+                width = hmtx[target][0] + round(over)
+                pen = T2CharStringPen(width, gset)
+                kset[kn].draw(TransformPen(pen, (s, 0, 0, s, dx, dy)))
+                cs = chars[target]
+                return pen.getCharString(private=cs.private, globalSubrs=cs.globalSubrs), width
 
+            pads[face] = []
+            for p in PADS:
+                kn = kname(names[p]) if p in names else None
+                target = cmap[SWITCH_ICON[p]]
+                # (no such button on this face, the PlayStation's PS button: the game's own icon)
+                pads[face].append(add(f"pad_{face}_{p}", *draw(target, kn)) if kn in kset else
+                                  copy(f"pad_{face}_{p}", target))
+            statics[face] = {}
+            for c, s in STATIC.items():
+                kn = prefix + s
+                if c in cmap:
+                    statics[face][c] = add(f"static_{face}_{c:04x}", *draw(cmap[c], kn)) if kn in kset else cmap[c]
+        for i in range(len(PADS)):
+            placed[base + i] = pads[face][i]
+        for k, c in enumerate(STATIC):
+            if c in statics[face]:
+                placed[base + STATIC_AT + k] = statics[face][c]
+        for b in range(len(SWITCH)):
+            for i in range(len(PADS)):
+                placed[BIND_BASE + (n * len(SWITCH) + b) * len(PADS) + i] = pads[face][i]
+    taken = sorted(c for c in placed if c in cmap)
+    if taken:
+        raise SystemExit("prompts: the game's font already has code points %s: no room for the faces' icons" %
+                         ", ".join("U+%04X" % c for c in taken[:4]))
     game.setGlyphOrder(order)
-    gid = {n: i for i, n in enumerate(order)}
-    mapping = {c: gid[n] for c, n in cmap.items() if c <= 0xFFFF}
-    for i, p in enumerate(PADS):
-        mapping[PAD_BASE + i] = gid[f"pad_{p}"]
+    out = io.BytesIO()
+    game.save(out)
+    _FACES_CACHE[key] = got = (out.getvalue(), placed, pads, statics)
+    return got
+
+
+def face_font(otf, face):
+    """the game's font (decrypted) with every controller face's icons (faces_font) and this face's on the codes the game and the
+    overlay read: a pad icon per input at PAD_BASE + its number, the Switch buttons' code points on the default controls' icons,
+    the d-pad's (STATIC) on the face's. (the font, the glyph of each pad input's icon: write_hint's names)"""
+    from fontTools.ttLib import TTFont
+    from fontTools.ttLib.tables.DefaultTable import DefaultTable
+
+    plain, placed, pads, statics = faces_font(otf)
+    game = TTFont(io.BytesIO(plain))
+    gid = {n: i for i, n in enumerate(game.getGlyphOrder())}
+    mapping = {c: gid[n] for c, n in TTFont(io.BytesIO(otf)).getBestCmap().items() if c <= 0xFFFF}
+    mapping.update({c: gid[n] for c, n in placed.items()})
+    own = pads[face]
+    for i in range(len(PADS)):
+        mapping[PAD_BASE + i] = gid[own[i]]
     for c, p in zip(SWITCH, DEFAULT):
-        mapping[c] = gid[f"pad_{p}"]
+        mapping[c] = gid[own[PADS.index(p)]]
+    for c, n in statics[face].items():
+        mapping[c] = gid[n]
     t = DefaultTable("cmap")
-    t.data = cmap4(mapping, set(SWITCH))
+    t.data = cmap4(mapping, set(SWITCH) | set(STATIC))   # (each a segment of its own: host/prompts.c points them anew)
     game["cmap"] = t
     out = io.BytesIO()
     game.save(out)
-    return out.getvalue()
+    return out.getvalue(), own
 
 
 # ---- the textures with button icons (UI/Layout2Archive/Common.*.bntx: 878 textures, ASTC 4x4 and BC4, the Switch 2's block-linear
@@ -576,8 +632,8 @@ def guide_widened(stays):
 
 def guide_route(size, bar, row, where, pad, stays, frame=None):
     """the way (points, the lines' pixels) of a line from a bar's row to the pad input's part, round the picture's other parts and
-    with the fewest bends, crossing the lines that stay (L) as little as it can: it comes to a stick's centre, to a part just off
-    its edge (above it best), or to a frame's corner (frame: centre, corners' distance)"""
+    with the fewest bends, crossing the lines that stay (L) as little as it can: it comes to a stick's centre, to a part's edge
+    (from above best), or to a frame's corner (frame: centre, corners' distance)"""
     import heapq
     import math
     import numpy as np
@@ -631,9 +687,10 @@ def guide_route(size, bar, row, where, pad, stays, frame=None):
     elif pad in ("lstick", "rstick"):
         for d in range(4):
             goal(x, y, d, 0)
-    else:
-        for (ex, ey), d, extra in (((x, y - r - 13), 2, 0), ((x, y + r + 13), 3, GUIDE_SIDE), ((x - r - 13, y), 0, GUIDE_SIDE),
-                                   ((x + r + 13, y), 1, GUIDE_SIDE)):
+    else:   # (on its edge, as the game's own lines end: 2 pixels into it)
+        e = max(r - 2, 0)
+        for (ex, ey), d, extra in (((x, y - e), 2, 0), ((x, y + e), 3, GUIDE_SIDE), ((x - e, y), 0, GUIDE_SIDE),
+                                   ((x + e, y), 1, GUIDE_SIDE)):
             if r or d >= 2:
                 goal(ex, ey, d, extra)
     start = (0, 0, 0 if bar == 0 else 1)
@@ -700,9 +757,10 @@ def guide_draw(size, way, dot):
 def guide_line(size, bar, row, where, pad, stays):
     """a leader line (L, size) from a bar's row to the pad input's part (where: the picture's parts), ending on a dot"""
     way = guide_route(size, bar, row, where, pad, stays)
-    if not way:   # (no way round: straight along the row, then up or down)
+    if not way:   # (no way round: straight along the row, then up or down to the part's edge, as guide_route ends)
         x, y, r = guide_at(where[pad])
-        y += 0 if pad in ("lstick", "rstick") else -(r + 13) if row < y else r + 13
+        e = 0 if pad in ("lstick", "rstick") else max(r - 2, 0)
+        y += -e if row < y else e
         way = [(BARS[0] if bar == 0 else BARS[1], row + 3), (x, row + 3), (x, y)]
     return guide_draw(size, way, True)
 
@@ -726,10 +784,33 @@ def guide_frame(size, bar, row, where, group, stays):
     return ImageChops.lighter(im, guide_draw(size, way, False))
 
 
+def game_line(im, bar, row):
+    """where the game's line from bar (0 left, 1 right) at row is drawn in im (L, a guide texture): the shape it makes between
+    the bars, as it is (the router's route to the same part runs elsewhere: taking that out left pieces of the game's line), a
+    little wider for its soft edge. The whole shape the line's pixels touch: a game line touching another between the bars
+    would be taken with it (the game's do not touch). None found near the label: an empty mask, said on stderr"""
+    from PIL import Image, ImageDraw, ImageFilter
+    x0, x1 = BARS[0] + 3, BARS[1] - 3   # (off the bars: they join the lines of one side)
+    lit = im.point(lambda v: 255 if v > 24 else 0)
+    inner = Image.new("L", im.size, 0)
+    inner.paste(lit.crop((x0, 0, x1, im.height)), (x0, 0))
+    x = x0 + 2 if bar == 0 else x1 - 3
+    y = min((y for y in range(row - 12, row + 13) if 0 <= y < im.height and inner.getpixel((x, y))), key=lambda y: abs(y - row),
+            default=None)
+    out = Image.new("L", im.size, 0)
+    if y is None:
+        print(f"prompts: no game line from bar {bar} at row {row}: nothing taken out there", file=sys.stderr)
+        return out
+    ImageDraw.floodfill(inner, (x, y), 128)
+    out.paste(inner.point(lambda v: 255 if v == 128 else 0).filter(ImageFilter.MaxFilter(7)).crop((BARS[0] + 1, 0, BARS[1], im.height)),
+              (BARS[0] + 1, 0))
+    return out
+
+
 def guide_layers(game, face):
     """the page's leader lines for this face's picture, from the game's (L images, GUIDES): each texture's lines that stay (the
     Switch face: the game's), and {texture: [(Switch button, {pad input: its line})]}"""
-    from PIL import Image, ImageChops, ImageFilter
+    from PIL import Image, ImageChops
     where, size = parts(face), game[0].size
     keep = []   # (the game's bars, or on the Switch face all the game's but the lines that move)
     for im in game:
@@ -756,9 +837,7 @@ def guide_layers(game, face):
                                           guide_line(size, bar, row, where, pad, stays)) for pad in PADS if pad in where}
         if face == "switch":   # (the game's own line where the pad input's is hookshot's default's: taken out of what stays)
             own = lines[DEFAULT[SW[end]]]
-            around = Image.new("L", size, 0)
-            grown = own.filter(ImageFilter.MaxFilter(25 if DEFAULT[SW[end]] in sum(GUIDE_GROUPS, ()) else 15))
-            around.paste(grown.crop((BARS[0] + 1, 0, BARS[1], size[1])), (BARS[0] + 1, 0))
+            around = game_line(game[tx], bar, row)
             game_own = ImageChops.multiply(game[tx], around)
             for pad, im in lines.items():
                 if im is own:
@@ -789,23 +868,29 @@ def guide_layers_of(b, tex, face):
 
 
 def picture_layers(b, tex, im):
-    """the layers putting a face's controller picture (1160x680 RGBA, drawn like Controller_Pro) in place of the Pro Controller:
-    the picture, the page's tinted copy (each channel a line of the grey level, fitted on the game's pair) and the shadow (the
-    outline's left part squeezed into ControllerSh_Pro1 and blurred, fitted on the game's)"""
+    """the layers putting a face's controller picture (1160x680 RGBA, drawn in grey like Controller_Pro) in place of the Pro
+    Controller: the picture, the page's tinted copy (each grey the colour the game's own pair gives it) and the shadow (the
+    outline's left part squeezed into ControllerSh_Pro1 and blurred, fitted on the game's). ((Triforce) 11-24) The game's tint
+    is no straight line of the grey: its black outlines turn a brown lighter than the #333333 body, which turns almost black,
+    so a line fitted through the pair crushed a hand-drawn picture's outlines, lit its body and dimmed its buttons"""
     import numpy as np
     from PIL import Image, ImageFilter
     plain, tinted = (np.asarray(decode(b, tex[n]).convert("RGBA")).astype(float) for n in (PICTURES[0], PICTURE_TINT))
-    solid = plain[..., 3] > 250
-    grey = plain[solid][:, :3].sum(1)
-    lines = [np.polyfit(grey, tinted[solid][:, c], 1) for c in range(3)]
+    solid = (plain[..., 3] > 250) & (tinted[..., 3] > 250)
+    grey, colour = np.rint(plain[solid][:, :3].mean(1)).astype(int), tinted[solid][:, :3]
+    levels, counts = np.unique(grey, return_counts=True)
+    levels = levels[counts >= 20]   # (the greys the game drew enough of: not a few blended edge pixels)
+    if not len(levels):
+        raise SystemExit(f"prompts: no grey of the game's {PICTURES[0]} has its colour in {PICTURE_TINT}: not the pair known")
+    table = np.array([np.median(colour[grey == v], 0) for v in levels])
     px = np.asarray(im).astype(float)
-    level = px[..., :3].sum(2)
-    tint = np.dstack([np.clip(np.polyval(lines[c], level), 0, 255) for c in range(3)] + [px[..., 3]])
+    level = px[..., :3].mean(2)
+    tint = np.dstack([np.interp(level, levels, table[:, c]) for c in range(3)] + [px[..., 3]])
     sh = tex[PICTURE_SHADOW]
     shadow = im.getchannel("A").crop((40, 0, 480, 680)).resize((sh[2], sh[3])).filter(ImageFilter.GaussianBlur(24))
     shadow = shadow.point(lambda v: round(v * 0.7))
     return [Layer(PICTURES[0] + ".png", PICTURES[0], 0xFF, 0, im),
-            Layer(PICTURE_TINT + ".png", PICTURE_TINT, 0xFF, 0, Image.fromarray(tint.astype("uint8"))),
+            Layer(PICTURE_TINT + ".png", PICTURE_TINT, 0xFF, 0, Image.fromarray(np.rint(tint).astype("uint8"))),
             Layer(PICTURE_SHADOW + ".png", PICTURE_SHADOW, 0xFF, 0, shadow)]
 
 
@@ -1465,6 +1550,98 @@ def size_entry(table, path):
     return None
 
 
+# ---- (Triforce) the game's texts that name the console, in the PC's words. One does: the hint for playing the ocarina by
+# microphone ("Ocarina Audio Input") says to use the console's built-in one; on a PC the game listens to the microphone the
+# Insert menu's Microphone row chooses. It is reworded in the same messages archive as the title's entry (title_messages
+# writes the one file a language), in the string's own room: the string's bytes from start to end become the replacement,
+# the rest (the other sentences, the tags, the reading aids over the kanji) stays the game's, and what is left of its room is
+# filled with NULs, so no offset moves and the archive keeps its size. A wording is known by its fingerprint (no game text in
+# this file); a string that is not one of them (another version, a mod's text) is left as it is and said
+# [(msbt, label, {a wording's fingerprint: (start, end, replacement)})]
+PC_TEXTS = [
+    # the "Ocarina Audio Input" hint: the console's built-in microphone -> your microphone (the languages that have that wording)
+    ("LayoutMsg/ActionGuide_00.msbt", "Pa_ActionGuide_01-T_Description_00", {
+        "b816b30394a86b8a": (4, 38, "your microphone"),       # USen, EUen
+        "9925b429328b1fd2": (21, 69, "votre microphone\n"),   # USfr, EUfr
+        "e4bd22fcea2f8529": (16, 60, "un micrófono"),         # USes, EUes
+        "0dd1fb25d15aec84": (4, 46, "o seu microfone"),       # USpt
+        "3179003a18de9124": (9, 64, "dein Mikrofon"),         # EUde
+        "7fa2434137fc436c": (11, 54, "il tuo microfono"),     # EUit
+        "7f5339bb84e3bb77": (8, 56, "je microfoon"),          # EUnl
+        "21bce07f220b2409": (8, 57, "mikrofonowi"),           # EUpl
+        "54935b14b603297c": (0, 55, "Микрофон"),              # EUru
+        "ed6bdf6d1550bdad": (0, 50, ""),                      # JPja: "the console's" goes, the microphone stays
+        "01467ba53d125ec9": (0, 28, ""),                      # KRko: the same
+        "cd07456de7b137ad": (6, 32, ""),                      # CNzh: the same
+        "c52f433f130e10eb": (6, 32, ""),                      # TWzh: the same
+    }),
+]
+
+
+def text_fingerprint(text):
+    """a wording's name in PC_TEXTS: of the string's whole room, its terminator too"""
+    import hashlib
+    return hashlib.sha1(bytes(text)).hexdigest()[:16]
+
+
+def msbt_rooms(m):
+    """an MSBT's strings by label: {label: (start, end)}, each string's room in m (its bytes, tags and terminator, up to the
+    next string's start); None when it is not a UTF-8 MSBT with labels and texts"""
+    if len(m) < 0x20 or m[:8] != b"MsgStdBn" or m[8:10] != b"\xff\xfe" or m[12] != 0:   # (little-endian, UTF-8)
+        return None
+    at, sections = 0x20, {}
+    while at + 16 <= len(m):
+        size = struct.unpack_from("<I", m, at + 4)[0]
+        sections[bytes(m[at:at + 4])] = (at + 16, size)
+        at = (at + 16 + size + 15) & ~15
+    if b"LBL1" not in sections or b"TXT2" not in sections:
+        return None
+    lbl, _ = sections[b"LBL1"]
+    txt, txt_size = sections[b"TXT2"]
+    count = struct.unpack_from("<I", m, txt)[0]
+    starts = list(struct.unpack_from("<%dI" % count, m, txt + 4)) + [txt_size]
+    out = {}
+    for slot in range(struct.unpack_from("<I", m, lbl)[0]):
+        n, at = struct.unpack_from("<II", m, lbl + 4 + 8 * slot)
+        at += lbl
+        for _ in range(n):
+            length = m[at]
+            index = struct.unpack_from("<I", m, at + 1 + length)[0]
+            if index < count:
+                out[bytes(m[at + 1:at + 1 + length]).decode("utf-8")] = (txt + starts[index], txt + starts[index + 1])
+            at += 5 + length
+    return out
+
+
+def pc_texts(sarc, strings=None):
+    """a language's messages (Mals/*.sarc, decompressed) with PC_TEXTS' edits made: (the new bytes, the same length; the
+    labels reworded; the labels left as they are, each with why)"""
+    out, done, left = bytearray(sarc), [], []
+    for msbt, label, edits in PC_TEXTS if strings is None else strings:
+        at = sarc_member(out, msbt)
+        if not at:
+            left.append((label, "no %s" % msbt))
+            continue
+        base, end = at
+        rooms = msbt_rooms(out[base:end])
+        if rooms is None or label not in rooms:
+            left.append((label, "no such string"))
+            continue
+        a, b = (base + x for x in rooms[label])
+        text = bytes(out[a:b])
+        if text_fingerprint(text) not in edits:
+            left.append((label, "its text is not one this was written for"))
+            continue
+        start, stop, new = edits[text_fingerprint(text)]
+        new = new.encode("utf-8")
+        if not 0 <= start <= stop < len(text) or len(new) > stop - start:
+            raise ValueError("%s: the replacement does not fit what it replaces" % label)
+        text = text[:start] + new + text[stop:]
+        out[a:b] = text + b"\0" * (b - a - len(text))   # (in its own room: nothing after it moves)
+        done.append(label)
+    return bytes(out), done, left
+
+
 def title_messages(romfs, dictionary, out, text=TITLE_TEXT):
     """writes <out>/mals/<language>.product.110.sarc.zs for each language whose messages are the ones known and whose
     rewritten archive is no larger than the game's file (and within its entry in the size table, where it has one); the
@@ -1474,7 +1651,7 @@ def title_messages(romfs, dictionary, out, text=TITLE_TEXT):
     the game has it (the build says so) rather than raising the entry"""
     import zstandard
     _, table = read_size_table(romfs, dictionary)
-    done = []
+    done, worded_in = [], []
     for name in sorted(os.listdir(os.path.join(romfs, MALS))):
         if not name.endswith(".sarc.zs"):
             continue
@@ -1482,17 +1659,27 @@ def title_messages(romfs, dictionary, out, text=TITLE_TEXT):
         new = title_sarc(game, text)
         if not new:
             print(f"prompts: {MALS}/{name}: the title keeps its text (its messages are not the ones known)", file=sys.stderr)
-            continue
         entry = size_entry(table, f"{MALS}/{name[:-3]}")
         fits = len(game) if entry is None else min(len(game), entry)   # (the entry's allowance over the file kept)
-        if len(new) > fits:
+        if new and len(new) > fits:
             print(f"prompts: {MALS}/{name}: the title keeps its text ({len(new)} bytes; the game's file is {len(game)}, "
                   f"its size table entry {entry}: a shorter TITLE_TEXT fits)", file=sys.stderr)
+            new = None
+        # ((Triforce) the texts that name the console, in the PC's words, in the same file: they keep its size)
+        worded, said, left = pc_texts(new or game)
+        for label, why in left:
+            print(f"prompts: {MALS}/{name}: {label} left as it is ({why})", file=sys.stderr)
+        if not new and not said:
             continue
         os.makedirs(os.path.join(out, "mals"), exist_ok=True)
         with open(os.path.join(out, "mals", name.lower()), "wb") as f:
-            f.write(zstandard.ZstdCompressor(level=3).compress(new))
-        done.append(name.split(".")[0])
+            f.write(zstandard.ZstdCompressor(level=3).compress(worded))
+        if new:
+            done.append(name.split(".")[0])
+        if said:
+            worded_in.append(name.split(".")[0])
+    if worded_in:
+        print("prompts: the ocarina's microphone hint says your microphone in " + " ".join(worded_in), file=sys.stderr)
     return done
 
 
@@ -1515,8 +1702,8 @@ def main():
             import PIL  # noqa: F401
             import texture2ddecoder  # noqa: F401
             textures = read_zs(a.romfs, TEXTURES, dictionary)
-        except ImportError:
-            print("prompts: the textures keep the Switch's icons (no astc_encoder, Pillow or texture2ddecoder)", file=sys.stderr)
+        except ImportError as e:   # (the module that is missing: a package's own dependency too, astc_encoder's archspec)
+            print(f"prompts: the textures keep the Switch's icons (no {e.name or e})", file=sys.stderr)
     if textures:
         os.makedirs(a.out, exist_ok=True)
         with open(os.path.join(a.out, "Common.bntx"), "wb") as f:
@@ -1543,7 +1730,7 @@ def main():
             prompt_keys.write_binds(os.path.join(d, "keys.bin"), binds)
             names = prompt_keys.hint_names()
         else:
-            plain = face_font(otf, face)
+            plain, names = face_font(otf, face)
         font = wrap(key, plain)
         if hint:
             write_hint(os.path.join(d, "hint.bin"), plain, hint, names)

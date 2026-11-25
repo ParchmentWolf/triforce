@@ -192,6 +192,13 @@ bool memory_mirror_bind_wait(VkSemaphoreSubmitInfo*) { return false; }
 // checked by tests/test_barrier_rules.py): texture_begin_recording has none of its own to reset)
 bool is_bc(VkFormat) { return false; }
 bool is_astc(VkFormat) { return false; }
+struct {
+    VkDevice device = VK_NULL_HANDLE;
+    VkQueue queue = VK_NULL_HANDLE;
+    uint32_t queue_family = 0;
+    std::mutex present_mu;
+} dev;
+#include "init_pieces.inc"   // ((Triforce) an upload command buffer that goes on in pieces: upload_piece_next)
 #include "init_upload.inc"
 #include "init_hooks.inc"
 
@@ -299,6 +306,23 @@ void texture_look() {
     early.done();
     look.upload_value = rec_value, look.upload_seg = up_seg, look.uploaded = true;
 }
+/// ((Triforce) upload_piece_next) A long ASTC upload, cut twice: its first part where an upload goes (this thread's uploads, or
+/// the earliest open segment's init command buffer: UploadRedirect), the rest in two pieces of that command buffer, a write of
+/// the texture in each; what is recorded after it goes on in the last piece
+void texture_long() {
+    std::lock_guard lk(par_lock);
+    if (textures.empty()) create(kTex);
+    UploadRedirect early(upload_earliest::wanted(upload_earliest_on(), false, false) && tl_seg_index >= 0);
+    VkCommandBuffer c = upload_cmd();
+    record(c, 'W', kTex);
+    for (int k = 0; k < 2; k++) {
+        const VkCommandBuffer next = upload_piece_next(c);
+        CHECK(next != c && upload_cmd() == next);
+        c = next;
+        record(c, 'W', kTex);
+    }
+    early.done();
+}
 bool tex2_made = false;
 void texture2_use() {   // (another new texture, made by whichever worker gets there first and copied into in its uploads)
     std::lock_guard lk(par_lock);
@@ -338,6 +362,7 @@ int64_t record_segment(VkCommandBuffer& cmd, const Segment& g) {   // (vk_replay
         if (a == 't') texture_use(), record(cmd, 'U', kTex);
         if (a == 'u') texture_look(), record(cmd, 'R', kTex);
         if (a == 'n') texture2_use(), record(cmd, 'U', kTex2);
+        if (a == 'P') texture_long(), record(cmd, 'R', kTex);   // ((Triforce) an upload in pieces, then a draw that samples it)
         if (a == 'r') std::this_thread::sleep_for(std::chrono::microseconds(std::rand() % 3000));
         if (a == 's' || a == 'S') scratch_use(a == 'S');
         if (a == 'x' || a == 'z' || a == 'w') latch[(int)a].wait();
@@ -365,11 +390,9 @@ void draw_flush_recording(int slot) { CHECK(slot >= 0 && slot < 8); published_sl
 void queue_flush_locked() {}
 void checkpoints_report() {}
 [[noreturn]] void device_lost() { std::_Exit(3); }   // (vk_replay.cpp: the report, then the process ends)
-struct {
-    VkDevice device = VK_NULL_HANDLE;
-    VkQueue queue = VK_NULL_HANDLE;
-    std::mutex present_mu;
-} dev;
+VkResult submit_again(VkResult first, const VkSubmitInfo2&, VkFence) { return first; }   // (submit_retry.h: no refusal here)
+void host_read_barrier(VkCommandBuffer) {}   // (a recording's last command, for the host's reads: nothing to order here)
+#include "init_alone.inc"   // ((Triforce) submit_alone_locked, pieces_alone: an upload command buffer and its pieces, each alone)
 std::atomic<int64_t> par_lock_wait_ns{0}, par_locks{0};
 std::atomic<bool> par_active{false};
 std::vector<int> run_order;   // (the order the workers run in, one after another; empty: all at once)
@@ -429,6 +452,10 @@ void occ_seal(Recording&, uint64_t) {}
 Recording recordings[8];
 int recording_count = 0;
 uint64_t rec_cur_value = 1;
+bool seg_setup_par_on() { return false; }   // (RX_VK_SEG_SETUP_PAR: off, the default)
+void segment_begin_here(Recording&) {}      // (its job's part of that: nothing with it off)
+Recording& begin_segment_recording(uint64_t value);
+Recording& begin_segment_slot(uint64_t value) { return begin_segment_recording(value); }   // (never called with it off)
 Recording& begin_segment_recording(uint64_t value) {
     const int k = recording_count++;
     published_slots.erase(k);
@@ -629,7 +656,100 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
             std::_Exit(1);
         }).detach();
-    if (c == "later_makes") {   // (segment 1's worker makes the texture, then segment 0's uploads it again and draws with it)
+    if (c == "upload_pieces") {   // ((Triforce) an upload command buffer that went on in pieces: each a submission of its own,
+                                  // in order, right after the command buffer it followed and before its segment's commands
+        // (the queue from `from`: `base`, then `want` pieces, then `then`, nothing between them)
+        const auto follows = [&](const char* name, size_t from, const char* base, int want, const char* then) {
+            size_t i = from;
+            while (i < queue.size() && queue[i]->name != base) i++;
+            int got = 0;
+            while (i + 1 + got < queue.size() && queue[i + 1 + got]->name.rfind("pool_", 0) == 0) got++;
+            const bool ok = i < queue.size() && got == want && i + 1 + got < queue.size() && queue[i + 1 + got]->name == then;
+            if (!ok) std::printf("  FAIL: %s: want %s, %d pieces, %s in the queue%s\n", name, base, want, then, queue_text().c_str()), failures++;
+            for (size_t k = i + 1; ok && k <= i + got; k++)
+                if (queue[k]->ops.empty() || queue[k]->ops[0].kind != 'F')
+                    std::printf("  FAIL: %s: piece %s does not begin with a full barrier\n", name, queue[k]->name.c_str()), failures++;
+        };
+        const auto run = [&](const char* name, const std::vector<std::string>& scripts, const std::vector<int>& order) {
+            std::vector<Segment> seg;
+            for (const auto& s : scripts) seg.push_back({s});
+            const size_t from = queue.size();
+            submit_segments(seg, order);
+            play(name);
+            const int n = play_content(name, from);
+            if (n != 3) std::printf("  FAIL: %s: %d writes of the texture in the queue, want 3\n", name, n), failures++;
+            return from;
+        };
+        // the earliest segment's own uploads; its segment end's barrier and what it uploads after go into the last piece
+        size_t from = run("upload_pieces (its own uploads)", {"Pn", "-"}, {0, 1});
+        follows("upload_pieces (its own uploads)", from, "upload_0", 2, "cmd_0");
+        if (named("upload_0") && ops_text(named("upload_0")).find("t2") != std::string::npos)
+            std::printf("  FAIL: an upload made after the cut went into the first command buffer, ahead of the pieces\n"), failures++;
+        reset_run();
+        // a later segment's worker first: into segment 0's init command buffer, whose end's barrier goes into its last piece
+        from = run("upload_pieces (an earlier segment's init)", {"t", "P"}, {1, 0});
+        follows("upload_pieces (an earlier segment's init)", from, "init_0", 2, "upload_0");
+        reset_run();
+        // segment 2's into init_0, then segment 0 makes another texture (into its last piece) and segment 1 uses the first
+        from = run("upload_pieces (init, then its own)", {"n", "t", "P"}, {2, 0, 1});
+        follows("upload_pieces (init, then its own)", from, "init_0", 2, "upload_0");
+        reset_run();
+        std::srand(11);
+        const char* pick[] = {"-", "P", "rP", "Pr", "r", "t", "n"};
+        int runs = 3;
+        for (int i = 0; i < 60 && !failures; i++, runs++) {   // (at once, the workers' timing mixed: one long upload a run)
+            reset_run();
+            std::vector<std::string> scripts;
+            const int who = std::rand() % 4;
+            for (int k = 0; k < 4; k++) scripts.push_back(k == who ? pick[1 + std::rand() % 3] : pick[std::rand() % 7 > 3 ? 4 + std::rand() % 3 : 0]);
+            std::vector<Segment> seg;
+            for (const auto& s : scripts) seg.push_back({s});
+            const size_t q0 = queue.size();
+            submit_segments(seg, {});
+            int pieces = 0;
+            for (size_t q = q0; q < queue.size(); q++) pieces += queue[q]->name.rfind("pool_", 0) == 0;
+            for (auto* cb : all_cbs)
+                if (!cb->ops.empty() && !cb->submitted && cb->ops.size() > (size_t)std::count_if(cb->ops.begin(), cb->ops.end(), [](const Op& o) {
+                        return o.kind == 'F' || o.kind == 'G'; }))
+                    std::printf("  FAIL: upload_pieces (at once): %s has commands and was never submitted\n", cb->name.c_str()), failures++;
+            if (pieces != 2 || play_content("upload_pieces (at once)", q0) != 3)
+                std::printf("  FAIL: upload_pieces (at once): %d pieces in the queue%s\n", pieces, queue_text().c_str()), failures++;
+        }
+        // upload_astc_gpu's count (AstcChunk): Kokiri Forest's terrain array, 1365 x 1365 x 90, a layer a dispatch at its first
+        // level: 16 million texels a command buffer (the default) are 8 layers, so 90 layers go on in 11 pieces, and the count
+        // is the command buffer's, carried from one upload to the next (2 layers in the last piece, then 6 more before a 12th)
+        reset_run();
+        {
+            VkCommandBuffer up = make_cb("longupload", 0);
+            vkBeginCommandBuffer(up, nullptr);
+            texture_begin_recording(up, rec_cur_value);
+            int cuts = 0;
+            {
+                AstcChunk chunk(upload_cmd());
+                VkCommandBuffer at = chunk.at;
+                for (int layer = 0; layer < 90; layer++) {
+                    const VkCommandBuffer now = chunk.before(1365ull * 1365);
+                    cuts += now != at, at = now;
+                    record(now, 'W', kTex2);
+                }
+                CHECK(chunk.per == 16000000ull && cuts == 11 && chunk.n == 2 * 1365ull * 1365);
+            }
+            {
+                AstcChunk chunk(upload_cmd());
+                CHECK(chunk.n == 2 * 1365ull * 1365);   // (as the upload before left it)
+                VkCommandBuffer at = chunk.at;
+                for (int layer = 0; layer < 7; layer++) cuts += chunk.before(1365ull * 1365) != at, at = chunk.at;
+                CHECK(cuts == 12 && chunk.before(1) == at && chunk.n == 1365ull * 1365 + 65536);   // (a small dispatch counts 64 K)
+            }
+            std::vector<UploadPiece> taken;
+            CHECK(texture_upload_last(up) != up && texture_upload_pieces(up, taken) == 12 && texture_upload_last(up) == up);
+            for (const UploadPiece& p : taken) CHECK(p.ended && p.cmd->ended && !p.cmd->submitted);
+            CHECK(!up->ended);   // (the first command buffer is its recording's to end)
+            texture_upload_pieces_free(taken);
+            CHECK(taken.empty() && texture_upload_pieces(up, taken) == 0);
+        }
+        std::printf("%s: %d runs, every piece sent alone after its command buffer and before the commands\n", c.c_str(), runs);
+    } else if (c == "later_makes") {   // (segment 1's worker makes the texture, then segment 0's uploads it again and draws with it)
         submit_segments({{"t"}, {"t"}}, {1, 0});
         play(c.c_str());
     } else if (c == "three") {   // (segment 0 is done; 2 makes it while 1 still records, and 1 uses it)

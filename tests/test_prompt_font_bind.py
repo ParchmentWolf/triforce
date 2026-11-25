@@ -71,11 +71,14 @@ def main():
         "    return -1;",
         "}",
         re.search(r"static const uint16_t switch_code\[HOS_SW_N\] = \{[^}]*\};", src).group(0),
+        src[src.index("#define LIVE_FACES"):src.index("static int game_dir(")],
         re.search(r"static unsigned rd16\(.*", src).group(0),
         re.search(r"static uint32_t rd32\(.*", src).group(0),
         re.search(r"static void wr16\(.*", src).group(0),
         block(src, "static unsigned cmap4_glyph("),
         block(src, "static int bound_input("),
+        block(src, "static int cmap4_point("),
+        block(src, "static int text_code("),
         block(src, "static int cmap4_bind("),
         block(src, "static int bind_font("),
         # (a controller's face: the keyboard and mouse face's keys are tests/test_prompt_keys.py's)
@@ -85,6 +88,12 @@ def main():
         "    const size_t n = fread(st, 1, sizeof st, f);",
         "    fclose(f);",
         "    if (argc > 2 && !strcmp(argv[2], \"font\")) { printf(\"%d\\n\", bind_font(st, n, HOS_PROMPT_XBOX)); return 0; }",
+        "    if (argc > 2 && !strcmp(argv[2], \"text\")) {   /* ((Triforce) text_code on these controls, the PS5 face) */",
+        "        int bind[HOS_SW_N];",
+        "        for (int b = 0; b < HOS_SW_N; b++) bind[b] = hos_binding(HOS_BIND_PAD, b, 0);",
+        "        for (int i = 3; i < argc; i++) printf(\"%d\\n\", text_code((unsigned)strtoul(argv[i], NULL, 0), HOS_PROMPT_PS5, bind));",
+        "        return 0;",
+        "    }",
         "    printf(\"%d\\n\", cmap4_bind(st, n, HOS_PROMPT_XBOX));",
         "    for (int i = 2; i < argc; i++) printf(\"%u\\n\", cmap4_glyph(st, n, (unsigned)strtoul(argv[i], NULL, 0)));",
         "    return 0;",
@@ -104,6 +113,11 @@ def main():
         wrapped = subprocess.run([str(exe), str(font), "font"], capture_output=True, text=True)
         check(wrapped.returncode == 0 and wrapped.stdout.split() == ["0"],
               "a cmap subtable offset that wraps: exit %d, %r" % (wrapped.returncode, wrapped.stdout))
+        faces_out = faces_cmap(exe, Path(tmp))
+        text_out = subprocess.run([str(exe), str(bin_), "text"] + [str(x) for x in TEXT_CODES], check=True,
+                                  capture_output=True, text=True).stdout.split()
+    check_faces(faces_out)
+    check_text([int(x) for x in text_out])
     done, got = int(out[0]), [int(x) for x in out[1:]]
     check(done == len(BIND), "%d buttons bound, not %d" % (done, len(BIND)))
     for b, code in enumerate(prompt_assets.SWITCH):
@@ -111,8 +125,57 @@ def main():
         check(got[b] == want, "Switch button %d (U+%04X): glyph %d, not %d" % (b, code, got[b], want))
     for i in range(len(prompt_assets.PADS)):
         check(got[len(prompt_assets.SWITCH) + i] == 200 + i, "pad icon %d moved" % i)
-    print("ok: %d of %d Switch buttons pointed at their pad icons, the rest and the pad icons kept"
-          % (done, len(prompt_assets.SWITCH)))
+    print("ok: %d of %d Switch buttons pointed at their pad icons, the rest and the pad icons kept; in a font with every face's "
+          "icons, the Xbox face's; a text's codes rewritten to the PS5 face's" % (done, len(prompt_assets.SWITCH)))
+
+
+# ((Triforce) the live part) a font with every controller face's codes (as faces_font: the Xbox face's icons on glyphs 300.., its
+# d-pad on 400..; the Switch buttons' and the d-pad's codes each a segment of their own): cmap4_bind for the Xbox face points
+# each Switch button at the Xbox face's icon of its input (an unbound one at its default's), the d-pad at the Xbox face's
+FACE_GLYPH, STATIC_GLYPH, OWN_STATIC = 300, 400, 50
+XBOX, PS5 = 1, 3   # (HOS_PROMPT_*)
+
+
+def faces_cmap(exe, tmp):
+    pa = prompt_assets
+    mapping = {c: 100 + b for b, c in enumerate(pa.SWITCH)}
+    mapping.update({c: OWN_STATIC + k for k, c in enumerate(pa.STATIC)})
+    base = pa.FACE_BASE + pa.FACE_CODES * XBOX
+    mapping.update({base + i: FACE_GLYPH + i for i in range(len(pa.PADS))})
+    mapping.update({base + pa.STATIC_AT + k: STATIC_GLYPH + k for k in range(len(pa.STATIC))})
+    path = tmp / "faces.bin"
+    path.write_bytes(pa.cmap4(mapping, set(pa.SWITCH) | set(pa.STATIC))[20:])
+    return subprocess.run([str(exe), str(path)] + [str(x) for x in list(pa.SWITCH) + list(pa.STATIC)], check=True,
+                          capture_output=True, text=True).stdout.split()
+
+
+def check_faces(out):
+    pa = prompt_assets
+    done, got = int(out[0]), [int(x) for x in out[1:]]
+    check(done == len(BIND), "faces: %d buttons bound, not %d" % (done, len(BIND)))
+    for b, code in enumerate(pa.SWITCH):
+        pad = BIND[b] if b in BIND else pa.PADS.index(pa.DEFAULT[b])
+        check(got[b] == FACE_GLYPH + pad, "faces: Switch button %d (U+%04X): glyph %d, not the Xbox face's %d" %
+              (b, code, got[b], FACE_GLYPH + pad))
+    for k in range(len(pa.STATIC)):
+        check(got[len(pa.SWITCH) + k] == STATIC_GLYPH + k, "faces: the d-pad's icon %d is not the Xbox face's" % k)
+
+
+# a text's codes: A and B as the game has them, A on the Switch face's code for the north button, the d-pad, the Xbox face's
+# d-pad icon, a letter (none of a button's: left as it is)
+TEXT_CODES = [0xE040, 0xE041, prompt_assets.BIND_BASE + 3, 0xE049,
+              prompt_assets.FACE_BASE + prompt_assets.FACE_CODES * XBOX + prompt_assets.STATIC_AT + 1, 0x41]
+
+
+def check_text(got):
+    pa = prompt_assets
+    sw, npads = len(pa.SWITCH), len(pa.PADS)
+    bind = pa.BIND_BASE + PS5 * sw * npads
+    want = [bind + 0 * npads + BIND[0], bind + 1 * npads + BIND[1], bind + 0 * npads + BIND[0],
+            pa.FACE_BASE + pa.FACE_CODES * PS5 + pa.STATIC_AT, pa.FACE_BASE + pa.FACE_CODES * PS5 + pa.STATIC_AT + 1, -1]
+    check(got == want, "text_code: %s, not %s" % (got, want))
+    check(pa.BIND_BASE + len(pa.LIVE_FACES) * sw * npads <= pa.PAD_BASE, "the bind codes reach the pad icons'")
+    check(pa.FACE_BASE >= pa.PAD_BASE + 256, "the faces' codes among the keyboard face's keys (U+F700 + a key code)")
 
 
 if __name__ == "__main__":

@@ -143,6 +143,27 @@ int main() {
     CHECK(trim(256 * MB, 1, 8) == 4 && bytes_held == 128 * MB);       // (to half the bound)
     CHECK(trim(256 * MB, 2, 8) == 32 && bytes_held == 0 && age.empty());
     for (size_t i = 1; i < gone.size(); i++) CHECK(gone[i] == gone[i - 1] + 1);   // (always the oldest next)
+
+    // (RX_VK_TARGET_REUSE_MEMORY: off unless set; the short wait 64 only on an integrated GPU with the take on)
+    CHECK(reuse_level(nullptr) == 0 && reuse_level("") == 0 && reuse_level("0") == 0 && reuse_level("1") == 1 &&
+          reuse_level("2") == 2 && reuse_level("7") == 2);
+    CHECK(idle_presents(nullptr, 0, true) == 8 && idle_presents(nullptr, 1, false) == 8 && idle_presents(nullptr, 1, true) == 64 &&
+          idle_presents("3", 2, true) == 3 && idle_presents("0", 0, false) == 1);
+    // (a pooled allocation fits: its type, its alignment, at least the size and at most 1.5 times it; never memory of its own)
+    CHECK(fits(4 * MB, 0, 2, false, 4 * MB, 65536, 1u << 2));
+    CHECK(fits(6 * MB, 0, 2, false, 4 * MB, 65536, 1u << 2) && !fits(6 * MB + 65536 * 4, 0, 2, false, 4 * MB, 65536, 1u << 2));
+    CHECK(verdict(4 * MB, 0, 2, true, 4 * MB, 1, ~0u) == Fit::own_memory);
+    CHECK(verdict(4 * MB, 0, 2, false, 4 * MB, 1, 1u << 3) == Fit::type);
+    CHECK(verdict(4 * MB, 4096, 2, false, 4 * MB, 65536, ~0u) == Fit::alignment);
+    CHECK(verdict(4 * MB - 1, 0, 2, false, 4 * MB, 1, ~0u) == Fit::too_small);
+    // (size classes: 64 KiB steps of a quarter, never under the need, at most a quarter over it rounded to 64 KiB)
+    for (uint64_t need = 1; need <= 128 * MB; need = need * 3 / 2 + 4097) {
+        const uint64_t c = class_bytes(need, 128 * MB), r = (need + 65535) / 65536 * 65536;
+        CHECK(c >= need && c % 65536 == 0 && c * 4 <= r * 5 + 65536 * 4);
+        CHECK(fits(c, 0, 0, false, need, 1, 1));   // (any image of a class fits an allocation of it)
+    }
+    CHECK(class_bytes(0, 128 * MB) == 0 && class_bytes(129 * MB, 128 * MB) == 0);
+    CHECK(class_key(3, 65536) != class_key(4, 65536) && class_key(3, 65536) != class_key(3, 131072));
     return fails ? 1 : 0;
 }
 """
@@ -173,7 +194,9 @@ def main():
         "if (pool_bytes <= cap && !target_pool::idle_out(frame_no, it->since, idle, pool_taken.count(it->key) != 0)) {",
         "if (frame_no - it->since <= idle) break;", "pool_destroy(*it);", "it = pool_age.erase(it);")]
     check(at == sorted(at), "the trim does not walk the age list from its front with the rule's bound, count and wait")
-    check('getenv("RX_VK_TARGET_POOL_TRIM")' in trim and 'getenv("RX_VK_POOL_IDLE")' in trim and "target_pool::kIdle" in trim,
+    # (the short wait: RX_VK_POOL_IDLE, else kIdle, or kIdleReuse on an integrated GPU with RX_VK_TARGET_REUSE_MEMORY:
+    # target_pool::idle_presents)
+    check('getenv("RX_VK_TARGET_POOL_TRIM")' in trim and 'target_pool::idle_presents(getenv("RX_VK_POOL_IDLE"),' in trim,
           "the trim's switches are not read")
     check("pool_tier = target_pool::tier(known, pressure, allowed);" in tex, "the tier is not set where the pressure is known")
     dev = (ROOT / "docs" / "development.md").read_text(encoding="utf-8")

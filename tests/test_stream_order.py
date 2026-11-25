@@ -94,7 +94,7 @@ def check_temporal(temporal):
           "temporal_pre_point no longer decides by stream_order.h's rule")
     motion = function(temporal, "int actor_motion(VkCommandBuffer cmd, const Camera& cam,")
     in_order(motion, ["std::vector<State::Skin> skins = std::move(s.skins);", "stream_order::renumber(skins,",
-                      "for (const auto& k : skins) {"], "actor_motion")
+                      "for (size_t i = 0; i < skins.size(); i++) {"], "actor_motion")
     take = function(temporal, "std::vector<State::Captured> take_captures() {")
     check("stream_order::renumber(c," in take, "take_captures no longer puts the stored draws in stream order")
 

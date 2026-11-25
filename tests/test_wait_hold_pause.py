@@ -109,7 +109,7 @@ static bool async = false;
 static bool async_on() { return async; }
 static std::atomic<int> blocked_n{1};
 enum { FR_WAIT = 2 };
-static void queue_flush_for(int why) { CHECK(why == FR_WAIT); flushes++; }
+static void queue_flush_for(int why, uint64_t = UINT64_MAX) { CHECK(why == FR_WAIT); flushes++; }
 static std::atomic<uint64_t> done_value{0}, oldest{0};
 static std::atomic<bool> ev_cpu_any{false};   // (a signal of the CPU's queued, which no section has acted on yet)
 static std::atomic<uint64_t> signal_oldest{0};   // (the oldest unfinished stopped submission once a section has acted on it)

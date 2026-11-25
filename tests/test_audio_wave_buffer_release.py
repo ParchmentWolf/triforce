@@ -51,7 +51,22 @@ static int16_t adpcm_sample(Voice *v, const WB *w, int64_t s) { (void)v; (void)w
 """]
     actual.extend(helper.block(source, marker) for marker in (
         "static void put_handle(", "static int get_handle(", "static int voice_index(", "static Voice *voice_of(",
-        "static WB read_wb(", "static void release_wb(", "static int next_source_frame("))
+        "static WB read_wb(", "static int wb_in_guest(", "static void release_wb(", "static int next_source_frame("))
+    # (the update queue's apply also owns the Aux effects' state: their declarations and reset, as the file has them)
+    aux_start = source.index("typedef struct {", source.index("/* ---- Aux: the game supplies the processing"))
+    aux = [next(line for line in source.splitlines() if line.startswith("#define MAX_EFFECTS")),
+           source[aux_start:source.index("static int aux_on(void) {", aux_start)],
+           helper.block(source, "static void aux_ring_reset("), helper.block(source, "static void aux_reset(")]
+    actual.extend(aux)
+    actual.append("""/* ((Triforce) the controller speaker (host/pad_speaker.c, host/audio_source.h), off: nothing classed, nothing sent */
+enum { AUDIO_SOURCE_NONE, AUDIO_SOURCE_NAVI_VOICE, AUDIO_SOURCE_NAVI_SOUND, AUDIO_SOURCE_TARGET, AUDIO_SOURCE_OCARINA };
+enum { HOS_PAD_SPEAKER_OFF = 0, HOS_PAD_SPEAKER_ONLY = 1, HOS_PAD_SPEAKER_BOTH = 2 };
+static int hos_pad_speaker_active(void) { return 0; }
+static void hos_audio_source_load_async(void) {}
+static int hos_audio_source_ready(void) { return 0; }
+static int hos_audio_source_of(uint64_t data, uint32_t *crc) { (void)data, (void)crc; return -1; }
+static int hos_audio_source_trace(void) { return 0; }
+static const char *hos_audio_source_name(int cls) { (void)cls; return "?"; }""")
     actual.extend([queue, helper.block(source, "static void apply("), helper.block(source, "static void submit("),
                    helper.block(source, "static void commit(")])
     actual.extend(helper.block(source, "HLE(" + name + ")") for name in (APPEND, RELEASED, COUNT, STATE))

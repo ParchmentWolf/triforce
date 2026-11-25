@@ -37,7 +37,7 @@ def checks(inputs, fsr3):
     # the return for frame interpolation's inputs alone)
     # ((Triforce) with hdr: an RGBA16F network's colour unclamped, tests/test_fsr3_hdr_scene.py)
     check(up.index("!temporal_scene_format(in->format)") < up.index("fsr3_inputs::prepare(cmd, in, in_view, f, hdr)") <
-          up.index("if (!upscaling) return false;"), "fsr3_upscale: the inputs are not made where DLSS upscales")
+          up.index("if (!upscaling) {   // (frame interpolation's inputs alone"), "fsr3_upscale: the inputs are not made where DLSS upscales")
 
 
 def main():

@@ -21,7 +21,7 @@ def main():
     args = parser.parse_args()
     source = args.source.read_text(encoding="utf-8")
     start = source.index("    const PresentAspect aspect{", source.index("void present_image("))
-    end = source.index("    if (src && framelog_on())", start)
+    end = source.index("    // ((Triforce) RX_VK_FRAMELOG_WINDOW=1, with the frame log:", start)
     block = source[start:end]
     header = (ROOT / "gpu/vk/vk_present_rect.h").as_posix()
     fixture = '#include "' + header + '"\n' + r'''

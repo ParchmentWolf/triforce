@@ -78,6 +78,16 @@ void WriteStorageByCasLoop(EmitContext& ctx, const IR::Value& binding, const IR:
 }
 } // Anonymous namespace
 
+// ((Triforce) simulated turf, ir_opt/sim_turf_pool_pass.h) The descriptor's range in bytes. The simulated-turf lists take every
+// cap from it: the producers' guards and the readers' bounds follow what is bound, a list of the renderer's own of any size or
+// the game's own list (whose range is its header and its cap's records: the game's cap, exactly)
+Id EmitStorageBufferLength(EmitContext& ctx, const IR::Value& binding) {
+    if (!binding.IsImmediate()) throw NotImplementedException("Dynamic storage buffer length");
+    const Id ssbo{ctx.ssbos[binding.U32()].U32};
+    const Id words{ctx.OpArrayLength(ctx.U32[1], ssbo, 0U)};
+    return ctx.OpShiftLeftLogical(ctx.U32[1], words, ctx.Const(2u));
+}
+
 // (hookshot) 8- and 16-bit loads through a pointer no storage buffer was found for: the aligned 32-bit word by the same
 // search as LoadGlobal32, and the byte or half of it the address names (the console's loads are naturally aligned). They
 // threw "not implemented": 30 of OoT's mesh programs (LoadGlobalS16) were left untranslated on every card, issue 351

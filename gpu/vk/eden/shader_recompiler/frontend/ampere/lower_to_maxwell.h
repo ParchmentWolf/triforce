@@ -15,6 +15,7 @@
 #include <vector>
 #include "common/common_types.h"
 #include "shader_recompiler/frontend/ampere/geometry_exit.h"
+#include "shader_recompiler/frontend/ampere/program_address_map.h"
 #include "shader_recompiler/frontend/ampere/register_pressure.h"
 
 namespace Shader::Ampere {
@@ -104,13 +105,23 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const u32 target = relocation.output_target != ~0U ? relocation.output_target :
                 result.source_instruction_offsets[static_cast<size_t>(relocation.target)];
             const s64 relative = s64{address_of(target)} - address_of(relocation.output_index) - 8;
-            if (relative < -0x800000 || relative > 0x7fffff) return fail(index, "lowered branch distance");
-            result.instructions[relocation.output_index] |= (static_cast<u64>(relative) & 0xffffff) << 20;
+            u64& word = result.instructions[relocation.output_index];
+            if (relative < -0x800000 || relative > 0x7fffff) {
+                // ((Triforce) past the reach of BRA and CAL (a 24-bit offset, 8 MiB either way: about 786,000 lowered
+                // instructions): their absolute forms, JMP and JCAL, which hold the target's address in 32 bits (20-51;
+                // the frontend reads them so, IsAbsoluteJump). The predicate and the flow test stay as they are
+                const u64 op = word >> 52;
+                if (op != 0xe24 && op != 0xe26) return fail(index, "lowered branch distance");
+                word = (word & ~(u64{0xfff} << 52)) | (u64{op == 0xe24 ? 0xe21U : 0xe22U} << 52) |
+                       (u64{address_of(target)} << 20);
+                continue;
+            }
+            word |= (static_cast<u64>(relative) & 0xffffff) << 20;
         }
         result.source_size = (index + 1) * sizeof(Instruction);
         return result;
     };
-    if (code.empty() || code.size() > 65536) return fail(0, "invalid native program size");
+    if (code.empty() || code.size() > MaximumNativeInstructions) return fail(0, "invalid native program size");
     std::optional<GeometryExitEnvelope> geometry_exit;
     if (code.front().Bits(0, 12) == 0x34e) {
         if (!geometry_stage) return fail(0, "native program counter load outside geometry stage");
@@ -3823,11 +3834,14 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const s64 relative = static_cast<s64>(raw << 14) >> 14;
             if (s64{index} * 16 + 16 + relative != 0)
                 return fail(index, "native computed branch relative base");
-            const s64 offset = -s64{address_of(static_cast<u32>(result.instructions.size()))} - 8;
-            if (offset < -0x800000) return fail(index, "native computed branch range");
+            // ((Triforce) BRX goes to the table's value plus its own address plus its offset, which reaches back only 8 MiB
+            // (24 bits). Past that, JMX: the value plus the offset alone, -8 (the frontend's AnalyzeBRX adds the 8 back)
+            const s64 back = -s64{address_of(static_cast<u32>(result.instructions.size()))} - 8;
+            const bool absolute = back < -0x800000;
+            const s64 offset = absolute ? -8 : back;
             const u32 source = opcode == 0x958 ? uniform_register(insn.Bits(24, 8)) : insn.Bits(24, 8);
             if (source == ~0U) return fail(index, "native uniform computed branch source");
-            emit(0xe25000000000000fULL | predicate | (u64{source} << 8) |
+            emit((absolute ? 0xe20000000000000fULL : 0xe25000000000000fULL) | predicate | (u64{source} << 8) |
                  ((static_cast<u64>(offset) & 0xffffff) << 20));
             computed_branch = true;
             break;
@@ -3928,7 +3942,17 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             if (target < 0 || target % 16) return fail(index, "native branch destination alignment");
             relocations.push_back({static_cast<u32>(result.instructions.size()), target / 16});
             emit(0xe24000000000000fULL | branch_predicate);
-            if (computed_branch && target == s64{index} * 16 && branch_predicate == (u64{7} << 16))
+            // ((Triforce) a loop that leaves only by predicated EXITs: the program ends at the closing self-branch after the
+            // loop's unconditional jump back, which nothing falls into (one of OoT's compute programs, its EXITs all @P0)
+            const auto unconditional_jump = [&](const Instruction& before) {
+                const u32 op = before.Bits(0, 12);
+                return before.Bits(12, 4) == 7 && ((op == 0x947 && before.Bits(87, 4) == 7) || op == 0x94d);
+            };
+            // (and only when no branch so far goes past it: code a branch reaches behind it is the program's still)
+            const bool after_jump = index > 0 && call_targets.empty() && unconditional_jump(code[index - 1]) &&
+                                    std::none_of(relocations.begin(), relocations.end(),
+                                                 [&](const auto& r) { return r.target > s64{index}; });
+            if ((computed_branch || after_jump) && target == s64{index} * 16 && branch_predicate == (u64{7} << 16))
                 return finish(index); // the closing self-branch
             break;
         }
@@ -3963,7 +3987,9 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const bool write = opcode == 0x927;
             const u32 region = insn.Bits(76, 2);
             const bool output = insn.Bits(79, 1) != 0;
-            if ((insn.words[2] & ~0xf800U) != 0 || (region != 0 && region != 3) || write != output ||
+            // ((Triforce) a read may be of the output region (.O): the program reading back what it wrote (one of OoT's
+            // task programs reads its payload so); a write is always to it
+            if ((insn.words[2] & ~0xf800U) != 0 || (region != 0 && region != 3) || (write && !output) ||
                 (!write && region != 3) || (!write && dest == 255))
                 return fail(index, "native stage buffer access mode");
             emit(0xefc0000000000000ULL | predicate | (write ? u64{insn.Bits(32, 8)} : dest) |

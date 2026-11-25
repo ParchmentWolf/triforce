@@ -33,6 +33,11 @@ import fastvec
 import fma_soft
 import fma_steps
 import vecfp
+import cmpflags
+import fastfp
+import dead_flags
+import walk
+import discover
 import chunks
 import standalone
 import adr_entries  # noqa: E402
@@ -45,11 +50,15 @@ import a64_lift
 import a64_rtgen
 
 insn.install()
+fastfp.install()   # ((Triforce) fast float regions, with A64_FASTFP=1, hot or check: its emit_function in the kit's place, so before lift_fixes' and poll's wrappers of it: nx2/fastfp.py)
 lift_fixes.install()
 fastvec.install()   # ((Triforce, 11-21, LIFT-02) TBL, EXT, 128-bit loads and DUP as one instruction each: nx2/fastvec.py)
 fma_soft.install()  # ((Triforce, 11-22, LIFT-06) the exact FMA bodies' short way out where the CPU has no FMA3: nx2/fma_soft.py)
 fma_steps.install()   # ((Triforce, 11-22, LIFT-05) FRECPS and FRSQRTS S as one fused instruction where the build has FMA3: nx2/fma_steps.py)
 vecfp.install()   # ((Triforce, 11-22, LIFT-03) SSE fast paths before float forms lifted lane by lane, with A64_VECFP=1: nx2/vecfp.py)
+cmpflags.install()   # ((Triforce) a subtraction's V flag in a form the compiler folds, with A64_SUB_V=1 or ovf: nx2/cmpflags.py)
+dead_flags.install()   # ((Triforce, 11-24) the kit's dead_flags answered at once for a function that writes no flag: nx2/dead_flags.py)
+walk.install()   # ((Triforce, 11-24) the kit's walk, one shared entry per plain op's word: nx2/walk.py)
 
 
 def module_of(img, pc):
@@ -173,26 +182,35 @@ def main():
         oot_jitter.install(L, img)
         import oot_occlusion   # (no occlusion queries when HOOKSHOT_OCCLUSION_OFF=1: Fritchii's Occlusion Off)
         oot_occlusion.install(L, img)
-    L.discover(max_insns=a.max_func)
+    # ((Triforce, 11-24) its first loop's walks in spawned processes where there is no fork, the kit's result: nx2/discover.py)
+    discover.discover(L, img_dir, chunks.emit_jobs(), max_insns=a.max_func)
     print("discovered %d functions (%.0fs)" % (len(L.funcs), time.time() - t0))
-    total = coverage(L, img, img_dir)
-    jt = L.stats
-    print("jump tables %d (bounded %d, bounded by function %d, ADR table %d), BR without a table %d, PLT stubs %d" % (
-        len(L.jt), jt["jt_bounded"], jt["jt_unbounded"], jt["jt_adr_table"], len(L.jt_missing), len(L.plt)))
-    if jt["jt_table_reg_reused"]:
-        print("jump tables whose table register is reused before the br: %d" % jt["jt_table_reg_reused"])
-    for pc, reg in sorted(L.jt_missing.items()):
-        print("  BR without a table: %#x (x%d)" % (pc, reg))
-    with open(os.path.join(img_dir, "functions.json"), "w") as f:
-        json.dump({"%x" % e: [len(b), module_of(img, e)] for e, (b, _) in L.funcs.items()}, f)
-    if a.write:
+
+    def report():   # (reads the functions, writes none of the C)
+        coverage(L, img, img_dir)
+        jt = L.stats
+        print("jump tables %d (bounded %d, bounded by function %d, ADR table %d), BR without a table %d, PLT stubs %d" % (
+            len(L.jt), jt["jt_bounded"], jt["jt_unbounded"], jt["jt_adr_table"], len(L.jt_missing), len(L.plt)))
+        if jt["jt_table_reg_reused"]:
+            print("jump tables whose table register is reused before the br: %d" % jt["jt_table_reg_reused"])
+        for pc, reg in sorted(L.jt_missing.items()):
+            print("  BR without a table: %#x (x%d)" % (pc, reg))
+        with open(os.path.join(img_dir, "functions.json"), "w") as f:
+            json.dump({"%x" % e: [len(b), module_of(img, e)] for e, (b, _) in L.funcs.items()}, f)
+        print("coverage report (%.0fs)" % (time.time() - t0), flush=True)
+    if not a.write:
+        report()
+    else:
         if not a.no_polls:
             poll.install()
         gen = os.path.join(out_dir, "gen")
-        # ((Triforce) setup: what the emit's spawned processes do to the lifter's class before they emit, as this one did above)
+        # ((Triforce) setup: what the emit's spawned processes do to the lifter's class before they emit, as this one did above.
+        # (11-24) beside: the report is made while those processes already emit, where there are any: nx2/chunks.py write)
         files = chunks.write(L, gen, os.path.join(a.work, "image"), a.rechunk and not a.standalone,
-                             counters=[] if a.no_polls else [poll.stats], setup=[] if a.no_polls else [poll.install])
+                             counters=[] if a.no_polls else [poll.stats], setup=[] if a.no_polls else [poll.install],
+                             beside=report)
         import oot_patches
+        fastfp.guard_patches(oot_patches)   # ((Triforce) a lift with regions: no patch may change a function that holds one)
         main_build = next((m["build_id"] for m in meta["modules"] if m["name"] == "main"), "")
         # ((Triforce) wait=False: where the emit's processes were spawned they share the page marks while the files below are
         # written, which read none of the C; marks_done() waits for them before the report says their counts)
@@ -207,6 +225,8 @@ def main():
             print("standalone: nvn2_exports.c (%d sdk NVN functions routed to host/nvn2.c)" % len(nvn))
         chunks.marks_done()
         L.report()
+        if L.stats["entry_gotos"]:   # (nx2/lift_fixes.py, 4)
+            print("functions with code below their entry, started at it by a goto: %d" % L.stats["entry_gotos"])
         print("interrupt polls: %d loop headers in %d functions" % (poll.stats["polls"], poll.stats["functions"]))
         print("wrote %d code files to %s (%.0fs)" % (len(files), gen, time.time() - t0))
     print("done (%.0fs)" % (time.time() - t0))

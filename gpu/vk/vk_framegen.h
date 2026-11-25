@@ -48,6 +48,14 @@ struct Texture;
 /// library makes no frame without it). Nothing unless the Frame generation row is at AMD FSR and AMD's library can make the
 /// frames; recorded into cmd, on whichever thread records the dispatch (vk_draw.cpp)
 void framegen_hudless_note(VkCommandBuffer cmd, Texture* out, uint32_t level);
+/// ((Triforce) 11-24) The gameplay upscale's picture (its output, at level), recorded right after the upscale wrote it, before
+/// the game draws its HUD into it: copied while the Frame generation by row has AMD FSR 3.1 make the frames, so that
+/// framegen_record can mark the HUD for it (what the game drew over the picture since) and interpolate the picture without it.
+/// Anything else (null, another format or shape) is left alone. framegen_hudless_note calls it, and vk_draw.cpp's upscale_stub
+void framegen_hud_before(VkCommandBuffer cmd, Texture* picture, uint32_t level);
+/// ((Triforce) 11-24) Who made the last set's frames (the FPS counter's Frame generation line, vk_menu.cpp perf_framegen_text)
+enum { kMakerNone = 0, kMakerOwn = 1, kMakerFsr3 = 2, kMakerAmd = 3 };
+int framegen_maker();
 /// (Triforce) The process is about to exit: nothing of frame generation calls into a vendor's library after this
 void framegen_exiting();
 /// Each present: ultrawide's menus (the Insert menu's setting to the game's side, the sides blurred or black while a menu shows)

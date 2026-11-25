@@ -162,7 +162,9 @@ def check_source():
           "the steady step is not on unless HOS_STEP_STEADY=0")
     check("if (dt <= 0 || dt > 0.25) { count = next = 0; carry = 0; step_steady_reset(&steady); return; }" in step,
           "the steady step does not start afresh where the average does")
-    check("secs_avg = step_steady(&steady, dt, (double)pace_period_ns / 1e9, timed ? 1.0 / 240.0 : 1.0 / top, 4.0 / 60.0);" in step,
+    # ((Triforce) the timed path's floor: a 240th, or 1 / the cap above 240 (Uncapped: a 1000th), host/nn_vi.c shortest)
+    check("secs_avg = step_steady(&steady, dt, (double)pace_period_ns / 1e9, timed ? shortest : 1.0 / top, 4.0 / 60.0);" in step
+          and "const double shortest = 1.0 / (pace > 240 ? pace : 240);" in step,
           "the steady step is not taken from this interval and the paced period within each path's bounds")
     check(step.index("const int top = timed ? 60 : pace;") < step.index("secs_avg = step_steady("),   # ((Triforce, 11-22, PRESENT-30) pace_fps())
           "the bounds are read before they are known")

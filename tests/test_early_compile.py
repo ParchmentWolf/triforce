@@ -57,9 +57,11 @@ class TheEarlyRun(unittest.TestCase):
 class TheBuildStartsItBesideTheLift(unittest.TestCase):
     def test_before_the_lift_and_done_before_the_build(self):
         body = MAKE[MAKE.index("\ndef main("):]
-        early, lift, done, key, build = (body.index(text) for text in (
-            "early = EarlyCompile(work, env, a.jobs)", 'run(PY + ["nx2/lift.py", "--standalone"', "early.finish()",
-            "write_lift_key(work, key)", 'run(PY + ["nx2/build.py", "--standalone", "--jobs", str(a.jobs)], env, compiled)'))
+        early, lift, done = (body.index(text) for text in (
+            "early = EarlyCompile(work, env, a.jobs)", 'run(PY + ["nx2/lift.py", "--standalone"', "early.finish()"))
+        # (the lift's own key: the first one written after it; HOOKSHOT_LIFT_STORE's restore writes one before it)
+        key = body.index("write_lift_key(work, key)", done)
+        build = body.index('run(PY + ["nx2/build.py", "--standalone", "--jobs", str(a.jobs)], env, compile_line, ')
         self.assertTrue(early < lift < done < key < build)
         self.assertIn("atexit.register(early.stop)", body)
 

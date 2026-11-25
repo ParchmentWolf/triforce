@@ -20,6 +20,26 @@ def block(source, marker):
     return source[start:at]
 
 
+def between(source, start, end):
+    """((Triforce) from start up to, not including, the first end after it)"""
+    at = source.index(start)
+    return source[at:source.index(end, at + len(start))]
+
+
+def sim_turf_cut(draw):
+    """((Triforce) vk_draw.cpp's simulated turf as RecordingRes and draw_begin_recording use it: the sample, the readback's
+    size, the recording's ready flag and RX_VK_SIM_TURF_ADAPTIVE (on, as by default); the renderer's own turf lists are not
+    in use (sim_turf_private_on false, as by default), so no readback is made or read"""
+    return "\
+".join([block(draw, "struct SimTurfSample {") + ";",
+                      "constexpr size_t " + between(draw, "kSimTurfSamplesPerRecording =", ";") + ";",
+                      between(draw, "thread_local bool sim_turf_monitor_ready", ";") + ";",
+                      block(draw, "bool sim_turf_adaptive() {"),
+                      "bool sim_turf_private_on() { return false; }",
+                      "void sim_turf_observe(uint64_t, bool, uint32_t, uint64_t) {}",
+                      "void invalidate_mapped(VmaAllocation, uint64_t) {}"])
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--source', type=Path, default=ROOT)
@@ -30,7 +50,7 @@ def main():
     a = p.parse_args()
     draw = (a.source / 'gpu/vk/vk_draw.cpp').read_text(encoding='utf-8')
     fixture = (ROOT / 'tests/recording_admission_test.cpp').read_text(encoding='utf-8')
-    record = block(draw, 'struct RecordingRes {') + ';'
+    record = sim_turf_cut(draw) + '\n' + block(draw, 'struct RecordingRes {') + ';'
     assert 'std::vector<Stream> streams;' in record and 'std::vector<VkDescriptorPool> extra;' in record
     record = record.replace('std::vector<Stream> streams;', 'FaultVector<Stream> streams;')
     record = record.replace('std::vector<VkDescriptorPool> extra;', 'FaultVector<VkDescriptorPool> extra;')

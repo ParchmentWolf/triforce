@@ -91,7 +91,8 @@ def main():
           and "output_choice(opts.output_res) == OUTPUT_CUSTOM) &&" in shown, "the Custom size's rows show without Custom chosen")
     check("if ((value == &opts.output_width || value == &opts.output_height) && custom_env()) return true;" in menu,
           "the Custom size's rows can be changed while HOS_OUTPUT_SIZE sets the size")
-    check('out += "options_version=9\\n";' in menu, "the options file is not written as version 8 (output_sizes.h OUTPUT_OPTIONS_VERSION)")
+    # (10: the keys' Plus alone changed, host/nn_hid.c binds_load; the output numbers' schema is OUTPUT_OPTIONS_VERSION, 9, on)
+    check('out += "options_version=10\\n";' in menu, "the options file is not written as version 10 (output_sizes.h OUTPUT_OPTIONS_VERSION and later)")
     check("#define OUTPUT_OPTIONS_VERSION 9" in (ROOT / "gpu/vk/output_sizes.h").read_text(encoding="utf-8"),
           "output_sizes.h: the 5120-wide sizes are not pictures from options_version 8")
     check("rows[i].name != kUseWindowSize || (opts.output_res == OUTPUT_CUSTOM && !custom_env())" in shown
@@ -286,7 +287,7 @@ int main(int argc, char **argv) {
     }
     if (pw == 3840 && ph == 1600) CHECK_STR(tx_resolution(2), "75% (2880x1200)");   // (the 3D's size is the picture's share)
 
-    // ---- a size from outside keeps its shape (5:4 to 32:9) whatever its sides, stays within every limit and on its side of
+    // ---- a size from outside keeps its shape (5:4 to 48:9) whatever its sides, stays within every limit and on its side of
     // 16:9, and what comes out is taken as itself when given again (the menu saves it and the host reads it back): at once,
     // by how its width is chosen (output_width_range), with no second try
     for (long w = 200; w <= 12000; w += 61)
@@ -539,8 +540,8 @@ int main(int argc, char **argv) {
              ini=v8 + "output_width=0\noutput_height=-3\n"),   # (a side that is not a size: the row's default)
         case(8, 8, "3840x2160", "Custom (5120x2160)", 900, ini=v8 + "output_width=5120\noutput_height=2160\n",
              picture="5120x2160", shape=23704, row="21:9 (5120x2160)", custom="5120x2160"),
-        case(8, 8, "1920x1080", "Custom (3840x1080)", 512, ini=v8 + "output_width=7680\noutput_height=1080\n",
-             picture="3840x1080", shape=35556, row="32:9 (3840x1080)", custom="3840x1080", rows="7680x1080"),   # (32:9 at most)
+        case(8, 8, "1920x1080", "Custom (5760x1080)", 515, ini=v8 + "output_width=7680\noutput_height=1080\n",
+             picture="5760x1080", shape=53333, row="5.33:1 (5760x1080)", custom="5760x1080", rows="7680x1080"),   # (48:9 at most)
         # (a 16:9 Custom takes the Ultrawide row's shape, as a fixed 16:9 size does)
         case(8, 8, "2560x1440", "Custom (2560x1440)", 610, ini=v8 + "output_width=2560\noutput_height=1440\nultrawide=3\n",
              picture="5120x1440", row="32:9"),

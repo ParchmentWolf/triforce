@@ -129,7 +129,9 @@ def main():
     check("const bool game_black = embed_open || page == kModsRowPage;" in dp,
           "dim_page: over play (our own background over the bars) the dim is cut black at the picture's edges")
     dm = block(menu, "void draw_menu(ui::Ctx& c, bool perf_under) {")
-    check("if (!embed_open && !row && !ui::system_bg(c)) c.d->AddRectFilled(ImVec2(0, 0), ImVec2(c.w, c.h), ui::rgba(8, 5, 2, ui::kDimAlpha));" in dm,
+    # ((Triforce) but the tuning bar, page 0 alone, over the game seen whole: no dialog there)
+    check("if (!embed_open && !row && !tuning && !ui::system_bg(c)) c.d->AddRectFilled(ImVec2(0, 0), ImVec2(c.w, c.h), ui::rgba(8, 5, 2, ui::kDimAlpha));" in dm
+          and "const bool tuning = tune_mode && page == 0 && !embed_open && !row;" in dm,
           "draw_menu: over play our background no longer covers the whole window (dim_page's one rectangle there is for it)")
     ask = block(menu, "void draw_quit_ask(ui::Ctx& c) {")
     check("dim_window(c.d, menu_map, menu_grid(menu_window_w, menu_window_h), menu_window_w, menu_window_h, ui::rgba(8, 5, 2, 220));" in ask and

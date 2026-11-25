@@ -27,10 +27,12 @@ Usage:  python -I nx2/build.py [--jobs 1] [--only 0,7] [--opt O1] [--no-polls] [
 """
 import argparse
 import concurrent.futures
+import contextlib
 import ctypes
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -43,6 +45,8 @@ import cold_parts
 import lifted_c
 import rtgen
 import logo_rgba
+import object_store
+import reshade_fx   # ((Triforce) the ReShade FX compiler's jobs: gpu/vk/reshade
 import ui_fonts
 import toolchain
 import version
@@ -57,6 +61,9 @@ HOST_ZSTD_SOURCES = ("common/debug.c", "common/entropy_common.c", "common/error_
                      "common/xxhash.c", "common/zstd_common.c", "decompress/huf_decompress.c", "decompress/zstd_ddict.c",
                      "decompress/zstd_decompress.c", "decompress/zstd_decompress_block.c")
 OBJ_CACHE = os.path.join(kit.WORK, "objcache")
+# ((Triforce) HOOKSHOT_OBJ_STORE: one store of objects for every work folder, nx2/object_store.py. Its folder for this work
+# folder's compiler and headers, or None (off unless set))
+OBJ_STORE = object_store.folder(kit.WORK)
 # (hookshot) work/hot_order.txt: the functions that run, hottest first (sampled), packed together by the linker; RX_NO_ORDER=1: off
 PGO = os.environ.get("RX_PGO", "")
 # ((Triforce, 11-21, the performance audit's LIFT-10, after Source A's) RX_VK_PGO: the renderer's own code (gpu/vk/*.cpp, not
@@ -117,7 +124,9 @@ def check_vk_symbols(so):
     globals written inside an anonymous namespace, which makes a different symbol that nothing
     defines.
     """
-    nm = shutil.which("nm") or shutil.which("llvm-nm")
+    # ((Triforce) GNU nm on some Linux distributions leaves the symbol versions' suffixes out here, so ordinary libc imports
+    # looked unresolved; llvm-nm keeps them)
+    nm = shutil.which("llvm-nm") or shutil.which("nm")
     if not nm:
         return True   # (not a reason to fail a build; the check is a guard, not a dependency)
     try:
@@ -165,17 +174,283 @@ def no_throttle(handle=None):
     except (OSError, ValueError, TypeError):
         pass
 
+# ((Triforce) skipped links) a link whose inputs are the last one's is not run again. What decides it, kept beside the output as
+# <output>.linkkey (JSON) after each link that succeeded:
+#   - the key: the command, the compiler, the system headers' stamp, each object's key (its .o.sha1 stamp; its size and time
+#     without one), and the contents of the other files the command names (resources, the symbol order);
+#   - every file the linker itself read, as it says (link_trace): the libraries it found by search path (-l, -static-libstdc++,
+#     the C runtime's archives and start files) as well as the ones named, by size and time; and the linker program;
+#   - the outputs: the binary and every map the command asks for, by size, time and file id, so a file written over one, or a
+#     map deleted, links again.
+# A link with no such record (it failed, the linker's list could not be read, or a toolchain this does not know) always runs.
+# Delete <output>.linkkey to link again by hand. 3 s for the exe and less for the DLL on Windows, every build.
+# HOOKSHOT_LINK_SKIP=0: every link runs, as before
+LINK_RECORD = 1
+
+
+def link_inputs(cmd, output):
+    """The files a link reads: the objects of its @response files, and the other existing files it names (not its outputs)"""
+    objs, others = [], []
+    for arg in cmd:
+        if arg.startswith("@") and os.path.isfile(arg[1:]):
+            with open(arg[1:], encoding="utf-8") as f:
+                objs += [line.strip().strip('"') for line in f if line.strip()]
+            others.append(arg[1:])
+            continue
+        # (a file inside an option: -Xlink=/order:@<file>, --symbol-ordering-file=<file>; a whole argument too)
+        m = re.match(r"^(?:-Xlink=)?(?:/\w+:@?|-Wl,|--[\w-]+=)(.+)$", arg)
+        for path in (arg, m.group(1) if m else None):
+            if path and os.path.isfile(path) and os.path.abspath(path) != os.path.abspath(output) and not path.endswith(".map"):
+                others.append(path)
+                break
+    return objs, others
+
+
+def link_maps(cmd):
+    """The maps the command asks the linker to write: -Map=<file> (lld, GNU ld), /map:<file> (lld-link, and lld's MinGW driver
+    through -Xlink=)"""
+    maps = []
+    for arg in cmd:
+        m = re.search(r"(?:^|[,=])(?:--?Map=|/map:)(.+)$", arg, re.I)
+        if m:
+            maps.append(m.group(1))
+    return maps
+
+
+def link_key(cmd, output):
+    h = hashlib.sha1("\0".join(cmd).encode(), usedforsecurity=False)
+    # (the compiler: a new one compiles every object again to the same keys, and the link must follow it)
+    cc = shutil.which(cmd[0]) or cmd[0]
+    st = os.stat(cc)
+    h.update(("%s %d %d\n" % (cc, st.st_size, st.st_mtime_ns)).encode())
+    with contextlib.suppress(OSError), open(os.path.join(kit.WORK, "system_headers.txt"), "rb") as f:
+        h.update(f.read())
+    objs, others = link_inputs(cmd, output)
+    for obj in objs:
+        stamp = obj + ".sha1"
+        try:
+            with open(stamp) as f:
+                h.update(("%s %s\n" % (obj, f.read())).encode())
+        except OSError:
+            st = os.stat(obj)
+            h.update(("%s %d %d\n" % (obj, st.st_size, st.st_mtime_ns)).encode())
+    for path in others:
+        with open(path, "rb") as f:
+            h.update(path.encode() + b"\0" + hashlib.sha1(f.read(), usedforsecurity=False).digest())
+    return h.hexdigest()
+
+
+_LINK_TARGETS = {}
+
+
+def link_trace(cmd):
+    """What makes the linker list every file it reads, for the compiler's target (-dumpmachine with the command's --target):
+    lld and GNU ld on Linux print each with --trace; lld's MinGW driver and lld-link say "Reading <file>" when verbose. None for
+    a target this does not know: that link keeps no record and always runs"""
+    probe = [cmd[0]] + [a for a in cmd if a.startswith("--target=")] + ["-dumpmachine"]
+    key = tuple(probe)
+    if key not in _LINK_TARGETS:
+        try:
+            r = subprocess.run(probe, capture_output=True, text=True)
+            _LINK_TARGETS[key] = r.stdout.strip().lower() if r.returncode == 0 else ""
+        except OSError:
+            _LINK_TARGETS[key] = ""
+    t = _LINK_TARGETS[key]
+    if "msvc" in t:
+        return ["-Xlinker", "/verbose"]
+    if "mingw" in t or "windows" in t:
+        return ["-Wl,--verbose"]
+    if "linux" in t:
+        return ["-Wl,--trace"]
+    return None
+
+
+# (lld's verbose lines: the files it reads, the archive members it takes, an object's directives, the command its MinGW driver
+# made; none is an error or a warning)
+_VERBOSE = re.compile(r"^(?:ld\.lld|lld-link|lld)(?:\.exe)?: (?:Reading|Loaded|Directives:) |^lld-link(?:\.exe)? -lldmingw ")
+
+
+def traced_files(text):
+    """The files a link's own list names (link_trace), and the rest of its output without that list. An archive's member
+    (lib.a(member.o)) counts as its archive; a line that names no file that exists is output, not the list"""
+    files, rest = [], []
+    for line in text.splitlines():
+        s = line.strip()
+        m = re.match(r"^(?:ld\.lld|lld-link|lld)(?:\.exe)?: Reading (.+)$", s)
+        name = m.group(1) if m else s
+        gnu = re.match(r"^-l\S+\s+\((.+)\)$", name)   # (GNU ld's -t: a library by its -l name, then the file it found)
+        name = gnu.group(1) if gnu else name
+        member = re.match(r"^(.+)\(([^()]+)\)$", name)
+        if member and os.path.isfile(member.group(1)):
+            name = member.group(1)
+        if name and os.path.isfile(name):
+            files.append(os.path.abspath(name))
+        elif not _VERBOSE.match(s):
+            rest.append(line)
+    return files, "\n".join(rest) + ("\n" if rest else "")
+
+
+def link_program(cmd):
+    """The linker the compiler runs for this command (the first word of -###'s last command), or None"""
+    try:
+        r = subprocess.run(cmd + ["-###"], capture_output=True, text=True)
+    except OSError:
+        return None
+    for line in reversed((r.stderr or "").splitlines()):
+        m = re.match(r'^\s*"([^"]+)"', line)
+        if m:   # (Windows: clang names ld.lld without its .exe)
+            return next((p for p in (m.group(1), m.group(1) + ".exe", shutil.which(m.group(1))) if p and os.path.isfile(p)), None)
+    return None
+
+
+def file_stats(paths, ident=False):
+    """[path, size, mtime_ns(, file id)] for each, or None when one is gone"""
+    out = []
+    for p in paths:
+        try:
+            st = os.stat(p)
+        except OSError:
+            return None
+        out.append([p, st.st_size, st.st_mtime_ns] + ([st.st_ino] if ident else []))
+    return out
+
+
+def run_link(cmd, output):
+    """subprocess.run(cmd) for a link, or nothing when everything it read and wrote is as the last successful one left it"""
+    if os.environ.get("HOOKSHOT_LINK_SKIP") == "0":
+        return subprocess.run(cmd, capture_output=True, text=True)
+    keyfile = output + ".linkkey"
+    outputs = [output] + link_maps(cmd)
+    try:
+        key = link_key(cmd, output)
+    except OSError:   # (an input gone: the linker says which)
+        key = None
+    try:
+        with open(keyfile, encoding="utf-8") as f:
+            old = json.load(f)
+    except (OSError, ValueError):
+        old = None
+    program = link_program(cmd)
+    if (key and program and isinstance(old, dict) and old.get("record") == LINK_RECORD and old.get("key") == key
+            and old.get("linker") == file_stats([program]) and old.get("outputs") == file_stats(outputs, ident=True)
+            and old.get("inputs") and old.get("inputs") == file_stats([i[0] for i in old["inputs"]])):
+        print("  (%s: what it reads and writes is as the last link left it, not linked again)" % os.path.basename(output), flush=True)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    with contextlib.suppress(OSError):
+        os.remove(keyfile)
+    trace = link_trace(cmd)
+    r = subprocess.run(cmd + (trace or []), capture_output=True, text=True)
+    if trace is not None:
+        out_files, r.stdout = traced_files(r.stdout or "")
+        err_files, r.stderr = traced_files(r.stderr or "")
+        objs = {os.path.abspath(o) for o in link_inputs(cmd, output)[0]}   # (the objects: their stamps are in the key)
+        read = sorted({f for f in out_files + err_files if f not in objs and f not in map(os.path.abspath, outputs)})
+    else:
+        read = []
+    record = {"record": LINK_RECORD, "key": key, "linker": file_stats([program]) if program else None,
+              "outputs": file_stats(outputs, ident=True), "inputs": file_stats(read)}
+    if r.returncode == 0 and key and program and read and record["outputs"] and record["inputs"] and record["linker"]:
+        with open(keyfile, "w", encoding="utf-8") as f:
+            json.dump(record, f, indent=0)
+    return r
+
+
+COMPDB = "compile_commands.json"
+
+
+def write_compdb(out, jobs, lifted=None):
+    """((Triforce) <build>/compile_commands.json, for clangd and clang-tidy: every compile this build runs, with
+    compile_one's compiler and flags. The lifted C
+    (lifted: the gen/ folder, about 1.4 GB) is left out, or clangd's background index would read all of it; the host's commands
+    still name gen/ and rt64/ for their headers. Point clangd at the file (--compile-commands-dir, or a link to it at the
+    checkout's top, which .gitignore leaves out). A failure to write it is no failed build"""
+    top = os.path.normcase(os.path.abspath(lifted)) + os.sep if lifted else None
+    entries = [{"directory": os.getcwd(), "file": src, "output": obj, "arguments": [cc] + list(fl) + ["-c", src, "-o", obj]}
+               for cc, src, obj, fl, deps in jobs
+               if not (top and os.path.normcase(os.path.abspath(src)).startswith(top))]
+    tmp = os.path.join(out, COMPDB + ".new")
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(entries, f, indent=0)
+        os.replace(tmp, os.path.join(out, COMPDB))
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+
+
+def linker(*opts):
+    """((Triforce, 11-24, after Source A's) Linker options, each as an argument of its own after -Xlinker. The ones that name a
+    file (the map, the link order) are in the build files folder, which the player chooses (make_game.py --work), and the
+    compiler splits -Wl, (and so toolchain.link_opt) at every comma: a comma in that folder's path cut the map's path in two and
+    stopped the link. On Windows link.exe-style options ("/map:x"), through lld's MinGW driver (-Xlink=) for llvm-mingw, as
+    toolchain.link_opt"""
+    return [arg for opt in opts for arg in ("-Xlinker", "-Xlink=" + opt if toolchain.mingw() else opt)]
+
+
+IMAGE_LIMIT = 2**31   # ((Triforce, 11-24, after Source A's) x86-64 code reaches its data RIP-relative, +-2 GB)
+
+
+def image_span(path):
+    """((Triforce, 11-24, after Source A's) Bytes from the start of the image to the end of its last section, as the loader maps
+    it: a PE's SizeOfImage, or an ELF's PT_LOAD segments from the lowest address to the highest end. None when the file is
+    neither. The game's code reaches its data (.data, the GOT, .refptr) RIP-relative, a signed 32-bit offset. lld does not
+    range-check those fixups on x86-64 COFF: a lifted build compiled at -O0 linked a 2,262 MB exe with no error, and its first
+    instruction that read a64_dirty read 4 GB below it. So the build checks the size itself. On ELF this is only a second
+    check: lld does range-check x86-64 PC-relative fixups there and fails the link itself"""
+    import struct
+    with open(path, "rb") as f:
+        head = f.read(4096)
+        if head[:2] == b"MZ" and len(head) >= 64:
+            pe = struct.unpack_from("<I", head, 0x3C)[0]
+            f.seek(pe)
+            hdr = f.read(24 + 60)
+            if hdr[:4] != b"PE\0\0" or len(hdr) < 24 + 60:
+                return None
+            return struct.unpack_from("<I", hdr, 24 + 56)[0]   # (OptionalHeader.SizeOfImage, PE32 and PE32+ alike)
+        if head[:4] == b"\x7fELF" and head[4] == 2:   # (ELFCLASS64)
+            e = "<" if head[5] == 1 else ">"
+            phoff, = struct.unpack_from(e + "Q", head, 0x20)
+            phentsize, phnum = struct.unpack_from(e + "HH", head, 0x36)
+            f.seek(phoff)
+            table = f.read(phentsize * phnum)
+            loads = []
+            for i in range(phnum):
+                p_type, = struct.unpack_from(e + "I", table, i * phentsize)
+                if p_type == 1:   # (PT_LOAD)
+                    vaddr, = struct.unpack_from(e + "Q", table, i * phentsize + 0x10)
+                    memsz, = struct.unpack_from(e + "Q", table, i * phentsize + 0x28)
+                    loads.append((vaddr, vaddr + memsz))
+            return max(b for _, b in loads) - min(a for a, _ in loads) if loads else None
+    return None
+
+
+def image_too_big(exe):
+    """The link FAILED message when the linked image is past what its code can address, else None (and the image is deleted
+    then, so nothing starts it)"""
+    span = image_span(exe)
+    if span is None or span < IMAGE_LIMIT:
+        return None
+    try:
+        os.remove(exe)
+    except OSError:
+        pass
+    return ("link FAILED: the game's image is %d MB, past the %d MB its code can address (x86-64 RIP-relative); the linker "
+            "does not check this and the game would read the wrong memory. The lifted code is too big for one image: "
+            "build it at -O1 (not -O0), or split the lifted code into more than one module" % (span >> 20, IMAGE_LIMIT >> 20))
+
+
 def HOT_ORDER():
     p = os.path.join(kit.WORK, "hot_order.txt")
     if not os.path.exists(p) or os.environ.get("RX_NO_ORDER"):
         return []
     if LINUX:
-        return ["-Wl,--symbol-ordering-file=" + p, "-Wl,--no-warn-symbol-ordering"]
-    return [toolchain.link_opt("/order:@" + p.replace("\\", "/")), toolchain.link_opt("/ignore:4037")]
+        return linker("--symbol-ordering-file=" + p, "--no-warn-symbol-ordering")
+    return linker("/order:@" + p.replace("\\", "/"), "/ignore:4037")
 
 
 HOST_LIBS = ["-lpthread", "-ldl", "-lm"] if LINUX else \
-    ["-lwinhttp", "-luser32", "-lwinmm", "-ladvapi32", "-lole32", "-lshell32", "-lgdi32", "-ldbghelp"]
+    ["-lwinhttp", "-luser32", "-lwinmm", "-ladvapi32", "-lole32", "-lshell32", "-lgdi32", "-ldbghelp",
+     "-lsetupapi"]   # ((Triforce) the last: host/hos_sdl.c hos_sdl_pad_audio_endpoint, a DualSense's own sound card)
 GPU = os.path.join(kit.HERE, "..", "gpu")
 # FFmpeg (libavcodec's VP8/VP9 decoders, swscale) for nn::codec's video decoders (host/nn_video.c): the static build
 # in the Eglantine clone's package cache
@@ -212,10 +487,101 @@ def tree_headers(*roots, skip=()):
         # gpu/vk header change rebuilt the WebGPU renderer)
         for d, dirs, files in os.walk(root):
             dirs[:] = sorted(x for x in dirs if x not in skip)
-            found += [os.path.join(d, f) for f in files if f.endswith((".h", ".hpp", ".inc"))]
+            found += [os.path.join(d, f) for f in files if f.endswith(HEADER_EXTS)]
         for path in sorted(found):
             h.update(os.path.basename(path).encode() + open(path, "rb").read())
     return h.hexdigest().encode()
+
+
+# ((Triforce) a header edit compiles the files that read it) The renderer's own files depended on every header under gpu/vk,
+# gpu/render, gpu/compat and suyu's texture decoders (tree_headers), and the runtime's on every header of host/: a comment in a
+# header two files include compiled 35 files again (417 s of compiler time). Each of those files is compiled with -MD now, and
+# clang's depfile beside the object (vk_x.d for vk_x.o) says which headers it read. The next build names the object by those of
+# them under the same folders, their names and contents (renderer_deps), and the blob stays for a file with no depfile yet or one
+# that cannot be read. What a file reads from elsewhere (the Vulkan and SPIR-V headers, the compiler's, FFmpeg's) counts as
+# before. What an #include can name: .def and .inl too, which the folders' blob (tree_headers) takes as well.
+# HOOKSHOT_DEPFILES=0: every such file named by the whole folders' headers, as before
+HEADER_EXTS = (".h", ".hpp", ".inc", ".inl", ".def")
+_HEADER_DIGESTS = {}   # (a header's path -> its name and content's sha1, once a run: many files read the same headers)
+DEPFILE_DEPS = b"depfile:"   # (what renderer_deps' dependency text starts with when it comes from a depfile)
+DEPFILE_PENDING = "depfile-pending"   # (the stamp of an object compiled now from a depfile key, until rekey_depfiles keys it)
+DEPFILES = os.environ.get("HOOKSHOT_DEPFILES") != "0"
+
+
+def depfile_paths(text):
+    """The prerequisites of a make-style depfile (clang -MD): the target and its ':' left out, line continuations joined,
+    '\\ ' a space in a name, '$$' a '$', '\\#' a '#'. Clang writes the names with '/' on Windows too"""
+    text = text.replace("\\\r\n", " ").replace("\\\n", " ")
+    colon = re.search(r":(\s|$)", text)
+    if not colon:
+        return []
+    paths, cur, i, body = [], [], 0, text[colon.end():]
+    while i < len(body):
+        c = body[i]
+        if c == "\\" and i + 1 < len(body) and body[i + 1] in " #":
+            cur.append(body[i + 1])
+            i += 2
+            continue
+        if c == "$" and body[i + 1:i + 2] == "$":
+            cur.append("$")
+            i += 2
+            continue
+        if c.isspace():
+            if cur:
+                paths.append("".join(cur))
+                cur = []
+        else:
+            cur.append(c)
+        i += 1
+    if cur:
+        paths.append("".join(cur))
+    return paths
+
+
+def depfile_of(obj):
+    return obj[:-2] + ".d" if obj.endswith(".o") else obj + ".d"
+
+
+# ((Triforce) the depfiles kept beside the object cache, <work>/objcache/depfiles/<object's name>.d: a player's build lets the
+# build folder go once the game folder is ready (make_game.py keep_translation, or all of sa), and the object cache keeps only the
+# objects the last build's stamps name, which are the depfile keys (rekey_depfiles). Without the depfiles the next update named
+# every renderer and runtime object by the folders' blob again, which the cache no longer held: ~550 files compiled again at every
+# update. Any depfile gives a sound key (an object is cached by a depfile key only from its own depfile), so an old copy can only
+# miss, never take a wrong object)
+def kept_depfile(obj):
+    return os.path.join(OBJ_CACHE, "depfiles", os.path.basename(depfile_of(obj)))
+
+
+def renderer_deps(blob, roots, obj):
+    """The headers under roots that obj's last compile read (its depfile), by name and content; blob, the whole folders', when
+    there is no depfile or it names nothing under them. The renderer's own objects and the runtime's"""
+    if not DEPFILES:
+        return blob
+    paths = None
+    for path in (depfile_of(obj), kept_depfile(obj)):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                paths = depfile_paths(f.read())
+            break
+        except OSError:
+            pass
+    if paths is None:
+        return blob
+    tops = [os.path.normcase(os.path.abspath(r)) + os.sep for r in roots]
+    picked = sorted({os.path.normcase(os.path.abspath(p)) for p in paths if p.endswith(HEADER_EXTS)
+                     and os.path.normcase(os.path.abspath(p)).startswith(tuple(tops))})
+    if not picked:
+        return blob
+    h = hashlib.sha1(b"depfile 1\0", usedforsecurity=False)
+    for path in picked:
+        if path not in _HEADER_DIGESTS:
+            try:
+                with open(path, "rb") as f:
+                    _HEADER_DIGESTS[path] = os.path.basename(path).encode() + hashlib.sha1(f.read(), usedforsecurity=False).digest()
+            except OSError:   # (a header gone since: the key changes, and the file is compiled again)
+                _HEADER_DIGESTS[path] = os.path.basename(path).encode() + b"\0gone"
+        h.update(_HEADER_DIGESTS[path])
+    return DEPFILE_DEPS + h.hexdigest().encode()
 
 
 def ngx_library(sdk, linux):
@@ -282,16 +648,31 @@ def vk_sources():
     return sorted(out)
 
 
-def strip_comments(data):
+def strip_comments(data, collapse=False):
     """(Triforce) C or C++ text without its comments, for translation_text, and whether it has a raw string literal. A block
     comment becomes a space, a line's comment goes with the spaces before it; everything else is kept as it is. A string or
     character literal ends at its closing quote or at the end of its line (a backslash takes the next character with it, a
     line end too), a number's ' are digit separators, an #include's <name> and a raw string literal are kept whole: what this
-    reads wrongly it keeps, it never takes code or a literal for a comment"""
+    reads wrongly it keeps, it never takes code or a literal for a comment. ((Triforce, 11-24) collapse: and the blanks
+    between the tokens, outside those literals, each run one space, none at a line's start but on the line after one a
+    backslash ends (there it joins the two lines, and one space keeps their tokens apart): the tokens as the compiler's
+    phase 3 leaves them, so an indentation edit, or more or fewer blanks where there were some, keeps the stamp)"""
     ident = frozenset(b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_$")
     out, raw, i, n = bytearray(), False, 0, len(data)
     while i < n:
         c = data[i]
+        if collapse and c in b" \t\v\f":
+            i += 1
+            if out and out[-1] in b" \t\v\f":
+                continue
+            if not out or out[-1] == 10:
+                k = len(out) - 2
+                while k >= 0 and out[k] in b" \t\v\f":
+                    k -= 1
+                if k < 0 or out[k] != 92:
+                    continue
+            out += b" "
+            continue
         if data.startswith(b"//", i):
             j = data.find(b"\n", i)
             i = n if j < 0 else j
@@ -342,7 +723,9 @@ def translation_text(rel, data):
     or C++ file without the parts between an "Outside the translation stamp" mark and the next "Inside the translation stamp
     again" (gpu/vk/vk_shader.cpp's: code that cannot change a translation, gpu/vk/program_carry.h), without its comments, and
     without its blank lines and the spaces at its lines' ends (but for the line after one a backslash ends, and in a file with
-    a raw string literal). Marks that do not pair: the file whole, and the build says so"""
+    a raw string literal). ((Triforce, 11-24) And the blanks between its tokens one space each, none at a line's start
+    (strip_comments collapse): an indentation edit, or more or fewer blanks where there were some, no longer moves the stamp. Not in a file
+    with a raw string literal, which is taken as before.) Marks that do not pair: the file whole, and the build says so"""
     out_mark, in_mark = b"// ---- (Triforce) Outside the translation stamp", b"// ---- (Triforce) Inside the translation stamp again"
     data = data.replace(bytes((13, 10)), bytes((10,)))
     if not rel.endswith((".c", ".cc", ".cpp", ".h", ".hpp", ".inc")):
@@ -359,9 +742,9 @@ def translation_text(rel, data):
         print("build: %s: its translation stamp marks do not pair: the whole file is in the stamp (no program cache is carried "
               "over this update)" % rel, flush=True)
         kept = lines
-    data, raw = strip_comments(b"\n".join(kept))
-    if raw:
-        return data
+    data, raw = strip_comments(b"\n".join(kept), True)
+    if raw:   # (a raw string literal: the file without its comments only, as before)
+        return strip_comments(b"\n".join(kept))[0]
     lines = []
     for line in data.split(b"\n"):
         if lines and lines[-1].endswith(b"\\"):
@@ -480,26 +863,26 @@ def translation_stamp_keep(record, stamp, files):
     os.replace(tmp, record)
 
 
-def cpm_dirs():
-    """CPM packages: RX_CPM, packaged tools/cpm, then legacy project caches.
-    The packages provide Vulkan and SPIR-V headers, VMA and FFmpeg."""
+def cpm_dirs(work=None):
+    """CPM packages: RX_CPM, packaged tools/cpm, then legacy project caches (work: the build's work folder where kit.WORK is not
+    it yet: make_game.py's Linux check before the build). The packages provide Vulkan and SPIR-V headers, VMA and FFmpeg."""
     eden_ns2 = os.path.dirname(kit.ROOT)
     return [d for d in (os.environ.get("RX_CPM"), os.path.join(kit.ROOT, "cpm"),
-                        os.path.join(kit.WORK, "eg", ".cache", "cpm"),
+                        os.path.join(work if work is not None else kit.WORK, "eg", ".cache", "cpm"),
                         os.path.join(eden_ns2, "mkw-recomp", "work", "eg", ".cache", "cpm"),
                         os.path.join(eden_ns2, "Eglantine", ".cache", "cpm")) if d and os.path.isdir(d)]
 
 
-def cpm_package(name):
+def cpm_package(name, work=None):
     """The newest version of a package in the first CPM cache that has it (cpm_dirs), or None"""
-    for root in cpm_dirs():
+    for root in cpm_dirs(work):
         d = os.path.join(root, name)
         if os.path.isdir(d) and os.listdir(d):
             return os.path.join(d, sorted(os.listdir(d))[-1])
     return None
 
 
-def header_package(cpm_name, probe, env=None):
+def header_package(cpm_name, probe, env=None, work=None):
     """A package root with include/<probe>: CPM first, then env (package root or its include/ folder),
     then common system prefixes (/usr/local, /usr). Distro vulkan-headers / spirv-headers install
     under /usr/include; this is what makes a source build find them without a CPM tree."""
@@ -508,7 +891,7 @@ def header_package(cpm_name, probe, env=None):
     def ok(root):
         return bool(root) and os.path.isfile(os.path.join(root, "include", *parts))
 
-    pkg = cpm_package(cpm_name)
+    pkg = cpm_package(cpm_name, work)
     if ok(pkg):
         return pkg
     if env:
@@ -525,6 +908,22 @@ def header_package(cpm_name, probe, env=None):
         if ok(prefix):
             return prefix
     return None
+
+
+VK_HEADERS = (("Vulkan", "vulkanheaders", "vulkan/vulkan.h", "HOOKSHOT_VULKAN_HEADERS"),
+              ("SPIR-V", "spirv-headers", "spirv/unified1/spirv.h", "HOOKSHOT_SPIRV_HEADERS"),
+              ("VMA", "vulkanmemoryallocator", "vk_mem_alloc.h", "HOOKSHOT_VMA_HEADERS"))
+
+
+def vulkan_headers(work=None):
+    """The Vulkan back end's header packages (VK_HEADERS), each its root or None: the compile's, and make_game.py's Linux check's"""
+    return [header_package(package, probe, env, work) for _, package, probe, env in VK_HEADERS]
+
+
+def prebuilt_renderer():
+    """The AppImage's prebuilt back end (HOOKSHOT_VK_PREBUILT), or "": it is built without NVIDIA's SDK, so a build with
+    HOOKSHOT_NGX_SDK compiles its own"""
+    return "" if NGX_SDK else os.environ.get("HOOKSHOT_VK_PREBUILT", "")
 
 
 def cache_put(obj, key):
@@ -785,20 +1184,37 @@ FFMPEG = next((os.path.join(d, n) for d in [os.path.join(r, "ffmpeg") for r in c
 FFMPEG_LIBS = ("avcodec", "swscale", "swresample", "avutil")
 
 
-def ffmpeg_linux():
+def ffmpeg_linux(missing=None):
     """(linux) FFmpeg's compile and link flags: HOOKSHOT_FFMPEG=<prefix> with static libraries (the AppImage's, with
-    dav1d for OoT's AV1 movies), else the system's through pkg-config; None without either"""
+    dav1d for OoT's AV1 movies), else the system's through pkg-config; None without either. missing, when given, collects what
+    the route chosen lacks (make_game.py's Linux check)"""
     pre = os.environ.get("HOOKSHOT_FFMPEG")
     if pre and os.path.exists(os.path.join(pre, "lib", "libavcodec.a")):
         libs = [os.path.join(pre, "lib", "lib%s.a" % l) for l in FFMPEG_LIBS]
+        if missing is not None:
+            for path in libs + [os.path.join(pre, "include", "lib" + l, l + ".h") for l in FFMPEG_LIBS]:
+                if not os.path.isfile(path):
+                    missing.append("FFmpeg: %s (HOOKSHOT_FFMPEG's static prefix)" % path)
         libs += [os.path.join(pre, "lib", "libdav1d.a")] if os.path.exists(os.path.join(pre, "lib", "libdav1d.a")) else []
         return ["-I" + os.path.join(pre, "include")], libs + ["-lm", "-lpthread"]
+    names = ["lib" + l for l in FFMPEG_LIBS]
     try:
-        names = ["lib" + l for l in FFMPEG_LIBS]
         cflags = subprocess.run(["pkg-config", "--cflags"] + names, capture_output=True, text=True, check=True).stdout.split()
         libs = subprocess.run(["pkg-config", "--libs"] + names, capture_output=True, text=True, check=True).stdout.split()
         return cflags, libs
-    except (OSError, subprocess.CalledProcessError):
+    except (OSError, subprocess.CalledProcessError) as e:
+        if missing is not None:
+            absent = []
+            for name in names:
+                try:
+                    if subprocess.run(["pkg-config", "--exists", name], capture_output=True).returncode:
+                        absent.append(name)
+                except OSError:
+                    absent = ["pkg-config"] + names
+                    break
+            missing.append("FFmpeg: %s (HOOKSHOT_FFMPEG with lib/libavcodec.a first, else pkg-config --cflags/--libs for %s; "
+                           "install the development libraries or set HOOKSHOT_FFMPEG). %s" %
+                           (", ".join(absent or names), " ".join(names), e))
         return None
 
 
@@ -836,6 +1252,12 @@ WRITE_TRACK = [] if os.environ.get("RX_SOFT_WRITE_WATCH") == "0" else ["-DA64_WR
 # as "this page and the next" (host/rx_backend.c collect_in): a store of up to 4 KB reaches no further. A full rebuild.
 if WRITE_TRACK and os.environ.get("RX_MARK_ONE") == "1":
     WRITE_TRACK = WRITE_TRACK + ["-DA64_MARK_ONE"]
+# (Triforce) RX_MARK_BITMAP=1: the lifted game's stores mark their page only where the page is a GPU page (host/mark_bitmap.c,
+# nx2/rtgen.py A64_MARK_BITMAP: a bit per page, tested before the mark); the host's own marks stay. Off unless asked for:
+# a mark missed is stale data drawn, so it wants its pictures compared first. A full rebuild (the lifted code's and the
+# host's flags). MARK_BITMAP: the lifted code's flag; MARK_BITMAP_HOST: the host files' (the bitmap itself, and nvdrv.c's bits)
+MARK_BITMAP = ["-DA64_MARK_BITMAP"] if WRITE_TRACK and os.environ.get("RX_MARK_BITMAP", "").strip().lower() in ("1", "on", "true", "yes") else []
+MARK_BITMAP_HOST = ["-DHOS_MARK_BITMAP"] if MARK_BITMAP else []
 
 # (hookshot) the host CPU the lifted game and the runtime are built for: x86-64-v3 (AVX2, FMA, BMI1/2, LZCNT,
 # MOVBE; Haswell and Zen 1 on). With FMA the FPX1 fast paths cover double-precision FMA (RECOMP_FPX_FMA64; it took
@@ -843,12 +1265,42 @@ if WRITE_TRACK and os.environ.get("RX_MARK_ONE") == "1":
 # expression is rounded as written (the exact bodies and FPX1's proofs assume it). RX_MARCH=x86-64: the old baseline
 # (issue 363: a Xeon E5-2667 v2 (Ivy Bridge, no AVX2) built the game and then stopped at its first AVX2 instruction,
 # 0xc000001d. The game is built on the PC it runs on: a CPU without x86-64-v3's features gets x86-64-v2, or x86-64)
-from host_cpu import host_march   # (make_game.py asks it too: the AppImage's renderer)
+from host_cpu import host_march, host_mtune, native_cpu   # (make_game.py asks it too: the AppImage's renderer)
 
 MARCH = os.environ.get("RX_MARCH") or host_march()
-if MARCH != "x86-64-v3":
+if os.environ.get("RX_MARCH"):   # ((Triforce) a choice made by hand is not a CPU without AVX2)
+    if MARCH != "x86-64-v3":
+        print("build: the game is built for %s (RX_MARCH)" % MARCH, flush=True)
+elif MARCH != "x86-64-v3":
     print("build: this CPU has no AVX2: the game is built for %s (a little slower)" % MARCH, flush=True)
 CPU = ["-march=" + MARCH, "-ffp-contract=off"]
+# ((Triforce) HOOKSHOT_NATIVE_CPU=1, off by default: it changes the code the game runs, the coordinator measures its fps first)
+# A CPU with x86-64-v3's features gets the game built for itself, -march=native: what it has beyond v3 (AVX-512 and the rest), and
+# tuned for it (native tunes as well, the Steam Deck's Zen 2 included: no -mtune of our own then). native names no CPU, and the
+# object keys are made from the flags, so the CPU clang resolves it to goes into the flags too
+# (-DHOOKSHOT_NATIVE_CPU=<cpu>_<tune>_<features>): another CPU (a new one, the disk in another PC) compiles again instead of
+# linking objects made for instructions it may lack. If clang can't say, it stays x86-64-v3; an RX_MARCH=native that clang
+# cannot name stops the build. Every object is compiled again once when it is turned on or off
+_CLANG = toolchain.find("clang") if os.environ.get("HOOKSHOT_NATIVE_CPU") == "1" or MARCH == "native" else ""   # (asked only then)
+_native = None
+if (os.environ.get("HOOKSHOT_NATIVE_CPU") == "1" and not os.environ.get("RX_MARCH") and MARCH == "x86-64-v3"
+        and os.path.isfile(_CLANG)):
+    _native = native_cpu(_CLANG, target() + ["-march=native"] + CPU[1:])
+    if _native:
+        MARCH, CPU[0] = "native", "-march=native"
+if MARCH == "native" and not _native:
+    _native = native_cpu(toolchain.need(_CLANG), target() + CPU)
+    if not _native:
+        sys.exit("build: clang does not say what -march=native is on this PC: set RX_MARCH to a CPU level")
+if _native:
+    print("build: the game is built for this PC's CPU (%s)" % _native, flush=True)
+    CPU += ["-DHOOKSHOT_NATIVE_CPU=" + _native]
+# (Triforce) -mtune for the host's CPU where it is known (the Steam Deck: znver2); RX_MTUNE=<cpu> chooses. Scheduling and
+# instruction choice only: the instructions allowed stay -march's, and -ffp-contract=off the float results. (Not with -march=native,
+# which tunes for the CPU itself, unless RX_MTUNE asks)
+MTUNE = os.environ.get("RX_MTUNE") or ("" if _native else host_mtune())
+if MTUNE:
+    CPU += ["-mtune=" + MTUNE]
 
 
 def flags(gen, rt64, opt, polls):
@@ -856,7 +1308,108 @@ def flags(gen, rt64, opt, polls):
         "-I" + rt64, "-I" + gen, "-I" + os.path.join(kit.KIT, "rt"), "-I" + NX2_RT, "-Wno-everything",
         "-fno-strict-aliasing", "-mcx16", "-" + opt, "-g0", "-mllvm", "-rotation-max-header-size=0",
         "-ffunction-sections", "-mllvm", "-capture-tracking-max-uses-to-explore=5000"] + \
-        (["-DA64_POLLING"] if polls else []) + WRITE_TRACK
+        (["-DA64_POLLING"] if polls else []) + WRITE_TRACK + MARK_BITMAP
+
+
+# ((Triforce) HOOKSHOT_SPLIT_GIANTS, off by default: it changes the code the game runs, the coordinator measures its fps first)
+# nx2/split_giants.py: the lifted functions of split_giants.MIN_KB (256) or more are compiled as pieces cut at their labels, with a
+# dispatch loop under the function's own name (compile_one compiles that copy; the lifted files stay as the lift wrote them, so its
+# patches, cuts and lists never see the pieces). The lifted chunks and the hot pieces both. Measured here on this game's lifted C:
+# 286 functions of 158 MB cut into 12,824 pieces (2 left whole); code_023.c, one 4.8 MB function, 122 s -> 39 s at -O1, the same
+# PC. Elsewhere a whole first build's compile 1,347 -> 1,057 s on a Ryzen 5 5600, and the longest hot piece 346 -> about 60 s.
+# "1": on, pieces of split_giants.PIECE_KB (8); a number: the pieces' size in KB. HOOKSHOT_SPLIT_DIRECT=0: the pieces go through
+# the dispatch loop only, never straight from one to the next (split_giants.macros)
+def split_giants_flags():
+    """The flag the lifted chunks and the hot pieces carry when their giants are split (split_giants.FLAG: the piece size and
+    the splitter's own hash, so a change of either builds them again); [] when off"""
+    raw = os.environ.get("HOOKSHOT_SPLIT_GIANTS", "").strip() or "1"   # ((Triforce, 11-24) on by default: lab, no fps change)
+    if raw == "0" or not raw.isdigit():
+        return []
+    import split_giants
+    return [split_giants.flag(split_giants.PIECE_KB if raw == "1" else int(raw),
+                              os.environ.get("HOOKSHOT_SPLIT_DIRECT", "").strip() != "0")]
+
+
+def a64_rt_flags(fl, opt):
+    """((Triforce) RX_A64_RT_O2) The shared A64 helpers' flags: fl at -O2 when RX_A64_RT_O2 is 1 (on, true, yes), else fl itself"""
+    if os.environ.get("RX_A64_RT_O2", "").strip().lower() not in ("1", "on", "true", "yes"):
+        return fl
+    return ["-O2" if f == "-" + opt else f for f in fl]
+
+
+# ((Triforce) HOOKSHOT_LIGHT_PASSES, ON by default since 11-24 (=0: off). It changes the code the game runs; lab 11-24, his save at
+# the Castle Town market, 60 s windowed, twice each: plain 84.0 / 83.9 fps, this with HOOKSHOT_SPLIT_GIANTS 84.2 / 84.3; the
+# game's whole compile 530 -> 257 s (5,932 -> 3,249 compiler-seconds, longest file 289 -> 100 s) on a 24-thread PC, -j16)
+# Ordinary lifted chunks compile at -O1 without its module passes (the inliner, ipsccp, globalopt, function-attrs ...: -mllvm
+# -opt-disable; LLVM skips only passes it marks optional, so the code stays correct). Measured elsewhere on single chunks:
+# -21..-34% compile time, +3..5% code, the same peak memory; -O1's inliner barely inlines lifted code (the same call counts),
+# but the few helpers it did inline (third_party/a64-kit's VFPX_HEADER a64_v_* helpers, VSET_HEADER's and FPX_FZ_HEADER's
+# fallbacks) became real calls there (+4.6% game CPU) until they were made always_inline in the lifter: that lifter change is
+# not made here, so measure with it. A chunk with a function of HOOKSHOT_LIGHT_PASSES_KB (1024) KB of C or more keeps every
+# pass: without the module passes a giant function's later passes blow up (3.25-4.7 GB, 8x the time). The hot pieces (code_hot*)
+# keep theirs (-O2 and the profile). The flags are part of each object's key (object_key), so a light object and a full one are
+# never taken for each other. opt-bisect-verbose=false: without it the option prints a line for every pass on every function
+LIGHT_PASSES = ["ipsccp", "called-value-propagation", "globalopt", "openmp-opt", "deadargelim", "globaldce", "elim-avail-extern",
+                "rpo-function-attrs", "function-attrs", "constmerge", "cg-profile", "rel-lookup-table-converter", "inline",
+                "inliner-ml-advisor-release"]
+LIGHT_FLAGS = ["-mllvm", "-opt-disable=" + ",".join(LIGHT_PASSES), "-mllvm", "-opt-bisect-verbose=false"]
+
+
+def light_passes_kb():
+    """The largest function (KB of C) a lifted chunk may hold and still compile without the module passes; None: off"""
+    if os.environ.get("HOOKSHOT_LIGHT_PASSES", "1").strip().lower() not in ("1", "true", "on", "yes", ""):   # (11-24: on by default)
+        return None
+    try:
+        kb = max(1, int(os.environ.get("HOOKSHOT_LIGHT_PASSES_KB") or 1024))
+    except ValueError:
+        kb = 1024
+    return kb
+
+
+def light_flags_work(cc):
+    """Whether cc takes LIGHT_FLAGS: one tiny compile. -opt-disable is LLVM 22's, and a Linux system's older clang stops at it,
+    so every light chunk would fail: with such a compiler they keep every pass"""
+    try:
+        r = subprocess.run([cc, "-x", "c", "-O1", "-Wno-everything", "-S", "-o", "-", "-"] + LIGHT_FLAGS,
+                           input="int f(int x) { return x + 1; }\n", capture_output=True, text=True, encoding="utf-8",
+                           errors="replace")
+    except OSError as e:
+        r = subprocess.CompletedProcess([cc], 1, "", str(e))
+    if r.returncode:
+        print("build: this compiler does not take the light passes' flags (%s): every lifted chunk keeps -O1's module passes"
+              % (r.stderr.strip().splitlines() or ["?"])[0], flush=True)
+    return r.returncode == 0
+
+
+def largest_function(text):
+    """The largest function of a lifted file's text, in bytes: each function from the newline before its definition, as
+    mem_need was first measured"""
+    starts = [m.start() - 1 for m in lifted_c.definitions(text)] + [len(text)]
+    return max([b - a for a, b in zip(starts, starts[1:])] or [0])
+
+
+def lifted_largest(src):
+    """A lifted file's largest function in bytes (largest_function), from the record (HASHES) while it still describes the file,
+    so a build reads no lifted file it already knows"""
+    entry, st = known(src)
+    if entry is not None and isinstance(entry.get("largest"), int):
+        return entry["largest"]
+    with open(src, "rb") as f:
+        content = f.read()
+    largest = largest_function(content)
+    remember(src, st, content)["largest"] = largest
+    return largest
+
+
+def lifted_flags(src, fl, deps, bar_kb):
+    """A lifted chunk's flags: fl, or fl + LIGHT_FLAGS (light_passes_kb). A kept file that is not on disk gets the flags whose
+    part its list recorded (so the kept objects still fit)"""
+    if bar_kb is None:
+        return fl
+    light = fl + LIGHT_FLAGS
+    if src in KEPT and not os.path.exists(src):
+        return light if KEPT[src][2] == kept_part(light, deps) else fl
+    return light if lifted_largest(src) < bar_kb * 1024 else fl
 
 
 def write_info(out):
@@ -877,7 +1430,7 @@ def flag_text(fl):
     AppImage mount is a new /tmp/.mount_... path every start, and that path is not a change in the headers."""
     kept = []
     for f in fl:
-        if f.startswith("-I"):
+        if f.startswith("-I") or f == "-MD":   # ((Triforce) -MD writes the depfile beside the object: renderer_deps)
             continue
         if f.startswith("--sysroot="):
             f = "--sysroot=<sysroot>"
@@ -894,6 +1447,190 @@ def flag_text(fl):
 def object_key(src, fl, deps):
     """What an object depends on: its source, the flags (flag_text), and the headers."""
     return hashlib.sha1(open(src, "rb").read() + flag_text(fl).encode() + deps, usedforsecurity=False).hexdigest()
+
+
+def kept_part(fl, deps):
+    """What of an object key is not its source: the flags (flag_text) and the headers"""
+    return hashlib.sha1(flag_text(fl).encode() + deps, usedforsecurity=False).hexdigest()
+
+
+def key_of(src, fl, deps):
+    """object_key, without reading a source HASHES still knows: the key worked out from it before, for these flags and headers,
+    is the same"""
+    part = kept_part(fl, deps)
+    USED.setdefault(src, set()).add(part)
+    entry, st = known(src)
+    if entry is not None and part in entry["keys"]:
+        return entry["keys"][part]
+    content = open(src, "rb").read()
+    key = hashlib.sha1(content + flag_text(fl).encode() + deps, usedforsecurity=False).hexdigest()
+    remember(src, st, content)["keys"][part] = key
+    return key
+
+
+# ((Triforce) the object keys by the sources' size, modification time and file number) Every build read and hashed each source
+# again to name its object, the 1.5 GB of lifted C up to three times (migrate_stamps, the object keys' fingerprint, plan_jobs):
+# 7.5 s of a one-file edit's 32 s build on Windows, measured. A file whose size, time and number are the ones recorded has the
+# content it had; its key for the same flags and headers (kept_part) is the one worked out then, and its content's SHA-1 is kept
+# for the fingerprint. A file written less than RACY_NS before the record's build started is read again: a change within the
+# clock's step keeps the time (git's "racily clean" index entries). Kept in <build>/hash_cache.json; a record that cannot be
+# read is no record. The record is written under the time its build started, before it looked at any source, and keeps, for
+# each source this build looked at, only the keys this build asked for (a header's edit added a key to every renderer source,
+# and the file only grew); a source this build did not look at (a renderer-only build's lifted C) keeps its record as it was.
+# HOOKSHOT_HASH_CACHE=0: every source read and hashed, as before
+HASH_CACHE = "hash_cache.json"
+HASH_SCHEME = 1
+RACY_NS = 2 * 10 ** 9
+HASHES = {}   # (source path -> {"stat": [size, mtime_ns, number], "sha1": the content's, "keys": {kept_part: object key}})
+HASHES_AT = [0]   # (when the record read in was started, in ns: entries for files written after it, less RACY_NS, are not trusted)
+HASHES_STARTED = [0]
+USED = {}   # (source path -> the kept_parts key_of was asked for this build; content_sha1's sources with none)
+
+
+def file_stat(src):
+    st = os.stat(src)
+    return [st.st_size, st.st_mtime_ns, st.st_ino]
+
+
+def known(src):
+    """(the record of src while it still describes the file on disk, or None; and the file's stat, None when it is not there)"""
+    try:
+        st = file_stat(src)
+    except OSError:
+        return None, None
+    entry = HASHES.get(src)
+    if entry is not None and st[2] and entry.get("stat") == st and st[1] < HASHES_AT[0] - RACY_NS:
+        return entry, st
+    return None, st
+
+
+def remember(src, st, content):
+    """The record of src for the content just read from it: the one there when it was made from that same content (its other
+    keys hold), else a new one. A record not trusted for its time (RACY_NS) that names other content is dropped with its keys"""
+    digest = hashlib.sha1(content, usedforsecurity=False).hexdigest()
+    entry = HASHES.get(src)
+    if entry is None or entry.get("stat") != st or entry.get("sha1") != digest:
+        entry = {"stat": st, "sha1": digest, "keys": {}}
+        if st is not None:
+            HASHES[src] = entry
+    return entry
+
+
+def content_sha1(src):
+    """A source's content's SHA-1, from the record when it still describes the file"""
+    USED.setdefault(src, set())
+    entry, st = known(src)
+    if entry is not None:
+        return entry["sha1"]
+    return remember(src, st, open(src, "rb").read())["sha1"]
+
+
+def load_hashes(out):
+    HASHES_STARTED[0] = time.time_ns()   # (before any source is stat'd: the time the next record is written under)
+    HASHES.clear()
+    USED.clear()
+    HASHES_AT[0] = 0
+    if os.environ.get("HOOKSHOT_HASH_CACHE") == "0":
+        return
+    try:
+        with open(os.path.join(out, HASH_CACHE), encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("scheme") != HASH_SCHEME:
+            return
+        HASHES_AT[0] = int(data["written_ns"])
+        for src, entry in data["files"].items():
+            if (isinstance(entry.get("stat"), list) and len(entry["stat"]) == 3 and isinstance(entry.get("sha1"), str)
+                    and isinstance(entry.get("keys"), dict)):
+                HASHES[src] = {"stat": [int(x) for x in entry["stat"]], "sha1": entry["sha1"], "keys": dict(entry["keys"])}
+                if isinstance(entry.get("largest"), int):   # ((Triforce) a lifted file's largest function: lifted_largest)
+                    HASHES[src]["largest"] = entry["largest"]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        HASHES.clear()
+        HASHES_AT[0] = 0
+
+
+def save_hashes(out):
+    """The record of the sources this build saw, for the next one (written atomically; a failure only costs the next build a read)"""
+    if os.environ.get("HOOKSHOT_HASH_CACHE") == "0":
+        return
+
+    def kept(src, e):
+        if src not in USED:
+            return e
+        return dict(e, keys={part: key for part, key in e["keys"].items() if part in USED[src]})
+    data = {"scheme": HASH_SCHEME, "written_ns": HASHES_STARTED[0] or time.time_ns(),
+            "files": {src: kept(src, e) for src, e in sorted(HASHES.items()) if os.path.exists(src)}}
+    tmp = os.path.join(out, HASH_CACHE + ".new")
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(data, f, separators=(",", ":"))
+        os.replace(tmp, os.path.join(out, HASH_CACHE))
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+
+
+# ((Triforce) a player's update) make_game.py lets the lifted C (1.5 GB) go once the game folder is ready, but keeps the compiled
+# objects and this list, gen/lifted_objects.txt: each lifted file's name, its object key, its size, and what of the key is not the
+# source (flags and headers, kept_part). The next build with the same lift key (make_game.py kept_before) skips the lift and passes
+# --kept-lift: the lifted files are then these names, linked from the object cache by these keys, the same objects as before. When
+# a key's object is gone or the flags or headers changed, the build stops with KEPT_STALE before compiling anything, and
+# make_game.py translates the game again. The list's first line names the lift it was written for (the lift key in gen/.lift_key)
+# and KEPT_SCHEME: a list another lift left, or one of another format, is not used. KEPT_STALE is not 3, abort()'s exit status on
+# Windows
+KEPT_LIST = "lifted_objects.txt"
+KEPT_SCHEME = 1
+KEPT_STALE = 75
+KEPT = {}   # (source path -> (object key, size, kept_part)) for the lifted files that are not on disk
+
+
+def src_size(src):
+    """A source's size; a kept lifted file's as it was"""
+    if src in KEPT and not os.path.exists(src):
+        return KEPT[src][1]
+    return os.path.getsize(src)
+
+
+def lift_key_of(gen):
+    """The key of the lift in gen (the first line of make_game.py's .lift_key), or "-" without one"""
+    try:
+        with open(os.path.join(gen, ".lift_key"), encoding="utf-8") as f:
+            return (f.read().split() or ["-"])[0]
+    except OSError:
+        return "-"
+
+
+def kept_header(key):
+    return "# lift %s %d\n" % (key, KEPT_SCHEME)
+
+
+def read_kept(path):
+    """The list's files, or {} when its first line is not the header of this lift (lift_key_of) and scheme"""
+    kept = {}
+    gen = os.path.dirname(path)
+    with open(path, encoding="utf-8") as f:
+        if f.readline() != kept_header(lift_key_of(gen)):
+            return kept
+        for line in f:
+            parts = line.split()
+            if len(parts) == 4 and parts[2].isdigit():
+                kept[os.path.join(gen, parts[0])] = (parts[1], int(parts[2]), parts[3])
+    return kept
+
+
+def write_kept(gen, jobs):
+    """gen/lifted_objects.txt for the lifted files of a build that compiled every file (see KEPT_LIST)"""
+    lines = []
+    for cc, src, obj, fl, deps in jobs:
+        name = os.path.basename(src)
+        if os.path.dirname(src) == gen and name.startswith("code_") and name.endswith(".c"):
+            lines.append("%s %s %d %s\n" % (name, PLANNED.get((src, obj)) or key_of(src, fl, deps), src_size(src),
+                                            kept_part(fl, deps)))
+    tmp = os.path.join(gen, KEPT_LIST + ".new")
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(kept_header(lift_key_of(gen)))
+        f.writelines(sorted(lines))
+    os.replace(tmp, os.path.join(gen, KEPT_LIST))
 
 
 def times_from(path):
@@ -921,7 +1658,7 @@ def per_file_seconds(jobs, history):
     """One expected duration for each job, in order: the seconds this PC measured for that module before, or, for a
     module it never compiled (a new release adds or renames files), the rate those measurements ran at. On a PC with
     no measurements at all, the first build uses the rates a full build on the development PC showed."""
-    sizes = [max(0.0, os.path.getsize(src) / (1 << 20)) for _, src, *_ in jobs]
+    sizes = [max(0.0, src_size(src) / (1 << 20)) for _, src, *_ in jobs]
     measured = [(history[os.path.basename(src)], mb) for (_, src, *_), mb in zip(jobs, sizes)
                 if os.path.basename(src) in history and mb > 0]
     rate = sum(secs for secs, _ in measured) / sum(mb for _, mb in measured) if measured else None
@@ -943,7 +1680,7 @@ def plan_jobs(jobs):
     The keys go to compile_one, which then does not hash every source a second time."""
     work, keys = [], {}
     for cc, src, obj, fl, deps in jobs:
-        key = object_key(src, fl, deps)
+        key = PLANNED.get((src, obj)) or key_of(src, fl, deps)
         keys[(src, obj)] = key
         stamp = obj + ".sha1"
         if os.path.exists(obj) and os.path.exists(stamp) and open(stamp).read() == key:
@@ -969,14 +1706,65 @@ def migrate_stamps(gen, obj_dir, fl, deps):
         if not (os.path.exists(obj) and os.path.exists(stamp)):
             continue
         src = os.path.join(gen, f)
+        old = open(stamp).read()
+        if os.path.exists(os.path.join(OBJ_CACHE, old + ".o")):
+            continue   # ((Triforce) stamped with a key of today's kind already: its object is in the cache by it. Nothing to read)
         content = open(src, "rb").read()
-        if open(stamp).read() == hashlib.sha1(content + " ".join(fl).encode() + deps, usedforsecurity=False).hexdigest():
+        if old == hashlib.sha1(content + " ".join(fl).encode() + deps, usedforsecurity=False).hexdigest():
             key = object_key(src, fl, deps)
             open(stamp, "w").write(key)
             cache_put(obj, key)
 
 
 PLANNED = {}   # (src, obj) -> the object key plan_jobs worked out, so compile_one does not hash every source again
+DEPFILE_JOBS = {}   # ((Triforce) a renderer or runtime object -> the folders' blob, the folders, its other deps: renderer_deps)
+
+
+def rekey_depfiles(jobs):
+    """((Triforce) After the compile: each renderer or runtime object stamped and cached by the key its own depfile gives (renderer_deps), the only key
+    that vouches for it. An object compiled now is stamped DEPFILE_PENDING by compile_one when its planned key came from the last
+    compile's depfile, which may lack a header the new source reads (add an include, take it out, edit the header, put it
+    back, and that key names an object built with the old header); one compiled from the folders' blob was cached
+    by that key too, which covers every header. One stamped otherwise is another build's and is left alone"""
+    for cc, src, obj, fl, deps in jobs:
+        if obj not in DEPFILE_JOBS or not os.path.exists(obj):
+            continue
+        stamp = obj + ".sha1"
+        try:
+            with open(stamp) as f:
+                old = f.read()
+        except OSError:
+            continue
+        if old != DEPFILE_PENDING and old != (PLANNED.get((src, obj)) or key_of(src, fl, deps)):
+            continue
+        blob, roots, extras = DEPFILE_JOBS[obj]
+        key = key_of(src, fl, renderer_deps(blob, roots, obj) + extras)
+        cache_put(obj, key)   # (also when it is the planned key: compile_one caches no object by a depfile key)
+        if key != old:
+            with open(stamp, "w") as f:
+                f.write(key)
+        keep_depfile(obj)
+
+
+def keep_depfile(obj):
+    """((Triforce) obj's depfile copied to kept_depfile, when it is not the same there already; a failure costs the next build
+    only a compile"""
+    src, dst = depfile_of(obj), kept_depfile(obj)
+    try:
+        with open(src, "rb") as f:
+            data = f.read()
+        try:
+            with open(dst, "rb") as f:
+                if f.read() == data:
+                    return
+        except OSError:
+            pass
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        with open(dst + ".new", "wb") as f:
+            f.write(data)
+        os.replace(dst + ".new", dst)
+    except OSError:
+        pass
 
 
 # (hookshot) the order of the compile: the longest first (LPT), so no long one starts late and runs alone at the end. The lift's
@@ -997,7 +1785,7 @@ def chunk_costs(gen):
 def compile_cost(src, costs):
     """A file's compile time, roughly (see HOT_COST)"""
     name = os.path.basename(src)
-    return costs.get(name, os.path.getsize(src)) * (HOT_COST if name.startswith("code_hot") else 1)
+    return costs.get(name, src_size(src)) * (HOT_COST if name.startswith("code_hot") else 1)
 
 
 # HOOKSHOT_MEM_LOG=1: each compile's peak memory beside what mem_need counted it at ("@@mem <file> <peak MB> <counted MB>
@@ -1016,6 +1804,7 @@ def sample_peak(proc, peak):
 def compile_one(job):
     cc, src, obj, fl, deps = job
     key = PLANNED.get((src, obj)) or object_key(src, fl, deps)
+    PLANNED[(src, obj)] = key   # ((Triforce) for write_kept and rekey_depfiles)
     stamp = obj + ".sha1"
     if os.path.exists(obj) and os.path.exists(stamp) and open(stamp).read() == key:
         return src, 0.0, None
@@ -1030,11 +1819,32 @@ def compile_one(job):
             shutil.copyfile(cached, obj)
         open(stamp, "w").write(key)
         return src, 0.0, None
-    lease = GATE.enter(src) if GATE else None
+    # ((Triforce, 11-24, after Source A's) a zero byte in the source: the translation and the repository never write one into
+    # C, so the drive or the memory changed the file after it was written. A player's code_009.c (26 MB) had one where a "("
+    # belonged, and the compiler said only "extraneous ')' before ';'". Refused first, in one line with "error:", with what to
+    # do. A read of a few milliseconds for the biggest file, beside a compile of seconds to minutes; a file it cannot read is
+    # the compiler's to report)
+    try:
+        with open(src, "rb") as f:
+            data = f.read()
+    except OSError:
+        data = b""
+    at = data.find(b"\0")
+    if at >= 0:
+        return src, 0.0, ("%s:%d:%d: error: this file has a zero byte, which the build never writes: the drive or the PC's "
+                          "memory changed it after it was written. Build again: the file is made again. If this keeps "
+                          "happening, check the drive for errors and test the memory"
+                          % (src, data.count(b"\n", 0, at) + 1, at - data.rfind(b"\n", 0, at)))
+    del data   # (not held while the compiler runs: a 26 MB file per job)
+    c_src = src
+    if any(f.startswith("-DHOOKSHOT_SPLIT_GIANTS=") for f in fl):   # ((Triforce) HOOKSHOT_SPLIT_GIANTS: a copy with the giants cut, if any)
+        import split_giants
+        c_src = split_giants.compile_copy(src, obj, fl)
+    lease = GATE.enter(src) if GATE else None   # (the whole file's need: the pieces' is less)
     t = time.time()
     peak = [0]
     try:
-        with subprocess.Popen([cc] + fl + ["-c", src, "-o", obj], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as p:
+        with subprocess.Popen([cc] + fl + ["-c", c_src, "-o", obj], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as p:
             no_throttle(getattr(p, "_handle", None))
             if GATE:
                 GATE.started(lease, p)
@@ -1044,12 +1854,20 @@ def compile_one(job):
     finally:
         if GATE:
             GATE.leave(lease)
+        if c_src != src and os.path.exists(c_src):
+            os.remove(c_src)
     if MEM_LOG:
         print("@@mem %s %d %d %.1f" % (os.path.basename(src), peak[0], mem_need(src), time.time() - t), flush=True)
     r = subprocess.CompletedProcess(p.args, p.returncode, out, err)
     if r.returncode:
         failure = r.stderr or r.stdout or "Compiler exited with status %d without diagnostics." % r.returncode
         return src, time.time() - t, failure[-4000:]
+    if deps.startswith(DEPFILE_DEPS):
+        # ((Triforce) keyed by the last compile's depfile: this source may read headers that one did not, so the key does not vouch
+        # for the object. rekey_depfiles stamps and caches it by the key its own new depfile gives; a build that stops before
+        # that leaves it pending, and the next one compiles it again)
+        open(stamp, "w").write(DEPFILE_PENDING)
+        return src, time.time() - t, None
     open(stamp, "w").write(key)
     cache_put(obj, key)
     return src, time.time() - t, None
@@ -1062,6 +1880,17 @@ def compile_one(job):
 # dependencies hold nothing the lift writes) and compiles the game's own files alone. The lifted files are not read here:
 # the lift is writing them
 EARLY = os.environ.get("RX_EARLY") == "1"
+
+
+def copy_renhdrum(out, name):
+    """(Triforce) RenHDrum beside the game (renhdrum.dll, renhdrum.so on Linux), when scripts/renhdrum.py build has made it
+    in third_party/renhdrum/: host/rumble_renhdrum.c loads it by full path from the game's own folder, for the controllers
+    it plays (host/vibration.h). Optional: without it every controller keeps its motors or its own HD rumble"""
+    rh = os.path.join(kit.HERE, "..", "third_party", "renhdrum", name)
+    dst = os.path.join(out, name)
+    if os.path.exists(rh) and (not os.path.exists(dst) or os.path.getsize(dst) != os.path.getsize(rh)):
+        import shutil
+        shutil.copyfile(rh, dst)
 
 
 def main():
@@ -1077,6 +1906,9 @@ def main():
     # (CI: a player's build started from the tree the AppImage carries, with no game. Everything up to the compile, without the
     # lift's files; every other file the compile would read must be there, and nothing is compiled. scripts/linux/check_player_build.sh)
     p.add_argument("--dry-run", action="store_true")
+    # ((Triforce) make_game.py: the lifted C was let go after the last build, its objects by this list (KEPT_LIST); exit status
+    # KEPT_STALE when it no longer fits)
+    p.add_argument("--kept-lift", metavar="LIST")
     a = p.parse_args()
     sa = os.path.join(kit.WORK, "sa")
     gen = os.path.join(sa if a.standalone else kit.WORK, "gen")
@@ -1084,6 +1916,7 @@ def main():
     obj_dir = os.path.join(out, "obj")
     gen_dir = os.path.join(out, "gen")   # (the logo and the fonts the Vulkan back end compiles in: made with it, below)
     os.makedirs(obj_dir, exist_ok=True)
+    load_hashes(out)   # ((Triforce) the sources' keys by their size, time and number: HASH_CACHE)
     if os.environ.get("RX_VK_ONLY") or a.dry_run or EARLY:   # (the Vulkan back end needs no game: built so with no lift, as the AppImage's is)
         os.makedirs(gen, exist_ok=True)
     rt64 = rtgen.write(os.path.join(out, "rt64"))
@@ -1105,6 +1938,16 @@ def main():
                        (["-DA64_POLL_CTX"] if a.dll else []), deps)   # (as fl below: the flags its objects were built with)
         migrate_stamps(gen, obj_dir, fl, deps)
     chunks = [] if EARLY else sorted(f for f in os.listdir(gen) if f.startswith("code_") and f.endswith(".c"))
+    if a.kept_lift and a.standalone and not chunks and not EARLY:   # ((Triforce) the lifted C of the last build, let go: KEPT_LIST)
+        try:
+            KEPT.update(read_kept(a.kept_lift))
+        except (OSError, UnicodeDecodeError) as e:
+            print("the list of the kept translation could not be read (%s): translating the game again" % e, flush=True)
+            return KEPT_STALE
+        if not KEPT:
+            print("the list of the kept translation is empty or from another translation: translating the game again", flush=True)
+            return KEPT_STALE
+        chunks = sorted(os.path.basename(s) for s in KEPT)
     if a.only:
         want = {"code_%03d.c" % int(n) for n in a.only.split(",")}
         chunks = [c for c in chunks if c in want]
@@ -1134,7 +1977,8 @@ def main():
     # lifted chunks at -O2 too (never the hot pieces), each compiled as parts of RX_COLD_PART_MB under <build>/split in place
     # of the chunk (nx2/cold_parts.py). Unset: srcs as they are, and no file takes cold_fl below
     cold_stats = {}
-    srcs, cold = cold_parts.expand(srcs, os.path.join(out, "split"), os.environ, stats=cold_stats)
+    # ((Triforce) not with --kept-lift: the kept objects were built from the whole chunks, whose C is gone)
+    srcs, cold = (srcs, set()) if KEPT else cold_parts.expand(srcs, os.path.join(out, "split"), os.environ, stats=cold_stats)
     if cold:
         print("RX_COLD_OPT: %d files at -O2 (parts of %d MB; %d chunks cut again, %d kept as cut before)" % (
             len(cold), cold_parts.part_bytes(os.environ) >> 20, cold_stats.get("written", 0), cold_stats.get("kept", 0)), flush=True)
@@ -1153,6 +1997,11 @@ def main():
     # (triforce) RX_HOT_FLAGS=<flags>: more flags for the hot pieces alone (a variant of them without building the rest again)
     if os.environ.get("RX_HOT_FLAGS"):
         hot_fl = hot_fl + os.environ["RX_HOT_FLAGS"].split()
+    # ((Triforce) HOOKSHOT_SPLIT_GIANTS: the giants of the lifted chunks and of the hot pieces compiled as pieces)
+    giants_fl = split_giants_flags()
+    if giants_fl:
+        hot_fl = hot_fl + giants_fl
+        print("build: giant lifted functions compiled in pieces (HOOKSHOT_SPLIT_GIANTS: %s)" % giants_fl[0], flush=True)
     # (hookshot) RX_PGO=gen: code_hot.c counts its branches (host/pgo_rt.c writes them; -O1 builds much sooner, and the counters are
     # placed before the optimiser, so a profile from it fits the -O2 build). RX_PGO=<merged .prof>: built with that profile
     if PGO == "gen":
@@ -1163,36 +2012,72 @@ def main():
         with open(PGO, "rb") as f:
             hot_fl = hot_fl + ["-fprofile-instr-use=" + PGO, "-DHOOKSHOT_PROFILE_SHA1=" + hashlib.sha1(f.read(), usedforsecurity=False).hexdigest()[:16]]
     cold_fl = cold_parts.cold_flags(fl, a.opt, os.environ) if cold else fl   # ((Triforce, LIFT-17) -O2 and the part size)
+    # ((Triforce) RX_A64_RT_O2=1, off by default: the shared instruction and runtime helpers (a64_rt.c, a64_suyu.c), small files
+    # beside the giant lifted chunks, at -O2 without raising the chunks' level. It changes the code the game runs: the coordinator
+    # measures its fps first (one A/B pair elsewhere went one way, the next the other)
+    rt_fl = a64_rt_flags(fl, a.opt)
+    if rt_fl is not fl:
+        print("build: the shared A64 runtime helpers at -O2 (RX_A64_RT_O2=1)", flush=True)
+    bar_kb = light_passes_kb()   # ((Triforce) HOOKSHOT_LIGHT_PASSES=1: the lifted chunks' light flags, lifted_flags)
+    if bar_kb is not None and not light_flags_work(cc):
+        bar_kb = None
     jobs = [(cc, s, os.path.join(obj_dir, os.path.basename(s)[:-2] + ".o"),
-             hot_fl if os.path.basename(s).startswith("code_hot") else cold_fl if s in cold else fl,
+             hot_fl if os.path.basename(s).startswith("code_hot") else cold_fl if s in cold else
+             rt_fl if os.path.basename(s) in ("a64_rt.c", "a64_suyu.c") else
+             lifted_flags(s, fl + giants_fl, deps, bar_kb) if os.path.basename(s).startswith("code_") and os.path.dirname(s) == gen
+             else fl,
              shim_deps if os.path.dirname(s) == NX2_RT else deps) for s in srcs]
     # (issue 624) what the game code's object keys are made of, as short fingerprints: two builds' logs side by side say which part
     # changed when an update compiled everything again (the headers, the flags, the profile, or the lifted code itself)
+    if KEPT and OBJ_STORE:   # ((Triforce) a kept object the folder let go that another work folder gave the store)
+        object_store.fetch(OBJ_STORE, OBJ_CACHE, [k[0] for k in KEPT.values()])
+    if KEPT:   # ((Triforce) the kept translation is used only as it was: the same flags and headers, and every object still cached)
+        stale = [os.path.basename(j[1]) for j in jobs if j[1] in KEPT and not os.path.exists(j[1]) and
+                 (kept_part(j[3], j[4]) != KEPT[j[1]][2] or not os.path.exists(os.path.join(OBJ_CACHE, KEPT[j[1]][0] + ".o")))]
+        if stale:
+            print("the translation kept from the last build does not fit this one (%d of %d files: %s): translating the game again"
+                  % (len(stale), len(KEPT), ", ".join(stale[:4])), flush=True)
+            return KEPT_STALE
+        print("the translation kept from the last build: %d files, their objects cached" % len(KEPT), flush=True)
+        PLANNED.update({(j[1], j[2]): KEPT[j[1]][0] for j in jobs if j[1] in KEPT and not os.path.exists(j[1])})
+    if bar_kb is not None:
+        light = sorted(os.path.basename(j[1]) for j in jobs if j[3][-len(LIGHT_FLAGS):] == LIGHT_FLAGS)
+        print("build: %d lifted chunks without -O1's module passes (HOOKSHOT_LIGHT_PASSES, functions under %d KB): %s"
+              % (len(light), bar_kb, " ".join(light)), flush=True)
     fp = lambda b: hashlib.sha1(b, usedforsecurity=False).hexdigest()[:10]
     norm = lambda f: flag_text(f).encode()
     code = hashlib.sha1(usedforsecurity=False)
     for code_src in sorted(x for x in srcs if os.path.basename(x).startswith("code_")):
-        code.update(os.path.basename(code_src).encode() + open(code_src, "rb").read())
+        code.update(os.path.basename(code_src).encode() +
+                    (KEPT[code_src][0] if code_src in KEPT and not os.path.exists(code_src) else content_sha1(code_src)).encode())
     print("object keys: game-code headers %s, flags %s, hot flags %s, lifted code %s (%d files)" % (
         fp(deps), fp(norm(fl)), fp(norm(hot_fl)), code.hexdigest()[:10],
         sum(1 for x in srcs if os.path.basename(x).startswith("code_"))), flush=True)
     # the runtime: ordinary C at -O2, with its own headers (any host/*.h change rebuilds all of it)
     host_fl = target() + CPU + (["-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + \
-        ["-I" + HOST, "-I" + rt64, "-I" + gen, "-Wno-everything", "-O2", "-g0", "-mcx16", "-DA64_POLLING"] + WRITE_TRACK
+        ["-I" + HOST, "-I" + rt64, "-I" + gen, "-Wno-everything", "-O2", "-g0", "-mcx16", "-DA64_POLLING"] + WRITE_TRACK + MARK_BITMAP_HOST
+    # ((Triforce) host_deps is what every runtime file was named by before, for a file with no depfile yet (host_blob); each is
+    # compiled with -MD and named by the headers its depfile says it read under host_roots (renderer_deps), so a host/*.h edit
+    # compiles the files that include it, and an edit to a gpu/ header a runtime file reads (gpu/render/rx.h ...) is no longer
+    # missed. host_extras: what a file reads from elsewhere (FFmpeg's version), as before)
     host_deps = deps + b"".join(open(os.path.join(HOST, f), "rb").read() for f in sorted(os.listdir(HOST))
                                 if f.endswith(".h"))
     if LINUX:
         host_deps += b"".join(open(os.path.join(POSIX, f), "rb").read() for f in sorted(os.listdir(POSIX)) if f.endswith(".h"))
         host_deps += open(os.path.join(GPU, "vk", "vk_api.h"), "rb").read()
     host_deps += open(os.path.join(GPU, "vk", "dlss_math.h"), "rb").read()   # (host/rx_backend.c's DLSS jitter)
-    host_deps += ffmpeg_version_key()
-    jobs += [(cc, s, os.path.join(obj_dir, "host_" + os.path.basename(s)[:-2] + ".o"),
-              host_fl + ["-I" + os.path.join(OPUS, "include")] +
+    host_blob, host_extras = host_deps, ffmpeg_version_key()
+    host_roots = (HOST, gen, rt64, GPU, os.path.join(OPUS, "include"), os.path.join(kit.HERE, "..", "third_party", "zstd", "lib"))
+    host_objs = [os.path.join(obj_dir, "host_" + os.path.basename(s)[:-2] + ".o") for s in host_srcs]
+    DEPFILE_JOBS.update((o, (host_blob, host_roots, host_extras)) for o in host_objs)
+    jobs += [(cc, s, o,
+              host_fl + ["-MD", "-I" + os.path.join(OPUS, "include")] +
               (["-I" + os.path.join(FFMPEG, "include")] if FFMPEG else []) +
               (FFMPEG_LX[0] if LINUX and FFMPEG_LX else []) +
               ([stamp_def] if os.path.basename(s) == "hos_main.c" else []) +
               # (RenoDX's HDR in this build: the scene's colour target is RGBA16F with HDR Native, hos_scene_rgba16f)
-              (["-DHOOKSHOT_RENODX"] if RENODX and os.path.basename(s) == "nn_vi.c" else []), host_deps) for s in host_srcs]
+              (["-DHOOKSHOT_RENODX"] if RENODX and os.path.basename(s) == "nn_vi.c" else []),
+              renderer_deps(host_blob, host_roots, o) + host_extras) for s, o in zip(host_srcs, host_objs)]
     # libopus 1.5.2 (third_party/opus, from TOTKPort): nn::codec's hardware Opus decoder (host/nn_codec.c)
     # (hookshot: built for the same CPU target as the rest (CPU), so its float code can be vectorized where the target has
     # AVX2: the vendored copy has no x86 intrinsics files of its own)
@@ -1233,11 +2118,9 @@ def main():
             jobs.append((cxx, src, os.path.join(obj_dir, "gpu_" + name + ".o"), gflags, gdeps))
     # the Vulkan back end, a DLL of its own (RX_BACKEND=vulkan): CPM cache, HOOKSHOT_*_HEADERS, or system includes
     vk_jobs = []
-    vk_headers = header_package("vulkanheaders", "vulkan/vulkan.h", "HOOKSHOT_VULKAN_HEADERS")
-    spirv_headers = header_package("spirv-headers", "spirv/unified1/spirv.h", "HOOKSHOT_SPIRV_HEADERS")
-    vma_headers = header_package("vulkanmemoryallocator", "vk_mem_alloc.h", "HOOKSHOT_VMA_HEADERS")
+    vk_headers, spirv_headers, vma_headers = vulkan_headers()
     # (the AppImage's prebuilt triforce_vk.so is built without NVIDIA's SDK: a build with HOOKSHOT_NGX_SDK compiles its own)
-    vk_prebuilt = "" if NGX_SDK else os.environ.get("HOOKSHOT_VK_PREBUILT", "")
+    vk_prebuilt = prebuilt_renderer()
     build_vk = a.standalone and not a.only and not vk_prebuilt and vk_headers and spirv_headers and vma_headers
     if a.standalone and not a.only and vk_prebuilt:
         print("the Vulkan back end: %s, as built" % vk_prebuilt)
@@ -1315,6 +2198,13 @@ def main():
         fsr_flags = ["-DHOOKSHOT_FSR", "-I" + os.path.join(kit.HERE, "..", "third_party", "fidelityfx")] if FSR else []
         if FSR:
             print("the Vulkan back end: with AMD FSR 4 (AMD's FSR API headers, third_party/fidelityfx)", flush=True)
+        # ((Triforce) Intel XeSS Super Resolution (vk_xess.cpp), from Intel's MIT XeSS API headers (third_party/xess/inc): in every
+        # Windows build, as it only loads the player's own libxess.dll at run time (never shipped: Intel's licence) and does
+        # nothing without it. Only vk_xess.cpp sees Intel's headers. Not on Linux, where Intel ships no XeSS library: there it is
+        # the stubs that say XeSS is Windows only)
+        xess_headers = os.path.join(kit.HERE, "..", "third_party", "xess", "inc")
+        xess_flags = [] if LINUX else ["-DHOOKSHOT_XESS", "-I" + xess_headers]
+        xess_deps = b"" if LINUX else tree_headers(os.path.join(xess_headers, "xess"))
         # (RenoDX's HDR, a build's option too: only vk_renodx.cpp sees its compiled shaders; without them it is the stubs
         # that replace nothing)
         renodx_flags = ["-DHOOKSHOT_RENODX", "-I" + RENODX] if RENODX else []
@@ -1325,8 +2215,9 @@ def main():
         # rebuild their ~500 files; the back end itself depends on everything, suyu's texture decoders included)
         vk_lib_deps = tree_headers(os.path.join(vk, "eden"), os.path.join(vk, "sirit"), os.path.join(vk, "compat"),
                                    os.path.join(GPU, "compat"))
-        vdeps = tree_headers(vk, os.path.join(GPU, "render"), os.path.join(GPU, "compat"),
-                             os.path.join(GPU, "third_party", "suyu", "video_core", "textures"))
+        vdeps_roots = (vk, os.path.join(GPU, "render"), os.path.join(GPU, "compat"),
+                       os.path.join(GPU, "third_party", "suyu", "video_core", "textures"))
+        vdeps = tree_headers(*vdeps_roots)
         # (hookshot) Dear ImGui (third_party/imgui) draws the overlays over the window's image (gpu/vk/vk_imgui.cpp; vk_menu.cpp
         # draws with it). Its objects see only its own headers; its headers are a dependency of the two files that include them
         imgui = os.path.normpath(os.path.join(kit.HERE, "..", "third_party", "imgui"))
@@ -1359,20 +2250,31 @@ def main():
         for src in vk_sources():
             name = os.path.relpath(src, vk).replace(os.sep, "_")[:-4]
             lib = os.path.relpath(src, vk).split(os.sep)[0] in ("eden", "sirit")
-            vk_jobs.append((cxx, src, os.path.join(obj_dir, "vk_" + name + ".o"),
-                            vflags + ([] if lib else vk_pgo) +
+            obj = os.path.join(obj_dir, "vk_" + name + ".o")
+            # ((Triforce) the renderer's own files: the headers their depfile names (renderer_deps); DEPFILE_JOBS re-keys them)
+            extras = ((logo_text if os.path.basename(src) == "vk_imgui.cpp" else b"") +
+                      (renodx_deps if os.path.basename(src) == "vk_renodx.cpp" else b"") +
+                      (xess_deps if os.path.basename(src) == "vk_xess.cpp" else b"") +
+                      (ngx_deps if os.path.basename(src) == "vk_dlss.cpp" else b"") +
+                      (sl_deps if os.path.basename(src) == "vk_dlssg.cpp" else b"") +
+                      (imgui_deps if os.path.basename(src) in imgui_users else b""))
+            if not lib:
+                DEPFILE_JOBS[obj] = (vdeps, vdeps_roots, extras)
+            vk_jobs.append((cxx, src, obj,
+                            vflags + ([] if lib else vk_pgo + ["-MD"]) +
                             ([shader_stamp, translation_def] if os.path.basename(src) == "vk_shader.cpp" else []) +
                             ([stamp_def] if os.path.basename(src) == "vk_menu.cpp" else []) +
                             (ngx_flags if os.path.basename(src) == "vk_dlss.cpp" else []) +
                             (sl_flags if os.path.basename(src) == "vk_dlssg.cpp" else []) +
                             (imgui_flags if os.path.basename(src) in imgui_users else []) +
                             (fsr_flags if os.path.basename(src) == "vk_fsr4.cpp" else []) +
+                            (xess_flags if os.path.basename(src) == "vk_xess.cpp" else []) +
                             (renodx_flags if os.path.basename(src) == "vk_renodx.cpp" else []),
-                            vk_lib_deps if lib else vdeps + (logo_text if os.path.basename(src) == "vk_imgui.cpp" else b"") +
-                            (renodx_deps if os.path.basename(src) == "vk_renodx.cpp" else b"") +
-                            (ngx_deps if os.path.basename(src) == "vk_dlss.cpp" else b"") +
-                            (sl_deps if os.path.basename(src) == "vk_dlssg.cpp" else b"") +
-                            (imgui_deps if os.path.basename(src) in imgui_users else b"")))
+                            vk_lib_deps if lib else renderer_deps(vdeps, vdeps_roots, obj) + extras))
+        # ((Triforce) the ReShade presets (the Graphics tab's ReShade preset row): ReShade's FX compiler (third_party/reshade_fx,
+        # BSD-3-Clause; stb_image's PNG decoder, MIT) and the presets' runtime in gpu/vk/reshade, which vk_sources leaves out
+        vk_jobs.extend(reshade_fx.build_jobs(cxx, os.path.normpath(os.path.join(kit.HERE, "..")), gen_dir, obj_dir, vflags + vk_pgo,
+                                             vflags, vdeps, windows=not LINUX))
         if NGX_SDK and not LINUX and toolchain.mingw():
             # (llvm-mingw: NVIDIA's static library was built with Microsoft's compiler for its static runtime (/MT). What it asks
             # of that runtime: the C parts as for the static FFmpeg (host/mingw_msvc_shims.c), the C++ ones in vk_ngx_msvc_rt.cpp)
@@ -1407,10 +2309,22 @@ def main():
     global GATE
     GATE = None if os.environ.get("HOOKSHOT_MEM_GATE") == "0" else MemoryGate()
     eta_jobs = GATE.expected(a.jobs) if GATE else a.jobs   # (the countdown with the compilers the memory holds, not --jobs)
+    if not EARLY:
+        write_compdb(out, jobs, gen)   # ((Triforce) for clangd and clang-tidy; the lifted C left out)
     counted, expected, pending = os.environ.get("HOOKSHOT_TIMES"), {}, []
+    if OBJ_STORE and not EARLY:   # ((Triforce) the objects this build needs that another work folder built: in the folder's cache
+        # before the plan counts them. The folder's own first, those of a build that stopped before it shared them too)
+        object_store.share(OBJ_CACHE, OBJ_STORE)
+        for _, src, obj, fl, deps in jobs:
+            if (src, obj) not in PLANNED and os.path.exists(src):
+                PLANNED[(src, obj)] = key_of(src, fl, deps)
+        got = object_store.fetch(OBJ_STORE, OBJ_CACHE, [PLANNED[(j[1], j[2])] for j in jobs if (j[1], j[2]) in PLANNED])
+        print("object store %s: %d objects from it" % (OBJ_STORE, got), flush=True)
     if counted:
         work_jobs, keys = plan_jobs(jobs)
         PLANNED.update(keys)
+        if not EARLY:
+            save_hashes(out)   # ((Triforce) the sources this plan hashed, for the next build: HASH_CACHE)
         estimate = per_file_seconds(work_jobs, times_from(counted))
         pending = list(estimate)
         for job, seconds in zip(work_jobs, estimate):
@@ -1426,7 +2340,7 @@ def main():
         try:
             for future in concurrent.futures.as_completed(submitted):
                 src, secs, err = future.result()
-                size = os.path.getsize(src) >> 20
+                size = src_size(src) >> 20
                 if err:
                     failed.append(submitted[future])
                     print("not compiled yet: %s (%d MB, %.0fs), tried again alone at the end:\n%s"
@@ -1455,7 +2369,7 @@ def main():
     still = 0
     for job in failed:
         src, secs, err = compile_one(job)
-        size = os.path.getsize(src) >> 20
+        size = src_size(src) >> 20
         if err:
             still += 1
             print("FAILED %s (%d MB, %.0fs, alone too):\n%s" % (os.path.basename(src), size, secs, err), flush=True)
@@ -1469,10 +2383,19 @@ def main():
     print("compiled in %.0fs, %d failed" % (time.time() - t0, still), flush=True)
     if still:
         return 1
+    if not EARLY:   # ((Triforce) the keys the compile worked out, for the next build, whether or not a countdown planned them)
+        save_hashes(out)
+    rekey_depfiles(jobs)   # ((Triforce) the renderer's own objects and the runtime's, by their new depfiles; early ones too)
+    if OBJ_STORE and not EARLY:   # ((Triforce) after rekey_depfiles: the objects it caches by their depfile's key go to the store too)
+        print("object store: %d new objects to it" % object_store.share(OBJ_CACHE, OBJ_STORE), flush=True)
     if build_vk:   # ((Triforce) the translation stamp this build compiled, for the next build's line: translation_stamp_note)
         translation_stamp_keep(*translation_record)
     if EARLY:   # (nothing to link yet: the game's own objects come with the build after the lift)
         return 0
+    # ((Triforce) the lifted files' object keys, for an update that skips the lift: KEPT_LIST. Not for a part of the game (--only,
+    # the renderer alone) nor for chunks compiled in parts (RX_COLD_OPT): those objects are not the whole chunks')
+    if a.standalone and not a.only and not vk_only and not cold and not a.dry_run:
+        write_kept(gen, jobs)
     vk_objs = {j[2] for j in vk_jobs}
     objs = [j[2] for j in jobs if j[2] not in vk_objs]
     rsp = os.path.join(out, "objs.rsp")
@@ -1485,26 +2408,30 @@ def main():
         exe = os.path.join(out, EXE)   # (+ Triforce.map: crash offsets -> f_<guest address>)
         t = time.time()
         # (--export-dynamic-symbol: the window's state, which the Vulkan back end's own Win32 calls read by name)
-        r = subprocess.run([cc] + target() + ["-fuse-ld=lld", "-o", exe, "-Wl,-Map=" + exe + ".map", "-Wl,--gc-sections",
-                                              "-Wl,--export-dynamic-symbol=hos_posix_*", "@" + rsp] + HOT_ORDER() +
+        r = run_link([cc] + target() + ["-fuse-ld=lld", "-o", exe] + linker("-Map=" + exe + ".map") +
+                           ["-Wl,--gc-sections", "-Wl,--export-dynamic-symbol=hos_posix_*", "@" + rsp] + HOT_ORDER() +
                            (["-fprofile-instr-generate"] if PGO == "gen" else []) +
-                           (FFMPEG_LX[1] if FFMPEG_LX else []) + HOST_LIBS,
-                           capture_output=True, text=True)
+                           (FFMPEG_LX[1] if FFMPEG_LX else []) + HOST_LIBS, exe)
         undefined = sorted({l.strip() for l in (r.stdout + r.stderr).splitlines() if "undefined symbol" in l})
         if r.returncode:
             print("link FAILED (%.0fs), %d undefined symbols" % (time.time() - t, len(undefined)))
             print("\n".join(undefined[:60]) if undefined else (r.stdout + r.stderr)[-3000:])
+            return 1
+        too_big = image_too_big(exe)   # ((Triforce, 11-24))
+        if too_big:
+            print(too_big)
             return 1
         print("linked %s: %d MB (%.0fs)" % (exe, os.path.getsize(exe) >> 20, time.time() - t))
         sdl = os.environ.get("HOOKSHOT_SDL2", "")   # (libSDL2-2.0.so.0 beside it, when the AppImage brings one)
         if sdl and os.path.exists(sdl):
             import shutil
             shutil.copyfile(sdl, os.path.join(out, "libSDL2-2.0.so.0"))
+        copy_renhdrum(out, "renhdrum.so")
     elif a.standalone and not a.only and not vk_only:
         exe = os.path.join(out, "Triforce.exe")   # (+ Triforce.map: crash offsets -> f_<guest address>)
         t = time.time()
-        r = subprocess.run([cc] + toolchain.native_target() + toolchain.native_link() +
-                           ["-o", exe, toolchain.link_opt("/map:" + exe[:-4] + ".map"), toolchain.link_opt("/stack:8388608"), "@" + rsp] + HOT_ORDER() + HOST_LIBS +
+        r = run_link([cc] + toolchain.native_target() + toolchain.native_link() +
+                           ["-o", exe] + linker("/map:" + exe[:-4] + ".map") + [toolchain.link_opt("/stack:8388608"), "@" + rsp] + HOT_ORDER() + HOST_LIBS +
                            repro_link() +   # ((Triforce, 11-22, IO-45) HOOKSHOT_LINK_REPRO=1: no link time in the file)
                            ([toolchain.link_opt("/nodefaultlib:clang_rt.profile.lib")] if PGO == "gen" else []) +
                            ([os.path.join(kit.WORK, "hookshot.res")] if os.path.exists(os.path.join(kit.WORK, "hookshot.res")) else []) +   # (nx2/make_icon.py)
@@ -1514,11 +2441,15 @@ def main():
                            ([os.path.join(FFMPEG, "lib", l + ".lib") for l in ("avcodec", "swscale", "swresample", "avutil")] +
                             ["-lbcrypt", "-lmfplat", "-lmfuuid", "-lstrmiids", "-lole32"] if FFMPEG else []) +
                            (["-lc++", "-lunwind"] if toolchain.mingw() else []),   # (llvm-mingw: the C++ parts' runtime, linked in; MSVC's comes by itself)
-                           capture_output=True, text=True)
+                           exe)
         undefined = sorted({l.strip() for l in (r.stdout + r.stderr).splitlines() if "undefined symbol" in l})
         if r.returncode:
             print("link FAILED (%.0fs), %d undefined symbols" % (time.time() - t, len(undefined)))
             print("\n".join(undefined[:60]) if undefined else (r.stdout + r.stderr)[-3000:])
+            return 1
+        too_big = image_too_big(exe)   # ((Triforce, 11-24))
+        if too_big:
+            print(too_big)
             return 1
         print("linked %s: %d MB (%.0fs)" % (exe, os.path.getsize(exe) >> 20, time.time() - t))
         if wgpu:   # (wgpu_native.dll beside it; in use while the game runs)
@@ -1545,6 +2476,7 @@ def main():
         if os.path.exists(sdl3) and (not os.path.exists(sdl3_dst) or os.path.getsize(sdl3_dst) != os.path.getsize(sdl3)):
             import shutil
             shutil.copyfile(sdl3, sdl3_dst)
+        copy_renhdrum(out, "renhdrum.dll")
     if vk_prebuilt and a.standalone and not a.only:
         import shutil
         shutil.copyfile(vk_prebuilt, os.path.join(out, VK_LIB))
@@ -1554,14 +2486,14 @@ def main():
         open(vrsp, "w", encoding="utf-8").write("\n".join('"%s"' % j[2].replace("\\", "/") for j in vk_jobs))
         t = time.time()
         if LINUX:   # (its C++ runtime inside: the game folder runs where the AppImage's sysroot is older than the system)
-            link = [toolchain.need(toolchain.find("clang++"))] + target() + [
-                "-fuse-ld=lld", "-shared", "-o", vdll, "-Wl,-Map=" + vdll + ".map", "-Wl,-Bsymbolic", "-Wl,--gc-sections",
-                "-static-libstdc++", "-static-libgcc", "@" + vrsp] + \
+            link = [toolchain.need(toolchain.find("clang++"))] + target() + ["-fuse-ld=lld", "-shared", "-o", vdll] + \
+                linker("-Map=" + vdll + ".map") + ["-Wl,-Bsymbolic", "-Wl,--gc-sections", "-static-libstdc++", "-static-libgcc",
+                                                   "@" + vrsp] + \
                 ([ngx_library(NGX_SDK, True)] if NGX_SDK else []) + ["-ldl", "-lpthread", "-lm"]
         else:   # (Triforce: advapi32 for RivaTuner Statistics Server's folder in the registry, gpu/vk/rtss_sys_win.cpp)
             link = [cc] + toolchain.native_target() + toolchain.native_link() + \
-                ["-shared", "-o", vdll, toolchain.link_opt("/map:" + vdll[:-4] + ".map"), "@" + vrsp, "-luser32", "-ladvapi32"] +               (["-lc++", "-lunwind"] if toolchain.mingw() else []) + ngx_link(NGX_SDK, toolchain.mingw()) + repro_link()
-        r = subprocess.run(link, capture_output=True, text=True)
+                ["-shared", "-o", vdll] + linker("/map:" + vdll[:-4] + ".map") + ["@" + vrsp, "-luser32", "-ladvapi32"] +               (["-lc++", "-lunwind"] if toolchain.mingw() else []) + ngx_link(NGX_SDK, toolchain.mingw()) + repro_link()
+        r = run_link(link, vdll)
         if r.returncode:
             undefined = sorted({l.strip() for l in (r.stdout + r.stderr).splitlines() if "undefined symbol" in l})
             print("%s link FAILED, %d undefined symbols" % (VK_LIB, len(undefined)))
@@ -1574,12 +2506,16 @@ def main():
         dll = os.path.join(out, "hookshot_game.dll")   # (+ hookshot_game.map: crash offsets -> f_<guest address>)
         t = time.time()
         r = subprocess.run([cc] + toolchain.native_target() + toolchain.native_link() +
-                           ["-shared", "-o", dll, toolchain.link_opt("/map:" + dll[:-4] + ".map"), "@" + rsp],
+                           ["-shared", "-o", dll] + linker("/map:" + dll[:-4] + ".map") + ["@" + rsp],
                            capture_output=True, text=True)
         undefined = sorted({l.strip() for l in (r.stdout + r.stderr).splitlines() if "undefined symbol" in l})
         if r.returncode:
             print("link FAILED (%.0fs), %d undefined symbols" % (time.time() - t, len(undefined)))
             print("\n".join(undefined[:40]) if undefined else (r.stdout + r.stderr)[-3000:])
+            return 1
+        too_big = image_too_big(dll)   # ((Triforce, 11-24))
+        if too_big:
+            print(too_big)
             return 1
         print("linked %s: %d MB, no undefined symbols (%.0fs)" % (dll, os.path.getsize(dll) >> 20, time.time() - t))
     return 0

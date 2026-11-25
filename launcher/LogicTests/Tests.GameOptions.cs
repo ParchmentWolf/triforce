@@ -102,6 +102,16 @@ static partial class Tests
         foreach (var line in s.Split('\n'))
         {
             var code = line.Split("//")[0];
+            // ((Triforce) 11-24) arrays, pad_speaker[12] = {0, ...}: each element by its index, and the name alone where every
+            // element is the same (toggle[HOS_SW_ZL]: a symbol for an index)
+            var arr = Regex.Match(code, @"^\s*int\s+(\w+)\[\d+\]\s*=\s*\{([^}]*)\}\s*;");
+            if (arr.Success)
+            {
+                var vals = arr.Groups[2].Value.Split(',').Select(x => int.Parse(x.Trim())).ToList();
+                for (var i = 0; i < vals.Count; i++) d[arr.Groups[1].Value + "[" + i + "]"] = vals[i];
+                if (vals.Distinct().Count() == 1) d[arr.Groups[1].Value + "[]"] = vals[0];
+                continue;
+            }
             var m = Regex.Match(code, @"^\s*int\s+(.*);");
             if (!m.Success) continue;
             foreach (var part in m.Groups[1].Value.Split(','))
@@ -122,9 +132,14 @@ static partial class Tests
         Check(table.Count > 100, "the table read: " + table.Count + " entries");
         var symbols = new Dictionary<string, int>
         {
-            ["kLastOutput"] = 9, ["OUTPUT_MIN_W"] = 640, ["OUTPUT_MAX_W"] = 7680, ["OUTPUT_MIN_H"] = 360, ["OUTPUT_MAX_H"] = 2880, ["ur::kValues - 1"] = 6, ["ur::kUpscalers - 1"] = 6, ["ur::kModels - 1"] = 3, ["aa_rows::kValues - 1"] = 3,
+            ["kLastOutput"] = 9, ["OUTPUT_MIN_W"] = 640, ["OUTPUT_MAX_W"] = 7680, ["OUTPUT_MIN_H"] = 360, ["OUTPUT_MAX_H"] = 2880, ["ur::kValues - 1"] = 6, ["ur::kUpscalers - 1"] = 9, ["ur::kModels - 1"] = 3, ["aa_rows::kValues - 1"] = 3,
             ["2 + kMaxMics"] = 18, ["HOS_PROMPT_N"] = 6, ["mr7::FG_DLSS_LAST"] = 12, ["framegen_rows::kRowMax"] = 9,
+            // ((Triforce) 11-22..25: N64 Classic, the FPS counter's levels, Frame generation by, FSR 4 model, ReShade, Menu language)
+            ["n64_rules::FAITHFUL"] = 1, ["n64_rules::REMEMBERED"] = 2, ["n64_rules::kPresets - 1"] = 2, ["fps_levels::kMax"] = 6,
+            ["framegen_rows::kByMax"] = 1, ["ur::kFsr4Models - 1"] = 1, ["reshade::last_builtin_preset"] = 26, ["i18n::lang_count()"] = 14,
         };
+        // (an array element by a symbol's index, toggle[HOS_SW_ZL]: the array's one value)
+        int Dflt(string field) => defaults.TryGetValue(field, out var v) ? v : defaults[Regex.Replace(field, @"\[.*\]$", "[]")];
         int Num(string s, string what) => int.TryParse(s, out var v) ? v : symbols.TryGetValue(s, out v) ? v : throw new TestFailed(what + ": a symbol the test does not know, " + s);
         var tabs = new Dictionary<string, GameOptionTab>
         {
@@ -137,6 +152,8 @@ static partial class Tests
         // parts' defaults, by the schema's own rules)
         var hidden = table.Where(r => r.Tab == "TAB_HIDDEN" && r.Value != "nullptr").ToList();
         var partDefaults = new Dictionary<string, int>(StringComparer.Ordinal);
+        // ((Triforce) 11-24/25) the game's own state among them (auto_tune, auto_for, n64_classic_last): kept keys, no part
+        hidden = hidden.Where(r => !GameOptionsSchema.KeptKeys.ContainsKey(GameOptionsSchema.IniKey(r.Name))).ToList();
         foreach (var r in hidden)
         {
             var key = GameOptionsSchema.IniKey(r.Name);
@@ -150,7 +167,7 @@ static partial class Tests
         }
         Equal(string.Join(",", hidden.Select(r => GameOptionsSchema.IniKey(r.Name)).OrderBy(k => k, StringComparer.Ordinal)),
             string.Join(",", GameOptionsSchema.Parts.Keys.OrderBy(k => k, StringComparer.Ordinal)), "the parts are the hidden rows");
-        var left = new[] { "&opts.language", "&opts.pad_layout" };   // (Game language: language.txt's; Layout preset: KeptKeys)
+        var left = new[] { "&opts.language", "&opts.pad_layout", "&output_pick", "&reshade_menu::user_pick" };   // (+ 11-24: the Output device and the User preset file, the game's own lists of this PC's devices and files)   // (Game language: language.txt's; Layout preset: KeptKeys)
         var sections = new Dictionary<string, string>();
         var names = new List<string>();
         foreach (var r in table)
@@ -177,7 +194,7 @@ static partial class Tests
             else
             {
                 Check(!row.IsMerged && GameOptionsSchema.IniKey(r.Name) == row.Key, r.Name + ": its own line, key " + row.Key);
-                Equal(defaults[r.Value["&opts.".Length..]], row.Default, r.Name + ": default");
+                Equal(Dflt(r.Value["&opts.".Length..]), row.Default, r.Name + ": default");
             }
         }
         Equal(string.Join("|", names), string.Join("|", GameOptionsSchema.All.Select(r => r.Name)), "the rows, in the menu's order");
@@ -235,15 +252,15 @@ static partial class Tests
             }
             else Equal(0, r.Choices.Count, r.Name + ": a slider has no choice list");
         }
-        Equal("Screen,Ultrawide,HDR,RenoDX,Overlay", string.Join(",", GameOptionsSchema.Sections(GameOptionTab.Display)), "Display's sections");
-        Equal("Upscaling,Anti-aliasing,Frame generation,Frame rate & latency,Textures,Advanced", string.Join(",", GameOptionsSchema.Sections(GameOptionTab.Graphics)), "Graphics' sections");
-        Equal("Controller,Mouse & keyboard,Rumble,Gameplay,Motion,Controls", string.Join(",", GameOptionsSchema.Sections(GameOptionTab.Controls)), "Controls' sections");
-        Equal("Sound,Microphone", string.Join(",", GameOptionsSchema.Sections(GameOptionTab.Audio)), "Audio's sections");
-        Equal("Game,Online", string.Join(",", GameOptionsSchema.Sections(GameOptionTab.System)), "System's sections (with rows)");
+        Equal("Screen,Ultrawide,HUD,HDR,RenoDX,Accessibility,Overlay", string.Join(",", GameOptionsSchema.Sections(GameOptionTab.Display)), "Display's sections");
+        Equal("Evil HD,This PC,Upscaling,Anti-aliasing,N64 Classic,Frame generation,Frame rate & latency,Textures,Post-processing,Detail,Advanced", string.Join(",", GameOptionsSchema.Sections(GameOptionTab.Graphics)), "Graphics' sections");
+        Equal("Controller,Mouse & keyboard,Rumble,Gameplay,Motion,Hold to toggle,Controls", string.Join(",", GameOptionsSchema.Sections(GameOptionTab.Controls)), "Controls' sections");
+        Equal("Sound,Microphone,Controller speaker", string.Join(",", GameOptionsSchema.Sections(GameOptionTab.Audio)), "Audio's sections");
+        Equal("Achievements,Game,Saves & reports,Online", string.Join(",", GameOptionsSchema.Sections(GameOptionTab.System)), "System's sections (with rows)");
 
         string L(string key, int v) => GameOptionsSchema.Get(key).Label(v);
         string Cs(string key) => string.Join("|", GameOptionsSchema.Get(key).Choices.Select(c => c.Value + "=" + c.Label));
-        Equal("-3=30|-2=40|-1=45|0=60 (the console's)|1=90|2=120|3=144|4=165|5=240|6=Monitor's rate", Cs("frame_rate_cap"), "fps cap");
+        Equal("-3=30|-2=40|-1=45|0=60 (the console's)|1=90|2=120|3=144|4=165|5=240|6=Monitor's rate|7=Uncapped", Cs("frame_rate_cap"), "fps cap");
         Equal("7=1536x864 (handheld)|3=1920x1080|0=2048x1152|1=2560x1440|2=3840x2160|4=5120x1440|6=5120x2160|5=5120x2880|8=Screen|9=Custom (2560x1440)", Cs("output_res"),
             "output sizes, smallest first, then Screen and Custom");
         Equal("0=Game|1=NVIDIA DLSS|3=AMD FSR 3.1|4=AMD FSR 4", Cs("dlss"), "upscalers: the engines, in the menu's order");
@@ -254,7 +271,7 @@ static partial class Tests
         Equal("0=Off|1=Expanded|2=Native|3=Native + RenoDX", Cs(GameOptionsSchema.HdrKey), "HDR, RenoDX merged in");
         Equal("0=Off|1=Even|2=Steady, any rate|3=Steady, refresh steps", Cs(GameOptionsSchema.PacingKey), "frame pacing, steady merged in");
         Equal("0=Auto|1=Switch|2=Xbox|3=PlayStation 4|4=PlayStation 5|5=Steam Deck|6=Keyboard & mouse", Cs("button_prompts"), "prompts");
-        Equal("0=Insert or F1|1=F1 only", Cs("menu_shortcut"), "menu shortcut");
+        Equal("0=Insert or F1|1=F1 only|2=Insert, F1 or Esc|3=Insert, F1 or touchpad|4=Insert, F1, Esc or touchpad", Cs("menu_shortcut"), "menu shortcut");
         // (Low latency by the card's maker: NVIDIA's Reflex where it is not known)
         var vendorBefore = GameOptionsSchema.LatencyVendorOf;
         try
@@ -312,7 +329,7 @@ static partial class Tests
         Equal("75% (3840x1620)", wide.Label("resolution"), "of the whole 5120x2160");
         wide.Set("output_res", 2);
         Equal("21:9", wide.Label("ultrawide"), "a 16:9 size: the row's shape");
-        Equal(4, wide.ChoicesOf("ultrawide").Count, "and its four choices");
+        Equal(5, wide.ChoicesOf("ultrawide").Count, "and its five choices (4:3 since N64 Classic)");
         Equal("75% (3312x1398)", wide.Label("resolution"), "the row's 21:9 at the 4K output: kept to 3840x2160's pixels");
         wide.Set("ultrawide", 0);
         Equal("75% (2880x1620)", wide.Label("resolution"), "the game's own picture");
@@ -482,7 +499,8 @@ static partial class Tests
         var info = new FileInfo(path);
         var (len, time) = (info.Length, info.LastWriteTimeUtc);
         var f = GameOptionsFile.Load(RealGame);
-        Check(f.Exists && f.Version == GameOptionsSchema.CurrentVersion, "read, version " + f.Version);
+        // (the game writes 10 since 11-24, a version the launcher leaves as it is: CurrentVersion)
+        Check(f.Exists && f.Version >= GameOptionsSchema.CurrentVersion, "read, version " + f.Version);
         // (every key is a row or a kept one: these, knowingly. options_version: the format; menu_size: the old Menu size row;
         // layout_preset: rebinds the pad_ lines in the game; the Debug tab's; pad_* and key_*: the Controls page's bindings)
         Equal("", string.Join(",", f.UnknownKeys), "no key nobody knows");
@@ -497,7 +515,7 @@ static partial class Tests
             if (r.Kind == GameOptionKind.Choice)
                 Check(f.ChoicesOf(r.Key).Any(c => c.Value == v && c.Label == label), r.Name + ": " + v + " = \"" + label + "\" is one of its choices");
             else
-                Check(Regex.IsMatch(label, @"^(-?\d+( nits|%)?|\d\.\d\d|Off|Muted|Default \(24%\))$"), r.Name + ": a slider's label \"" + label + "\"");
+                Check(Regex.IsMatch(label, @"^(-?\d+( nits|%| ms)?|\d\.\d\d|Off|Muted|Default \(24%\)|(TV|Controller) waits \d+ ms|100% \(the game's\))$"), r.Name + ": a slider's label \"" + label + "\"");
             Check(r.IsMerged || v == GameOptionsSchema.NativeStep || f.Raw(r.Key) == null || v == r.AsRead(GameOptionsFile.Atoi(f.Raw(r.Key)!)),
                 r.Name + ": the file's value as the game reads it");
         }

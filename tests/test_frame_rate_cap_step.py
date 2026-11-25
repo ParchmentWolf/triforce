@@ -65,6 +65,10 @@ static void hos_log(const char *fmt, ...) { (void)fmt; }
 int rx_option(int id, int otherwise) { (void)id; return otherwise; }
 int hos_ini_option(const char *key, int otherwise) { (void)key; return otherwise; }
 enum { HOS_OPT_DISPLAY_CAP = 60 };   /* (gpu/vk/vk_api.h: Monitor's rate, tests/test_fps_cap_monitor.py) */
+enum { HOS_OPT_FPS_CAP_ROW = 342 };   /* ((Triforce) gpu/vk/vk_api.h: the cap's row in play, host/nn_vi.c fps_row_asked) */
+static volatile int fps_row_asked = -100;
+enum { HOS_OPT_EVIL_HD = 420 };   /* ((Triforce) Evil HD's render distance: host/evil_hd.c, tests/test_evil_hd_foliage.py) */
+void hos_evil_hd_tick(int row) { (void)row; }
 static volatile long long presents;
 volatile uint64_t hos_gfx_module = MOD;
 volatile int hos_fixed_resolution, hos_dynres_runs;
@@ -72,6 +76,7 @@ volatile uint32_t hos_fixed_scale_bits;
 volatile float hos_text_scale;
 volatile uint64_t hos_step_probe, hos_res_module;
 volatile uint32_t hos_frame_seconds_bits;
+static volatile int step_pace;   /* (host/nn_vi.c's, which realtime_step notes its pace in: tests/test_frame_carry_cap60.py) */
 @HOST@
 static uint64_t a64_fpx_div32_div32(void *c, uint64_t a, uint64_t b) {
     float x, y; uint32_t w;

@@ -131,7 +131,7 @@ def check_source():
     hi = shader.index(in_mark, lo)
     between = shader[lo:hi]
     for needle in ("void size_note(VkShaderModule m, const std::vector<uint32_t>& code) {",
-                   "if (!m || fallback_size_driver() == fallback_size::Driver::Other) return;",
+                   "if (!m || !stage_sizes_counted()) return;",
                    "void size_move(VkShaderModule from, VkShaderModule to) {",
                    "size_move(st.module, (VkShaderModule)(uintptr_t)code.get());",
                    "fallback_size::Driver fallback_size_driver() {",

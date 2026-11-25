@@ -4,6 +4,7 @@
 #include "vk_dlssg.h"
 #include "vk_paths.h"
 #include "cpu_count.h"   // ((Triforce, 11-22, OS-49) the threads to size by: HOS_SIM_CPU
+#include "prepare_journal.h"   // ((Triforce, 11-24) kExitEntryLimit: the journalled preparation's exit status for one entry past its limit
 #include "vk_loader.h"
 
 #include <atomic>
@@ -11,6 +12,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -23,17 +25,24 @@
 #include "gpu_choice.h"
 #include "present_mode.h"   // (the swapchain's present mode: the VSync row and the switches)
 #include "surface_lost.h"   // ((Triforce, 11-22, PRESENT-45) the window's surface lost: create_swapchain, invalidate_lost_surface)
+#include "crash_markers.h"   // (mkwvk_close_asked: a close is not a crash)
 #include "vk_menu.h"
 #include "vk_dlss.h"
 #include "vk_fsr4.h"
+#include "vk_xess.h"   // ((Triforce) Intel XeSS's instance and device extensions and features, with its library beside the game)
 #include "vk_reflex.h"
 #include "vk_antilag.h"
 #include "vk_progress.h"
+#include "vk_programs.h"   // ((Triforce) RX_VK_LOAD=create: when programs are loaded
 #include "vk_dump.h"   // (write_png: RX_VK_STARTUP_SHOTS)
 #include "foliage_shadow.h"   // ((Triforce) RX_VK_FOLIAGE_SHADOW_VRS: whether the fragment shading rate is asked for)
 #include "recorder_auto.h"   // ((Triforce) the recorder thread's default by the GPU and the cores)
+#include "threaded_rendering.h"   // ((Triforce) the Threaded rendering row's rule: threaded_choice)
 #include "vk_gpu_clock.h"   // ((Triforce, Linux) the GPU's stable power state: gpu_clock_device_created)
 #include "mesa_spilling.h"    // ((Triforce, 11-22, PIPE-55) shader_spilling_rate=2 for Mesa's Intel compiler, Linux build)
+#include "cxx_escape.h"       // ((Triforce) a C++ exception out of the renderer: said, and the game stopped on it
+#include "renderer_guard.h"   // (every function the host is given, behind that)
+#include "native_fadd.h"   // ((Triforce) RX_VK_NATIVE_FADD: where a float add to a storage buffer is the GPU's own atomic)
 #include "new_wait.h"   // ((Triforce, 11-22, OS-04) a `new` refused at Windows' commit limit waits before it throws: new_refused)
 #include <new>
 
@@ -96,13 +105,24 @@ int64_t prof_ns[PROF_COUNT];
 Device dev;
 PFN_vkGetInstanceProcAddr instance_proc() { return vkx::instance_proc_addr(); }
 
-void logf(const char* fmt, ...) {
+static void vlogf(LogLevel level, const char* fmt, std::va_list a) {
+    static const char* const tags[] = {"[error] ", "[warn] ", "", "[debug] ", "[trace] "};
     char b[1024];
+    const int n = std::snprintf(b, sizeof b, "%s", tags[level >= log_error && level <= log_trace ? level : log_info]);
+    std::vsnprintf(b + n, sizeof b - n, fmt, a);
+    if (host) host->log(b);
+}
+void logf(const char* fmt, ...) {
     std::va_list a;
     va_start(a, fmt);
-    std::vsnprintf(b, sizeof b, fmt, a);
+    vlogf(log_info, fmt, a);
     va_end(a);
-    if (host) host->log(b);
+}
+void logf_at(LogLevel level, const char* fmt, ...) {
+    std::va_list a;
+    va_start(a, fmt);
+    vlogf(level, fmt, a);
+    va_end(a);
 }
 
 namespace {
@@ -155,6 +175,7 @@ bool create_instance() {
         std::vector<VkExtensionProperties> all(n);
         vkEnumerateInstanceExtensionProperties(nullptr, &n, all.data());
         dlss_instance_extensions(ext_list, all);
+        xess_instance_extensions(ext_list, all, app.apiVersion);   // ((Triforce) Intel XeSS's, when its library is there: vk_xess.cpp)
         // (hookshot) the HDR10 colour space for the Insert menu's HDR (the menu's settings are read after the instance is made, so
         // whenever the driver has it; the SDR choice in create_swapchain keeps to the sRGB surface)
         if (has_extension(all, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME))
@@ -189,6 +210,42 @@ static unsigned process_physical_cores() {
         if (info[i].Relationship == RelationProcessorCore) masks.push_back((uint64_t)info[i].ProcessorMask);
     const uint64_t affinity = (uint64_t)proc | (host && host->reserved_cpus ? host->reserved_cpus() : 0);
     return recorder_default::physical_cores(masks.data(), (int)masks.size(), affinity);
+}
+
+// (Triforce) Threaded rendering (threaded_rendering.h), resolved once for the run: RX_VK_THREADED when it is set, else the Debug
+// tab's row as the options file has it at the start (menu_init), the physical cores the process may run on (process_physical_cores)
+// and, for Auto, whether the run is safe for it: the capture off (RX_VK_CAPTURE=0: a replay behind the game is right only from the
+// capture), RX_VK_LOW_SPEC, a frame dump (RX_VK_DUMP), the bench (RX_VK_BENCH); then, only when Auto would pick the threads, the
+// buffer pools' mirrors, which read the device (asked at pick_device, after it is known: a reader before it gets Auto off).
+// On is the player's word: nothing is checked for it. Off, the default: every reader as before
+const threaded::Choice& threaded_choice() {
+    static const threaded::Choice choice = [] {
+        menu_init();
+        const int env = threaded::from_env(getenv("RX_VK_THREADED"));
+        const int setting = env >= 0 ? env : opts.threaded_rendering;
+        const unsigned cores = setting == threaded::AUTO ? process_physical_cores() : 0;
+        const char* capture = getenv("RX_VK_CAPTURE");
+        const char* unsafe = capture && atoi(capture) == 0                               ? "RX_VK_CAPTURE=0"
+                             : getenv("RX_VK_LOW_SPEC") && atoi(getenv("RX_VK_LOW_SPEC")) ? "RX_VK_LOW_SPEC"
+                             : getenv("RX_VK_DUMP")                                        ? "RX_VK_DUMP"
+                             : getenv("RX_VK_BENCH")                                       ? "RX_VK_BENCH"
+                                                                                           : nullptr;
+        threaded::Choice c = threaded::choose(setting, cores, unsafe != nullptr);
+        if (threaded::auto_picked(c)) {
+            if (!dev.physical) {
+                c = {false, false, threaded::Why::AutoUnsafe};
+                unsafe = "asked before the GPU was picked";
+            } else if (!pools_mirrored()) {
+                c = threaded::without_mirrors(c, cores);
+                unsafe = "the buffer pools have no mirrors";
+            }
+        }
+        char line[256];
+        threaded::describe(line, sizeof line, c, cores, unsafe, env >= 0);
+        logf("vk: Threaded rendering: %s", line);
+        return c;
+    }();
+    return choice;
 }
 
 bool pick_device() {
@@ -333,6 +390,11 @@ bool pick_device() {
         if (!getenv("RX_VK_RECORDER"))
             logf("vk: recorder thread %s by default (%s: %u logical processors, %u physical cores; RX_VK_RECORDER=thread or =off "
                  "decides)", recorder_default::on(why) ? "on" : "off", recorder_default::text(why), logical, physical);
+        // ((Triforce) Threaded rendering, resolved here, the device known: its recorder thread over that default, the switch over both)
+        if (threaded_choice().recorder_thread && !recorder_default::on(why)) {
+            recorder_auto(true);
+            if (!getenv("RX_VK_RECORDER")) logf("vk: recorder thread on: Threaded rendering (RX_VK_RECORDER=off: off)");
+        }
     }
     vkGetPhysicalDeviceMemoryProperties(dev.physical, &dev.memory);
     return true;
@@ -356,6 +418,11 @@ bool create_device() {
     optional(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, dev.external_memory_fd);   // (guest memory as udmabufs: vk_memory.cpp import_dma_buf)
     if (dev.external_memory_fd) optional(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME, dev.dma_buf_import);
     optional(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME, dev.pipeline_library);
+    // ((Triforce) RX_VK_LOAD=create or auto only: the load at a program's create call makes a compute pipeline from the caches by
+    // its module's identifier, without the program's code (vk_programs.h). Without the switch the device is made as before.
+    // Not a field of dev: vk_state.h is part of the translator's stamp)
+    bool module_id = false;
+    if (programs_load_asked()) optional(VK_EXT_SHADER_MODULE_IDENTIFIER_EXTENSION_NAME, module_id);
     if (dev.pipeline_library) optional(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME, dev.graphics_pipeline_library);
     optional(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME, dev.custom_border_color);
     optional(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME, dev.dynamic_state3);
@@ -390,6 +457,26 @@ bool create_device() {
         optional(VK_AMD_BUFFER_MARKER_EXTENSION_NAME, dev.buffer_marker);
     optional(VK_EXT_DEVICE_FAULT_EXTENSION_NAME, dev.device_fault);
     optional(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME, dev.coop_matrix);
+    // (Triforce) the GPU's own float add on storage buffers: the game's RED/ATOM.ADD.F32 become one OpAtomicFAddEXT instead
+    // of a compare-exchange loop, which gives up after CAS_LOOP_MAX_TRIES attempts and loses that add, and with which Intel's
+    // Windows driver lost the device at the sky's light sums (compute 499dbfd0721d2858, an Arc B580 after the intro). By
+    // default on the drivers and GPU families it was run on (native_fadd.h has the list); RX_VK_NATIVE_FADD=1 asks for it on
+    // any GPU, =0 keeps the loop on every one, the extension not even enabled
+    const char* const fadd_env = getenv("RX_VK_NATIVE_FADD");
+    VkPhysicalDeviceDriverProperties fadd_driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    {
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p2.pNext = &fadd_driver;
+        vkGetPhysicalDeviceProperties2(dev.physical, &p2);
+    }
+#ifdef _WIN32
+    constexpr bool fadd_windows = true;
+#else
+    constexpr bool fadd_windows = false;
+#endif
+    const bool fadd_wanted = native_fadd::wanted(fadd_env, fadd_driver.driverID, dev.props.deviceID, dev.props.driverVersion, fadd_windows);
+    bool atomic_float = false;
+    if (fadd_wanted) optional(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME, atomic_float);
     optional(VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME, dev.swap_mutable);   // (hookshot: the overlays, vk_imgui.cpp)
     dlss_device_extensions(want, exts);   // (hookshot: NVIDIA DLSS's, vk_dlss.cpp)
     bool fsr_descriptor_buffer = false;   // (hookshot, linux: only with a Vulkan FSR 4 library beside the game, vk_fsr4.cpp)
@@ -403,6 +490,11 @@ bool create_device() {
     if (dlssg::early()) dlssg::device_extensions(want, exts);
     else reflex_device_extensions(want, exts);   // (hookshot: NVIDIA Reflex's, vk_reflex.cpp)
     antilag_device_extensions(want, exts);   // (hookshot: AMD Anti-Lag 2's, vk_antilag.cpp)
+    // ((Triforce) Intel XeSS's, when its library is there and the instance took its own; last, so a device refused with them
+    // is made again without: below, at vkCreateDevice)
+    const size_t want_before_xess = want.size();
+    xess_device_extensions(want, exts);
+    const std::vector<const char*> xess_exts(want.begin() + (ptrdiff_t)want_before_xess, want.end());   // (its own, by name)
 
     // the queue: one family for graphics, compute and transfer
     vkGetPhysicalDeviceQueueFamilyProperties(dev.physical, &n, nullptr);
@@ -465,6 +557,8 @@ bool create_device() {
     VkPhysicalDeviceProvokingVertexFeaturesEXT pv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT};
     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
     void** tail = &f13.pNext;
+    VkPhysicalDeviceShaderModuleIdentifierFeaturesEXT module_idf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MODULE_IDENTIFIER_FEATURES_EXT};
+    if (module_id) *tail = &module_idf, tail = &module_idf.pNext;
     if (dev.mesh_shader) *tail = &mesh, tail = &mesh.pNext;
     if (dev.null_descriptor) *tail = &robust2, tail = &robust2.pNext;
     if (dev.index_uint8) *tail = &u8, tail = &u8.pNext;
@@ -484,6 +578,8 @@ bool create_device() {
     if (dev.memory_priority) *tail = &mem_prio, tail = &mem_prio.pNext;   // ((Triforce, 11-22, TEX-47) only with the switch)
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
     if (dev.coop_matrix) *tail = &coop, tail = &coop.pNext;
+    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT afloat{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT};
+    if (atomic_float) *tail = &afloat, tail = &afloat.pNext;
     VkPhysicalDeviceDescriptorBufferFeaturesEXT descriptor_buffer{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT};
     if (fsr_descriptor_buffer) *tail = &descriptor_buffer, tail = &descriptor_buffer.pNext;
     VkPhysicalDeviceFragmentShadingRateFeaturesKHR rate{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR};
@@ -492,6 +588,7 @@ bool create_device() {
     reflex_device_features(tail);   // (present ids, when NVIDIA Reflex's extensions are there)
     antilag_device_features(tail);   // (AMD Anti-Lag 2's, when its extension is there)
     vkGetPhysicalDeviceFeatures2(dev.physical, &f);
+    if (module_id && module_idf.shaderModuleIdentifier) module_ids_on();   // ((Triforce) RX_VK_LOAD=create: vk_programs.h)
     descriptor_buffer.descriptorBufferCaptureReplay = VK_FALSE;
     dev.view_2d_of_3d = dev.view_2d_of_3d && v2d3d.sampler2DViewOf3D;
     dev.memory_priority = dev.memory_priority && mem_prio.memoryPriority;   // ((Triforce, 11-22, TEX-47) the allocator's bit: vma_init)
@@ -500,6 +597,25 @@ bool create_device() {
     coop.cooperativeMatrixRobustBufferAccess = VK_FALSE;
     dev.coop_matrix = dev.coop_matrix && coop.cooperativeMatrix &&
                       f12.vulkanMemoryModel && f12.vulkanMemoryModelDeviceScope;
+    {   // ((Triforce) only the float add on buffers on: the one the translator emits)
+        dev.float_atomic_add = atomic_float && afloat.shaderBufferFloat32AtomicAdd;
+        void* const next = afloat.pNext;
+        afloat = VkPhysicalDeviceShaderAtomicFloatFeaturesEXT{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT};
+        afloat.pNext = next;
+        afloat.shaderBufferFloat32AtomicAdd = dev.float_atomic_add ? VK_TRUE : VK_FALSE;
+        const char* const how = dev.float_atomic_add ? "native (VK_EXT_shader_atomic_float)"
+                                : !fadd_wanted       ? "compare-exchange loop"
+                                : atomic_float       ? "compare-exchange loop (no shaderBufferFloat32AtomicAdd)"
+                                                     : "compare-exchange loop (no VK_EXT_shader_atomic_float)";
+        if (fadd_env) logf("vk: float atomic add on storage buffers: %s, RX_VK_NATIVE_FADD=%s", how, fadd_env);
+        else logf("vk: float atomic add on storage buffers: %s, %s", how,
+                  !fadd_wanted ? "by default only with NVIDIA's driver, Intel's Windows driver on Meteor Lake, Arrow Lake, Panther Lake, "
+                                 "Lunar Lake and Battlemage, and AMD's Windows driver on Radeon 860M/840M (RX_VK_NATIVE_FADD=1: native "
+                                 "where the GPU has it)"
+                  : fadd_driver.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY ? "NVIDIA's driver"
+                  : fadd_driver.driverID == VK_DRIVER_ID_AMD_PROPRIETARY    ? "AMD's Windows driver, Radeon 860M/840M (0x1114) from 0x8001a0"
+                                                                            : "Intel's Windows driver, Meteor Lake, Arrow Lake, Panther Lake, Lunar Lake or Battlemage");
+    }
     // (bounds-checked buffer access: an out-of-range access dropped instead of faulting the device. On by default: the GPU
     // culling pass 53caac5f faulted the device while a save loaded, about one start in three, and the scene's lighting read garbage
     // for single frames (the black flashes); with it, neither in A/B runs at the same GPU time. Lichii's OoT branch keeps it on too.
@@ -530,6 +646,7 @@ bool create_device() {
     dev.null_descriptor = dev.null_descriptor && robust2.nullDescriptor;
     pv.transformFeedbackPreservesProvokingVertex = VK_FALSE;
     dev.provoking_vertex = dev.provoking_vertex && pv.provokingVertexLast;
+    dev.vertex_divisor = dev.vertex_divisor && vdiv.vertexAttributeInstanceRateDivisor;   // (a divisor over 1 needs the feature, not only the extension)
     dev.conditional_rendering = dev.conditional_rendering && cond.conditionalRendering;
     dev.custom_border_color = dev.custom_border_color && border.customBorderColors && border.customBorderColorWithoutFormat;
     dev.depth_clip_control = dev.depth_clip_control && clip.depthClipControl;
@@ -564,6 +681,7 @@ bool create_device() {
         if (dev.radv_gcn) logf("vk: RADV on a GCN 1 to 4 GPU (no 16-bit storage input and output)");
         dev.fixes = vendor_fixes(facts);
         amd_older = amd_older_compiler(facts);
+        dev.amd_older_compiler = amd_older;
         vendor_fixes_env(dev.fixes, [](const char* name) -> const char* { return getenv(name); });
         logf("vk: vendor fixes for %s (%s): out-of-bounds texel fetches 0 %d, NaN tests by bits %d, gather offset %d",
              drv.driverName, drv.driverInfo, (int)dev.fixes.fetch_bounds, (int)dev.fixes.nan_bits, (int)dev.fixes.gather_offset);
@@ -589,21 +707,35 @@ bool create_device() {
     {   // (hookshot, after TotK Recomp's vk_caps.c) NVN's programs are written for 32 lanes: the translator is told 32, and the lane
         // shuffles of OoT's networks and the lane masks of its mesh programs depend on it. NVIDIA's GPUs have no other size; AMD's
         // default to 64 where they like, and the networks' output came out as coloured noise (Hookshot issues 10 and 14)
+        VkPhysicalDeviceFloatControlsProperties fc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
         VkPhysicalDeviceDriverProperties drv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        drv.pNext = &fc;
         VkPhysicalDeviceSubgroupSizeControlProperties sc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
         sc.pNext = &drv;
         VkPhysicalDeviceSubgroupProperties sg{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
         sg.pNext = &sc;
+        VkPhysicalDeviceMeshShaderPropertiesEXT mesh_props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT};
         VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
         p2.pNext = &sg;
+        if (dev.mesh_shader) fc.pNext = &mesh_props;   // ((Triforce) with the extension only: the simulated turf's pools, sim_turf_max_records)
         vkGetPhysicalDeviceProperties2(dev.physical, &p2);
+        if (dev.mesh_shader) dev.max_mesh_groups = std::min(mesh_props.maxMeshWorkGroupCount[0], mesh_props.maxMeshWorkGroupTotalCount);
         const bool pin = f13.subgroupSizeControl && sc.minSubgroupSize <= 32 && sc.maxSubgroupSize >= 32 && !getenv("RX_VK_NO_SUBGROUP_PIN");
         dev.sg32_stages = pin ? sc.requiredSubgroupSizeStages : 0;
+        dev.max_workgroup_subgroups = sc.maxComputeWorkgroupSubgroups;
         dev.subgroup_size = sg.subgroupSize;
+        dev.subgroup_stages = sg.supportedStages;
+        fc.pNext = nullptr;
+        dev.float_controls = fc;
+        logf("vk: shader caps: subgroup stages %#x; denorm independence %d, fp32 denorm preserve %u flush %u, signed zero fp16 %u fp32 %u; "
+             "int64 buffer atomics %u", (unsigned)sg.supportedStages, (int)fc.denormBehaviorIndependence, fc.shaderDenormPreserveFloat32,
+             fc.shaderDenormFlushToZeroFloat32, fc.shaderSignedZeroInfNanPreserveFloat16, fc.shaderSignedZeroInfNanPreserveFloat32,
+             dev.vk12.shaderBufferInt64Atomics);
+        dev.subgroup_min = sc.minSubgroupSize;
         dev.subgroup_max = sc.maxSubgroupSize > sg.subgroupSize ? sc.maxSubgroupSize : sg.subgroupSize;
         dev.driver_id = drv.driverID;
-        logf("vk: subgroups: default %u lanes, %u-%u, pinned to 32 on stages %#x", sg.subgroupSize, sc.minSubgroupSize, sc.maxSubgroupSize,
-             (unsigned)dev.sg32_stages);
+        logf("vk: subgroups: default %u lanes, %u-%u, pinned to 32 on stages %#x, at most %u subgroups a workgroup", sg.subgroupSize,
+             sc.minSubgroupSize, sc.maxSubgroupSize, (unsigned)dev.sg32_stages, dev.max_workgroup_subgroups);
         // ((Triforce, 11-22, PIPE-55) the rate create_instance asked Mesa's Intel compiler for, as this process sees it)
         if (mesa_spilling::told(drv.driverID == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA)) {
             const char* rate = getenv(mesa_spilling::kName);
@@ -657,6 +789,11 @@ bool create_device() {
     // and 4 (LLPC) draws them natively, as before. tests/test_task_mesh_fallback_devices.py
     task_mesh_fallback = dev.props.vendorID == 0x1002 && amd_older;
 #endif
+    // ((Triforce, 11-24) and on those cards the draws of a mesh stage with no task stage too: an RX 6800 XT lost the GPU near
+    // Saria at such a draw, which the rule for task + mesh draws let through to the driver's mesh shaders. Only where the
+    // rule above chose the fallback: the Mesh shaders row's Compute fallback and RX_VK_TASK_MESH_FALLBACK=1 on another GPU
+    // move task + mesh draws alone, as before. RX_VK_MESH_ONLY_FALLBACK=0: task + mesh draws alone on these cards too)
+    const bool amd_older_windows = task_mesh_fallback;
     {   // ((Triforce, 11-18) the menu's Mesh shaders row, mesh_shaders= in triforce_options.ini: 1 Compute fallback on any GPU with
         // mesh shaders (an RX 7700S's glowing walls went with it, #bug-tracker); 0 Auto, the rule above. RX_VK_TASK_MESH_FALLBACK over it)
         char exe[MAX_PATH];
@@ -675,20 +812,43 @@ bool create_device() {
     }
     if (const char* e = getenv("RX_VK_TASK_MESH_FALLBACK")) task_mesh_fallback = atoi(e) != 0;
     dev.task_mesh_fallback = task_mesh_fallback && dev.mesh_shader && f12.bufferDeviceAddress && !getenv("RX_VK_NO_MESH_FALLBACK");
-    if (dev.task_mesh_fallback) logf("vk: task + mesh programs use the compute fallback (RX_VK_TASK_MESH_FALLBACK=0: native)");
+    dev.mesh_only_fallback = dev.task_mesh_fallback && amd_older_windows &&
+                             !(getenv("RX_VK_MESH_ONLY_FALLBACK") && !atoi(getenv("RX_VK_MESH_ONLY_FALLBACK")));
+    if (dev.task_mesh_fallback)
+        logf("vk: %s programs use the compute fallback (RX_VK_TASK_MESH_FALLBACK=0: native%s)",
+             dev.mesh_only_fallback ? "mesh-only and task + mesh" : "task + mesh",
+             dev.mesh_only_fallback ? "; RX_VK_MESH_ONLY_FALLBACK=0: task + mesh alone" : "");
     if (robust) logf("vk: robust buffer access %s", robust_ok ? "on" : "not supported");
     f.features.robustBufferAccess = robust_ok ? VK_TRUE : VK_FALSE;   // (off by default: the game's accesses stay in their buffers)
     dev.features = f.features;
     dev.sparse_images = (families[dev.queue_family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) && f.features.sparseBinding &&
                         f.features.sparseResidencyImage2D && !(getenv("RX_VK_SPARSE") && !atoi(getenv("RX_VK_SPARSE")));
     dev.sparse_buffers = (families[dev.queue_family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) && f.features.sparseBinding;
+    // ((Triforce) Intel XeSS's features (vk_xess.cpp), last, into the chain as it will be made: the library sets what it needs
+    // in the renderer's structures and adds what it lacks (VK_EXT_mutable_descriptor_type's); nothing without its library, and
+    // a refusal leaves the chain as it was and XeSS out for the run)
+    VkBaseOutStructure* chain_end = (VkBaseOutStructure*)&f;
+    while (chain_end->pNext) chain_end = chain_end->pNext;
+    void* chain = &f;
+    xess_device_features(&chain, tail);
     VkDeviceCreateInfo ci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
-    ci.pNext = &f;
+    ci.pNext = chain;
     ci.queueCreateInfoCount = compute_family != UINT32_MAX ? 2 : 1;
     ci.pQueueCreateInfos = qs;
     ci.enabledExtensionCount = (uint32_t)want.size();
     ci.ppEnabledExtensionNames = want.data();
     VkResult made = vkCreateDevice(dev.physical, &ci, nullptr, &dev.device);
+    if (made != VK_SUCCESS && xess_device_refused()) {   // ((Triforce) refused with XeSS's: made again as without its library)
+        logf("vk: vkCreateDevice failed with Intel XeSS's extensions and features (VkResult %d): made again without them", (int)made);
+        for (const char* x : xess_exts)   // (by name: the list may have lost one of the renderer's since)
+            for (size_t i = 0; i < want.size(); i++)
+                if (!strcmp(want[i], x)) want.erase(want.begin() + (ptrdiff_t)i--);
+        chain_end->pNext = nullptr;
+        ci.pNext = &f;
+        ci.enabledExtensionCount = (uint32_t)want.size();
+        ci.ppEnabledExtensionNames = want.data();
+        made = vkCreateDevice(dev.physical, &ci, nullptr, &dev.device);
+    }
     if (made != VK_SUCCESS && dlssg::early()) {   // (Streamline's refused it: the loader's, without frame generation)
         char why[96];
         snprintf(why, sizeof why, "Streamline could not make the device (VkResult %d)", (int)made);
@@ -703,6 +863,10 @@ bool create_device() {
 
 
     load_device(dev.device);
+    // ((Triforce) when programs are loaded: RX_VK_LOAD, before the title without it (vk_programs.h). Without mesh shaders, or with
+    // the task + mesh draws through the fallback, a start in create mode still keeps the fallback's programs ready; only the
+    // log's reason depends on it (load_default.h))
+    programs_load_decide(dev.mesh_shader && !dev.mesh_fallback && !dev.task_mesh_fallback);
     vkGetDeviceQueue(dev.device, dev.queue_family, 0, &dev.queue);
     dev.present_queue = VK_NULL_HANDLE;
     dev.present_family = dev.queue_family;
@@ -726,10 +890,22 @@ bool create_device() {
         vkGetPhysicalDeviceProperties2(dev.physical, &p2);
         dev.max_push_descriptors = pp.maxPushDescriptors;
     }
+    if (dev.vertex_divisor) {
+        VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT vp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p2.pNext = &vp;
+        vkGetPhysicalDeviceProperties2(dev.physical, &p2);
+        dev.max_vertex_divisor = vp.maxVertexAttribDivisor;
+    }
     return true;
 }
 
 } // namespace
+
+// ((Triforce) Threaded rendering's halves, for the other files: vk_internal.h)
+bool threaded_render_thread() { return threaded_choice().render_thread; }
+bool threaded_recorder_thread() { return threaded_choice().recorder_thread; }
+bool threaded_on() { return threaded_choice().on(); }
 
 /// (hookshot) The UNORM format of an sRGB one (the same bytes, read and written as they are), else the format itself
 VkFormat unorm_of(VkFormat f) {
@@ -784,6 +960,7 @@ bool gpu_device_luid(uint8_t out[8]) {
 // ---- (Triforce, 11-22, the performance audit's PRESENT-45, after Source A's) The window's surface lost (surface_lost.h),
 // RX_VK_SURFACE_RECOVER (on unless =0)
 namespace { bool open_window_surface(bool log_failure); }   // (below, with the window's own code: start)
+namespace { int system_hdr_on(std::string* display); }      // (below too: Windows' own HDR setting for the window's display)
 bool surface_recover(VkResult result) {
     static const bool on = surface_lost::on(getenv("RX_VK_SURFACE_RECOVER"));
     return surface_lost::recovers(result == VK_ERROR_SURFACE_LOST_KHR, on, dlssg::active());
@@ -857,22 +1034,41 @@ bool create_swapchain(uint32_t width, uint32_t height) {
             f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
             fmt = f;
     // (hookshot) the Insert menu's HDR: a 10-bit HDR10 surface when the display lists one (Windows: "Use HDR" on in its display
-    // settings), the picture then written by framegen_hdr. Otherwise the SDR one above, said once
+    // settings), the picture then written by framegen_hdr. Otherwise the SDR one above, and why (dev.hdr_sdr_why: Windows'
+    // own setting tells "HDR off" from "the driver lists none with HDR on", as NVIDIA's can), said
+    // again when the reason or the display asked about changes, and when the menu's HDR was turned off in between
     dev.hdr = false;
+    dev.hdr_sdr_why = hdr_sdr_none;
+    static int told = -1;   // (the HdrSdrWhy last said, hdr_sdr_none an HDR10 surface; -1 nothing yet, or HDR off since)
+    static std::string told_display;
+    if (!opts.hdr) told = -1;
     if (opts.hdr) {
         for (const auto& f : formats)
             if ((f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || f.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32) &&
                 f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT)
                 fmt = f, dev.hdr = true;
-        static bool told;
-        if (!told) {
-            told = true;
+        std::string display;   // (the display Windows was asked about, named in the line: a PC can have several)
+        if (!dev.hdr) {
+            const int system_hdr = dev.swapchain_colorspace ? system_hdr_on(&display) : -1;
+            dev.hdr_sdr_why = !dev.swapchain_colorspace ? hdr_sdr_no_extension
+                              : system_hdr == 0     ? hdr_sdr_os_off
+                              : system_hdr == 1     ? hdr_sdr_driver
+                                                    : hdr_sdr_unknown;
+            if (!display.empty()) display = " (" + display + ")";
+        }
+        if ((int)dev.hdr_sdr_why != told || display != told_display) {
+            told = dev.hdr_sdr_why, told_display = display;
+            static const char* const why[] = {
+                "", " (no VK_EXT_swapchain_colorspace)", " (HDR is off for this display in Windows' display settings)",
+                (" though Windows has HDR on for this display: the graphics driver offers the game none (a clean reinstall of "
+                 "the driver, then a restart of the PC)"),
+                " (is HDR on in the display settings?)"};
+            static_assert(sizeof why / sizeof *why == hdr_sdr_count, "create_swapchain: a line for each HdrSdrWhy");
             if (dev.hdr)
                 logf("vk: HDR: an HDR10 surface (format %d), paper white %d nits, peak %d nits", (int)fmt.format, opts.hdr_white,
                      opts.hdr_peak);
             else
-                logf("vk: HDR: the display lists no HDR10 surface%s: SDR",
-                     dev.swapchain_colorspace ? " (is HDR on in the display settings?)" : " (no VK_EXT_swapchain_colorspace)");
+                logf("vk: HDR: the display%s lists no HDR10 surface%s: SDR", display.c_str(), why[dev.hdr_sdr_why]);
         }
     }
     // mailbox when the driver has it (latest frame, no tear). The game paces itself (nn_vi.c).
@@ -885,11 +1081,14 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     }
     if (result != VK_SUCCESS || modes.empty())
         logf("vk: querying present modes failed (VkResult %d, count %u); trying mandatory FIFO mode", (int)result, n);
-    const bool force_fifo = getenv("RX_VK_FIFO") != nullptr;   // (as on a card or driver with vsync forced)
+    const bool fifo_env = getenv("RX_VK_FIFO") != nullptr;   // (as on a card or driver with vsync forced)
     // (Windows, no mailbox: AMD's driver has none, and FIFO held anything under 60 fps at 30.
     //  Linux: immediate on NVIDIA's X11 path turns vblank off for every output, so the other
     //  monitor and other programs tear. RX_VK_IMMEDIATE=1 still asks for it.)
     const bool want_immediate = getenv("RX_VK_IMMEDIATE") != nullptr;
+    // ((Triforce) 11-24: the VSync row's Every refresh, 2: FIFO, each frame waiting for the display's refresh, as RX_VK_FIFO;
+    // RX_VK_IMMEDIATE still over the row)
+    const bool force_fifo = fifo_env || (opts.vsync == 2 && !want_immediate);
     // (Triforce) the Insert menu's VSync row off asks for immediate too, wherever the surface lists it; on, the choice is the
     // one above, from before the row. present_mode.h has the rule, the two switches still over the row
     bool has_mailbox = false, has_immediate = false;
@@ -995,7 +1194,7 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     dev.swap_extent = {width, height};
     dev.swap_images = std::move(images);
     logf("vk: swapchain %ux%u, %u images, %s%s", width, height, n, present_mode::name(chosen),
-         force_fifo ? " (RX_VK_FIFO)" : want_immediate ? " (RX_VK_IMMEDIATE)" : opts.vsync ? "" : " (VSync off)");
+         fifo_env ? " (RX_VK_FIFO)" : force_fifo ? " (VSync every refresh)" : want_immediate ? " (RX_VK_IMMEDIATE)" : opts.vsync ? "" : " (VSync off)");
     dev.swap_generation++;   // ((Triforce) an image held from the one before is let go: present_image, RX_VK_ACQUIRE_FENCE)
     present_mode_now.store((int)chosen, std::memory_order_relaxed);
     swap_views_make(ci.imageUsage, mutable_view ? view_formats[1] : fmt.format);
@@ -1007,10 +1206,97 @@ bool create_swapchain(uint32_t width, uint32_t height) {
 namespace {
 
 HWND main_window = nullptr;
+#ifdef _WIN32
+// (Triforce) Windows 11 24H2's advanced colour info (DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2 and the names of its numbers in
+// the Windows SDK), written out for headers that lack it or keep it behind NTDDI_VERSION
+struct AdvancedColorInfo2 {
+    DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+    UINT32 flags, color_encoding, bits_per_color_channel, active_color_mode;
+};
+enum : UINT32 {
+    kGetAdvancedColorInfo2 = 15,   // (DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2)
+    kAdvancedColorModeHdr = 2      // (DISPLAYCONFIG_ADVANCED_COLOR_MODE_HDR; 0 SDR, 1 wide colour)
+};
+#endif
+// (Triforce) whether the system has HDR on for the window's display: 1 on, 0 off, -1 not known. Windows' own setting ("Use
+// HDR"), as its display settings show it: create_swapchain's word on why the swapchain is SDR. *display is given the
+// display's name (the monitor's, else Windows' "\\.\DISPLAYn") once it is found, for the log. Windows 11 24H2 tells the mode
+// (activeColorMode). An older one only tells "advanced colour", which is HDR or the wide colour an SDR display is given:
+// off is off, on without "wide colour enforced" is HDR, and on with it is not told apart here (not known, so the old
+// question and no wrong word). Elsewhere not known (a Linux compositor lists HDR10 when it has HDR on).
+// Asked at each swapchain while HDR is on and the surface SDR: a few hundredths of a millisecond beside a swapchain's
+// tens, and an answer kept could outlive Windows' setting
+int system_hdr_on(std::string* display) {
+#ifdef _WIN32
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof mi;
+    if (!main_window || !GetMonitorInfoW(MonitorFromWindow(main_window, MONITOR_DEFAULTTONEAREST), &mi)) return -1;
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+    LONG r = ERROR_INSUFFICIENT_BUFFER;
+    for (int tries = 0; r == ERROR_INSUFFICIENT_BUFFER && tries < 4; tries++) {   // (the displays can change in between)
+        UINT32 np = 0, nm = 0;
+        if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) != ERROR_SUCCESS) return -1;
+        paths.resize(np), modes.resize(nm);
+        r = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, paths.data(), &nm, modes.data(), nullptr);
+        paths.resize(np), modes.resize(nm);
+    }
+    if (r != ERROR_SUCCESS) return -1;
+    for (const DISPLAYCONFIG_PATH_INFO& p : paths) {
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME source{};
+        source.header = {DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, sizeof source, p.sourceInfo.adapterId, p.sourceInfo.id};
+        if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS || wcscmp(source.viewGdiDeviceName, mi.szDevice)) continue;
+        if (display) {
+            DISPLAYCONFIG_TARGET_DEVICE_NAME target{};
+            target.header = {DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, sizeof target, p.targetInfo.adapterId, p.targetInfo.id};
+            const bool named = DisplayConfigGetDeviceInfo(&target.header) == ERROR_SUCCESS && target.monitorFriendlyDeviceName[0];
+            char utf8[256] = "";
+            WideCharToMultiByte(CP_UTF8, 0, named ? target.monitorFriendlyDeviceName : mi.szDevice, -1, utf8, sizeof utf8 - 1,
+                                nullptr, nullptr);
+            *display = utf8;
+        }
+        AdvancedColorInfo2 info2{};
+        info2.header = {(DISPLAYCONFIG_DEVICE_INFO_TYPE)kGetAdvancedColorInfo2, sizeof info2, p.targetInfo.adapterId,
+                        p.targetInfo.id};
+        if (DisplayConfigGetDeviceInfo(&info2.header) == ERROR_SUCCESS) return info2.active_color_mode == kAdvancedColorModeHdr;
+        DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO info{};
+        info.header = {DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO, sizeof info, p.targetInfo.adapterId, p.targetInfo.id};
+        if (DisplayConfigGetDeviceInfo(&info.header) != ERROR_SUCCESS) return -1;
+        return !info.advancedColorEnabled ? 0 : info.wideColorEnforced ? -1 : 1;
+    }
+#else
+    (void)display;
+#endif
+    return -1;
+}
 // (hookshot) hookshot --prepare-shaders (a builder, after a build): the same work with no game, its progress as
 // "@@progress" lines on stdout. A skip there leaves triforce_prepare_skipped beside the game: its own starts then
 // leave the work out too (what was not prepared is built when first drawn), until a --prepare-shaders run ends it
 bool prepare_only() { return getenv("HOOKSHOT_PREPARE_ONLY") != nullptr; }
+// ((Triforce, 11-24) The journalled run's own limit, per entry (prepare_journal.h, --prepare-entry-limit <s>): with a journal,
+// an entry that has been inside the driver for longer than one gets is named in the journal and the run ends at once with exit
+// status 6 (prepare_journal::kExitEntryLimit), to be started again without that program. Looked at once a second, on a thread
+// of its own. No journal, or no limit: nothing to do
+void prepare_entry_watch() {
+    const char* limit = getenv("HOOKSHOT_PREPARE_ENTRY_S");
+    const char* journal = getenv("HOOKSHOT_PREPARE_JOURNAL");
+    if (!limit || atoi(limit) <= 0 || !journal || !*journal) return;
+    std::thread([] {
+        for (;;) {
+            Sleep(1000);
+            if (prepare_journal_overdue()) {
+                if (host && host->log_flush) host->log_flush();
+                std::_Exit(prepare_journal::kExitEntryLimit);
+            }
+        }
+    }).detach();
+}
+/// Before the parts of a --prepare-shaders run: what one a supervisor started needs. Nothing in a game run
+void prepare_supervised() {
+    if (!prepare_only()) return;
+    prepare_entry_watch();
+    prepare_restart_forgive();
+}
 std::string skipped_path() {
     char exe[MAX_PATH];
     const DWORD n = game_module_path(exe, MAX_PATH);
@@ -1262,7 +1548,9 @@ void prepare_with_screen() {
         const bool update = prepare_is_update();   // (an update, RX_VK_PREPARE_BACKGROUND=1: what the notes name now, the rest in play)
         const bool prepared = !update && prepare_run(prep_progress, false);
         if (update) state_list_run();   // (as the start without a screen does, below: the state lists' pipelines before the precompile)
-        if (prepared && !prepare_stopped()) {   // (a first start only: the pipelines the notes predict, into the driver's cache)
+        // (a first start only: the pipelines the notes predict, into the driver's cache. (Triforce, 11-24) As Compile shaders says:
+        // predict_before_title)
+        if (!update && !prepare_stopped() && predict_before_title(prepared)) {
             prep_done.store(0), prep_total.store(0);
             prep_stage.store(1);
             predict_run(prep_progress);
@@ -1389,7 +1677,7 @@ bool started_up() {
     // (Triforce, 11-13: vk_draw.cpp driver_fault_restart)
     struct StartupWork {
         StartupWork() { startup_work_on.store(true); }
-        ~StartupWork() { startup_work_on.store(false); }
+        ~StartupWork() { startup_work_on.store(false), programs_play_begin(); }   // ((Triforce) the life log's census: play from here)
     } startup_work;
     if (prepare_only()) {
         // (three parts: the programs, the pipelines the notes predict, then those they name; most of the time is the first)
@@ -1413,6 +1701,12 @@ bool started_up() {
         };
         printf("@@stage shaders Preparing shaders\n");
         fflush(stdout);
+        // ((Triforce, 11-24) a run a supervisor started (prepare_journal.h): the run before taken off the crash markers, and the
+        // watch of one entry's time inside the driver (HOOKSHOT_PREPARE_ENTRY_S with HOOKSHOT_PREPARE_JOURNAL; none without)
+        prepare_supervised();
+        // ((Triforce) AMD FSR 4's pipelines with its tune on (RX_VK_FSR4_TUNE=1), first: its unrolled layers ask several GB of
+        // memory to build, before the shader caches are read)
+        fsr4_prepare_shaders();
         {
             const PrepareStopWatch watch;   // ((Triforce, 11-18) a stop asked from outside, while the work lasts)
             part = 0;
@@ -1428,7 +1722,7 @@ bool started_up() {
                 prepared = prepare_run(progress, false);
             }
             part = 1;
-            if (prepared && !prepare_stopped()) predict_run(progress);
+            if (!prepare_stopped() && predict_before_title(prepared)) predict_run(progress);   // ((Triforce, 11-24) compile_level.h)
             part = 2;
             if (!prepare_stopped()) {   // (as prepare_with_screen: a stopped run goes no further, and keeps what it made)
                 predict_plan_ensure();
@@ -1505,7 +1799,7 @@ bool started_up() {
             WriteFile(console, line, (DWORD)n, &wrote, nullptr);
         };
         const bool update = prepare_is_update();   // (an update: what the notes name now, the rest in play)
-        if (!update && prepare_run(progress, false)) predict_run(progress);
+        if (!update && predict_before_title(prepare_run(progress, false))) predict_run(progress);   // ((Triforce, 11-24) compile_level.h)
         predict_plan_ensure();
         if (update) state_list_run();
         precompile_run(progress);
@@ -1650,7 +1944,9 @@ bool prepare_only_start() { return prepare_only(); }
 
 // (hookshot) The window is being closed (host/display.c, host/posix/display_sdl.c, before they end the process): while the
 // shaders are prepared, their workers are stopped and what they made is kept first (10 s at most: a driver can take longer on one
-// pipeline). Looked up by name, so an executable and a back end of different versions still close
+// pipeline). Before that, the file that counts the starts that crashed in the precompile is put back as this start found it
+// (crash_markers.h): a quit is not a crash, nor is a process ended while it closes. Looked up by name, so an executable and
+// a back end of different versions still close
 extern "C"
 #ifdef _WIN32
 __declspec(dllexport)
@@ -1659,6 +1955,15 @@ __attribute__((visibility("default")))
 #endif
 void mkwvk_close_asked(void) {
     using namespace mkwvk;
+    // (before anything that takes time: the 10 s for the workers below, with the window not answering. A player who quits
+    // again then ends the process (End task), and so does the system at a log-out: that end comes after a quit, and must not
+    // count as a crash either)
+    crash_markers::close();
+    programs_census_log("close");   // ((Triforce) RX_VK_LOG_PROGRAM_LIFE or RX_VK_LOAD=create: vk_programs.h)
+    module_ids_flush();
+    page_table_census_log("close");   // ((Triforce) the guest pools the page table cannot reach: how many came, vk_memory.cpp)
+    page_table_check_close();         // ((Triforce) RX_VK_GP_TABLE: its bindings covered, and with =2 the loads checked, vk_draw.cpp)
+    fsr4_close();   // (AMD FSR 4's tuned layers: their background builds stopped before the exit's saves)
     if (!prep_running.load() || prepare_stopped()) return;
     logf("vk: the window was closed while the shaders were prepared: stopping, what is done is kept");
     prepare_stop();
@@ -1696,6 +2001,7 @@ void new_refused() {
 }
 } // namespace mkwvk
 
+static const MkwVkRenderer* init_body(const MkwVkHost* h);
 extern "C"
 #ifdef _WIN32
 __declspec(dllexport)
@@ -1703,12 +2009,29 @@ __declspec(dllexport)
 __attribute__((visibility("default")))
 #endif
 const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
+    try {
+        return init_body(h);
+    } catch (const std::exception& e) {
+        mkwvk::cxx_escape::escaped("mkwvk_init", e);   // (said, then the game stops; before the hooks are set, on stderr)
+    }
+}
+/// mkwvk_init's work, behind its catch
+static const MkwVkRenderer* init_body(const MkwVkHost* h) {
     using namespace mkwvk;
     if (!h || h->version != MKWVK_API_VERSION) return nullptr;
     host = h;
     std::set_new_handler(new_refused);   // ((Triforce, OS-04) a `new` refused at the commit limit waits before it throws)
+    // ((Triforce) a C++ exception out of the renderer, the bad_alloc that handler throws in the end among them: said with its
+    // type and what(), then the FATAL line (cxx_escape.h; no out-of-memory hook: the host has no notice of its own to call))
+    cxx_escape::g_hooks.log = [](const char* line) { logf("%s", line); };
+    cxx_escape::g_hooks.fatal = [](const char* why) { vk_fatal(why); };   // (vk_replay.cpp replay_fatal: logged, the host's log written out, exit code 3)
     if (!load_global()) {
+#ifdef _WIN32
         logf("vk: vulkan-1.dll not found");
+#else   // ((Triforce, 11-24) linux: why libvulkan.so.1 did not load, kept by LoadLibraryA from dlerror(); "" if it loaded)
+        const char* why = hos_load_error();
+        logf("vk: the Vulkan loader (libvulkan.so.1) or its vkGetInstanceProcAddr was not found%s%s", *why ? ": " : "", why);
+#endif
         return nullptr;
     }
     if (!create_instance() || !pick_device() || !create_device()) return nullptr;
@@ -1742,6 +2065,7 @@ const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
     table.resize = resize;
     table.describe = describe;
     fill_replay_table(table);
+    guard_renderer(table);   // ((Triforce) each function's exceptions said and stopped on, not left to the host's C: renderer_guard.h)
     return &table;
 }
 

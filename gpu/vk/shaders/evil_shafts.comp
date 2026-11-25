@@ -1,0 +1,73 @@
+#version 450
+// (Triforce, 11-24) Evil HD's light shafts (gpu/vk/vk_aa.cpp shafts_after, evil_hd.h): sunbeams through gaps in what stands
+// between the camera and the sky, as light scattering in the air would show them. From each pixel a line of samples runs
+// towards the sun's place on the screen (where the sun's direction from the shadow cascades lands, vk_temporal.cpp
+// temporal_note_cascade); each sample that is open sky adds the sky's light there above a threshold (the sun's disc and the
+// bright sky around it count, a grey sky little), less the further along the line. The sum, tinted as the sky it came from,
+// is added to the picture, the target of the game's SMAA composition (RGB9E5 of square roots, aa_common.glsl), through its
+// R32_UINT view. Faded out as the sun leaves the view (sun.w) and where the screen's own sun is far off it.
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D src;         // (the picture the composition took: linear, tone mapped)
+layout(binding = 1) uniform sampler2D depth_tex;
+layout(binding = 2, r32ui) uniform uimage2D dst;
+layout(push_constant) uniform Push {
+    vec2 inv;
+    ivec2 size;
+    vec4 cam;   // (a, b, flags: 1 the depth runs the other way, 2 show the shafts alone; the sky's distance)
+    vec4 sun;   // (its place on the screen, 0 to 1 each way; strength; how much of it is in front of the camera, 0 to 1)
+} pc;
+
+#include "aa_common.glsl"
+
+const int kSamples = 48;
+const float kReach = 0.85;   // (how far towards the sun the line runs, as a share of the way)
+const float kDecay = 0.978;  // (each sample's weight after the one before)
+
+float distance_at(vec2 uv) {
+    float d = textureLod(depth_tex, uv, 0.0).r;
+    if ((int(pc.cam.z) & 1) != 0) d = 1.0 - d;
+    return pc.cam.y / max(d - pc.cam.x, 1e-7);
+}
+// (the sky's light at uv above the threshold, 0 where anything stands in front of the sky)
+vec3 sky_light(vec2 uv) {
+    if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) return vec3(0.0);
+    if (distance_at(uv) < pc.cam.w) return vec3(0.0);
+    const vec3 c = textureLod(src, uv, 0.0).rgb;
+    const float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    return c * smoothstep(0.2, 0.75, l);
+}
+vec3 unpack_rgb9e5(uint w) {
+    const float scale = exp2(float(w >> 27) - 24.0);
+    return vec3(float(w & 511u), float((w >> 9) & 511u), float((w >> 18) & 511u)) * scale;
+}
+
+void main() {
+    const ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x >= pc.size.x || c.y >= pc.size.y) return;
+    const vec2 uv = (vec2(c) + 0.5) * pc.inv;
+    // (a different start along the line for each pixel: no bands, the steps' pattern too fine to see)
+    const float noise = fract(52.9829189 * fract(0.06711056 * float(c.x) + 0.00583715 * float(c.y)));
+    const vec2 step_uv = (pc.sun.xy - uv) * (kReach / float(kSamples));
+    vec2 p = uv + step_uv * noise;
+    vec3 sum = vec3(0.0);
+    float w = 1.0;
+    for (int i = 0; i < kSamples; i++) {
+        sum += sky_light(p) * w;
+        w *= kDecay;
+        p += step_uv;
+    }
+    // (less as the pixel is further from the sun on the screen: the shafts gather round it)
+    const float near_sun = 1.0 - smoothstep(0.2, 1.1, length((uv - pc.sun.xy) * vec2(pc.inv.y / pc.inv.x, 1.0)));
+    const vec3 shafts = sum / float(kSamples) * pc.sun.z * pc.sun.w * (0.35 + 0.65 * near_sun);
+    if ((int(pc.cam.z) & 2) != 0) {   // (RX_VK_EVIL_AO_SHOW=2, the lab's: the shafts alone, and the sun's place as a dot)
+        const float dot_here = 1.0 - smoothstep(0.004, 0.006, length(uv - pc.sun.xy));
+        imageStore(dst, c, uvec4(aa_pack_rgb9e5(sqrt(min(shafts * 4.0 + vec3(dot_here, 0.0, 0.0), vec3(1.0)))), 0u, 0u, 0u));
+        return;
+    }
+    if (dot(shafts, vec3(1.0)) < 1e-4) return;
+    const vec3 e = unpack_rgb9e5(imageLoad(dst, c).r);
+    const vec3 lit = e * e + shafts;
+    imageStore(dst, c, uvec4(aa_pack_rgb9e5(sqrt(lit)), 0u, 0u, 0u));
+}

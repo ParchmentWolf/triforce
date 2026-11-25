@@ -28,12 +28,18 @@ enum { OOT_HUD_MIDDLE = 0, OOT_HUD_LEFT = -1, OOT_HUD_RIGHT = 1 };
 /* The screens that keep the whole picture, by their class (the first word of the screen object), a bit each: bit k of
    the keep mask keeps screen k whole (the Insert menu's Ultrawide menus row clears the menus' bit 1; the two fades
    are never squeezed: one colour in the middle alone leaves the picture showing at the sides). */
-#define OOT_HUD_KEEP_N 4
+#define OOT_HUD_KEEP_N 5
 static const uint64_t oot_hud_keep_classes[OOT_HUD_KEEP_N] = {
     0x84c0d098ULL,   /* the item wheel's background */
     0x84c04fb0ULL,   /* the pause and system menus' background */
     0x84c061c8ULL,   /* the event fade */
     0x84c07b30ULL,   /* the loading fade */
+    /* ((Triforce) the system overlay (UISystemOverlayScreen): the system menus' header and button guides, which this game's
+       options line up with squeezed into the middle 16:9 (gpu/vk/game_grid.h), and, from the item wheel's first opening on,
+       the wheel's background as well. Its bit 4 is set only while the wheel's background is drawn (vk_framegen.cpp
+       wide_sides): that background then covers the whole picture, as screen 0's does; at every other time the overlay is
+       squeezed, as before */
+    0x84c0f4a0ULL,
 };
 
 static inline uint32_t oot_hud_keep_bit(uint64_t screen_class) {

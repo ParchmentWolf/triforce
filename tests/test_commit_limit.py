@@ -298,7 +298,7 @@ def read_sources():
                     fail("gpu/vk/%s:%d: a nothrow new outside a NoWait scope: at the commit limit it waits 5 s for a null it has "
                          "its own answer to" % (path.name, i + 1))
     main = (VK / "vk_main.cpp").read_text(encoding="utf-8")
-    init = block(main, "const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {")
+    init = block(main, "static const MkwVkRenderer* init_body(const MkwVkHost* h) {")   # (mkwvk_init's work, behind its catch: cxx_escape.h)
     if "std::set_new_handler(new_refused);" not in init:
         fail("vk_main.cpp mkwvk_init does not set the renderer's new handler")
     refused = block(main, "void new_refused() {")

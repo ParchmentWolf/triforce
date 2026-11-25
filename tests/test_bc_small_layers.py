@@ -99,13 +99,16 @@ def main():
     check('bc_scratch::small_layers(getenv("RX_VK_BC_SMALL_LAYERS"), dev.props.vendorID)' in layers,
           "the small scratch's layers are not the rule's of the switch and the card's vendor")
     make = block(tex, "bool bc_scratch_make() {")
-    check("if (bc_small_layers() > 1 && texture_detail_level() == tex_detail::kFull) {" in make,
+    # ((Triforce) at reduced detail only with RX_VK_BC_LEVELS=1, and then kBcTinyDim a side, for the groups of levels alone)
+    check("const bool tiny = bc_levels_on() && texture_detail_level() != tex_detail::kFull;" in make and
+          "if (bc_small_layers() > 1 && (texture_detail_level() == tex_detail::kFull || tiny)) {" in make and
+          "bc_small_px = tiny ? kBcTinyDim : bc_scratch::kSmallDim;" in make,
           "the small scratch is made with one layer asked, or at reduced texture detail")
-    check("si.extent = {bc_scratch::kSmallDim, bc_scratch::kSmallDim, 1};" in make and "si.arrayLayers = bc_small_layers();" in make and
+    check("si.extent = {bc_small_px, bc_small_px, 1};" in make and "si.arrayLayers = bc_small_layers();" in make and
           "sv.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, bc_small_layers()};" in make,
           "the small scratch or its view is not 1024 x 1024 with a run's layers")
     check("const uint64_t out = std::max(bc_scratch::out_bytes(bc_scratch_layers()), small_out);" in make and
-          "bc_small ? bc_scratch::small_out_bytes(bc_small_layers()) : 0" in make,
+          "bc_small ? (uint64_t)(bc_small_px / 4) * (bc_small_px / 4) * bc_small_layers() * 16 : 0" in make,
           "the output buffer does not hold a run of either scratch")
     check("bc_small_fresh = bc_small != VK_NULL_HANDLE;" in make, "a new small scratch's layout is not marked to be set")
     failed = make[make.index("!make_out()) {"):make.index("bc_scratch_fresh = true;")]
@@ -120,10 +123,20 @@ def main():
           "bc_small = VK_NULL_HANDLE" in idle, "the small scratch is not given back with the first")
     start = tex.index("    if (tex.bc) {   // (decoded into the scratch a run of consecutive layers at a time, re-encoded, copied in)")
     loop = tex[start:tex.index("        st_astc++;", start)]
-    check("const bool small = bc_scratch::small_level(g.w, g.h, bc_small != VK_NULL_HANDLE, tex.bc_resized);" in loop and
+    # ((Triforce) RX_VK_BC_LEVELS=1, off unless set: a group's levels finished before a level out of it, a second big one, a
+    # full output buffer or a new piece, and at the end; a failed upload's decoded group ordered before the next upload)
+    check('getenv("RX_VK_BC_LEVELS") && atoi(getenv("RX_VK_BC_LEVELS")) != 0' in tex, "RX_VK_BC_LEVELS is not off unless set")
+    check("const bool grouped = bc_levels_on() && !tex.bc_resized && !to_bc7 && bc_small && bc_small_layer[0] && tex.layers == 1 &&" in loop and
+          "chunk.cuts((uint64_t)g.w * g.h * n))\n                    group_flush(cmd);\n                cmd = chunk.before(" in loop and
+          "        group_flush(cmd);   // ((Triforce, RX_VK_BC_LEVELS) the last group's levels)" in loop and
+          "if (!pending.empty()) full_barrier(c);" in loop,
+          "a group of levels is not finished where it must be")
+    check("const bool small_fits = bc_scratch::small_level(g.w, g.h, bc_small != VK_NULL_HANDLE, tex.bc_resized) &&" in loop and
+          "const bool small = small_fits && (bc_small_px == bc_scratch::kSmallDim || in_group);" in loop and
           "const uint32_t run = small ? bc_small_layers() : bc_layers();" in loop,
           "a level does not ask the rule which scratch it goes through, or does not take that scratch's run")
-    check("VkDescriptorImageInfo ii{VK_NULL_HANDLE, small ? bc_small_view : bc_scratch_view, VK_IMAGE_LAYOUT_GENERAL};" in loop and
+    check(": (small ? bc_small_view : bc_scratch_view);" in loop and
+          "VkDescriptorImageInfo ii{VK_NULL_HANDLE, into, VK_IMAGE_LAYOUT_GENERAL};" in loop and
           "bc_encode_into(cmd, iw, ih, n, tex, level, layers[k0], 0, 0, small ? bc_small_view : VK_NULL_HANDLE);" in loop,
           "a small level is not decoded into the small scratch and encoded from it")
     check("bc_encode_resized(cmd, g.w, g.h, iw, ih, n, tex, level, layers[k0]);" in loop, "a resized texture's levels lost their own path")

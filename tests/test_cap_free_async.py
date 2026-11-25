@@ -184,7 +184,7 @@ def fixture(mem):
     if "test_thread(" not in code:
         raise ValueError("destroy_buffer_later starts no thread")
     return (FIXTURE.replace("@FREEBUF@", block(mem, "struct FreeBuf {", ";"))
-            .replace("@ENVOFF@", block(mem, "bool env_value_off(const char* v) {"))
+            .replace("@ENVOFF@", block(mem, "bool env_value_off(const char* v) {") + "\n" + block(mem, "bool env_on(const char* name) {"))
             .replace("@BLOCK@", code).replace("@EXIT@", block(mem, "void cap_exit_note() {")))
 
 

@@ -43,6 +43,12 @@ static inline int oot_sprint_kind(int32_t id) {
     case 253:   /* StepOn */
     case 35:    /* Slide */
     case 36:    /* SlideLand */
+    /* ((Triforce) 11-24: a roll keeps a sprint, which goes on when the roll ends, and so does a turn: a U-turn's or a
+       quick turn's state ended a toggled sprint each time Link turned about) */
+    case 99:    /* Rolling */
+    case 21:    /* TurnAround */
+    case 22:    /* Turn */
+    case 188:   /* QuickTurn */
         return OOT_SPRINT_KEEP;
     case 40:    /* Wait */
         return OOT_SPRINT_WAIT;

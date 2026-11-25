@@ -186,7 +186,22 @@ NV(nvnDeviceInitialize) {
     RET(1);
 }
 NV(nvnDeviceFinalize) { ((nvn_dev *)P(0))->magic = 0; }
-NV(nvnDeviceGetProcAddress) { RET(U64(1) ? nvn_native_proc((const char *)GP(U64(1))) : 0); }
+/* ((Triforce) A proc name the game passes: read only inside guest memory and up to 255 characters, copied into out ("" when
+   it is not a string there). It was read in place to its end, which a pointer near the window's end (or no end) took past
+   the guest's memory into the host's */
+static const char *guest_name(uint64_t a, char *out, size_t cap) {
+    out[0] = 0;
+    const uint64_t room = a && a < (uint64_t)HOS_SPACE_END ? (uint64_t)HOS_SPACE_END - a : 0;
+    const size_t lim = room < cap ? (size_t)room : cap;
+    const char *s = lim ? (const char *)hos_guest_range(a, lim) : NULL;
+    const char *end = s ? (const char *)memchr(s, 0, lim) : NULL;
+    if (end) memcpy(out, s, (size_t)(end - s) + 1);
+    return out;
+}
+NV(nvnDeviceGetProcAddress) {
+    char name[256];
+    RET(U64(1) ? nvn_native_proc(guest_name(U64(1), name, sizeof name)) : 0);
+}
 /* (hookshot) API version 231.40: OoT (SDK 22.2.8) skips its graphics setup unless the minor is >= 40 (main
    0x8348c11c); MKW's driver said 39, which MKW accepts too. */
 /* The Switch 2 NVN2 driver's device limits: its nvnDeviceGetInteger (sdk+0x65b680) run for every id under
@@ -247,6 +262,11 @@ NV(nvnDeviceSetWindowOriginMode) {
     ((nvn_dev *)P(0))->origin = U32(1);
     hos_log("nvn: window origin %s", U32(1) ? "upper left" : "lower left");
 }
+/* (Triforce) what the game set (NVN's default, 0, before it sets one), as the driver answers. Without them a caller got
+   the "not implemented" stub's 0: lower left to a game that set upper left, so code that lays its own drawing over the
+   game's picture by the answer (a mod's overlay) drew it upside down */
+NV(nvnDeviceGetWindowOriginMode) { RET(((const nvn_dev *)P(0))->origin); }
+NV(nvnDeviceGetDepthMode) { RET(((const nvn_dev *)P(0))->depth_mode); }
 NV(nvnDeviceSetDepthMode) {
     ((nvn_dev *)P(0))->depth_mode = U32(1);
     const LONG was = InterlockedExchange(&depth_minus_w, U32(1) == NVN_DEPTH_MODE_NEAR_IS_MINUS_W);
@@ -310,6 +330,8 @@ NV(nvnMemoryPoolInitialize) {
     o->gpu = b->mem;
     hos_gpu_track(o->gpu, o->size, 1);   /* (the CPU's writes to it reach the renderer through write watch) */
     rx_nvn_pool_created(o->gpu, o->size);
+    void hos_prompts_pool(uint64_t mem, uint64_t size);   /* ((Triforce) prompts.c: the button prompts' textures, changed in place) */
+    hos_prompts_pool(o->mem, o->size);
     OLOG("pool %#llx size %#llx flags %#x", (unsigned long long)o->gpu, (unsigned long long)o->size, o->flags);
     RET(1);
 }
@@ -347,6 +369,8 @@ NV(nvnMemoryPoolFinalize) {
         ReleaseSRWLockExclusive(&vmap_lock);
     } else if (o->mem && o->magic == NVN_MAGIC('P', 'O', 'O', 'L')) {
         hos_gpu_track(o->gpu, o->size, 0);
+        void hos_prompts_pool_gone(uint64_t mem);   /* ((Triforce) prompts.c: the prompts' textures no longer written there) */
+        hos_prompts_pool_gone(o->mem);
     } else if (o->mem) {
         /* a pool object finalized again (its magic gone with the first Finalize): its range was untracked then, and untracking
            it again took the counted entry of a newer live pool made over the same memory since (the actor heap's small pools
@@ -1126,6 +1150,7 @@ static int set_shaders(nvn_prog *o, int n, const uint8_t *sd, int stride) {
         }
     }
     o->serial = new_serial();
+    rx_nvn_program_created(o);   /* ((Triforce) the stages are in memory now: the back end loads what it kept ready for them) */
     return 1;
 }
 NV(nvnProgramSetShaders) { RET(set_shaders((nvn_prog *)P(0), I(1), (const uint8_t *)P(2), 16)); }
@@ -1869,7 +1894,8 @@ NV(nvnCommandBufferEndRecording) {
     if (say_swept || say_made) {
         const int away = hos_vcore_away();
         if (say_swept)
-            hos_log("nvn: %zu copies of recordings whose control memory was reused let go (%zu live)", swept, live_now);
+            hos_log_at(HOS_LOG_DEBUG, "nvn: %zu copies of recordings whose control memory was reused let go (%zu live)", swept,
+                       live_now);
         if (say_made)
             hos_log("nvn: %llu recordings made, %zu live copies (%.1f MB), %zu texture copies; %lld command buffers' segments "
                     "(%.1f MB)", (unsigned long long)made_now, live_now, copy_bytes / 1048576.0, pins_now, (long long)seg_count,
@@ -2685,6 +2711,8 @@ static const nvn_tex *win_tex(const nvn_win *o, int i) {
 }
 void hos_vi_native_acquire(int active);
 void hos_vi_native_presented(void);
+int hos_vi_present_trace_enabled(void);              /* ((Triforce) HOS_PRESENT_TRACE: nn_vi.c present_trace */
+void hos_vi_present_phases(const int64_t phases[4]);   /* (and the present's phases for its row) */
 NV(nvnWindowBuilderSetDefaults) {
     nvn_win_builder *b = WB(P(0));
     void *dev = b->dev;
@@ -2775,19 +2803,27 @@ NV(nvnQueuePresentTexture) {
     nvn_win *o = (nvn_win *)P(1);
     const int i = I(2);
     if (i < 0 || i >= o->ntex) die("present of window texture %d", i);
+    HOS_CHAIN(HOS_CHAIN_PRESENT, (uint64_t)i);   /* ((Triforce) HOS_CHAIN: a present, scripts/chain.py's frame ends) */
     present_thread = hos_self();   /* (HOS_NVN_HOLD=2: the presenting thread, whose submits are not held) */
+    const int trace = hos_vi_present_trace_enabled();   /* ((Triforce) HOS_PRESENT_TRACE's phases: nn_vi.c present_trace) */
+    int64_t phases[4] = {0};
+    if (trace) phases[0] = hos_now_ns();
     held_flush_why(HF_PRESENT);   /* (a present flushes the queue) */
     {
         const int away = hos_vcore_away();
         const int ft = hos_ft_on();
         if (ft) hos_log("ft %.3f present> (lr %#llx)", hos_ft_ms(), (unsigned long long)c->x[30]);
+        if (trace) phases[1] = hos_now_ns();
         rx_nvn_present(win_tex(o, i), o->crop);
+        if (trace) phases[2] = hos_now_ns();
         if (ft) hos_log("ft %.3f present<", hos_ft_ms());
         if (away) hos_vcore_back();
+        if (trace) phases[3] = hos_now_ns();
     }
     o->presents++;
     extern volatile LONG64 hos_present_count;   /* display.c */
     InterlockedIncrement64(&hos_present_count);
+    if (trace) hos_vi_present_phases(phases);
     hos_vi_native_presented();
     /* ((Triforce, 11-22, the performance audit's OS-51) the host's part of a frame as long as the stall line's: mkw_glue.c) */
     { void hos_stall_host_presented(void); hos_stall_host_presented(); }
@@ -3004,6 +3040,8 @@ static const nvn_impl impls[] = {
     {"nvnDeviceInstallDebugCallback", n_nvnDeviceInstallDebugCallback},
     {"nvnDeviceSetWindowOriginMode", n_nvnDeviceSetWindowOriginMode},
     {"nvnDeviceSetDepthMode", n_nvnDeviceSetDepthMode},
+    {"nvnDeviceGetWindowOriginMode", n_nvnDeviceGetWindowOriginMode},
+    {"nvnDeviceGetDepthMode", n_nvnDeviceGetDepthMode},
     {"nvnDeviceFinalizeCommandHandle", n_nvnDeviceFinalizeCommandHandle},
     {"nvnDeviceGetCurrentTimestampInNanoseconds", n_nvnDeviceGetCurrentTimestampInNanoseconds},
     {"nvnDeviceGetTimestampInNanoseconds", n_nvnDeviceGetTimestampInNanoseconds},
@@ -3500,6 +3538,6 @@ void nvn2_dispatch(Ctx *c, const char *name, void **cache) {
 
 /* nvnBootstrapLoader(char const* name) -> the proc */
 HLE(nvnBootstrapLoader) {
-    const char *name = ARG(0) ? (const char *)GP(ARG(0)) : "";
-    RET(nvn_native_proc(name));
+    char name[256];
+    RET(nvn_native_proc(guest_name(ARG(0), name, sizeof name)));
 }

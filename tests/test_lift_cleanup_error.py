@@ -21,7 +21,7 @@ SOURCE = ROOT / "nx2/make_game.py"
 
 def production():
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"), filename=str(SOURCE))
-    helpers = {"say", "fail", "gen_print", "write_lift_key", "lifted_before", "key_after_lift"}
+    helpers = {"say", "fail", "gen_print", "write_lift_key", "lifted_before", "key_after_lift", "kept_before", "kept_list_fits"}
     definitions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in helpers]
     assert {node.name for node in definitions} == helpers
     key = next(node for node in tree.body if isinstance(node, ast.Assign) and
@@ -49,7 +49,8 @@ class LiftCleanupErrorTests(unittest.TestCase):
         self.events = []
         self.namespace, self.branch = production()
         self.namespace.update(work=str(self.work), exefs=str(self.root / "exefs"), env={}, key="b" * 40, PY=["authored-python"],
-                              lift_key=self.lift_key, chunks_copied=False)
+                              lift_key=self.lift_key, chunks_copied=False, gen_dir=str(self.gen),
+                              KEPT_LIST="lifted_objects.txt", KEPT_SCHEME=1, kept_lift=[], contextlib=contextlib)
         self.actual_write = self.namespace["write_lift_key"]
         self.tools = b""   # (what the stand-in key reads of the tools: changed by a test, as an update during the lift)
 
@@ -57,7 +58,7 @@ class LiftCleanupErrorTests(unittest.TestCase):
             self.events.append("key")
             self.actual_write(work, key)
 
-        def run(command, environment):
+        def run(command, environment, on_line=None):
             self.assertEqual(command, ["authored-python", "nx2/lift.py", "--standalone", "--write", "--exefs",
                                        str(self.root / "exefs"), "--work", str(self.work)])
             self.assertEqual(environment, {})
@@ -82,7 +83,8 @@ class LiftCleanupErrorTests(unittest.TestCase):
             def stop(self):
                 pass
 
-        self.namespace.update(run=run, write_lift_key=write_key, EarlyCompile=Early, a=mock.Mock(jobs=None),
+        self.namespace.update(run=run, write_lift_key=write_key, EarlyCompile=Early, a=mock.Mock(jobs=None), lift_progress=lambda: None,
+                              _lift_store=mock.Mock(root=lambda: None),
                               atexit=mock.Mock())
 
     def lift_key(self, exefs, work, env, chunks=True):
@@ -157,7 +159,7 @@ class LiftCleanupErrorTests(unittest.TestCase):
             path.write_bytes(data)
         child = self.namespace["run"]
 
-        def run(command, environment):
+        def run(command, environment, on_line=None):
             self.assertFalse((self.gen / "code_obsolete.c").exists())
             self.assertFalse((self.gen / "code_obsolete.c.whole").exists())
             self.assertFalse(self.key.exists())
@@ -203,7 +205,7 @@ class LiftCleanupErrorTests(unittest.TestCase):
         """The lift as nx2/chunks.py save does it into a work folder without chunks.txt: the boundaries the sizes gave"""
         child = self.namespace["run"]
 
-        def run(command, environment):
+        def run(command, environment, on_line=None):
             child(command, environment)
             (self.work / "image").mkdir(parents=True, exist_ok=True)
             (self.work / "image/chunks.txt").write_text("# first guest address\n80001000\n", encoding="utf-8")
@@ -241,7 +243,7 @@ class LiftCleanupErrorTests(unittest.TestCase):
     def test_failed_lift_leaves_no_fresh_key(self):
         self.seed()
 
-        def stopped(command, environment):
+        def stopped(command, environment, on_line=None):
             self.events.append("lift")
             raise SystemExit(37)
 

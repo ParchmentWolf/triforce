@@ -114,4 +114,16 @@ inline bool hold_met(uint64_t total, uint64_t live, uint64_t dead, uint64_t evic
     return going >= total || total - going <= evict_to;
 }
 
+/// (Triforce) The allowance as the rules take it, from the driver's count (used) and allowance: one the driver gives as the
+/// count itself, within kAtCount, is past. AMD's Windows driver reports a process over what it allows as allowed what it uses
+/// (an RX 6600 at 5940 of 5940 MB, another at 6.6 of 6.6 GB after 5.3 of 6.5). Taken as it is, every rule saw the count within
+/// it while the driver paged. Then a tenth under the count (kPastShare), so the rules give back until the driver says again how
+/// much it allows. An allowance under the count is past already and stays as it is; 0 (unknown) too
+inline constexpr uint64_t kAtCount = 16ull << 20;
+inline constexpr uint64_t kPastShare = 10;
+inline uint64_t past_allowance(uint64_t used, uint64_t allowed) {
+    if (!allowed || allowed + kAtCount < used || allowed > used + kAtCount) return allowed;
+    return used - used / kPastShare;
+}
+
 }   // namespace vram_compact

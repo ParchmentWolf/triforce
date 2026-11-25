@@ -16,6 +16,25 @@ static int safe_tag(const char *s) {
         if (!isalnum((unsigned char)s[i]) && !strchr("._+-", s[i])) return 0;
     return 1;
 }
+
+/* ((Triforce, 11-24, after Source A's) Whether release a is newer than release b: "v0.7.2" > "v0.7.1", and a release after
+   its own prereleases ("v0.7.1" > "v0.7.1-test3"). A folder built by a test build of the next release, before it is out, is
+   newer than the latest release: "Update" would build the older one over it. Tags that are not v<numbers> compare as not newer */
+static int newer_version(const char *a, const char *b) {
+    if (*a == 'v' || *a == 'V') a++;
+    if (*b == 'v' || *b == 'V') b++;
+    if (!isdigit((unsigned char)*a) || !isdigit((unsigned char)*b)) return 0;
+    for (;;) {
+        unsigned long x = 0, y = 0;
+        while (isdigit((unsigned char)*a)) x = x * 10 + (unsigned long)(*a++ - '0');
+        while (isdigit((unsigned char)*b)) y = y * 10 + (unsigned long)(*b++ - '0');
+        if (x != y) return x > y;
+        const int ma = *a == '.' && isdigit((unsigned char)a[1]), mb = *b == '.' && isdigit((unsigned char)b[1]);
+        if (ma && mb) { a++, b++; continue; }
+        if (ma != mb) return ma;   /* (v0.7.1.1 after v0.7.1) */
+        return !*a && *b;   /* (the same numbers: a release after a prerelease of it, nothing else newer) */
+    }
+}
 #endif
 
 #ifdef _WIN32
@@ -115,6 +134,7 @@ void hos_update_check(void) {
     }
     fprintf(stderr, "update: this folder is %s, the latest release is %s\n", have, tag);
     if (!strcmp(tag, have) || !strcmp(tag, skipped)) return;
+    if (newer_version(have, tag)) return;   /* ((Triforce, 11-24) a test build of the next release: not offered the older one */
 
     wchar_t wtag[128], whave[128], wbuilder[MAX_PATH], text[2048];
     MultiByteToWideChar(CP_UTF8, 0, tag, -1, wtag, 128);
@@ -167,12 +187,14 @@ void hos_update_check(void) {
         hos_log_flush();   /* (the lines logged before, queued: host/hos_thread.c log_queue) */
         fprintf(stderr, "update: Triforce Setup started to update to %s; the game closes\n", tag);
         fflush(stderr);
+        { void hos_crash_clean_end(void); hos_crash_clean_end(); }   /* ((Triforce) a clean end: host/hos_crash_record.c */
         ExitProcess(0);
     }
     MessageBoxW(NULL, L"Triforce Setup could not be started. The game starts as it is.", L"Triforce update", MB_OK | MB_ICONWARNING | MB_TOPMOST);
 }
 #elif defined(__linux__)
 #include "hos_paths.h"
+extern const char *hos_user_dir;   /* (host/nn_fs.c: the saves' folder, set by hos_main.c before hos_update_check) */
 #include <ctype.h>
 #include <sys/stat.h>
 #include <stdio.h>
@@ -277,14 +299,22 @@ void hos_update_check(void) {
     dir[n] = 0;
     snprintf(path, sizeof path, "%striforce_version.txt", dir);
     if (!read_value(path, "version", have, sizeof have) || !safe_tag(have)) return;
-    snprintf(path, sizeof path, "%suser/triforce_update_skip.txt", dir);
-    read_value(path, "skip", skipped, sizeof skipped);
+    /* ((Triforce, 11-24, after Source A's) "Skip this version" is kept with the saves, where they are (hos_main.c sets
+       hos_user_dir first: $XDG_DATA_HOME/triforce/user, or --user's folder). In user/ beside the game, where Linux keeps no
+       saves any more, the next start's move of an old user/ folder (hos_main.c saves_dir) took the file for a save, moved it
+       and wrote saves-moved.txt, and the start asked again; skipped again, the file was in both places, which the move reads
+       as saves it cannot move: the game then ran on the empty user/ beside it and showed no saves */
+    char skip[MAX_PATH + 64];
+    if (hos_user_dir) snprintf(skip, sizeof skip, "%s/triforce_update_skip.txt", hos_user_dir);
+    else snprintf(skip, sizeof skip, "%suser/triforce_update_skip.txt", dir);
+    read_value(skip, "skip", skipped, sizeof skipped);
     if (!latest_tag(tag, sizeof tag)) {
         fprintf(stderr, "update: the latest release could not be asked for (offline?)\n");
         return;
     }
     fprintf(stderr, "update: this folder is %s, the latest release is %s\n", have, tag);
     if (!strcmp(tag, have) || !strcmp(tag, skipped)) return;
+    if (newer_version(have, tag)) return;   /* ((Triforce, 11-24) a test build of the next release: not offered the older one */
     snprintf(path, sizeof path, "%striforce_version.txt", dir);
     const int has_builder = installed_builder(builder, sizeof builder) ||
                             (read_value(path, "builder", builder, sizeof builder) && access(builder, X_OK) == 0);
@@ -301,10 +331,9 @@ void hos_update_check(void) {
     if (!fgets(answer, sizeof answer, pick)) answer[0] = 0;
     pclose(pick);
     if (!strncmp(answer, "Skip", 4)) {
-        snprintf(path, sizeof path, "%suser", dir);
-        mkdir(path, 0755);
-        snprintf(path, sizeof path, "%suser/triforce_update_skip.txt", dir);
-        FILE *f = fopen(path, "wb");
+        if (hos_user_dir) mkdir(hos_user_dir, 0755);
+        else snprintf(path, sizeof path, "%suser", dir), mkdir(path, 0755);
+        FILE *f = fopen(skip, "wb");
         if (f) fprintf(f, "skip=%s\n", tag), fclose(f);
         return;
     }

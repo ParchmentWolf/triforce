@@ -66,7 +66,33 @@ def main():
     check(both.count(FOCUS) == 1 and both.count(TICK) == 1, "the supported build's lift did not get both hooks once")
     plain = applied(False)
     check(FOCUS not in plain and TICK not in plain, "another build's lift got the menus' hooks")
-    print("PASS: the menus' hooks go first in their functions, once, only in the supported build's lift")
+    # ((Triforce) the button prompts' live part, host/prompts.c: a text box's draw and layout, FreeType's glyph render)
+    prompts = ((oot_patches.patch_text_draw, oot_patches.TEXT_DRAW_HEAD, "    hos_prompts_text_draw(c->x[0]);",
+                "extern void hos_prompts_text_draw(uint64_t box);"),
+               (oot_patches.patch_text_layout, oot_patches.TEXT_LAYOUT_HEAD, "    hos_prompts_text_layout(c->x[0]);",
+                "extern void hos_prompts_text_layout(uint64_t box);"),
+               (oot_patches.patch_glyph, oot_patches.GLYPH_HEAD, "    hos_prompts_glyph(c->x[1]);",
+                "extern void hos_prompts_glyph(uint64_t slot);"))
+    for patch, head, call, decl in prompts:
+        out = patch(lifted(head))
+        check(out is not None and out.count(call) == 1 and head + call in out, "not first in its function once: %s" % call)
+        check(decl in out and BODY in out and patch(out) == out, "declared, the body kept, once: %s" % call)
+        check(patch(lifted(head.replace("void f_", "void g_"))) is None, "a file without the function was patched: %s" % call)
+    with tempfile.TemporaryDirectory() as gen:
+        path = os.path.join(gen, "code_000.c")
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(lifted(*(head for _, head, _, _ in prompts)))
+        stdout = sys.stdout
+        sys.stdout = open(os.devnull, "w")
+        try:
+            oot_patches.apply(gen, protect_hearts=True)
+        finally:
+            sys.stdout.close()
+            sys.stdout = stdout
+        with open(path, encoding="utf-8", newline="") as f:
+            got = f.read()
+    check(all(got.count(call) == 1 for _, _, call, _ in prompts), "the supported build's lift did not get the prompts' hooks once")
+    print("PASS: the menus' and the button prompts' hooks go first in their functions, once, only in the supported build's lift")
 
 
 if __name__ == "__main__":

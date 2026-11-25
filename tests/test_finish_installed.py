@@ -334,7 +334,7 @@ class ReproLink(unittest.TestCase):
         self.assertEqual(source.count("repro_link()"), 2)
         exe = source[source.index('exe = os.path.join(out, "Triforce.exe")'):]
         self.assertTrue("repro_link() +" in exe[:exe.index("capture_output=True")])
-        dll = source[source.index('["-shared", "-o", vdll, toolchain.link_opt("/map:" + vdll[:-4] + ".map")'):]
+        dll = source[source.index('["-shared", "-o", vdll] + linker("/map:" + vdll[:-4] + ".map")'):]
         self.assertTrue("+ repro_link()" in dll[:dll.index("\n")])
         docs = (ROOT / "docs" / "development.md").read_text(encoding="utf-8")
         self.assertEqual(len([l for l in docs.splitlines() if l.startswith("| `HOOKSHOT_LINK_REPRO=1` |") and "IO-45" in l]), 1)

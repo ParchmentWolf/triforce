@@ -36,7 +36,7 @@
 #define OUTPUT_LAST 9
 #define OUTPUT_OPTIONS_VERSION 9   /* (stock 0.6 and native 0.5.2 migrate to this distinct schema) */
 
-/* A size from outside keeps its shape, within what the picture takes (5:4 to 32:9, output_picture), and is brought into
+/* A size from outside keeps its shape, within what the picture takes (5:4 to 48:9, output_picture), and is brought into
    these limits in that shape: no side past its end, and at most 5120 x 2880's pixels. The game's render targets come from a
    pool scaled with the picture's pixels and kept to 900 MB, the most known to pass the game's own reservation at boot
    (host/nn_applet.c hos_rt_pool_size); 5120 x 2880 (14.7 million pixels) is the largest picture that booted and played
@@ -50,7 +50,9 @@
    picture at the 4K output was 7680 x 2160, and the game crashed as Kokiri Forest loaded, issue 1031: 5400 x 1520 there) */
 #define OUTPUT_ROW_PIXELS (3840.0 * 2160.0)
 #define OUTPUT_SHAPE_MIN (5.0 / 4.0)
-#define OUTPUT_SHAPE_MAX (32.0 / 9.0)
+/* ((Triforce) 11-24) up to 48:9, three 16:9 screens side by side (7680 x 1440, 5760 x 1080), which a screen's size or
+   Custom of that shape is now: it was kept to 32:9, the picture between black bars there */
+#define OUTPUT_SHAPE_MAX (48.0 / 9.0)
 
 /* The fixed size v's width or height (v 0 to 6) */
 static inline unsigned output_fixed_size(int v, int height) {
@@ -94,7 +96,7 @@ static inline int output_parse_size(const char *s, long *w, long *h) {
 }
 
 /* (output_size_used) The widths, whole multiples of 8, that a picture of height h can have on one side of 16:9 (wide: wider
-   than it, else narrower): those whose shape is within 5:4 to 32:9 and outside the 1% beside 16:9, within the width's ends
+   than it, else narrower): those whose shape is within 5:4 to 48:9 and outside the 1% beside 16:9, within the width's ends
    and the pixels. *lo > *hi: none at that height */
 static inline void output_width_range(unsigned h, int wide, unsigned *lo, unsigned *hi) {
     const double game = 16.0 / 9.0, edge = (double)h * game * (wide ? 1.01 : 0.99);
@@ -108,7 +110,7 @@ static inline void output_width_range(unsigned h, int wide, unsigned *lo, unsign
 }
 
 /* A size from outside as the game takes it: 0 when there is none (a side 0 or less); else 1 and the size in its own shape
-   (kept to 5:4 to 32:9) within the limits above: made smaller in that shape where a side or the pixels are past them, larger
+   (kept to 5:4 to 48:9) within the limits above: made smaller in that shape where a side or the pixels are past them, larger
    where a side is under its least. Its width is a whole multiple of 8 pixels (as every picture's), its height too where it
    was made smaller, and a shape within 1% of 16:9 is the game's own frame at that height. The shape is taken first: clamping
    each side by itself would change it (7680 x 4320 would come out 2.67:1).
@@ -132,7 +134,9 @@ static inline int output_size_used(long w, long h, unsigned *out_w, unsigned *ou
     double fh = (double)h, scale = 1.0;
     const double fw = fh * shape;
     if (fh * scale > OUTPUT_MAX_H) scale = OUTPUT_MAX_H / fh;
-    if (fw * scale > OUTPUT_MAX_W) scale = OUTPUT_MAX_W / fw;
+    /* ((Triforce) 11-24: half a pixel of room, so that a size this made at the width's end (shapes past 32:9 reach it below
+       2160 lines) is taken as itself again: its width over its height times its height is not 7680 to the last bit) */
+    if (fw * scale > OUTPUT_MAX_W + 0.5) scale = OUTPUT_MAX_W / fw;
     if (fw * fh * scale * scale > OUTPUT_MAX_PIXELS) scale = sqrt(OUTPUT_MAX_PIXELS / (fw * fh));
     unsigned uh, lo, hi;
     if (scale < 1.0) {   /* (smaller, in its shape: the height a whole multiple of 8 as well) */
@@ -164,7 +168,7 @@ static inline void output_custom_read(long *w, long *h) {
 
 /* The picture for the game's frame of height frame_h and a shape want, width over height: 0 for the game's own 16:9 picture
    (want 0, 1 or less, or within 1% of 16:9), else 1 and its size, whole multiples of 8 pixels wide. The shape is kept to
-   5:4 to 32:9. sized: the shape is the Output resolution's own (frame_h its height, want its width over its height), and the
+   5:4 to 48:9. sized: the shape is the Output resolution's own (frame_h its height, want its width over its height), and the
    picture is that size; otherwise the shape is the Ultrawide row's or HOS_ASPECT's, and a picture of more than
    3840 x 2160's pixels is made smaller in its shape */
 static inline int output_picture(unsigned frame_h, double want, int sized, unsigned *out_w, unsigned *out_h) {

@@ -72,6 +72,11 @@ mkdir -p "$T/scripts"
 cp scripts/ngx_sdk.py "$T/scripts/"
 cp -a gpu/vk gpu/compat gpu/third_party "$T/gpu/"
 cp -a third_party/imgui third_party/fonts "$T/third_party/"
+# ((Triforce) the ReShade presets' FX compiler and PNG decoder, compiled into the renderer: nx2/reshade_fx.py)
+cp -a third_party/reshade_fx third_party/stb_image "$T/third_party/"
+# ((Triforce, 11-24) RenHDrum' C header, host/rumble_renhdrum.c includes it (the library itself is the player's own renhdrum.dll / .so))
+mkdir -p "$T/third_party/renhdrum"
+cp -a third_party/renhdrum/include third_party/renhdrum/LICENSE-MIT third_party/renhdrum/LICENSE-APACHE third_party/renhdrum/NOTICE third_party/renhdrum/PROVENANCE.md "$T/third_party/renhdrum/"
 mkdir -p "$T/third_party/zbic" "$T/third_party/a64-kit"
 cp -a third_party/zbic/zbic.so third_party/zbic/LICENSE third_party/zbic/PROVENANCE.md "$T/third_party/zbic/"
 cp -a third_party/a64-kit/* "$T/third_party/a64-kit/"
@@ -109,6 +114,14 @@ cp third_party/zstd/LICENSE third_party/zstd/PROVENANCE.md "$T/licenses/zstd/"
 cp third_party/fonts/libertinus/OFL.txt third_party/fonts/PROVENANCE.md "$T/licenses/libertinus/"
 mkdir -p "$T/licenses/fidelityfx"
 cp third_party/fidelityfx/LICENSE.md "$T/licenses/fidelityfx/"
+# ((Triforce, 11-24) AMD's FidelityFX SDK's shaders, compiled into gpu/vk/shaders' FSR 3.1 headers that every build has:
+# scripts/fsr3_shaders.py)
+mkdir -p "$T/licenses/fidelityfx-sdk"
+cp third_party/fidelityfx-sdk/LICENSE.txt third_party/fidelityfx-sdk/PROVENANCE.md "$T/licenses/fidelityfx-sdk/"
+# ((Triforce) the ReShade presets: ReShade's FX compiler (BSD-3-Clause) and stb_image's PNG decoder (MIT), nx2/reshade_fx.py)
+mkdir -p "$T/licenses/reshade_fx" "$T/licenses/stb_image"
+cp third_party/reshade_fx/LICENSE.md third_party/reshade_fx/PROVENANCE.md "$T/licenses/reshade_fx/"
+cp third_party/stb_image/LICENSE third_party/stb_image/PROVENANCE.md "$T/licenses/stb_image/"
 # ---- end of the licences ----
 
 # the sysroot: this system's C library (headers, start files, the libraries to link against) and GCC's runtime pieces

@@ -41,6 +41,10 @@ using VkBuffer = int;
 using VkCommandBuffer = int;
 VkBuffer guest_pages_buffer = 7;
 std::atomic<bool> par_active{false};
+// ((Triforce) RX_VK_GP_TABLE's cover, which the cut part feeds and these checks do not use: off)
+std::atomic<bool> table_cover_on{false};
+void table_mark_changed(uint64_t, uint64_t) {}
+void table_flushed_keep() {}
 struct Update {
     uint64_t first;
     std::vector<uint64_t> values;

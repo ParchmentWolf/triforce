@@ -111,6 +111,8 @@ typedef struct {
     int clock_set;                   /* (hookshot) the movie's clock: the picture at clock_pts was due at clock_ns */
     int64_t clock_ns, clock_pts;
     int64_t last_pts;                /* the pts of the last picture handed out */
+    int64_t held;                    /* (Triforce) acquires that showed the last picture again, the next one early (dec_acquire) */
+    int shown_slot;                  /* (Triforce) 1 + the buffer the last picture handed out is in, 0 none yet */
     int64_t log_submits;             /* (HOS_VIDEO_LOG) submissions still to log, after a flush or the end */
     VideoMovie movie;                /* ((Triforce, 11-22, IO-32) this movie's pictures and decode time, for its line) */
     VideoPace pace;                  /* ((Triforce, 11-22, THREAD-82) the gap between its pictures and what a decode takes
@@ -402,6 +404,9 @@ static void movie_end(Dec *d) {
     if (video_movie_line(&d->movie, d->ctx ? d->ctx->codec->name : "Media Foundation", video_pace_spacing(&d->pace), line,
                          sizeof line))
         hos_log("video: %s", line);
+    if (d->held)
+        hos_log("video: %lld times the last picture was shown again, the next one ahead of the movie's clock", (long long)d->held);
+    d->held = 0, d->shown_slot = 0;   /* (the next movie's first picture is never held: dec_acquire) */
     memset(&d->movie, 0, sizeof d->movie);
     memset(&d->pace, 0, sizeof d->pace);   /* ((Triforce, 11-22, THREAD-82) the next movie's gap and decode time are its own) */
 }
@@ -799,6 +804,43 @@ static void dec_acquire(Ctx *c) {
         if (skipped && video_log()) hos_log("video: %d pictures skipped to catch up with the movie's clock", skipped);
         d->movie.skipped += skipped;   /* ((Triforce, 11-22, IO-32) and in the movie's line) */
     }
+    {   /* (Triforce) and none ahead of it. The game takes the next picture when its count of the movie's 60ths says so
+           (hos_movie_frames, host/nn_vi.c), and while a movie plays at the 60 cap the frames are paced at 240
+           (movie_pace.h) and the count follows their time, not the clock: at ~226 fps an opening's picture ran ahead,
+           0.2 s after 6 s and 0.73 s at its end, while its sound kept the clock (heard as the sound coming late). A
+           picture more than `early` ahead waits in the queue, and the buffer handed out shows the last picture again:
+           copied into it from the buffer that has it, both read through ReadDecoderOutputImage* (OoT's). Not a movie's
+           first picture, nor its last (the end is the game's to see). HOS_VIDEO_NO_HOLD=1: every picture handed out
+           when asked, as before. tests/test_video_hold_early.py */
+        static int no_hold = -1;
+        if (no_hold < 0) no_hold = getenv("HOS_VIDEO_NO_HOLD") != NULL && atoi(getenv("HOS_VIDEO_NO_HOLD")) != 0;
+        const int64_t early = 25000000;   /* (the late side's frame and a half) */
+        const Picture *next = &d->queue[d->qhead];
+        Pool *to = (Pool *)host_of(d->slots[slot], POOL_MAGIC);
+        const int from_slot = d->shown_slot - 1;
+        const Pool *from = from_slot >= 0 && from_slot < MAX_SLOTS && d->slot_pts[from_slot] == d->last_pts
+                               ? (const Pool *)host_of(d->slots[from_slot], POOL_MAGIC) : NULL;
+        if (!no_hold && d->clock_set && !next->last && next->pts - d->clock_pts > hos_now_ns() - d->clock_ns + early &&
+            to && from && to->read_by_api && from->read_by_api && to->w == from->w && to->h == from->h && to->nv12 && from->nv12) {
+            if (to != from) {
+                memcpy(to->nv12, from->nv12, (size_t)to->w * to->h * 3 / 2);
+                const int rgba = from->rgba && to->rgba && !from->rgba_stale;
+                if (rgba) memcpy(to->rgba, from->rgba, (size_t)to->w * to->h * 4);
+                to->rgba_stale = !rgba;
+            }
+            d->slot_pts[slot] = d->last_pts, d->slot_last[slot] = 0, d->busy[slot] = 1, d->shown_slot = slot + 1;
+            d->held++;
+            if (video_log())
+                hos_log("video: acquire %lld: the next picture is %.0f ms ahead of the movie's clock: buffer %d shows the last again",
+                        (long long)d->acquires, (double)(next->pts - d->clock_pts - (hos_now_ns() - d->clock_ns)) / 1e6, slot);
+            input_room(d);
+            ReleaseSRWLockExclusive(&d->lock);
+            if (away) hos_vcore_back();
+            if (ARG(0)) G32(ARG(0)) = (uint32_t)slot;
+            RET(0);
+            return;
+        }
+    }
     Picture *p = &d->queue[d->qhead];
     Pool *o = (Pool *)host_of(d->slots[slot], POOL_MAGIC);
     /* (the picture at the pool's size: rows and columns past either are left out) */
@@ -829,6 +871,7 @@ static void dec_acquire(Ctx *c) {
     }
     d->slot_pts[slot] = d->last_pts = p->pts;
     d->slot_last[slot] = p->last;
+    d->shown_slot = slot + 1;
     d->busy[slot] = 1;
     {   /* (hookshot) HOS_VIDEO_LOG: the picture's time against this decoder's movie clock, to see it fall behind the sound */
         if (video_log() && d->acquires % 60 == 0) {

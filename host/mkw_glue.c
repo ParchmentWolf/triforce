@@ -5,6 +5,8 @@
 #include "heap_commit.h"   /* ((Triforce, 11-21, MEM-09) the heap committed as it is touched: its rules) */
 #include "stall_host.h"   /* ((Triforce, 11-22, OS-51) the host's part of a long frame, counted where it is spent) */
 #include "host_alloc.h"   /* ((Triforce, 11-22, OS-04) the wait at Windows' commit limit: its length, and the host's own allocations) */
+#include "hos_crash_record.h"   /* ((Triforce) the local crash record, written before the report below: host/hos_crash_record.c) */
+#include "hos_paths.h"
 #include <stdio.h>
 #include <stdlib.h>
 #define WIN32_LEAN_AND_MEAN
@@ -211,12 +213,195 @@ static LONG CALLBACK commit_on_touch(EXCEPTION_POINTERS *info) {
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
+#ifdef _WIN32
+/* A thread's stack is only reserved (the guest's 64 MB, hos_thread.c): Windows commits each page below it as the stack grows,
+   through the guard page. At the commit limit it can't commit the next guard page and raises a stack overflow with the stack
+   nearly unused. That one waits for commit as a guest page does (commit_wait above: up to HOS_COMMIT_WAIT_MS), and the thread
+   goes on. A stack that really ran out (under 128 KB of its reservation left) goes on to the crash report, and so does one
+   whose commit never came back, after the out-of-memory notice.
+   The handler runs on what is left of the stack Windows did commit (under a page where the thread asked for no guarantee,
+   hos_stack_guarantee's 32 KB on the game's threads and fibers, less the exception's own frames), with only reserved pages
+   below it: until the 64 KB below the stack is committed, nothing here may take more stack than a system call (hos_log takes
+   over 4 KB, and running off the page there would end the process with no line and no report). So the wait is its own loop,
+   as commit_wait's but saying nothing, and the 64 KB is committed as guard pages, which Windows then hands to the stack one
+   at a time as it grows, as its own. Commit that never came back: stack_spare, 1 MB committed at the start, is given back for
+   that 64 KB, so the line, the notice and the crash report have a stack to run on */
+enum { STACK_ROOM = 0x10000, STACK_SPARE = 1 << 20 };
+static void *volatile stack_spare;
+static int stack_wait_ms;   /* (HOS_COMMIT_WAIT_MS, read by hos_commit_init: the handler itself reads no switch) */
+static LONG CALLBACK stack_on_touch(EXCEPTION_POINTERS *info) {
+    if (info->ExceptionRecord->ExceptionCode != EXCEPTION_STACK_OVERFLOW) return EXCEPTION_CONTINUE_SEARCH;
+    char *const limit = (char *)((NT_TIB *)NtCurrentTeb())->StackLimit;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery(limit - 1, &mbi, sizeof mbi) || mbi.State != MEM_RESERVE) return EXCEPTION_CONTINUE_SEARCH;
+    const size_t left = (size_t)(limit - (char *)mbi.AllocationBase);
+    if (left < 2 * STACK_ROOM) return EXCEPTION_CONTINUE_SEARCH;   /* (it really ran out) */
+    char *const room = limit - STACK_ROOM;
+    int ms = 0;
+    while (!VirtualAlloc(room, STACK_ROOM, MEM_COMMIT, PAGE_READWRITE | PAGE_GUARD)) {
+        if (GetLastError() != ERROR_COMMITMENT_LIMIT) return EXCEPTION_CONTINUE_SEARCH;   /* (not the limit: as before) */
+        if (ms >= stack_wait_ms) {   /* (as commit_wait: 100 x 50 ms unless HOS_COMMIT_WAIT_MS says otherwise) */
+            void *spare = InterlockedExchangePointer((void *volatile *)&stack_spare, NULL);
+            if (!spare || !VirtualFree(spare, 0, MEM_RELEASE) ||
+                !VirtualAlloc(room, STACK_ROOM, MEM_COMMIT, PAGE_READWRITE | PAGE_GUARD))
+                return EXCEPTION_CONTINUE_SEARCH;   /* (no stack to say it on: the crash report, as before) */
+            hos_log("mem: a thread's stack still could not grow after %d ms at the commit limit, with %llu KB of it unused", ms,
+                    (unsigned long long)(left >> 10));
+            static volatile LONG said;
+            if (InterlockedExchange(&said, 1) == 0) {
+                hos_log("mem: Windows is out of memory (RAM and page file): close other programs, or let Windows manage the page file size");
+                CloseHandle(CreateThread(NULL, 0, hos_out_of_memory_box, NULL, 0, NULL));
+            }
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        Sleep(HOST_ALLOC_STEP_MS);
+        ms += HOST_ALLOC_STEP_MS;
+    }
+    static volatile LONG grown;
+    const LONG n = InterlockedIncrement(&grown);
+    if (n <= 8 || (n & 255) == 0)
+        hos_log("mem: a thread's stack grew at the commit limit after waiting %d ms for commit (%ld so far)", ms, (long)n);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+#endif
+
 /* A crash nothing handles: what, where (mkw.exe+offset: nx2/dllmap.py reads mkw.map the same way), and the guest
    state of the thread, as of its last call out of lifted code, with its frame chain from x29. */
 static uint64_t peek_guest(uint64_t a) {
     MEMORY_BASIC_INFORMATION mbi;
     if (a >= HOS_GUEST_SPACE - 8 || !VirtualQuery(GP(a), &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) return 0;
     return G64(a);
+}
+
+#ifdef _WIN32
+/* (Triforce) The x64 stack walks below (the crash report's, HOS_SAMPLE's and HOS_SAMPLE_ALL's) go one frame at a time
+   through unwind_step, which reads only the walked thread's own stack. RtlVirtualUnwind reads the frame's saved registers
+   and its return address at the stack pointer, or through the frame register when the function has one; a thread stopped
+   where its unwind data does not describe the frame (being made or ending, switching stacks, mid-prologue) gave it a
+   stack pointer that was not a stack, and its read faulted in the sampler's thread, which took the game down (0xc0000005
+   in ntdll.dll, from sample_all_thread). The host is C without SEH, so the walk is made unable to fault rather than
+   guarded: a step whose stack pointer, or frame register, is outside [lo, hi), the thread's committed stack, ends the walk
+   there, and the sample is only cut short. (The crash report's other threads have their own walk with the same bound:
+   host/crash_threads.c) */
+typedef struct { uint64_t lo, hi; } StackRange;
+/* a thread's committed stack (its TEB's StackLimit to StackBase), read while it is suspended; {0, 0} when it can't be */
+static StackRange thread_stack(HANDLE th) {
+    typedef LONG(NTAPI * QueryThread)(HANDLE, int, PVOID, ULONG, PULONG);
+    static QueryThread query;
+    static int looked;
+    if (!looked) {
+        query = (QueryThread)(void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread");
+        looked = 1;
+    }
+    struct {   /* (THREAD_BASIC_INFORMATION, ThreadBasicInformation = 0: not in the SDK's headers) */
+        LONG exit_status;
+        NT_TIB *teb;
+        void *process, *thread;
+        ULONG_PTR affinity;
+        LONG priority, base_priority;
+    } tbi = {0};
+    StackRange r = {0, 0};
+    if (query && query(th, 0, &tbi, sizeof tbi, NULL) >= 0 && tbi.teb) {
+        r.lo = (uint64_t)tbi.teb->StackLimit;
+        r.hi = (uint64_t)tbi.teb->StackBase;
+    }
+    return r;
+}
+static StackRange own_stack(void) {
+    const NT_TIB *tib = (const NT_TIB *)NtCurrentTeb();
+    StackRange r = {(uint64_t)tib->StackLimit, (uint64_t)tib->StackBase};
+    return r;
+}
+static int on_stack(StackRange s, uint64_t p) { return p >= s.lo && p + 8 <= s.hi; }
+/* one frame up: 1 when ctx is now its caller's frame, 0 when the walk ends (no unwind data, or a step that would read
+   outside the stack s). An empty s ({0, 0}: its limits could not be read) ends every walk at its first frame */
+static int unwind_step(CONTEXT *ctx, StackRange s) {
+    if (!on_stack(s, ctx->Rsp)) return 0;
+    DWORD64 image = 0;
+    PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(ctx->Rip, &image, NULL);
+    if (!f) return 0;
+    /* (UNWIND_INFO: the low nibble of its fourth byte is the frame register, 0 for none; registers 0 to 15 are Rax to R15,
+       in CONTEXT's order. An entry whose UnwindData has its low bit set points at the RUNTIME_FUNCTION that has it) */
+    const RUNTIME_FUNCTION *rf = f;
+    if (rf->UnwindData & 1) rf = (const RUNTIME_FUNCTION *)(image + (rf->UnwindData & ~1u));
+    const BYTE *info = (const BYTE *)(image + rf->UnwindData);
+    const unsigned frame_reg = info[3] & 15;
+    if (frame_reg && !on_stack(s, (&ctx->Rax)[frame_reg])) return 0;
+    void *handler_data;
+    DWORD64 frame;
+    RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx->Rip, f, ctx, &handler_data, &frame, NULL);
+    return on_stack(s, ctx->Rsp) || !ctx->Rip;
+}
+#endif
+
+/* ((Triforce) the local crash record, host/hos_crash_record.c) The independent record is complete before the CRASH lines
+   below, which stay as they are and still run after it. Fixed labels, module+offset and registers only */
+static void record_exception(EXCEPTION_POINTERS *info) {
+    Ctx *c = hos_ctx();
+    HosThread *thread = hos_self();
+    const EXCEPTION_RECORD *rec = info->ExceptionRecord;
+    HosCrashContext context = {0};
+    context.reason = "unhandled exception";
+    context.thread = thread ? hos_thread_name(thread) : "host";
+    context.code = rec->ExceptionCode;
+    context.pc = (uintptr_t)info->ContextRecord->Rip;
+    context.sp = (uintptr_t)info->ContextRecord->Rsp;
+    context.fp = (uintptr_t)info->ContextRecord->Rbp;
+    context.fault_address = rec->NumberParameters > 1 ? rec->ExceptionInformation[1] : 0;
+    context.guest_base = (uintptr_t)A64_MEM;
+    context.guest_size = HOS_GUEST_SPACE;
+    context.guest_registers = c ? c->x : NULL;
+#ifdef _WIN32
+    context.native_context = info->ContextRecord;
+    context.exception_filter = 1;
+#else
+    /* (host/posix/win32_posix.c on_signal keeps the signal and its code in the record's unused tail) */
+    context.signal_number = (int)rec->ExceptionInformation[13];
+    context.signal_code = (int)(intptr_t)rec->ExceptionInformation[14];
+    if (context.signal_number) context.reason = "fatal signal";
+#endif
+    if (hos_crash_record_write(&context)) {
+#ifdef _WIN32
+        hos_crash_record_dump(info);   /* (HOS_CRASH_MINIDUMP=1 only: off by default) */
+#endif
+    }
+}
+
+/* A fatal end that is not an exception (hos_fatal, the renderer's FATAL and device lost lines: host/hos_thread.c) */
+void hos_crash_record_fatal(const uint64_t *guest_registers, const char *reason) {
+    HosThread *thread = hos_self();
+    HosCrashContext context = {0};
+    context.reason = reason;
+    context.thread = thread ? hos_thread_name(thread) : "host";
+    context.guest_base = (uintptr_t)A64_MEM;
+    context.guest_size = HOS_GUEST_SPACE;
+    context.guest_registers = guest_registers;
+#ifdef _WIN32
+    CONTEXT native;
+    RtlCaptureContext(&native);
+    context.native_context = &native;
+    context.pc = (uintptr_t)native.Rip;
+    context.sp = (uintptr_t)native.Rsp;
+    context.fp = (uintptr_t)native.Rbp;
+#else
+    context.pc = (uintptr_t)hos_crash_record_fatal;
+    context.sp = (uintptr_t)&context;
+    context.fp = (uintptr_t)__builtin_frame_address(0);
+#endif
+    hos_crash_record_write(&context);
+}
+
+/* (host/hos_main.c) Before the log's rotation, so a start's recovery reads the run before's log, not this run's new one.
+   log_path: the game's own log, NULL when it keeps the stderr it was given */
+void hos_crash_record_prepare(const char *log_path) {
+    char path[4096];
+    DWORD n = hos_game_path_a(path, sizeof path);
+    if (!n || n >= sizeof path) return;
+    while (n && path[n - 1] != '/' && path[n - 1] != '\\') --n;
+    if (!n) return;
+    path[n] = 0;
+    const char *hos_version(void);
+    hos_crash_record_start(path, hos_version(), log_path);
 }
 
 static LONG WINAPI report_crash(EXCEPTION_POINTERS *info) {
@@ -229,6 +414,7 @@ static LONG WINAPI report_crash(EXCEPTION_POINTERS *info) {
        report, written at the report's end (host/crash_threads.h) */
     void hos_crash_threads_begin(void), hos_crash_threads_end(void);
     hos_crash_threads_begin();
+    record_exception(info);   /* ((Triforce) the local crash record, before the report's lines: host/hos_crash_record.c */
     EXCEPTION_RECORD *rec = info->ExceptionRecord;
     const uint64_t rip = info->ContextRecord->Rip;
     HMODULE mod = NULL;
@@ -245,6 +431,7 @@ static LONG WINAPI report_crash(EXCEPTION_POINTERS *info) {
 #ifdef _WIN32
     {   /* the host stack from the faulting frame (x64 unwind data), as module+offset (nx2/samap.py maps mkw.exe's) */
         CONTEXT ctx = *info->ContextRecord;
+        const StackRange stack = own_stack();
         char hb[1024];
         int n = snprintf(hb, sizeof hb, "CRASH: host backtrace:");
         for (int i = 0; i < 20 && ctx.Rip && n < (int)sizeof hb - 48; i++) {
@@ -255,12 +442,7 @@ static LONG WINAPI report_crash(EXCEPTION_POINTERS *info) {
                 GetModuleFileNameA(m, mn, MAX_PATH);
             const char *mb = strrchr(mn, '\\');
             n += snprintf(hb + n, sizeof hb - n, " %s+%#llx", mb ? mb + 1 : mn, (unsigned long long)(ctx.Rip - (uint64_t)m));
-            DWORD64 image = 0;
-            PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(ctx.Rip, &image, NULL);
-            if (!f) break;
-            void *handler_data;
-            DWORD64 frame;
-            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx.Rip, f, &ctx, &handler_data, &frame, NULL);
+            if (!unwind_step(&ctx, stack)) break;   /* (a fault in here would be a second crash inside the report) */
         }
         hos_log("%s", hb);
     }
@@ -369,6 +551,12 @@ static LONG CALLBACK report_fatal(EXCEPTION_POINTERS *info) {
 
 void hos_commit_init(void) {
     AddVectoredExceptionHandler(1, commit_on_touch);
+#ifdef _WIN32
+    /* (a stack page refused at the commit limit: stack_on_touch above) */
+    stack_wait_ms = hos_commit_wait_ms();
+    stack_spare = VirtualAlloc(NULL, STACK_SPARE, MEM_COMMIT, PAGE_READWRITE);
+    AddVectoredExceptionHandler(1, stack_on_touch);
+#endif
     AddVectoredExceptionHandler(0, report_fatal);
     SetUnhandledExceptionFilter(report_crash);
     const char *after = getenv("HOS_STATS_AFTER");
@@ -482,6 +670,7 @@ static DWORD WINAPI sample_thread(void *p) {
         CONTEXT ctx = {0};
         ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
         const BOOL got = GetThreadContext(th, &ctx);
+        const StackRange stack = got ? thread_stack(th) : (StackRange){0, 0};   /* ((Triforce) the walk stays on it) */
         uint64_t keys[2] = {0, 0};
         char stack_line[1024];
         int stack_len = 0;
@@ -508,12 +697,7 @@ static DWORD WINAPI sample_thread(void *p) {
                 if (depth == 0) keys[0] = key;
                 if (m == exe && !keys[1]) keys[1] = key;
                 if (m == exe && !stacks) break;
-                DWORD64 image = 0;
-                PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(ctx.Rip, &image, NULL);
-                if (!f) break;
-                void *hd;
-                DWORD64 frame;
-                RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx.Rip, f, &ctx, &hd, &frame, NULL);
+                if (!unwind_step(&ctx, stack)) break;
             }
         }
         ResumeThread(th);
@@ -749,6 +933,7 @@ static DWORD WINAPI sample_all_thread(void *p) {
             }
             CloseHandle(snap);
             t0 = hos_now_ns();
+            fprintf(out, "# t0_ns %lld\n", (long long)t0);   /* ((Triforce) the clock of HOS_CHAIN's records: scripts/chain.py) */
             hos_log("prof: all-thread sampling of %d threads into %s", nt, path);
         }
         Sleep(2);
@@ -758,6 +943,7 @@ static DWORD WINAPI sample_all_thread(void *p) {
             CONTEXT ctx = {0};
             ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
             const BOOL got = GetThreadContext(th[i], &ctx);
+            const StackRange stack = got ? thread_stack(th[i]) : (StackRange){0, 0};   /* ((Triforce) the walk stays on it) */
             char line[1024];
             int len = snprintf(line, sizeof line, "%ld %s|", ms, tn[i]);
             for (int depth = 0; got && depth < 16 && ctx.Rip && len < (int)sizeof line - 96; depth++) {
@@ -776,12 +962,7 @@ static DWORD WINAPI sample_all_thread(void *p) {
                 }
                 len += snprintf(line + len, sizeof line - len, "%s%s+%llx", depth ? ";" : "", mi < 0 ? "?" : modname[mi],
                                 (unsigned long long)(ctx.Rip - (uint64_t)m));
-                DWORD64 image = 0;
-                PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(ctx.Rip, &image, NULL);
-                if (!f) break;
-                void *hd;
-                DWORD64 frame;
-                RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx.Rip, f, &ctx, &hd, &frame, NULL);
+                if (!unwind_step(&ctx, stack)) break;
             }
             ResumeThread(th[i]);
             fprintf(out, "%s\n", line);

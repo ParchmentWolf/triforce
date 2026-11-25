@@ -10,6 +10,9 @@
 #include "hos_sim_cpu.h"   /* ((Triforce, 11-22, OS-49) HOS_SIM_CPU, a lab switch: fewer of the PC's cores */
 #include "pace_wait.h"   /* ((Triforce) hos_sleep_until_ns: the frame wait to its time) */
 #include "short_sleep.h" /* ((Triforce, 11-21) how sleeps under a millisecond wait, by the PC's processors) */
+#include "log_redact.h"  /* ((Triforce) 11-24: the log's lines without the player's home folder and user name) */
+#include "hos_crash_record.h"     /* ((Triforce) the local crash record: host/hos_crash_record.c */
+#include "hos_report_prefixes.h"  /* (the renderer's fatal lines it is written for) */
 #include <stdio.h>
 #include <stdlib.h>
 #define WIN32_LEAN_AND_MEAN
@@ -39,9 +42,11 @@ struct HosThread {
     /* the kernel side (hos_svc.c): this thread's Horizon handle and the event it blocks on */
     uint32_t kernel_handle;
     HANDLE wake;
-    /* virtual cores (HOS_VCORES): the core held + 1 (0: none), the last one, a better waiter's request, queued; (Triforce)
+    /* virtual cores (HOS_VCORES): the core held + 1 (0: none), the last one, a better waiter's request, queued, and
+       whether it has run without one since an escape (vc_acquire; until its next block, hos_vcore_away, or the next
+       hos_vcore_back); (Triforce)
        when a release granted it the core it waits for (vc_grant), until it runs (the vcores: line's grant to run) */
-    int vc_held, vc_last, vc_queued;
+    int vc_held, vc_last, vc_queued, vc_escaped;
     volatile int vc_kick;
     int64_t vc_since, vc_grant_at;
     /* (HOS_CORE_COUNT, TICK-062 A10) calls that ask for the core number (HLE, svc 0x10), waits for a virtual core and their time */
@@ -317,16 +322,60 @@ static void log_flush(void) {}
 
 void hos_log_flush(void) { log_flush(); }
 
-void hos_log(const char *fmt, ...) {
+/* (Triforce) A line's level as the log writes it: none for info, so the lines most of the log is stay as they were; "[trace] "
+   (and error, warn, debug) after the thread's tag for the rest, where a log viewer reads it to show info and above unless asked
+   for more */
+static const char *log_level_tag(int level) {
+    switch (level) {
+    case HOS_LOG_ERROR: return "[error] ";
+    case HOS_LOG_WARN: return "[warn] ";
+    case HOS_LOG_DEBUG: return "[debug] ";
+    case HOS_LOG_TRACE: return "[trace] ";
+    default: return "";
+    }
+}
+
+static void hos_vlog(int level, const char *fmt, va_list ap) {
     char buf[1024], line[1100];
-    va_list ap;
-    va_start(ap, fmt);
     vsnprintf(buf, sizeof buf, fmt, ap);
-    va_end(ap);
-    snprintf(line, sizeof line, "[hos %s] %s\n", cur ? cur->name : "host", buf);
+    /* ((Triforce) the renderer's device lost and FATAL lines (host/hos_report_prefixes.h): the local crash record first
+       (host/hos_crash_record.c: the first one of a run only), then the line as before */
+    if (!strncmp(buf, HOS_REPORT_DEVICE_LOST_PREFIX, sizeof HOS_REPORT_DEVICE_LOST_PREFIX - 1))
+        hos_crash_record_fatal(NULL, "device lost");
+    else if (!strncmp(buf, HOS_REPORT_FATAL_PREFIX, sizeof HOS_REPORT_FATAL_PREFIX - 1))
+        hos_crash_record_fatal(NULL, strstr(buf, "VK_ERROR_DEVICE_LOST") ? "device lost" : "Vulkan fatal");
+    /* ((Triforce) 11-24: the line without the player's home folder and user name, as it is written: players pass the log
+       around (host/log_redact.h; HOS_LOG_REDACT=0: as it is). Redacted straight into the line, after the thread's name: no
+       buffer more on a stack a crash report may have little of */
+    int at = snprintf(line, sizeof line, "[hos %s] %s", cur ? cur->name : "host", log_level_tag(level));
+    if (at < 0) at = 0;
+    if (at > (int)sizeof line - 2) at = (int)sizeof line - 2;
+    at += (int)hos_log_redact(line + at, sizeof line - (size_t)at - 1, buf);
+    line[at] = '\n', line[at + 1] = 0;
+    {   /* (Triforce) HOS_CONTROL: log lines for the control bridge's subscribers (host/control.c); nothing without it */
+        extern volatile int hos_control_on;
+        if (hos_control_on) {
+            void hos_control_log(const char *line);
+            hos_control_log(line);
+        }
+    }
     if (log_queue(line)) return;
     fputs(line, stderr);
     fflush(stderr);
+}
+
+void hos_log(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    hos_vlog(HOS_LOG_INFO, fmt, ap);
+    va_end(ap);
+}
+
+void hos_log_at(int level, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    hos_vlog(level, fmt, ap);
+    va_end(ap);
 }
 
 /* (Triforce, after NX2navi) 32 KiB of the calling thread's or fiber's stack kept back for its own stack overflow. Windows
@@ -373,7 +422,13 @@ void hos_fatal(Ctx *c, const char *fmt, ...) {
     void hos_crash_threads_begin(void), hos_crash_threads_end(void);
     hos_crash_threads_begin();
     if (!c) c = hos_ctx();
+    hos_crash_record_fatal(c ? c->x : NULL, "hos_fatal");   /* ((Triforce) the local crash record first: host/hos_crash_record.c */
     log_flush();
+    {   /* ((Triforce) 11-24: as hos_log's lines, without the home folder and the user's name) */
+        static char clean[1024];   /* (one fatal error reports: hos_ending_enter) */
+        hos_log_redact(clean, sizeof clean, buf);
+        memcpy(buf, clean, sizeof buf);
+    }
     fprintf(stderr, "[hos %s] FATAL: %s", cur ? cur->name : "host", buf);
     if (c) fprintf(stderr, " (lr %#llx sp %#llx)", (unsigned long long)c->x[30], (unsigned long long)c->x[31]);
     fprintf(stderr, "\n");
@@ -495,13 +550,21 @@ HosThread *hos_thread_by_handle(uint32_t h) {
 }
 
 /* Block on the thread's wake event (the kernel layer's lock must not be held). */
+/* ((Triforce) HOS_CHAIN: the kernel's waits, svc mutexes, condition variables and the address arbiter, end in a wake of the
+   thread itself: one key per thread, bit 62: never a guest address) */
+static uint64_t wake_chain_key(HosThread *t) { return 1ULL << 62 | (uint64_t)(uintptr_t)t; }
 void hos_thread_wait(HosThread *t, int64_t timeout_ns, int *timed_out) {
     DWORD ms = timeout_ns < 0 ? INFINITE : (DWORD)((timeout_ns + 999999) / 1000000);
+    HOS_CHAIN(HOS_CHAIN_WAIT, wake_chain_key(t));
     const int away = hos_vcore_away();
     *timed_out = WaitForSingleObject(t->wake, ms) == WAIT_TIMEOUT;
     if (away) hos_vcore_back();
+    HOS_CHAIN(HOS_CHAIN_WOKE, wake_chain_key(t));
 }
-void hos_thread_wake(HosThread *t) { SetEvent(t->wake); }
+void hos_thread_wake(HosThread *t) {
+    HOS_CHAIN(HOS_CHAIN_SIGNAL, wake_chain_key(t));
+    SetEvent(t->wake);
+}
 
 /* TICK-062 B2: hos_thread_of is a linear scan of every thread under a shared lock. HOS_THREAD_OF_CACHE=1: each thread keeps
    a few (ThreadType, thread) pairs, valid while thread_gen has not changed. thread_gen is bumped by everything that can
@@ -716,6 +779,21 @@ static uint64_t pick_reserved_core(const uint64_t *masks, const unsigned char *c
     if (logical < 8 || fast < 4) return 0;
     return last;
 }
+/* (Triforce) The logical processors this process may run on (its affinity mask: `start /affinity`, a launcher's, Process
+   Lasso's), for the kept core's choice; every one when the mask cannot be read (Windows gives 0 for a process with threads
+   in more than one processor group). A core as a candidate for the kept core: its mask when all its logical processors
+   are among those, else 0, which pick_reserved_core takes for no core and does not count. A core outside the process's
+   mask is no place for the replay: Windows refuses the thread's pin there and the thread then runs beside the game's,
+   while the choice below returned before hos_reserved_cpus' own look at the mask (its fallback's): under 0x0FFF of 16
+   the last core of all, 0xC000, was kept. tests/test_reserved_core_mask.py */
+static uint64_t reserved_candidate(uint64_t core, uint64_t allowed) { return core & ~allowed ? 0 : core; }
+#if defined(_WIN32)
+static uint64_t process_cpus(void) {
+    DWORD_PTR proc = 0, sys = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) || !proc) return ~0ull;
+    return (uint64_t)proc;
+}
+#endif
 /* (Triforce, after NX2navi's cache placement) The die with the largest L3 cache, on a processor whose L3 caches differ: a
    two-die X3D part, 3D V-Cache on one die (host/hos_x3d.h has the rule and where nothing is done). The game's threads
    are kept on it (hos_thread_pin), and the core kept for the replay is its last one (last_fastest_core), not the
@@ -821,6 +899,7 @@ static uint64_t last_fastest_core(int *cores) {
     const WORD group = GetThreadGroupAffinity(GetCurrentThread(), &ga) ? ga.Group : 0;
     const uint64_t die = hos_x3d_cpus();   /* (Triforce: the cores of the die the game's threads are kept on, when there is one) */
     const uint64_t home = die ? 0 : l3_home_mask;   /* ((Triforce, 11-23) or of the home, hos_l3_home.h) */
+    const uint64_t allowed = process_cpus();        /* ((Triforce) only a core the process may run on wholly: reserved_candidate) */
     if (GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len) || GetLastError() != ERROR_INSUFFICIENT_BUFFER)
         return 0;
     char *buf = (char *)malloc(len);
@@ -832,13 +911,67 @@ static uint64_t last_fastest_core(int *cores) {
                 (!die || ((uint64_t)e->Processor.GroupMask[0].Mask & die)) &&
                 (!home || ((uint64_t)e->Processor.GroupMask[0].Mask & home)) &&
                 (!sim_cpu_mask || ((uint64_t)e->Processor.GroupMask[0].Mask & sim_cpu_mask))) {   /* ((Triforce, OS-49) inside it) */
-                masks[n] = (uint64_t)e->Processor.GroupMask[0].Mask;
+                /* ((Triforce) listed and counted in *cores as before; no candidate outside the process's mask) */
+                masks[n] = reserved_candidate((uint64_t)e->Processor.GroupMask[0].Mask, allowed);
                 classes[n] = e->Processor.EfficiencyClass;
                 n++;
             }
             at += e->Size;
         }
     free(buf);
+    *cores = n;
+    return pick_reserved_core(masks, classes, n);
+}
+#elif !defined(__EMSCRIPTEN__)
+/* ((Triforce, 11-24, after Source A's) A Linux cpulist ("0-7", "0-11,16-19") as a mask of logical processors 0-63; 0 when it
+   does not parse */
+static uint64_t parse_cpu_list(const char *s) {
+    uint64_t mask = 0;
+    while (*s && *s != '\n') {
+        char *end;
+        long a = strtol(s, &end, 10), b = a;
+        if (end == s || a < 0) return 0;
+        s = end;
+        if (*s == '-') {
+            b = strtol(++s, &end, 10);
+            if (end == s || b < a) return 0;
+            s = end;
+        }
+        for (long i = a; i <= b && i < 64; i++) mask |= 1ull << i;
+        if (*s == ',') s++;
+        else if (*s && *s != '\n') return 0;
+    }
+    return mask;
+}
+/* ((Triforce, 11-24, after Source A's) Linux: Windows' EfficiencyClass has no file of its own, but on Intel's hybrid CPUs the
+   kernel lists the performance cores' logical processors in /sys/devices/cpu_core/cpus (the hybrid PMU; the efficiency cores
+   are in cpu_atom). Without it the last core was kept, and on those CPUs that is an efficiency core: a Core Ultra 7 265KF's
+   logical processor 19 (P-cores 0-7, E-cores 8-19). Those cores are class 1, the others 0, and pick_reserved_core chooses as
+   on Windows, among the cores the process may run on wholly. *cores: 0 when the file is not there (a CPU of one kind, AMD, an
+   older kernel): the last core, as before */
+static uint64_t last_fastest_core(int *cores) {
+    *cores = 0;
+    char line[256] = {0};
+    FILE *f = fopen("/sys/devices/cpu_core/cpus", "r");
+    if (!f) return 0;
+    const int read = fgets(line, sizeof line, f) != NULL;
+    fclose(f);
+    const uint64_t fast = read ? parse_cpu_list(line) : 0;
+    if (!fast) return 0;
+    static SYSTEM_LOGICAL_PROCESSOR_INFORMATION info[256];
+    DWORD len = sizeof info;
+    if (!GetLogicalProcessorInformation(info, &len)) return 0;
+    DWORD_PTR proc = 0, sys = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) || !proc) proc = ~(DWORD_PTR)0;
+    static uint64_t masks[256];
+    static unsigned char classes[256];
+    int n = 0;
+    for (DWORD i = 0; i < len / sizeof info[0] && n < 256; i++)
+        if (info[i].Relationship == RelationProcessorCore) {
+            masks[n] = reserved_candidate((uint64_t)info[i].ProcessorMask, (uint64_t)proc);
+            classes[n] = ((uint64_t)info[i].ProcessorMask & fast) != 0;
+            n++;
+        }
     *cores = n;
     return pick_reserved_core(masks, classes, n);
 }
@@ -911,14 +1044,31 @@ uint64_t hos_reserved_cpus(void) {
         }
         if (cores) return mask = fast;
     }
+#elif !defined(__EMSCRIPTEN__)
+    {   /* ((Triforce, 11-24) Intel's hybrid CPUs on Linux: a performance core, last_fastest_core) */
+        int cores = 0;
+        const uint64_t fast = last_fastest_core(&cores);
+        if (cores && fast) {
+            hos_log("cpu: the replay's core on a performance core (hybrid, /sys/devices/cpu_core): %#llx of %d cores",
+                    (unsigned long long)fast, cores);
+            return mask = fast;
+        }
+    }
 #endif
     SYSTEM_LOGICAL_PROCESSOR_INFORMATION info[256];
     DWORD len = sizeof info;
     if (!GetLogicalProcessorInformation(info, &len)) return mask;
+    /* (Triforce) of the processors this process may run on. A process kept to some of them (taskset, a launcher's
+       affinity) had the PC's last core kept all the same, outside its set, and a thread may leave the set: the replay ran
+       there, beside whatever else did. A timed session kept to one CCD of a 7900X (CPUs 0-5,12-17) replayed on CPUs 11 and
+       23 of the other, with the builds: frames of 2-8 s whenever one ran, and a 13th core when none did. A core counts
+       when all its logical processors are allowed; with every processor allowed, the last core as before */
+    DWORD_PTR proc = 0, sys = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) || !proc) proc = ~(DWORD_PTR)0;
     int logical = 0;
     uint64_t last = 0;
     for (DWORD i = 0; i < len / sizeof info[0]; i++)
-        if (info[i].Relationship == RelationProcessorCore) {
+        if (info[i].Relationship == RelationProcessorCore && !((uint64_t)info[i].ProcessorMask & ~(uint64_t)proc)) {
             logical += __builtin_popcountll((uint64_t)info[i].ProcessorMask);
             if ((uint64_t)info[i].ProcessorMask > last) last = (uint64_t)info[i].ProcessorMask;
         }
@@ -1006,9 +1156,11 @@ static void sleep_away(int64_t ns, int guest) {
         SwitchToThread();
         return;
     }
+    HOS_CHAIN(HOS_CHAIN_SLEEP, (uint64_t)ns);   /* ((Triforce) HOS_CHAIN) */
     const int away = hos_vcore_away();
     sleep_for(ns, guest);
     if (away) hos_vcore_back();
+    HOS_CHAIN(HOS_CHAIN_AWAKE, (uint64_t)ns);
 }
 void hos_sleep_ns(int64_t ns) { sleep_away(ns, 0); }
 /* (the host's own sleep, as pace_wait_until takes it) */
@@ -1129,6 +1281,9 @@ void hos_sleep_until_ns(int64_t until, int64_t margin_ns) {
 
 /* ---- nn::os threads -------------------------------------------------------------------------------------- */
 static HosThread *thread_arg(Ctx *c, uint64_t tt) {
+    /* ((Triforce) the calling thread's own ThreadType, the usual case: GetThreadPriority(GetCurrentThread()) ~2,400 times a
+       frame in Hyrule from the navigation workers: its own record, without the lookup) */
+    if (tt && cur && cur->guest_tt == tt) return cur;
     HosThread *t = hos_thread_of(tt);
     if (!t) hos_fatal(c, "unknown nn::os::ThreadType %#llx", (unsigned long long)tt);
     return t;
@@ -1586,9 +1741,13 @@ void hos_thread_log_handles(void) {
    then the one waiting longest). A waiter better than a holder asks it to give the core up (vc_kick), which it does at
    its next checkpoint (every nn::os call and SVC: hos_vcore_checkpoint), as Horizon would run the better thread at
    once. Guest code with no checkpoint (a spin loop) keeps its core, so a waiter that has waited too long runs anyway
-   without one (an "escape", logged with the holders): HOS_VCORE_ESCAPE_US for a better waiter (default 1000),
-   HOS_VCORE_ESCAPE_EQ_US otherwise (20000). Every 5 s the log has a "vcores:" line. GetCurrentCoreNumber answers the
-   core a thread holds. (Triforce) A waiter that asked a holder for its core spins for it before it sleeps (vc_spin). */
+   without one (an "escape", logged with the holders): HOS_VCORE_ESCAPE_US for a better waiter, HOS_VCORE_ESCAPE_EQ_US
+   otherwise (both 250000: 250 ms; vc_acquire has the defaults, and the one-core rule's own, HOS_VCORE_PIN_ESCAPE_MS). An
+   escape runs a thread with no core while the holder still runs on it, so two threads share that core's number and its
+   per-core state: it is a deadlock breaker, and it lasts only until the escaped thread's next block, after which the
+   thread waits for a core again as every other does (hos_vcore_away, hos_vcore_back). Every 5 s the log has a "vcores:"
+   line. GetCurrentCoreNumber answers the core a thread holds. (Triforce) A waiter that asked a holder for its core spins
+   for it before it sleeps (vc_spin). */
 #if !defined(__EMSCRIPTEN__)
 static SRWLOCK vc_lock = SRWLOCK_INIT;
 static HosThread *vc_owner[8];
@@ -1671,6 +1830,8 @@ static void vc_dequeue(HosThread *t) {
     t->vc_queued = 0;
 }
 /* core c is free: to the best waiter allowed on it; holding vc_lock */
+/* ((Triforce) HOS_CHAIN: a thread's wait for a core, and the grant that ends it; bit 63: never a guest address) */
+static uint64_t vc_chain_key(HosThread *t) { return 1ULL << 63 | (uint64_t)(uintptr_t)t; }
 static void vc_grant(int c) {
     HosThread *best = NULL;
     for (int i = 0; i < vc_nq; i++)
@@ -1679,6 +1840,7 @@ static void vc_grant(int c) {
     vc_dequeue(best);
     best->vc_grant_at = hos_now_ns();   /* ((Triforce) grant to run, taken where it holds vc_lock again: vc_acquire) */
     vc_take(best, c);
+    HOS_CHAIN(HOS_CHAIN_SIGNAL, vc_chain_key(best));
     WakeConditionVariable(&best->vc_cv);   /* (no one sleeps there when it spins: vc_spin reads vc_held) */
 }
 static void vc_stats_locked(int64_t now) {
@@ -1779,6 +1941,7 @@ static void vc_acquire(HosThread *t) {
         return;
     }
     const int64_t t0 = hos_now_ns();
+    HOS_CHAIN(HOS_CHAIN_WAIT, vc_chain_key(t));
     t->vc_since = t0;
     t->vc_queued = 1;
     if (vc_nq < 1024) vc_queue[vc_nq++] = t;
@@ -1799,11 +1962,17 @@ static void vc_acquire(HosThread *t) {
         if (!worst && hos_now_ns() - t0 > slice)
             for (int k = 0; k < vc_cores() && !worst; k++)
                 if ((m >> k & 1) && vc_owner[k] && vc_owner[k]->priority == t->priority) worst = vc_owner[k];
-        if (worst && !worst->vc_kick) {
-            worst->vc_kick = worst->priority > t->priority ? 1 : 2;
+        if (worst) {
+            if (!worst->vc_kick) {
+                worst->vc_kick = worst->priority > t->priority ? 1 : 2;
+                vc_st.kicks++;
+            }
+            /* ((Triforce) the interrupt published at every look, also for a request already pending: it repairs one whose
+               interrupt went to a context the holder no longer runs (it switched to or from a fiber between the read of
+               run_ctx and the store, so its loops never saw it and only its next nn::os call or SVC, or the waiter's
+               escape, ended the wait). A holder that sees it twice finds no request the second time: vc_yield) */
             Ctx *rc = worst->run_ctx;   /* (a fiber's context while it runs one) */
             __atomic_store_n(rc ? &rc->poll : &worst->ctx.poll, 1, __ATOMIC_RELAXED);
-            vc_st.kicks++;
         }
         /* (Triforce) a holder was asked for a core t may use: a spin for it first, once a wait (vc_spin). A release in
            the spin granted t its core (vc_held), the only one it then holds; else a core freed that no waiter took */
@@ -1850,6 +2019,7 @@ static void vc_acquire(HosThread *t) {
         }
         if (waited > limit) {
             vc_dequeue(t);
+            t->vc_escaped = 1;   /* (until its next block: hos_vcore_away) */
             vc_st.escapes++;
             static int logged;
             if (logged < 40) {
@@ -1867,6 +2037,7 @@ static void vc_acquire(HosThread *t) {
         }
     }
     const int64_t now = hos_now_ns(), waited = now - t0;
+    HOS_CHAIN(HOS_CHAIN_WOKE, vc_chain_key(t));
     vc_st.wait_ns += waited;
     if (waited > vc_st.max_ns) vc_st.max_ns = waited;
     __atomic_add_fetch(&vc_gap.ns, waited, __ATOMIC_RELAXED), __atomic_add_fetch(&vc_gap.n, 1, __ATOMIC_RELAXED);   /* ((Triforce, OS-51)) */
@@ -1917,15 +2088,30 @@ static void vc_yield(HosThread *t, int strict) {
     vc_release(t);
     vc_acquire(t);
 }
+/* 1 when the caller is to take a core again after its block (hos_vcore_back): it gave its core up, or it has run without
+   one since an escape. An escape lasts until the thread's next block, as every other thread waits for a core after one;
+   it took none again before, so an escaped thread ran with no core, and under the core number of a core another thread
+   held, for the rest of its life: beside a thread held to that same one core too, which the wait in vc_acquire (the
+   11-23 one-core rule) is there to prevent. Only the outermost of nested blocks takes the core again */
 int hos_vcore_away(void) {
     HosThread *t = cur;
-    if (!hos_vcores_on() || !t || !t->vc_held) return 0;
+    if (!hos_vcores_on() || !t) return 0;
+    if (!t->vc_held) {
+        const int escaped = t->vc_escaped;   /* (only the outermost block of nested ones takes the core again) */
+        t->vc_escaped = 0;
+        return escaped;
+    }
     vc_release(t);
     return 1;
 }
 void hos_vcore_back(void) {
     HosThread *t = cur;
-    if (hos_vcores_on() && t && !t->vc_held) vc_acquire(t);
+    if (!hos_vcores_on() || !t) return;
+    /* after it the thread holds a core or has escaped again (vc_acquire sets the flag again): the escape the flag stood
+       for has ended, also at a back without its away (a thread's start). A flag left up while a core is held would make
+       a later inner block's away answer 1 and take a core in the middle of the outer block */
+    t->vc_escaped = 0;
+    if (!t->vc_held) vc_acquire(t);
 }
 /* ((Triforce, 11-22, the performance audit's OS-51) the waits for a core since the last take: their summed time, how many,
    the longest; all left at zero. No lock: a wait that ends meanwhile is in this take or the next) */

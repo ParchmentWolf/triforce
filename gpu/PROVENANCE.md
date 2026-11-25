@@ -36,3 +36,6 @@ Hookshot's AMD FSR 4 (`vk/vk_fsr4.cpp`) was first written for Lichii's OoT branc
 N3oTraX. It draws with the frame chain of hckrman101's NVIDIA DLSS (#841), moved into `vk/vk_temporal.cpp` so both
 upscalers share it. `third_party/fidelityfx/` is AMD's FSR API headers from FidelityFX SDK v2.4.0 (MIT, `LICENSE.md`);
 AMD's signed DLLs are loaded from the user's PC at run time and are not vendored.
+Intel XeSS Super Resolution (`vk/vk_xess.cpp`, `vk/xess_rules.h`) is the chain's third engine. `third_party/xess/` is
+Intel's MIT XeSS API headers only (its `PROVENANCE.md`); Intel's `libxess.dll` is the player's, loaded at run time from
+their PC and never vendored, linked or downloaded.

@@ -25,6 +25,10 @@ static uint8_t *at(uint64_t a, size_t n) {
     return mem + (a - MEM_BASE);
 }
 #define A64_PTR(a) at((a), 1)
+/* (host/hos.h's, over the stand-in's memory: NULL unless all n bytes lie in it) */
+static void *hos_guest_range(uint64_t a, uint64_t n) {
+    return a >= MEM_BASE && n <= MEM_SIZE && a - MEM_BASE <= MEM_SIZE - n ? mem + (a - MEM_BASE) : NULL;
+}
 static uint8_t recomp_load8(Ctx *c, uint64_t a) { (void)c, loads++; return *at(a, 1); }
 static uint32_t recomp_load32(Ctx *c, uint64_t a) { (void)c, loads++; uint32_t v; memcpy(&v, at(a, 4), 4); return v; }
 static uint64_t recomp_load64(Ctx *c, uint64_t a) { (void)c, loads++; uint64_t v; memcpy(&v, at(a, 8), 8); return v; }

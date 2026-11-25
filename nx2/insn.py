@@ -18,6 +18,14 @@ Model:
   - Pointer authentication is the identity, as in Eglantine's dynarmic: PAC*/AUT* (register forms) and XPAC* leave
     Xd unchanged, PACGA writes 0. Nothing in the game's own code can tell, since no pointer is ever signed.
   - MTE: tags are always 0. STG/ST2G only do their base-register writeback.
+  - SCVTF / UCVTF (scalar, fixed-point: Sd, Sn, #fbits and Dd, Dn, #fbits), which suyu's translator lacks and the
+    game's own code doesn't use (a mod's code may): the integer in Vn's low 32 or 64 bits over 2^fbits, through suyu's
+    own recomp_fixed_to_fp (the helper of its general-register fixed-point form: the FPCR's rounding, IXC), the rest
+    of Vd cleared.
+
+One form suyu does know is written here too, because its C is wrong for one input:
+  - SDIV: suyu's C divides as C does, and the most negative number divided by -1 is undefined there. x86's idiv traps
+    on it (#DE), where AArch64 gives the dividend back. sdiv() writes suyu's text with that case added.
 """
 import os
 
@@ -118,6 +126,29 @@ def stg(w):
         return "/* stg: memory tags are not modelled */"
     return "c->x[%d] += (uint64_t)(int64_t)%d; /* st%sg, writeback: tags are not modelled */" % (
         rn, imm, "2" if opc == 2 else "")
+
+
+def sdiv(w):
+    """SDIV Xd, Xn, Xm and Wd, Wn, Wm, as suyu writes them (arm64_to_c.h: 0 for a divisor of 0, a W result
+    zero-extended) but for the one quotient that does not fit: the most negative number divided by -1. AArch64 wraps
+    it, which gives the dividend back; C leaves that division undefined and x86's idiv traps on it, so lifted code
+    dividing like that killed the game with no message (SIGFPE; 0xC0000095 on Windows). A divisor of -1 is therefore
+    a negation in unsigned arithmetic, which wraps to the same value for every dividend. tests/test_sdiv_overflow.py
+
+    (Triforce) Written without a new comparison or conditional: _m is 1 for a divisor of -1 and 0 otherwise, made by
+    arithmetic alone (_t = divisor + 1 is 0 only then; (_t | -_t) has its top bit set unless _t is 0); the division is
+    then by 1 (-1 + 2 * _m), and its quotient negated ((q ^ -_m) + _m). The compiler's profile of a function (the hot
+    pieces', nx2/build.py RX_PGO) is matched by a count of the function's conditions, comparisons, labels and jumps:
+    one more `==` or `?:` here and every recorded function with a division in it would be compiled without its
+    profile until a new one is recorded. Suyu's own `_b?...:0` stays the only condition, and there is no branch."""
+    sf, rm, rn, rd = w >> 31, (w >> 16) & 31, (w >> 5) & 31, w & 31
+    if rd == 31:
+        return None   # (the result is dropped: suyu writes no division for it either)
+    if sf:
+        return ("    { int64_t _a=(int64_t)%s,_b=(int64_t)%s; uint64_t _t=(uint64_t)_b+1,_m=((_t|(0-_t))>>63)^1; "
+                "c->x[%d]=(uint64_t)(_b?(((uint64_t)(_a/(_b+(int64_t)(_m<<1))))^(0-_m))+_m:0); }" % (xr(rn), xr(rm), rd))
+    return ("    { int32_t _a=(int32_t)(uint32_t)%s,_b=(int32_t)(uint32_t)%s; uint32_t _t=(uint32_t)_b+1u,_m=((_t|(0u-_t))>>31)^1u; "
+            "c->x[%d]=(uint64_t)(uint32_t)(_b?(((uint32_t)(_a/(_b+(int32_t)(_m<<1))))^(0u-_m))+_m:0); }" % (xr(rn), xr(rm), rd))
 
 
 # ---- the few SIMD forms suyu lacks that MKW's sdk uses (62 sites) -------------------------------------
@@ -261,7 +292,22 @@ def emit(w):
         return "/* pac/aut: pointer authentication is the identity */"
     if (w & 0xFF200000) == 0xD9200000:
         return stg(w)
+    if (w & 0x7FE0FC00) == 0x1AC00C00:                # SDIV (suyu's own C traps on x86 for INT_MIN / -1)
+        return sdiv(w)
+    if (w & 0xDF80FC00) == 0x5F00E400 and (w >> 21) & 3:   # SCVTF / UCVTF (scalar, fixed-point), S or D
+        return fixed_to_fp(w)
     return None
+
+
+def fixed_to_fp(w):
+    """SCVTF / UCVTF Sd, Sn, #fbits or Dd, Dn, #fbits: immh 01xx is S (fbits = 64 - immh:immb), 1xxx is D
+    (fbits = 128 - immh:immb); immh 001x (H) is not taken. U (bit 29) is UCVTF"""
+    width = 64 if (w >> 22) & 1 else 32
+    fbits = 2 * width - ((w >> 16) & 0x7F)
+    rd, rn, signed = w & 31, (w >> 5) & 31, 0 if (w >> 29) & 1 else 1
+    mask = "UINT64_MAX" if width == 64 else "UINT64_C(0xffffffff)"
+    return ("{ uint64_t _r = recomp_fixed_to_fp(c->vreg[%d][0] & %s, %d, %d, %d, %d, c->fpcr, &c->fpsr); "
+            "c->vreg[%d][0] = _r; c->vreg[%d][1] = 0; }" % (rn, mask, width, width, fbits, signed, rd, rd))
 
 
 def is_identity_model(w):
@@ -282,8 +328,16 @@ def install():
     base_classify = a64_lift.classify
     base_translate = a64emit.translate
 
+    ops = set()   # (words that are ("op",) at any pc: neither classify reads the pc for them)
+    OP = ("op",)
+
     def classify(w, pc):
-        return classify_ext(w, pc) or base_classify(w, pc)
+        if w in ops:   # (most of the 18 million words the discovery walks: one set lookup instead of both classifies)
+            return OP
+        k = classify_ext(w, pc) or base_classify(w, pc)
+        if k == OP:
+            ops.add(w)
+        return k
 
     def translate(items, batch=65536):
         mine = {}

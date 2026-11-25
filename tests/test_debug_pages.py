@@ -42,13 +42,13 @@ def main():
     for name, tool in (("Game flags", 11), ("Cutscenes", 12), ("Scan amiibo", 13)):
         found = re.findall(r'\{(TAB_\w+), "%s", nullptr, 0, 0, 0, nullptr,\s*(?:"[^\n]*"\s*)+, nullptr, false, true, (\d+)\},' % name, rows)
         check(found == [("TAB_DEBUG", str(tool))], "the row %s is not one tool (%d) of the Debug tab: %s" % (name, tool, found))
-    check("constexpr int kCheatRows = 14;" in menu, "kCheatRows does not count the three rows")
+    check("constexpr int kCheatRows = 15;" in menu, "kCheatRows does not count the three rows (and Movement speed, 14, after them)")
     for table in re.findall(r"says\[kCheatRows\] = \{([^}]*)\}|buttons\[kCheatRows\] = \{([^}]*)\}", menu):
         entries = re.findall(r'"[^"]*"|nullptr', table[0] or table[1])
-        check(len(entries) == 14, "a table of the tools' words has %d entries, not 14" % len(entries))
+        check(len(entries) == 15, "a table of the tools' words has %d entries, not 15" % len(entries))
     # the tab's layout: every tool but the two the Inventory page replaced, once, each in one group
     order = [int(n) for n in re.search(r"constexpr int debug_tools_order\[\] = \{([^}]*)\};", menu).group(1).split(",")]
-    check(sorted(order) == [0, 1, 2, 3, 4, 7, 8, 9, 10, 11, 12, 13], "the Debug tab's order does not have every tool once: %s" % order)
+    check(sorted(order) == [0, 1, 2, 3, 4, 7, 8, 9, 10, 11, 12, 13, 14], "the Debug tab's order does not have every tool once: %s" % order)
     groups = re.findall(r'\{"([^"]+)", (\d+), (\d+)\}', re.search(r"constexpr DebugGroup debug_groups\[\] = \{(.*?)\};", menu).group(1))
     at = 0
     for title, start, end in groups:
@@ -125,7 +125,9 @@ def main():
     code = re.sub(r"//[^\n]*", "", menu)
     check(code.count("std::thread(names_scan_thread)") == 1 and "std::thread(names_scan_thread).detach();" in function(menu, "void names_open("),
           "the game's files are read from somewhere else than a page's opening")
-    check(code.count("ui::folder_files(") == 1 and "ui::folder_files(" in function(menu, "void names_open("), "the amiibo folder is listed before its page is opened")
+    # ((Triforce) twice there: the .bin dumps and the Flipper .nfc files)
+    check(code.count("ui::folder_files(") == function(menu, "void names_open(").count("ui::folder_files(") == 2,
+          "the amiibo folder is listed before its page is opened")
     check(code.count("ui::game_files(") == 2 and function(menu, "void names_scan_thread(").count("ui::game_files(") == 2, "the game's files are read outside the scan")
     pushes = {name: function(menu, "void %s(" % name).count("_ask.push(") for name in ("names_send_flag", "names_confirm", "names_tick")}
     check(pushes == {"names_send_flag": 1, "names_confirm": 2, "names_tick": 1} and code.count("_ask.push(") == 4, "a line is made outside the pages: %s" % pushes)

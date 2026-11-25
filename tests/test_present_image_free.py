@@ -258,7 +258,7 @@ def fixture(replay):
     e = present.index("    si.pSignalSemaphoreInfos = &signal;", s)
     submit = present[s:e] + "    si.pSignalSemaphoreInfos = &signal;\n"
     h = replay.index("bool acquire_fence_on() {")
-    helpers = replay[h:replay.index(block(replay, "VkResult image_free(uint64_t timeout_ns) {"), h)] + \
+    helpers = "// ((Triforce) RX_VK_PRESENT_CHECK's note of an acquire: nothing here)\nstatic void present_check_acquired(uint32_t, uint64_t) {}\n" + replay[h:replay.index(block(replay, "VkResult image_free(uint64_t timeout_ns) {"), h)] + \
         block(replay, "VkResult image_free(uint64_t timeout_ns) {")
     return HEAD + helpers + STEP.replace("@ACQUIRE@", acquire).replace("@SUBMIT@", submit)
 

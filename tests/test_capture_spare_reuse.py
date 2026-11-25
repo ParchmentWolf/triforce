@@ -70,6 +70,7 @@ HEAD = r"""
 #include <cstdlib>
 #include <mutex>
 #include <set>
+#include <string>
 #include <thread>
 #include <vector>
 #include "cap_spare.h"
@@ -418,6 +419,9 @@ def main():
     check("`RX_VK_CAP_SPARE_FIT=0`" in dev and "`RX_VK_CAP_STEP_MB=<n>`" in dev, "docs/development.md: the two switches are not in the switches table")
 
     cut = "\n".join([
+        # (the switches' rule the capture's own switches are read by: RX_VK_CAPTURE_KEEP_OLD, RX_VK_CAP_BLOCKS)
+        block(mem, "bool env_value_off(const char* v) {"),
+        block(mem, "bool env_on(const char* name) {"),
         free,
         block(mem, "uint64_t cap_buf_size(uint64_t need) {"),
         line(mem, "int cap_prewarm_index(uint64_t size) {"),

@@ -38,7 +38,7 @@ def main():
     args = parser.parse_args()
     source = (ROOT / "gpu/vk/vk_replay.cpp").read_text(encoding="utf-8")
     begin = source.index("    const PresentAspect aspect{", source.index("void present_image("))
-    end = source.index("    if (src && framelog_on())", begin)
+    end = source.index("    // ((Triforce) RX_VK_FRAMELOG_WINDOW=1, with the frame log:", begin)
     fixture = (ROOT / "tests/present_aspect_vulkan.cpp").read_text(encoding="utf-8")
     fixture = fixture.replace("// @PRODUCTION_HELPERS@", function(source, "void image_barrier(") + "\n" +
                               function(source, "void blit_crop_to_rect("))

@@ -113,7 +113,7 @@ def check_source(src):
         "const bool blend = fg.have_prev && !gap;",
         "if (blend) {\n            n = auto_slots(",
         "fsr4_frame(cmd, *set, cur, uw, uh, sequence, blend);",
-        "!none && blend && m == 2 && fsr3fi::frames_wanted()",
+        "const int fsr_n = blend ? m - 1 : 0;",   # ((Triforce) 11-24: FSR 3.1 given the frame with none to make, its history alone)
         "if (set->made == 0 && !none && blend && m > 1) {"])
     need("vk_framegen.cpp fsr4_frame", block(fg, "framegen_rows::Made fsr4_frame("), ["in.reset = f.reset || !blend;"])
 
@@ -125,11 +125,11 @@ def check_source(src):
                                           "c.reset = in.reset || after_hold ?"])
     temporal = (src / "gpu/vk/vk_temporal.cpp").read_text(encoding="utf-8")
     # ((Triforce) a camera cut starts one too: tests/test_fsr3_history.py)
-    need("vk_temporal.cpp", temporal, ["const bool reset = !last || now - last > 2 || present_held_last() || cut;"])
+    need("vk_temporal.cpp", temporal, ["bool reset = !last || now - last > 2 || present_held_last() || cut;"])
     # ((Triforce) AMD FSR 3.1's own inputs as well: frames drawn during a hold are not carried into its history)
     inputs = (src / "gpu/vk/vk_fsr3_inputs.cpp").read_text(encoding="utf-8")
     need("vk_fsr3_inputs.cpp prepare", block(inputs, "bool prepare(VkCommandBuffer cmd, Texture* in, VkImageView in_view, Frame& out, bool linear) {"),
-         ["const bool held = !gap && present_held_last();", "const bool reset = gap || held || cut;"])
+         ["const bool held = !gap && present_held_last();", "bool reset = gap || held || cut;"])
 
     dev = (src / "docs/development.md").read_text(encoding="utf-8")
     for switch in ("RX_VK_HOLD_MS", "RX_VK_UPLOAD_NEW_MS", "RX_VK_UPLOAD_NEW_MB"):

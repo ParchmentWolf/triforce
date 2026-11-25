@@ -283,11 +283,11 @@ def check_compile(tmp, cc, preamble, fns, text):
 def check_sources():
     with open(os.path.join(ROOT, "nx2", "build.py"), encoding="utf-8") as f:
         build = f.read()
-    for line in ('    srcs, cold = cold_parts.expand(srcs, os.path.join(out, "split"), os.environ, stats=cold_stats)\n',
+    for line in ('    srcs, cold = (srcs, set()) if KEPT else cold_parts.expand(srcs, os.path.join(out, "split"), os.environ, stats=cold_stats)\n',
                  "    cold_fl = cold_parts.cold_flags(fl, a.opt, os.environ) if cold else fl",
-                 '             hot_fl if os.path.basename(s).startswith("code_hot") else cold_fl if s in cold else fl,\n'):
+                 '             hot_fl if os.path.basename(s).startswith("code_hot") else cold_fl if s in cold else\n'):
         check("nx2/build.py no longer has the line %r" % line.strip(), build.count(line) == 1)
-    at = [build.find(p) for p in ("    srcs, cold = cold_parts.expand(", "    srcs.sort(key=lambda s: -compile_cost(s, costs))",
+    at = [build.find(p) for p in ("    srcs, cold = (srcs, set()) if KEPT else cold_parts.expand(","    srcs.sort(key=lambda s: -compile_cost(s, costs))",
                                   "    cold_fl = cold_parts.cold_flags(", "    jobs = [(cc, s, os.path.join(obj_dir,")]
     check("nx2/build.py expands its sources before it orders them and makes the jobs", min(at) >= 0 and at == sorted(at))
     with open(os.path.join(ROOT, "nx2", "make_game.py"), encoding="utf-8") as f:

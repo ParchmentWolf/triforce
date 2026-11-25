@@ -124,7 +124,7 @@ def checks(temporal, fsr4, menu):
     check("temporal_stood_in()" in hint and "The game's own stands in: %s failed four times in a row" in hint,
           "the Upscaler's help does not say when the game's own stands in for FSR 4")
     # (the FSR 4 it names is the Upscaler row's, by its version: "AMD FSR 4.1")
-    stood = hint[hint.index("static char fsr4_stood_in["):hint.index("const char* const stood_in[2] = {")]
+    stood = hint[hint.index("static char fsr4_stood_in["):hint.index("const char* const stood_in[3] = {")]
     check("fsr4_name(false)" in stood, "the stand-in line names FSR 4 without its version")
     check("else if (variant < DLSS_WHY_COUNT + FSR_WHY_COUNT + 1) return stood_in[" in hint,
           "the stand-in lines are not among the help's variants (the menu's height)")
@@ -137,7 +137,7 @@ def checks(temporal, fsr4, menu):
     # ((Triforce, options_version 7) an engine's native AA is the Render resolution's Native (100%): that line says it, for
     # DLAA, FSR 4's and FSR 3.1's alike (ur::full_scale)
     resolution = function(menu, "const char* hn_resolution(int v, int variant) {")
-    native = resolution[resolution.index("if (ur::full_scale(up))"):resolution.index("const int p = ur::percent(v);")]
+    native = resolution[resolution.index("if (ur::full_scale(up))"):resolution.index("const int p = ur::percent(ur::snap(up, v));")]
     check("takes its full size at the next start." in native,
           "the native AA's help (the Render resolution's Native) does not say the 3D takes its full size at the next start")
     # FSR4-3: an RGBA16F picture goes to FSR 4
@@ -145,7 +145,7 @@ def checks(temporal, fsr4, menu):
     check("const bool hdr = pre != nullptr || in_format == VK_FORMAT_R16G16B16A16_SFLOAT;" in chain,
           "the chain no longer gives an RGBA16F picture as HDR colour")
     # FSR4-4, FSR4-8, FSR4-9, FSR4-10: the context and the dispatch
-    make = function(fsr4, "std::shared_ptr<Context> make_context(uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, bool drs, bool hdr) {")
+    make = function(fsr4, "std::shared_ptr<Context> make_context(uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, bool drs, bool hdr, Fsr4Model want) {")
     check("c->built.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION;" in make and
           "c->built.version = FFX_UPSCALER_VERSION;" in make and "c->version.header.pNext = &c->built.header;" in make,
           "the upscale context is made without ffxCreateContextDescUpscaleVersion")
@@ -157,11 +157,11 @@ def checks(temporal, fsr4, menu):
     check("c->upscale.maxRenderSize = drs ? FfxApiDimensions2D{ow, oh} : FfxApiDimensions2D{rw, rh};" in make,
           "a fixed share's context is not made for its own render size")
     prep = function(fsr4, "int prepare(VkCommandBuffer, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, bool hdr,")
-    check("temporal_rules::plan_context(" in prep and "make_context(rw, rh, ow, oh, plan.drs, hdr)" in prep,
+    check("temporal_rules::plan_context(" in prep and "make_context(rw, rh, ow, oh, plan.drs, hdr, want)" in prep,
           "FSR 4's prepare does not follow plan_context")
     ev = function(fsr4, "bool evaluate(VkCommandBuffer cmd, const TemporalFrame& f) {")
     check("temporal_rules::frame_ms(!s.evals," in ev and "d.frameTimeDelta = frame_ms;" in ev, "FSR 4's frame time is not clamped")
-    check("s.jitter_phases = ur::is_fsr4(mode) ? fsr3_math::jitter_phases(rw, dw) : (uint32_t)dlss_jitter_phases(rw, rh, dw, dh);"
+    check("s.jitter.publish(rw, rh, ur::is_fsr4(mode) ? fsr3_math::jitter_phases(rw, dw) : (uint32_t)dlss_jitter_phases(rw, rh, dw, dh),"
           in chain, "FSR 4's jitter is not AMD's length")
     # FSR4-7: the name by the version, and the driver in the help
     load = function(fsr4, "bool load() {")

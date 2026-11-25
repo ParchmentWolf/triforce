@@ -42,6 +42,22 @@ DLSS_LICENSE = (
 )
 
 
+def read_only(text):
+    """((Triforce, 11-24, after Source A's) text, a tk.Text, read-only as Windows' IsReadOnly box: it selects and copies
+    (Ctrl+A, Ctrl+C) but typing, paste, cut and delete leave it as it is. Returns the function that adds to its end. Its insert
+    and delete are refused in Tcl, so Tk's own bindings stay. (Not -state disabled: Tk 8.5 and early 8.6 give a disabled Text
+    no focus from a click off Windows, so Ctrl+C would not reach it.)"""
+    w = str(text)
+    text.tk.call("rename", w, w + "_rw")
+    text.tk.call("proc", w, "op args", "if {$op in {insert delete replace}} return\n"
+                                       "uplevel 1 [list {%s_rw} $op {*}$args]" % w)
+    # (Tk deletes the widget's own command when the window goes: the proc goes with it)
+    text.tk.call("trace", "add", "command", w + "_rw", "delete", "apply {{w args} {rename $w {}}} {%s}" % w)
+    # (Ctrl+A is line start in Tk's X11 bindings: here it selects all, as in the Windows box)
+    text.bind("<Control-a>", lambda e: (text.tag_add("sel", "1.0", "end"), "break")[1])
+    return lambda s: text.tk.call(w + "_rw", "insert", "end", s)
+
+
 def ngx_sdk_dir():
     """Where NVIDIA's DLSS SDK goes when the player ticks NVIDIA DLSS: beside the builder's versions, kept across updates."""
     return os.path.join(linux_update.data_root(), "ngx-sdk")
@@ -985,6 +1001,7 @@ class Builder(tk.Tk):
         self.proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                      text=True, bufsize=1, encoding="utf-8", errors="replace", start_new_session=True, **env_kw)
         threading.Thread(target=self.read, args=(self.proc,), daemon=True).start()
+        self.tick()   # ((Triforce, 11-24) the clock once the build runs: asked before it, it stopped at once
 
     def read(self, proc):
         for line in proc.stdout:
@@ -999,6 +1016,7 @@ class Builder(tk.Tk):
         self.compile_started = None
         self.times = None
         self.shaders_later = False
+        self.built = self.error = None   # ((Triforce, 11-24) this run's own: what make_game.py says, or Cancel)
         px = self.px
         page = self.page = ttk.Frame(self)
         page.pack(fill="both", expand=True)
@@ -1029,6 +1047,7 @@ class Builder(tk.Tk):
                            borderwidth=0, highlightthickness=0, padx=px(10), pady=px(8), insertbackground=INK,
                            selectbackground=BRAND, selectforeground=WHITE)
         self.log.grid(row=0, column=0, sticky="nsew")
+        self.add_log = read_only(self.log)   # ((Triforce, 11-24) selects and copies, takes no typing
         scroll = ttk.Scrollbar(lines, orient="vertical", command=self.log.yview, style="Log.Vertical.TScrollbar")
         scroll.grid(row=0, column=1, sticky="ns")
         self.log.configure(yscrollcommand=scroll.set)
@@ -1134,11 +1153,12 @@ class Builder(tk.Tk):
         elif line.startswith(make_game.NOT_PREPARED):
             self.shaders_later = True
         if hasattr(self, "log"):
-            self.log.insert("end", line + "\n")
+            self.add_log(line + "\n")
             self.log.see("end")
 
     def on_exit(self, code):
         self.proc = None
+        self.time_text.set("")   # ((Triforce, 11-24) the clock and its countdown are a running build's; the line above says how it ended)
         for w in self.buttons.winfo_children():
             w.destroy()
         folder = getattr(self, "built", None)
@@ -1166,7 +1186,7 @@ class Builder(tk.Tk):
             self.stage_label.configure(style="Go.Stage.TLabel")
             self.set_step(2)
         else:
-            self.stage_text.set("The build stopped: %s" % getattr(self, "error", "see the lines above"))
+            self.stage_text.set("The build stopped: %s" % (getattr(self, "error", None) or "see the lines above"))
             ttk.Button(self.buttons, text="Back", command=self.show_form, cursor="hand2").pack(side="right", padx=self.px(4))
             self.heading.configure(text="The build stopped")
             self.stage_label.configure(style="Bad.Stage.TLabel")

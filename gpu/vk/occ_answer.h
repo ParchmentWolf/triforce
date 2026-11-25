@@ -17,6 +17,10 @@
 // unknown, and the condition renders; a word whose count was written is read from memory, where a real 0 can skip the draw.
 // (11-22) A count over a draw that such a skip left out is marked (Counter::gate, Writers::kGatedSrc, the line counts them);
 // RX_VK_OCC_GATE=1: a condition on it renders (cond_decide), so a skip's 0 cannot hide the same object again and again.
+// (11-24) And such a count is written only when it is more than 0 (complete, gated_zero_visible; RX_VK_OCC_GATED_VISIBLE,
+// on by default): the queries counted nothing for the draw the condition left out, so a 0 over it says only that what was
+// drawn besides showed no sample, not that the object is hidden. A count that is not known for sure is visible, never 0: the
+// record keeps its 4096, the game's CPU goes on drawing the object, and the next count, with the draw in it, is the object's.
 //
 //   Counter   one counting, from a reset to its report, over the queries its draws began: the replay's (one per NVN
 //             queue's state, under replay_mu) or a parallel replay's segment's (the helper thread's: a segment starts with
@@ -430,6 +434,8 @@ struct Stats {
     // (11-22) counts over a draw a written count's condition left out (Counter::gate): counted whole, written (of them 0),
     // the conditions that read one, and those RX_VK_OCC_GATE=1 rendered
     int64_t gated = 0, gated_written = 0, gated_zeros = 0, cond_gated_read = 0, cond_gated = 0;
+    // ((Triforce, 11-24) of the gated counts, the 0s not written: the record kept 4096 (complete, gated_zero_visible)
+    int64_t gated_kept = 0;
     // at completion
     int64_t written = 0, zeros = 0;    // counts written into their records (of them 0: the object hidden)
     int64_t lost = 0;                  // a query not available once its recording was done: 4096 stays
@@ -457,6 +463,15 @@ struct Stats {
                         "(RX_VK_OCC_DEPTH_ONLY) is %s: %lld counts given up at a colour draw, %lld reports kept 4096 for it",
                         (long long)presents, (long long)colour_windows, (long long)colour_open, on ? "on" : "off",
                         (long long)colour_lost, (long long)inc_colour);
+    }
+    /// ((Triforce, 11-24) The gated zeros' line, into out. on: the rule is on (RX_VK_OCC_GATED_VISIBLE)
+    int gated_line(char* out, size_t size, int64_t presents, bool on) const {
+        return snprintf(out, size,
+                        "vk: occlusion queries (RX_VK_OCC_QUERY), %lld presents (4): counts of 0 over a draw a written count's "
+                        "condition left out are %s (RX_VK_OCC_GATED_VISIBLE): %lld such counts kept 4096 (not known: visible), "
+                        "%lld were written as 0",
+                        (long long)presents, on ? "not written" : "written as 0, as before", (long long)gated_kept,
+                        (long long)gated_zeros);
     }
     /// The line, into out
     int line(char* out, size_t size, int64_t presents, size_t tracked) const {
@@ -499,9 +514,14 @@ struct Stats {
 /// late must not land over that (NX2navi treats a report as pending until its value is written; here the write itself is
 /// a compare-and-write). Anything else leaves the record as it is, and the report's count is settled (no count comes: a
 /// condition reads memory). measured(addr, count): each whole count read back (the sites)
+/// ((Triforce, 11-24) gated_zero_visible: a count of 0 over a draw that a written count's condition left out (Rep::gated)
+/// is not written. The draw was not run, so the queries have nothing of it: the 0 is not the object's, it is not known.
+/// What is not known is visible: the record keeps the value the replay left (4096), the report is settled, and a
+/// condition on the word reads memory, where it renders. A gated count above 0 is written as before: something of the
+/// object showed. False: the 0 is written, as before)
 template <class Write, class Measured>
 void complete(const std::vector<Rep>& reps, const uint64_t* pairs, uint32_t used, bool readable, Writers& w, int64_t now,
-              Stats& st, Write&& write, Measured&& measured) {
+              Stats& st, Write&& write, Measured&& measured, bool gated_zero_visible = false) {
     for (const Rep& p : reps) {
         uint64_t sum = 0;
         const bool inside = p.n <= used && p.first <= used - p.n;   // (its queries in the block the recording took)
@@ -521,6 +541,11 @@ void complete(const std::vector<Rep>& reps, const uint64_t* pairs, uint32_t used
         case Writers::kUnknown: st.unknown++; continue;
         case Writers::kFixed: st.kept_fixed++; continue;
         case Writers::kWrite: break;
+        }
+        if (gated_zero_visible && p.gated && !sum) {   // (not known for sure: visible, never 0)
+            st.gated_kept++;
+            w.settle(p.addr, p.pos);
+            continue;
         }
         if (!write(p.addr, w.value(p.addr), sum)) {
             st.rearmed++;

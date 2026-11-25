@@ -7,6 +7,7 @@ import ast
 import hashlib
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -24,8 +25,12 @@ def production_code(path):
     # ((11-21, the performance audit's LIFT-10) vk_pgo_flags: the renderer's own files' profile flags, which the jobs ask for)
     names = {"tree_headers", "vk_sources", "flag_text", "object_key", "strip_comments", "translation_text", "translation_stamp",
              "vk_pgo_flags"}
-    functions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
-    assert {n.name for n in functions} == names
+    # ((Triforce) renderer_deps and its helpers and globals: the renderer's files keyed by their depfile's headers)
+    later = {"renderer_deps", "depfile_paths", "depfile_of", "kept_depfile"}
+    functions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names | later]
+    assert names <= {n.name for n in functions}
+    functions = [n for n in tree.body if isinstance(n, ast.Assign) and any(
+        isinstance(t, ast.Name) and t.id in ("HEADER_EXTS", "_HEADER_DIGESTS", "DEPFILE_JOBS", "DEPFILES") for t in n.targets)] + functions
     main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
     # Execute the real branch that hashes the translator, chooses per-source flags/deps and appends Vulkan jobs.
     branches = [n for n in ast.walk(main) if isinstance(n, ast.If) and any(
@@ -94,7 +99,7 @@ class ShaderStampCacheTests(unittest.TestCase):
     def jobs(self, linux, version="fixture", release=False, ngx="", mingw="llvm-mingw", fsr=False, vk_pgo=""):
         namespace = {
             "VK_PGO": vk_pgo,   # ((11-21, LIFT-10) RX_VK_PGO: "", "gen" or a profile's path)
-            "os": os, "hashlib": hashlib,
+            "os": os, "re": re, "hashlib": hashlib, "OBJ_CACHE": str(self.root / "objcache"),
             "GPU": str(self.root / "gpu"), "POSIX": str(self.root / "host/posix"), "HOST": str(self.root / "host"),
             "LINUX": linux, "CPU": ["-march=x86-64"],
             "kit": SimpleNamespace(ROOT=str(self.root), HERE=str(self.root / "nx2")),
@@ -110,6 +115,7 @@ class ShaderStampCacheTests(unittest.TestCase):
             # (the back end's branch makes its logo header and fonts file itself since #1567: no files written here)
             "logo_rgba": SimpleNamespace(write=lambda path: ""),
             "ui_fonts": SimpleNamespace(write=lambda path: None),
+            "reshade_fx": SimpleNamespace(build_jobs=lambda *args, **kwargs: []),
             "NGX_SDK": ngx,   # ("": no NVIDIA NGX SDK, vk_dlss.cpp built without DLSS, as by default)
             "NGX_MSVC_RT": "vk_ngx_msvc_rt.cpp",
             "FSR": fsr,   # (HOOKSHOT_FSR=1: vk_fsr4.cpp built with AMD FSR 4)

@@ -38,6 +38,7 @@ NOT_IN_KEY = {
     "OOT_EXEFS": "the game's code folder: its files are hashed by their contents",
     "OOT_ROMFS": "the game's data folder: kit.py names it, the lift reads nothing there",
     "HOOKSHOT_LIFT_JOBS": "how many processes write the C: the C is the same whatever the count (tests/test_spawn_emit.py)",
+    "HOOKSHOT_JOBS": "the workers the build was asked for, a ceiling on HOOKSHOT_LIFT_JOBS's count (nx2/build_jobs.py): the same C",
     "HOOKSHOT_LIFTED_C_REGEX": "how nx2/lifted_c.py finds the definitions, by jumps or by the patterns: the same matches "
                                "either way (the performance audit's IO-40, tests/test_lifted_c_scan.py)",
     "RX_JOBS": "how many compilers run at once (the kit's toolchain.default_jobs)",
@@ -194,9 +195,24 @@ class LiftKeyEnvironment(unittest.TestCase):
                     "a stray RX_ variable": key(RX_SOMETHING_ELSE="1", RX_MARCH="x86-64-v2"),
                     "a folder variable in the environment": key(OOT_WORK="elsewhere", OOT_ROMFS="there"),
                     "the switch itself, on": key(HOOKSHOT_KEEP_LIFT="1"),
+                    # ((Triforce, 11-24) the build's value over the shell's, as run() gives them to the lift)
+                    "a lifter switch the build sets, other in the shell": key(A64_HOT_CHUNK="0"),
                 }
                 for what, k in same.items():
                     self.assertEqual(k, first, what)
+                # ((Triforce, 11-24) the work folder's own hot list in another folder: the same key; a list named in the shell
+                # by its contents, so an edit to it changes the key)
+                hot_env = dict(given, A64_HOT_FUNCS=str(work / "hot_funcs.txt"))
+                self.assertEqual(key(hot_env), key(dict(given, OOT_WORK=str(other_work), A64_HOT_FUNCS=str(other_work / "hot_funcs.txt")),
+                                                   other_work))
+                own = root / "own_hot.txt"
+                own.write_text("f_80000000\n")
+                listed = key(A64_HOT_FUNCS=str(own))
+                (root / "elsewhere").mkdir()
+                (root / "elsewhere" / "own_hot.txt").write_text("f_80000000\n")
+                self.assertEqual(key(A64_HOT_FUNCS=str(root / "elsewhere" / "own_hot.txt")), listed)
+                own.write_text("f_80000040\n")
+                self.assertNotEqual(key(A64_HOT_FUNCS=str(own)), listed)
                 # ---- what does changes it
                 different = {
                     "a lifter switch in the environment": key(A64_NO_VFPX="1"),

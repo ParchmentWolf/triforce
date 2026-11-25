@@ -24,6 +24,7 @@ constexpr uint32_t kGcnPhis = 50000, kIntelPhis = 20000, kIntelCalls = 200;
 
 struct Size {
     uint32_t phis = 0, calls = 0;
+    bool lane_free = false;   // ((Triforce) nothing in it depends on the subgroup it runs in: fallback_lanes.h, vk_shader.cpp size_note)
 };
 struct Limits {
     uint32_t phis = 0, calls = 0;   // (0: none)

@@ -96,6 +96,14 @@ def check_source():
     if "if (!worker) maybe_split(cmd);" not in loop:
         raise SystemExit("replay: the serial replay no longer counts its parts after each draw and dispatch")
     split = block(replay, "void maybe_split(VkCommandBuffer& cmd) {")
+    # ((Triforce) Threaded rendering's parts at the game's pass ends come first, with the same hold for the next plain draw; the
+    # count's own path is the rest, from "} else if (part_end_now) {")
+    pe_at = split.find("if (pe.on && !part_end_now")
+    if pe_at >= 0:
+        pe = split[pe_at:split.index("} else if (part_end_now) {")]
+        if "if (split_before_draw_on()) {" not in pe or "part_end_wanted = true;" not in pe:
+            raise SystemExit("maybe_split: Threaded rendering's parts do not hold the part's end for the next plain draw where the rule is on")
+        split = split[:pe_at] + split[pe_at + len(pe) + len("} else "):]
     order = [split.find(n) for n in (
         "if (tail_on()) return;", "if (part_end_now) {", "part_end_wanted = false;",
         "if (!rec_cur || rec_parts + 1 >= kMaxParts || dump_on()) return;", "} else {", "if (part_end_wanted) return;",

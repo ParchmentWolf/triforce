@@ -355,7 +355,10 @@ int main(int argc, char** argv) {
 def check_source(mem, replay, texture, dev):
     # (every read of a capture buffer's bytes makes its page ready first)
     read = block(mem, "bool memory_read_as_submitted(")
-    before(read, "behind_read(*b, page0, page1)", "std::lock_guard lk(pools_mu)",
+    before(read, "behind_read(*behind_b, page0, page1)", "std::lock_guard lk(pools_mu)",
+           "memory_read_as_submitted: the pages of a capture behind are not made ready before the pools' lock")
+    # ((Triforce) and those of a read through a virtual GPU address over a page's end, each page where it maps)
+    before(read, "if (behind_b) behind_read(*behind_b, p, p);", "std::lock_guard lk(pools_mu)",
            "memory_read_as_submitted: the pages of a capture behind are not made ready before the pools' lock")
     before(read, "behind_ready(bc, e.slot);", "std::memcpy((uint8_t*)dst",
            "memory_read_as_submitted: a capture's bytes read before the page is ready")
@@ -424,8 +427,27 @@ def check_source(mem, replay, texture, dev):
         s = replay.index(seg_submit, at)
         check(w < s, "a parallel replay's segment (one of the two paths) is submitted before it is done")
         at = s + 1
-    check(replay.count("vkQueueSubmit2(") == 5, "vk_replay.cpp submits in a place this test does not know: check that the copies "
+    # (five submits, and submit_again's: one of them made again where the driver refused it for want of memory, the same
+    # submit at the same place, submit_retry.h)
+    # ((Triforce) and submit_alone_locked's: an upload command buffer and the pieces it went on in, each a submission of its
+    # own, sent by the same three places right before their own submit: after texture_uploads_recorded, as that one is)
+    alone = block(replay, "void submit_alone_locked(")
+    # ((Triforce) and part_submit's: Threaded rendering's recorder makes a part's submit as submit_recording decided it, posted after
+    # submit_recording's texture_uploads_recorded (vk_replay.cpp post_part_submit)
+    before(sub, "texture_uploads_recorded();", "post_part_submit(", "submit_recording: a part handed to the recorder before the copies are done")
+    check(block(replay, "void part_submit(const PartSubmit& s) {").count("vkQueueSubmit2(") == 1, "part_submit submits more than once")
+    check(replay.count("vkQueueSubmit2(") == 8 and block(replay, "VkResult submit_again(").count("vkQueueSubmit2(") == 1 and
+          alone.count("vkQueueSubmit2(") == 1, "vk_replay.cpp submits in a place this test does not know: check that the copies "
           "behind are done before it")
+    before(sub, "texture_uploads_recorded();", "submit_alone_locked(", "submit_recording: an upload's pieces submitted before the copies are done")
+    check(replay.count("submit_alone_locked(alone.data(), alone.size());") == 3, "the pieces are submitted somewhere this test does not know")
+    at = 0
+    for _ in range(2):   # (the two segment paths: after the job's wait, right before the segment's own submit)
+        w = replay.index(seg_wait, at)
+        s = replay.index(seg_submit, at)
+        a = replay.index("if (!alone.empty()) submit_alone_locked(alone.data(), alone.size());", w)
+        check(w < a < s, "a parallel replay's segment's upload pieces are not submitted between its job's end and its own submit")
+        at = s + 1
     # (the submitting thread: the synchronous replay leaves copies behind, and it finishes them before it returns)
     q = block(replay, "void submit_q(")
     sync = q[:q.index("std::lock_guard lk(submit_order_mu);")]

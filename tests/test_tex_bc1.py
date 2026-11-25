@@ -37,7 +37,9 @@ VK = ROOT / "gpu" / "vk"
 # (the two shaders the headers' reasoning is about: a header made anew has to be read anew, tex_bc1.h and astc_opaque.h
 # brought up to it, and its hash put here)
 ENCODER_SHA256 = "22913b4b9b18e113aecd728e8523a256649aea90b5dbf24353d5df5bb89042b6"
-DECODER_SHA256 = "64cee632883e52be013e23562f24d5a389055c73cc321e1413409c68a0b377d2"
+# (11-24: the decoder as before with its stores checked against the image's size, one StoreTexel function for the three
+# imageStore calls (a block at an image's edge stored past it): no error and no endpoint mode changed, astc_opaque.h is as it was)
+DECODER_SHA256 = "701a72347d81e4ca513d536b62064f4d5d6d64309191d0f546f9e36997b3a5e2"
 
 
 def check(ok, what):
@@ -152,7 +154,7 @@ def check_source():
           "the encoder is not told to write the colour half alone for a BC1 image")
     view = function(tex, "VkImageView texture_view(")
     check("if (use != ViewUse::Sample) return VK_NULL_HANDLE;" in view and
-          "f = (VkFormat)tex_bc1::view_format(tex->bc1, f == VK_FORMAT_R8G8B8A8_SRGB);" in view,
+          "f = (VkFormat)tex_bc1::view_format(tex->bc1, srgb);" in view and "const bool srgb = f == VK_FORMAT_R8G8B8A8_SRGB;" in view,
           "a kept texture's view is no longer of its image's own pair of formats, or is made for more than sampling")
     # an upload into a BC1 image: its bytes read once, checked, and those bytes staged; else BC3, whole
     up = function(tex, "bool upload_astc_gpu(")
@@ -160,13 +162,15 @@ def check_source():
     looked = up.index("opaque = opaque && astc_levels_opaque(tex, own.data() + k * tail, tail0, tail, level_align);")
     back = up.index('if (!bc1_retype(tex, "its memory holds blocks with alpha now")) {')
     again = up.index("return upload_astc_gpu(tex, total, nullptr);")
-    staged = up.index("if (tex.bc1) std::memcpy(s.data, own.data(), own.size());")
+    staged = up.index("std::memcpy(dest, own.data() + k * tail, tail);")
     check(read < looked < back < again < up.index("const Staging s = staging(") < staged,
           "an upload into a BC1 image no longer checks the very bytes it stages before it stages them")
-    check("for (size_t k = 0; k < layers.size() && !tex.bc1; k++) {" in up, "a BC1 image's upload reads the game's memory a second time")
+    bc1_stage = up[up.index("if (tex.bc1) {   // (its own copy"):]
+    check(bc1_stage.index("continue;") < bc1_stage.index("guest_bytes("), "a BC1 image's upload reads the game's memory a second time")
     levels = function(tex, "bool astc_levels_opaque(")
-    check("if (g.offset < tail0 || off >= tail || (off % align)) continue;" in levels and
-          up.count("if (g.offset < tail0 || off >= tail || (off % align)) continue;") == 2,
+    # ((Triforce) the upload decodes a level at a misaligned offset too now, from a copy of its own: the check looks at it)
+    check("if (g.offset < tail0 || off >= tail) continue;" in levels and
+          up.count("if (g.offset < tail0 || off >= tail) continue;") == 2,
           "the check no longer looks at the levels the upload decodes, by the upload's own test")
     check("Tegra::Texture::UnswizzleTexture(" in levels and "astc_opaque::all(lin.data(), n, (unsigned)tex.block_w, (unsigned)tex.block_h)" in levels,
           "the check no longer looks at a level's blocks, each once")

@@ -99,6 +99,12 @@ int hos_bench_menu(uint64_t screen, uint64_t vt, int focus, int focused_entry, i
 }
 static char taps[256];
 void hos_hid_tap(const char *press) { strncat(taps, press, sizeof taps - strlen(taps) - 2), strcat(taps, ";"); }
+void hos_input_clear_toggles(void) {}   /* ((Triforce) 11-24: host/nn_hid.c's hold-to-toggle latches, dropped by the focus hook) */
+/* ((Triforce) the Skip title screen row, host/oot_autoload.c: asked the same way while benchmark mode is off) */
+static int skip, skip_asked, skip_entry;
+static uint64_t skip_vt;
+int hos_oot_autoload_wants(void) { return skip; }
+int hos_oot_autoload_menu(uint64_t vt, int focused_entry) { skip_asked++, skip_vt = vt, skip_entry = focused_entry; return 1; }
 static uint64_t alloc(size_t n) { const uint64_t a = heap_top; heap_top += (n + 15) & ~(size_t)15; return a; }
 static void put64(uint64_t a, uint64_t v) { memcpy(GP(a), &v, 8); }
 static uint64_t get64(uint64_t a) { uint64_t v; memcpy(&v, GP(a), 8); return v; }
@@ -153,6 +159,20 @@ int main(void) {
     put64(get64(files + 32) + 96, alloc(16));
     hos_oot_menu_tick(&ctx, files);
     CHECK(asked == 2 && asked_screen == files && asked_entry == 0 && asked_entries == 3 && !strcmp(taps, "0:A/120;"));
+    /* ((Triforce) the Skip title screen row: not asked in benchmark mode, nor while it does not want; asked with the screen's
+       vtable and the focused entry otherwise, and its A pressed) */
+    skip = 1;
+    hos_oot_menu_tick(&ctx, files);
+    CHECK(asked == 3 && skip_asked == 0);
+    bench = 0, skip = 0, taps[0] = 0;
+    hos_oot_menu_tick(&ctx, files);
+    CHECK(asked == 3 && skip_asked == 0 && !taps[0]);
+    skip = 1;
+    hos_oot_menu_tick(&ctx, files);
+    CHECK(asked == 3 && skip_asked == 1 && skip_vt == 0x84c0eba0ULL && skip_entry == 0 && !strcmp(taps, "0:A/120;"));
+    put64(get64(files + 32) + 96, 0);   /* (its focus manager gone: not asked) */
+    hos_oot_menu_tick(&ctx, files);
+    CHECK(skip_asked == 1);
     if (!fails) printf("PASS\n");
     return fails != 0;
 }

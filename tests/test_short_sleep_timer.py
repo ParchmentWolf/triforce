@@ -112,9 +112,10 @@ int main() {
     // Source A's default off Windows, the day the constant says so: the game's 20 us on the timer on a Steam Deck's 8 and on 24
     CHECK(!short_sleep_yields(us20, short_sleep_timer_os(nullptr, 0, 0, SHORT_SLEEP_GUEST_TIMER), 1));
     CHECK(short_sleep_yields(us20, short_sleep_timer_os(nullptr, 0, 0, SHORT_SLEEP_GUEST_TIMER), 0));
-    // and what is built now: not the default (never measured in the game)
-    CHECK(SHORT_SLEEP_ELSEWHERE == SHORT_SLEEP_YIELD);
-    CHECK(short_sleep_yields(us20, short_sleep_timer_os(nullptr, 0, 0, SHORT_SLEEP_ELSEWHERE), 1));
+    // and what is built now (11-24): that default, the game's own on the timer, the host's still yielding
+    CHECK(SHORT_SLEEP_ELSEWHERE == SHORT_SLEEP_GUEST_TIMER);
+    CHECK(!short_sleep_yields(us20, short_sleep_timer_os(nullptr, 0, 0, SHORT_SLEEP_ELSEWHERE), 1));
+    CHECK(short_sleep_yields(us20, short_sleep_timer_os(nullptr, 0, 0, SHORT_SLEEP_ELSEWHERE), 0));
     return fails ? 1 : 0;
 }
 """
@@ -428,7 +429,7 @@ def main():
         r = storm("storm-leak", cut.replace(leave, "            (void)took;\n"))
         check(r.returncode != 0 and "short_pollers == 0" in r.stdout, "a yield branch that never gives its count back still passed")
     print("PASS: the game's short sleeps wait on the timer with 6 or fewer processors, the host's yield, and the switch reads its value; "
-          "off Windows, not set: the header's default (all yield), and =game puts the game's own on the timer anywhere")
+          "off Windows, not set: the header's default (the game's own on the timer), and =game puts the game's own on the timer anywhere")
     print("PASS: the cap on yielding sleepers is off unless set, lets the cap's worth in and sends the next to the timer, on threads too")
 
 

@@ -278,14 +278,23 @@ def check_source():
         raise SystemExit("program_pack packs without the switch, or a compute program (whose makers read the module's field)")
     if pack.index("if (p.failed || p.compute) continue;") > pack.index("vkDestroyShaderModule("):
         raise SystemExit("program_pack destroys a module before it knows the program is one to pack")
-    # (every place a program becomes ready packs it first: there are three)
+    # (every place a program becomes ready packs it first: there are four (the fourth a compute program read without its code
+    # for RX_VK_LOAD=create, read_light: program_pack leaves a compute program as it is); and two that make a program ready as
+    # failed, the translation jobs' answers to an exception (vk_jobs.h on_failure): a failed program holds nothing to pack)
     ready = [m.start() for m in re.finditer(r"ready\.store\(true, std::memory_order_release\);", shader)]
-    if len(ready) != 3:
-        raise SystemExit("vk_shader.cpp makes programs ready in %d places, not the three this test knows" % len(ready))
+    if len(ready) != 6:
+        raise SystemExit("vk_shader.cpp makes programs ready in %d places, not the six this test knows" % len(ready))
+    packed = failed = 0
     for at in ready:
         before = shader[shader.rindex("\n", 0, shader.rindex("\n", 0, at)):at]
-        if "program_pack(" not in before:
+        if "program_pack(" in before:
+            packed += 1
+        elif "job->p->failed = true;" in before:
+            failed += 1
+        else:
             raise SystemExit("a program becomes ready without program_pack before it")
+    if (packed, failed) != (4, 2):
+        raise SystemExit("programs made ready: %d packed first and %d as failed, not 4 and 2" % (packed, failed))
     # (the module made again is made of the store's words and destroyed by the store's last holder)
     mod = between(shader, "StageModule::StageModule(const Stage& st) {", "StageModule::~StageModule() {")
     if "if (!st.code) {\n        m_ = st.module;\n        return;\n    }" not in mod or "m_ = st.code->pin(" not in mod:

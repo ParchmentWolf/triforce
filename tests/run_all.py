@@ -247,6 +247,8 @@ def cpp_checks(tools, timeout):
     out.append((regmap, build_and_run(regmap, ["-O1", "-Wno-everything", "-I" + eden, "-I" + compat], [])))
     ldsm = "gpu/vk/tests/ldsm_address_test.cpp"   # (LDSM's row addresses kept apart from its shuffles' registers)
     out.append((ldsm, build_and_run(ldsm, ["-O1", "-Wno-everything", "-I" + eden, "-I" + compat], [])))
+    far = "gpu/vk/tests/far_branch_test.cpp"   # (programs over 1 MiB lower; branches past 8 MiB of lowered code are absolute)
+    out.append((far, build_and_run(far, ["-O1", "-Wno-everything", "-I" + eden, "-I" + compat], [])))
     return out, ([] if cxx else ["a C++ compiler"])
 
 
@@ -273,6 +275,11 @@ def compile_all():
 
 
 def main():
+    # ((Triforce) a check's output with a character the console's code page lacks (U+FFFD on cp1252) no longer stops the run
+    # and loses every later result)
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("names", nargs="*")
     p.add_argument("--jobs", type=int, default=os.cpu_count() or 2)

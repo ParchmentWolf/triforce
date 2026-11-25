@@ -109,7 +109,7 @@ def check_source(tex, dev):
     end = block(sweep, "for (const Evict& e : evict) {   // (and each one's bookkeeping and its end, as before)")
     need("vk_texture.cpp texture_sweep (each texture's end)", end,
          ["evicted_from_memory[evicted_key(tex->gpu, tex->width, tex->height, tex->nvn_format)] = tex->guest_size;",
-          "destroy_later(*tex);", "forget_gpu(tex);", "gone.push_back(tex);"])
+          "destroy_later(*tex);", "forget_gpu(tex);", "gone.insert(tex);"])
     need("docs/development.md", dev, ["`RX_VK_TEX_PRESSURE=0` or `=<pct>`", "`RX_VK_TEX_STEP=<n>`", "`RX_VK_TEX_COMMIT_FREE_MB=<MB>`"])
     # (keep taken: each look that takes a let-go texture back notes the gap, before it forgets the let-go; an early look
     # before the parallel replay's segments is no take-back; the let-go rule waits by it in both its places)

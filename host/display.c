@@ -24,6 +24,7 @@ void rx_close_asked(void);   /* host/rx_backend.c */
 void hos_relaunch_ask(void);        /* (host/hos_relaunch.c) */
 void hos_bug_capture_key(void);     /* (host/bug_capture.c) */
 void hos_window_closed_exit(void);
+void hos_input_clear_toggles(void);   /* ((Triforce) 11-24: host/nn_hid.c, hold-to-toggle's latches) */
 #ifndef WM_DPICHANGED
 #define WM_DPICHANGED 0x02E0
 #endif
@@ -52,22 +53,40 @@ void hos_mouse_give_back(int32_t dx, int32_t dy) {
 /* the free mouse, for the Insert menu (gpu/vk/vk_api.h MkwVkPointer): set on the window's thread, read on the renderer's */
 static volatile LONG ptr_x, ptr_y, ptr_w, ptr_h, ptr_in, ptr_pressed, ptr_wheel;   /* (client pixels; wheel in WHEEL_DELTA units) */
 static int menu_open, captured_before_menu;
+/* Esc let the captured mouse go just before it opened the Insert menu (WM_KEYDOWN; Menu shortcut "Insert, F1 or Esc",
+   gpu/vk/vk_menu.cpp): the capture that comes back when the menu closes. Spent by the next capture or menu */
+static int esc_had_capture;
 /* the game's own menus: open while one of their screens runs with the mouse (stamped each frame on the
    game's thread), their clicks */
 static int game_menu_open;
+/* (one of them has the mouse, the Insert menu closed: read on the game's thread, where the mouse's side buttons, which no
+   menu takes, stay their controls'. host/nn_hid.c mouse_buttons_arm) */
+static volatile LONG game_menu_mouse;
+int hos_mouse_in_game_menu(void) { return (int)game_menu_mouse; }
 static volatile LONG64 game_menu_seen_ns;
 static volatile LONG gm_pressed, gm_wheel;
 /* The cursor over the game's menus is hidden until the mouse is used (moved or a button pressed) and again once the
    pads or the keys are (nn_hid.c: hos_player_input_ns): a player on a controller never sees it, and a mouse at rest
    takes no part (no pointing or clicks while hidden). The wheel works hidden too, and does not show it: a button held
-   (R, for the item choice) counts as the pad in use, and hid the cursor again at each notch */
+   (R, for the item choice) counts as the pad in use, and hid the cursor again at each notch.
+   ((Triforce) 11-24) In play too, with the mouse not captured (the options' own cursor is theirs): the cursor over the
+   game's window is shown until the pads or the keys are used and again once the mouse is, so a player on a controller
+   sees it only until the first input. gm_mx, gm_my: the last point a move counted at, in screen coordinates */
 int64_t hos_player_input_ns(void);
-static volatile LONG gm_shown, gm_mx = -1, gm_my = -1;
+static volatile LONG gm_shown = 1, gm_mx = -1, gm_my = -1;
 static volatile LONG64 gm_mouse_ns;
 static void gm_mouse_used(void) { InterlockedExchange64(&gm_mouse_ns, (LONG64)hos_now_ns()); InterlockedExchange(&gm_shown, 1); }
 static int gm_cursor_shown(void) {
     if (gm_shown && hos_player_input_ns() > InterlockedCompareExchange64(&gm_mouse_ns, 0, 0)) InterlockedExchange(&gm_shown, 0);
     return (int)gm_shown;
+}
+/* Whether a move to (x, y) is the mouse used, from the last point one counted at (ax, ay). While the cursor is shown any
+   other point is. While it is hidden only one more than slack pixels away: a bumped desk or a sensor's noise does not
+   bring it back in a cutscene. In screen coordinates, so the WM_MOUSEMOVE Windows sends when the window moves or
+   resizes under a cursor at rest (F10, a DPI change: its client point changes, its screen point does not) is no move */
+static int gm_move_counts(int shown, LONG x, LONG y, LONG ax, LONG ay, LONG slack) {
+    const LONG dx = x > ax ? x - ax : ax - x, dy = y > ay ? y - ay : ay - y;
+    return shown ? dx || dy : dx > slack || dy > slack;
 }
 
 int hos_mouse_pointer(MkwVkPointer *out) {
@@ -88,15 +107,44 @@ static HANDLE renderer_up;
 static int fullscreen;
 static WINDOWPLACEMENT windowed_place;
 
+/* ((Triforce) 11-24) The Display tab's Fullscreen screen (HOS_OPT_FULLSCREEN_SCREEN): 0, the default, the screen the window
+   is on, as before; n the n-th of the connected screens in hos_screens' order (EnumDisplayMonitors', the list the menu was
+   given at the start). A screen no longer there: the window's */
+int rx_option(int id, int otherwise);
+static void mouse_capture(HWND w, int on);
+struct nth_screen { int left; HMONITOR found; };
+static BOOL CALLBACK nth_screen_each(HMONITOR m, HDC dc, LPRECT rect, LPARAM param) {
+    struct nth_screen *n = (struct nth_screen *)param;
+    (void)dc, (void)rect;
+    if (n->left-- == 0) { n->found = m; return FALSE; }
+    return TRUE;
+}
+static HMONITOR fullscreen_screen(HWND w) {
+    const int k = rx_option(HOS_OPT_FULLSCREEN_SCREEN, 0);
+    struct nth_screen n = {k - 1, NULL};
+    if (k > 0) EnumDisplayMonitors(NULL, NULL, nth_screen_each, (LPARAM)&n);
+    return n.found ? n.found : MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST);
+}
+
 static void set_fullscreen(HWND w, int on) {
-    if (on == fullscreen) return;
+    if (!on && !fullscreen) return;
     const LONG style = GetWindowLongA(w, GWL_STYLE);
+    if (on && fullscreen) {   /* ((Triforce) the Fullscreen screen changed while fullscreen: to the screen now chosen) */
+        MONITORINFO mi;
+        RECT now;
+        mi.cbSize = sizeof mi;
+        if (!GetMonitorInfoA(fullscreen_screen(w), &mi) || (GetWindowRect(w, &now) && EqualRect(&now, &mi.rcMonitor))) return;
+        SetWindowPos(w, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
+                     mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        if (mouse_captured) mouse_capture(w, 0), mouse_capture(w, 1);   /* (the cursor's clip to the window where it is now) */
+        hos_log("display: fullscreen on another screen");
+        return;
+    }
     if (on) {
         MONITORINFO mi;
         mi.cbSize = sizeof mi;
         windowed_place.length = sizeof windowed_place;
-        if (!GetWindowPlacement(w, &windowed_place) ||
-            !GetMonitorInfoA(MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST), &mi))
+        if (!GetWindowPlacement(w, &windowed_place) || !GetMonitorInfoA(fullscreen_screen(w), &mi))
             return;
         fullscreen = 1;
         SetWindowLongA(w, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
@@ -206,11 +254,24 @@ static UINT window_dpi(HWND w) {
     return dpi ? dpi : 96;
 }
 
+/* WM_MOUSEMOVE with the mouse free, also under the options: a click that closes them leaves the cursor shown. 4 pixels of
+   slack at 96 dpi */
+static void gm_mouse_moved(HWND w) {
+    const DWORD at = GetMessagePos();
+    const LONG x = (short)LOWORD(at), y = (short)HIWORD(at);
+    if (!gm_move_counts(gm_cursor_shown(), x, y, gm_mx, gm_my, MulDiv(4, (int)window_dpi(w), 96))) return;
+    gm_mx = x, gm_my = y;
+    gm_mouse_used();
+}
+
 static void mouse_capture(HWND w, int on) {
+    int rx_option(int id, int otherwise);
+    if (on && rx_option(6, 0) == 2) return;   /* ((Triforce) Mouse camera Off: the mouse plays no part, a click does not capture it) */
     if (on == (int)mouse_captured) return;
     mouse_captured = on;
     InterlockedExchange(&mouse_dx, 0);
     InterlockedExchange(&mouse_dy, 0);
+    if (on) esc_had_capture = 0;   /* (captured again: Esc's note is spent) */
     if (on) {
         RECT rc;
         GetClientRect(w, &rc);
@@ -233,14 +294,21 @@ static void gm_cursor_off(HWND w) {
    back, if the window still has the focus */
 static void menus_mouse(HWND w, int insert_open, int game_open) {
     const int was = menu_open || game_menu_open, now = insert_open || game_open, game_was = game_menu_open;
+    /* ((Triforce) 11-24: a menu opened, the Insert menu or one of the game's: hold-to-toggle's latches go, host/nn_hid.c) */
+    if ((insert_open && !menu_open) || (game_open && !game_was)) hos_input_clear_toggles();
     menu_open = insert_open, game_menu_open = game_open;
+    InterlockedExchange(&game_menu_mouse, game_open && !insert_open);
     /* (hidden till used; a menu back within a second, a moment between its screens, keeps the cursor as it was) */
     static int64_t game_closed_ns;
     if (!game_open && game_was) game_closed_ns = hos_now_ns();
-    if (game_open && !game_was && (!game_closed_ns || hos_now_ns() - game_closed_ns > 1000000000LL))
-        InterlockedExchange(&gm_shown, 0), gm_mx = ptr_x, gm_my = ptr_y;
+    if (game_open && !game_was && (!game_closed_ns || hos_now_ns() - game_closed_ns > 1000000000LL)) {
+        POINT at = {0};
+        GetCursorPos(&at);   /* (the screen's point, as gm_mouse_moved counts moves from) */
+        InterlockedExchange(&gm_shown, 0), gm_mx = at.x, gm_my = at.y;
+    }
     if (now && !was) {
-        captured_before_menu = (int)mouse_captured;
+        captured_before_menu = (int)mouse_captured || (insert_open && esc_had_capture);   /* (opened by Esc, which let it go) */
+        esc_had_capture = 0;
         mouse_capture(w, 0);
     } else if (!now && was) {
         if (captured_before_menu && GetForegroundWindow() == w) mouse_capture(w, 1);
@@ -357,10 +425,7 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_MOUSEMOVE:
         ptr_x = (short)LOWORD(lp), ptr_y = (short)HIWORD(lp);
-        if (game_menu_open && !menu_open && (ptr_x != gm_mx || ptr_y != gm_my)) {   /* (a move: not a repeat at rest) */
-            gm_mx = ptr_x, gm_my = ptr_y;
-            gm_mouse_used();
-        }
+        if (!mouse_captured) gm_mouse_moved(w);   /* (a move: not a repeat at rest. The captured mouse's are the camera's) */
         if (!ptr_in) {
             TRACKMOUSEEVENT t = {sizeof t, TME_LEAVE, w, 0};
             TrackMouseEvent(&t);
@@ -416,7 +481,8 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (game_menu_open && seen && (LONG64)hos_now_ns() - seen > 300000000LL &&
             InterlockedCompareExchange64(&game_menu_seen_ns, 0, seen) == seen)
             menus_mouse(w, menu_open, 0);
-        if (game_menu_open && !menu_open && !gm_cursor_shown()) gm_cursor_off(w);   /* (hidden by the pads or keys: at once) */
+        /* (hidden by the pads or keys: at once, not at the next move's WM_SETCURSOR; (Triforce) in play as in the game's menus) */
+        if (!menu_open && !gm_cursor_shown() && GetForegroundWindow() == w) gm_cursor_off(w);
         return 0;
     }
     case WM_SYSCOMMAND:
@@ -445,7 +511,10 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_KEYDOWN: {
         extern void hos_vk_note_key_press(unsigned key);
         if (!(lp & (1 << 30))) hos_vk_note_key_press((unsigned)wp);
-        if (wp == VK_ESCAPE) mouse_capture(w, 0);
+        if (wp == VK_ESCAPE) {   /* (it may open the Insert menu too: a capture let go here comes back) */
+            if (!menu_open && !game_menu_open && mouse_captured) esc_had_capture = 1;
+            mouse_capture(w, 0);
+        }
         /* (Triforce, after NX2navi's F8) a bug capture: only noted here, written on a thread of its own (host/bug_capture.c) */
         if (wp == VK_F8 && !(lp & (1 << 30))) hos_bug_capture_key();
         /* (Triforce: F11 does nothing; F10 and Alt+Enter switch fullscreen, below: F10 comes as a system key) */
@@ -479,9 +548,10 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_KILLFOCUS:
     case WM_CANCELMODE:
         mouse_capture(w, 0);
+        hos_input_clear_toggles();   /* ((Triforce) 11-24: no button stays latched behind another window) */
         break;
     case WM_SETCURSOR:
-        if ((mouse_captured || (game_menu_open && !menu_open && !gm_cursor_shown())) && LOWORD(lp) == HTCLIENT) {
+        if ((mouse_captured || (!menu_open && !gm_cursor_shown())) && LOWORD(lp) == HTCLIENT) {
             SetCursor(NULL);
             return TRUE;
         }
@@ -540,6 +610,8 @@ static void display_start_failed(const char *operation) {
     const DWORD error = GetLastError();
     hos_log("display: %s failed (error %lu)", operation, (unsigned long)error);
     hos_log_flush();
+    /* ((Triforce) no unclean-end record: the window after it says the game could not open its window, from this line) */
+    { void hos_crash_clean_end(void); hos_crash_clean_end(); }
     ExitProcess(1);
 }
 
@@ -602,7 +674,25 @@ static DWORD WINAPI display_main(void *p) {
     RAWINPUTDEVICE rid = {1, 2, 0, hwnd};   /* generic desktop mouse: WM_INPUT while the window is in front */
     RegisterRawInputDevices(&rid, 1, sizeof rid);
     renderer = rx_start(hwnd);
-    if (!renderer) hos_log("display: no WebGPU device: the window stays black");
+    if (!renderer) {
+        /* (Triforce) No renderer started (Vulkan lists no graphics card it can use, or triforce_vk.dll is not there): the
+           game ends at once and says why. Behind a black window it played on, sound and all, until the player closed it,
+           and nothing on screen said what was wrong. The renderer's own lines are in the log ("vk: no Vulkan 1.3 GPU",
+           "rx: ... did not load"). A test's window that takes no focus (HOS_WINDOW_NOACTIVATE) has nobody to read a
+           message: it only ends */
+        hos_log("display: the renderer did not start: the game ends");
+        hos_log_flush();
+        { void hos_fs_save_finish(void); hos_fs_save_finish(); }   /* (host/nn_fs.c: as every other end of the game) */
+        if (!noactivate)
+            MessageBoxA(hwnd, "Triforce could not start its renderer, so the game cannot show a picture and ends here.\n\n"
+                        "It needs a graphics card with Vulkan 1.3 and a current driver: update your graphics driver and start "
+                        "the game again. If triforce_vk.dll is missing from the game folder (an antivirus program may have "
+                        "taken it), run Triforce Setup again.\n\ntriforce_log.txt in the game folder says what was found.",
+                        "Triforce", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+        /* ((Triforce) said already: no unclean-end record, and no second window after it (host/hos_crash_dialog.h) */
+        { void hos_crash_clean_end(void); hos_crash_clean_end(); }
+        ExitProcess(1);
+    }
     SetEvent(renderer_up);
     SetTimer(hwnd, 1, 250, NULL);
     MSG m;

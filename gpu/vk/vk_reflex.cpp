@@ -261,6 +261,21 @@ void reflex_submit_ends() {
     if (r.frame_marked) mark(VK_LATENCY_MARKER_RENDERSUBMIT_END_NV);
 }
 
+// ((Triforce) 11-24) Each of the game's queue submits tagged with the frame its GPU work belongs to: without it the driver
+// guesses the frame of each submit, and with frame generation the display thread's copies sit between the game's frames, so
+// its "GPU end" of a frame could read hundreds of milliseconds (an RTX 5080 at 4x, measured elsewhere). Only the game's
+// rendering (vk_replay.cpp's recordings): the display thread's presents keep their present ids alone. RX_VK_REFLEX_SUBMIT_IDS=1
+const void* reflex_submit_id(const void* next) {
+    static const bool wanted = getenv("RX_VK_REFLEX_SUBMIT_IDS") && atoi(getenv("RX_VK_REFLEX_SUBMIT_IDS")) == 1;
+    if (!wanted) return next;
+    Reflex& r = rx();
+    std::lock_guard lk(r.mu);
+    if (!on() || !r.frame_marked) return next;   // (before the frame's sleep returned: the driver is told nothing)
+    thread_local VkLatencySubmissionPresentIdNV s{VK_STRUCTURE_TYPE_LATENCY_SUBMISSION_PRESENT_ID_NV};
+    s.pNext = next, s.presentID = r.id;
+    return &s;
+}
+
 const void* reflex_present_id(const void* next) {
     Reflex& r = rx();
     std::lock_guard lk(r.mu);
@@ -297,6 +312,7 @@ bool sleep_now() {
     }
     VkSemaphoreWaitInfo w{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
     w.semaphoreCount = 1, w.pSemaphores = &r.wake, w.pValues = &value;
+    const rec::Settled settled;   // ((Triforce) RX_VK_RECORDER_PARTS: the driver signals it, no part of the replay's)
     {
         // ((Triforce, 11-22, SYNC-27) the driver's sleep for latency is pacing, not a wait for the GPU's work: not counted)
         const ::gpu_wait_kinds::Exclude pacing;

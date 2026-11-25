@@ -55,7 +55,7 @@ def main():
         (tmp / "display_startup_actual.inc").write_text(actual + "\n", encoding="utf-8")
         exe = tmp / ("display_start.exe" if os.name == "nt" else "display_start")
         command = [cxx, "-std=c++20", "-O0", "-Wall", "-Wextra", "-Werror", "-D_CRT_SECURE_NO_WARNINGS",
-                   "-I" + str(tmp), str(ROOT / "tests/display_startup_failure_test.cpp"), "-o", str(exe)]
+                   "-I" + str(tmp), "-I" + str(ROOT / "host"), str(ROOT / "tests/display_startup_failure_test.cpp"), "-o", str(exe)]
         result = subprocess.run(command, cwd=tmp, env=env, capture_output=True, text=True, timeout=60,
                                 creationflags=flags)
         if result.returncode:

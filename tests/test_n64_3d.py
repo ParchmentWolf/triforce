@@ -128,7 +128,7 @@ def check_draw():
 def check_asides():
     temporal = (VK / "vk_temporal.cpp").read_text(encoding="utf-8")
     mode = function(temporal, "int temporal_mode() {")
-    in_order(mode, ["v = n64_rules::upscaler(n64_in_front(), v);", "if (!ur::is_dlss(v) && !ur::is_fsr4(v)) return ur::GAME;"],
+    in_order(mode, ["v = n64_rules::upscaler(n64_in_front(), v);", "if (!chain_engine(v)) return ur::GAME;"],
              "temporal_mode: DLSS and FSR 4 no longer step aside for N64 Classic's 3D pass, over the switches too")
     fsr3 = function((VK / "vk_fsr3.cpp").read_text(encoding="utf-8"), "bool fsr3_wanted() {")
     in_order(fsr3, ["if (env == 0) return false;",

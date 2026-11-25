@@ -125,7 +125,11 @@ int rx_option(int id, int otherwise) { (void)id; return otherwise; }
 static int steady_row;           /* (the options file's steady_frame_rate) */
 int hos_ini_option(const char *key, int otherwise) { return strcmp(key, "steady_frame_rate") ? otherwise : steady_row; }
 enum { HOS_OPT_DISPLAY_CAP = 60 };
+enum { HOS_OPT_FPS_CAP_ROW = 342 };   /* ((Triforce) gpu/vk/vk_api.h: the cap's row in play, host/nn_vi.c fps_row_asked) */
+static volatile int fps_row_asked = -100;
 enum { HOS_OPT_N64_FPS = 61 };
+enum { HOS_OPT_EVIL_HD = 420 };   /* ((Triforce) Evil HD's render distance: host/evil_hd.c, tests/test_evil_hd_foliage.py) */
+void hos_evil_hd_tick(int row) { (void)row; }
 static volatile long long presents;
 volatile uint64_t hos_gfx_module = MOD;
 volatile int hos_fixed_resolution, hos_dynres_runs;
@@ -133,6 +137,7 @@ volatile uint32_t hos_fixed_scale_bits;
 volatile float hos_text_scale;
 volatile uint64_t hos_step_probe, hos_res_module;
 volatile uint32_t hos_frame_seconds_bits;
+static volatile int step_pace;   /* (host/nn_vi.c's, which realtime_step notes its pace in: tests/test_frame_carry_cap60.py) */
 @HOST@
 /* one frame: the movie player's update when a movie plays, the frame's time, then what the present does in this order */
 static void present(int movie, int64_t frame_ns) {
@@ -245,8 +250,11 @@ def main():
     check("return n64_pace_fps(n64_rate, movie_pace_fps(movie_raise, fps_max()));" in block(vi, "static int pace_fps(void) {"),
           "pace_fps is not the rule's (N64 Classic's rate over it: tests/test_n64_pace.py)")
     decide = block(vi, "static void movie_pace_decide(void) {")
-    check('if (on < 0) on = !(getenv("HOS_MOVIE_PACE") && *getenv("HOS_MOVIE_PACE") && atoi(getenv("HOS_MOVIE_PACE")) == 0);' in decide,
+    check('    if (on < 0) {\n        on = !(getenv("HOS_MOVIE_PACE") && *getenv("HOS_MOVIE_PACE") && atoi(getenv("HOS_MOVIE_PACE")) == 0);' in decide,
           "HOS_MOVIE_PACE is not read once, on unless 0")
+    # (an input recording from the run's start, host/input_movie.c: no movie pacing, which moves the game's step)
+    check('if (on && ((rec && *rec) || (play && *play))) {\n            on = 0;' in decide,
+          "a run that records or plays an input recording keeps the movie pacing")
     check("const int raise = movie_pace_raise(on, fps_max(), steady != PACE_STEADY_OFF, movie_plays());" in decide
           and "movie_raise = raise;" in decide, "the decision is not the rule's, from the cap, the Steady row and the movie's stamp")
     steady = block(vi, "static int64_t steady_period(int64_t base, int64_t now) {")

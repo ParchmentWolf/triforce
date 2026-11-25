@@ -36,7 +36,7 @@ ROOT = Path(__file__).resolve().parents[1]
 VK = ROOT / "gpu" / "vk"
 
 RAISE = "for (Pool* p : mirror_synced) p->synced_gen = gens.now;"
-REGION_SKIP = "if (page % kRegionPages == 0 && region_gen(page / kRegionPages) <= p.synced_gen) {"
+REGION_SKIP = "} else if (region_gen(page / kRegionPages) <= p.synced_gen) {"   # ((Triforce, 11-24) from a pool's start inside a region too
 PAGE_GEN = "const WriteGen pg = page_gen(page);"
 DIRTY = "const bool dirty = pg > p.synced_gen;"
 
@@ -64,6 +64,7 @@ inline WriteGen next_gen() { return gens.next(); }
 inline WriteGen page_gen(uint64_t p) { return gens.page(p); }
 inline WriteGen region_gen(uint64_t r) { return gens.region_gen[r]; }
 thread_local uintptr_t tl_stamp_who;
+void memory_gpu_writes_note(uint64_t, uint64_t) {}   // (RX_VK_UB_SNAPSHOT's guard: tests/test_ub_snapshot_gpu_writes.py)
 void stamp_src_note(WriteGen, uintptr_t) {}
 void memory_drop_shadow(uint64_t, uint64_t) {}
 void cap_view_bump() {}
@@ -83,8 +84,9 @@ std::vector<uint64_t> sync(Pool& p) {
     mirror_synced.push_back(&p);
     std::vector<uint64_t> out;
     for (uint64_t page = p.lo >> kPageShift; page < (p.hi + 4095) >> kPageShift;) {
+        if (false) {
         @REGION_SKIP@
-            page += kRegionPages;
+            page = std::min<uint64_t>((p.hi + 4095) >> kPageShift, (page / kRegionPages + 1) * kRegionPages);
             continue;
         }
         @PAGE_GEN@

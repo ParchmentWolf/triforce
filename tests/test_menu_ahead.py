@@ -68,6 +68,7 @@ void dlss_probe() {   // (NGX's start: slow)
     dlss_calls++;
 }
 void fsr4_probe() { fsr_calls++; }
+void xess_probe() {}   // ((Triforce) Intel XeSS's, asked after the others
 namespace fsr4fg {
 framegen_rows::Why why() { fg_calls++; return framegen_rows::FG_OK; }
 }

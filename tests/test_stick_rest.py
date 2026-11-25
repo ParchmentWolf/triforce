@@ -57,8 +57,9 @@ static struct { unsigned rested; signed char held[4]; } pads[1];
 static void step(int i, int w[4]) {
     const int16_t raw[4] = {(int16_t)w[0], (int16_t)w[1], (int16_t)w[2], (int16_t)w[3]};
     static const int own[2] = {-1, -1};
+    const int z = 0;   /* (the rule asks for each axis by itself, cut at the zone: the default) */
     int32_t v[4];
-    for (int k = 0; k < 4; k++) v[k] = stick_value(raw[k], 0, 0, own[k >> 1]);
+    for (int k = 0; k < 4; k++) v[k] = stick_value(raw[k], 0, z, own[k >> 1]);
 ''' + block + r'''
     for (int k = 0; k < 4; k++) w[k] = v[k];
 }

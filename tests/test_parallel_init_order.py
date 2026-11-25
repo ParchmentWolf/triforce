@@ -44,7 +44,7 @@ import tempfile
 RUN_ALL_ARGS = ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"]
 
 ROOT = Path(__file__).resolve().parents[1]
-CASES = ("later_makes", "three", "scratch", "scratch2", "in_order", "serial", "close_race", "after_submit", "init_begin_fail",
+CASES = ("upload_pieces", "later_makes", "three", "scratch", "scratch2", "in_order", "serial", "close_race", "after_submit", "init_begin_fail",
          "init_end_fail", "alloc_fail", "own_uses", "own_all", "own_off", "upload_rules", "upload_later_first", "upload_three",
          "upload_own", "upload_own_nested", "upload_close_race", "upload_end_other", "upload_nested", "upload_then_make", "upload_barrier",
          "upload_gpu_route", "upload_random")
@@ -84,12 +84,12 @@ def main():
     create = create[create.index("\n") + 1:]   # (from the line after: the image's initialization, to its Texture*)
     if "// into GENERAL, and cleared" not in create or "Texture* p = tex.get();" not in create:
         raise SystemExit("create()'s initialization moved: update this test")
-    jobs = cut(replay, "    struct Job {", "    seg_ms += std::chrono::duration")
+    jobs = cut(replay, "    struct Job {", "    seg_ms += std::chrono::duration", after="const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_stop")
     have_seg_init = "struct SegInit {" in texture
     if "struct UploadRedirect {" not in texture or "if (!want || tl_seg_index < 0 || tl_up_redirect) return;" not in texture:
         raise SystemExit("FAIL: vk_texture.cpp has no UploadRedirect, or InitRedirect does not stand aside inside one")
     for step in ("j->order = base + k;", "j->index = (int)k;", "texture_set_segment(j->order);", "texture_segment_worker(j->index);"):
-        if replay.count(step) != 1:   # (UploadRedirect's order: upload_earliest::order_of)
+        if jobs.count(step) != 1:   # (UploadRedirect's order: upload_earliest::order_of)
             raise SystemExit("FAIL: replay_handle no longer numbers its segments' order as their index from base: " + step)
     exits = {"init_end_fail": 3} if have_seg_init else {}   # (replay_fatal ends the process)
     for step in ("record_segment(c, j->g);", "texture_begin_recording(j->r->upload, j->r->value);", "vkQueueSubmit2(",
@@ -107,7 +107,17 @@ def main():
         call = "if (par_threads_max() >= 2 && !init_pools_make(pi)) return false;"
         if call not in start or start.index(call) < start.index("for (Frame& f : frames)") or                 "return false" in start[start.index(call) + len(call):]:
             raise SystemExit("FAIL: replay_start does not make the init pools last (a later failure would leave them made)")
+    # ((Triforce) an upload command buffer that goes on in pieces: the pieces' own code, their type, what the submit takes and
+    # frees them with, and the submit's "each alone" (vk_replay.cpp))
+    texture_h = (vk / "vk_texture.h").read_text(encoding="utf-8")
+    pieces = block(texture_h, "struct UploadPiece {") + ";\n"
+    pieces += cut(texture, "// ---- (Triforce) an upload command buffer that goes on in pieces ----",
+                  "// ---- the recording's upload command buffer ----")
+    hooks += [block(texture, m) for m in ("size_t texture_upload_pieces(", "void texture_upload_pieces_free(",
+                                          "VkCommandBuffer texture_upload_last(")]
     inc = {
+        "init_pieces.inc": pieces,
+        "init_alone.inc": cut(replay, "std::atomic<int64_t> st_alone_submits{0};", "\nstruct Recording {"),
         "init_upload.inc": cut(texture, "// ---- the recording's upload command buffer ----", "// ---- staging:"),
         "init_create.inc": create,
         "init_scratch.inc": block(texture, "bool bc_scratch_layout("),

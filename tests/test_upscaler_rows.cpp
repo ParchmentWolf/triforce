@@ -119,13 +119,15 @@ int main() {
         using ur::FSR4_AA;
         const unsigned every = ur::bit(GAME) | ur::dlss_bits(true) | ur::fsr3_bits(true) | ur::fsr4_bits(true);
         const unsigned fsr3 = ur::bit(GAME) | ur::fsr3_bits(true);
-        CHECK("FSR 3.1's native AA after FSR 4's", FSR3_AA == 6 && ur::kUpscalers == 7);
+        CHECK("FSR 3.1's native AA after FSR 4's, Off after it, then Intel XeSS's two",
+              FSR3_AA == 6 && ur::OFF == 7 && ur::XESS == 8 && ur::XESS_AA == 9 && ur::kUpscalers == 10);
         CHECK("FSR 3.1's two run together", ur::fsr3_bits(true) == (ur::bit(FSR3) | ur::bit(FSR3_AA)) && ur::fsr3_bits(false) == 0u);
         // the row's order: each engine's native AA after it
-        const int order[] = {GAME, DLSS, DLAA, FSR3, FSR3_AA, FSR4, FSR4_AA};
-        for (int i = 0; i < 7; i++) {
-            CHECK("the row's order, Right", ur::step_upscaler(order[i], 1, every) == order[(i + 1) % 7]);
-            CHECK("the row's order, Left", ur::step_upscaler(order[i], -1, every) == order[(i + 6) % 7]);
+        const int order[] = {GAME, DLSS, DLAA, FSR3, FSR3_AA, FSR4, FSR4_AA, ur::OFF};   // ((Triforce) 11-24: Off last)
+        const unsigned every_off = every | ur::bit(ur::OFF);
+        for (int i = 0; i < 8; i++) {
+            CHECK("the row's order, Right", ur::step_upscaler(order[i], 1, every_off) == order[(i + 1) % 8]);
+            CHECK("the row's order, Left", ur::step_upscaler(order[i], -1, every_off) == order[(i + 7) % 8]);
         }
         unsigned seen = 0;
         for (int v : ur::kOrder) seen |= ur::bit(v);
@@ -174,9 +176,33 @@ int main() {
         using ur::FSR4_AA;
         const unsigned every = ur::bit(GAME) | ur::dlss_bits(true) | ur::fsr3_bits(true) | ur::fsr4_bits(true);
         CHECK("engines", ur::engine(DLAA) == DLSS && ur::engine(FSR4_AA) == FSR4 && ur::engine(FSR3_AA) == FSR3 &&
-                             ur::engine(DLSS) == DLSS && ur::engine(GAME) == GAME && ur::engine(-1) == GAME && ur::engine(9) == GAME);
+                             ur::engine(DLSS) == DLSS && ur::engine(GAME) == GAME && ur::engine(-1) == GAME && ur::engine(10) == GAME);
         CHECK("native AAs", ur::native_of(DLSS) == DLAA && ur::native_of(FSR4) == FSR4_AA && ur::native_of(FSR3) == FSR3_AA &&
                                 ur::native_of(GAME) == GAME);
+        // ((Triforce) Intel XeSS: its two run together, its Native AA at full scale, its engine after FSR 4's and before Off
+        {
+            using ur::XESS;
+            using ur::XESS_AA;
+            const unsigned all = every | ur::xess_bits(true) | ur::bit(ur::OFF);
+            CHECK("XeSS's two", ur::xess_bits(true) == (ur::bit(XESS) | ur::bit(XESS_AA)) && ur::xess_bits(false) == 0u &&
+                                    ur::is_xess(XESS) && ur::is_xess(XESS_AA) && !ur::is_xess(FSR4) && !ur::is_fsr4(XESS));
+            CHECK("XeSS's engine", ur::engine(XESS_AA) == XESS && ur::native_of(XESS) == XESS_AA && ur::full_scale(XESS_AA) &&
+                                       !ur::full_scale(XESS) && ur::scales_by_mode(XESS) && !ur::scales_by_mode(XESS_AA));
+            ur::Scaling x = ur::step_engine(FSR4, 6, 1, all);
+            CHECK("FSR 4 to XeSS", x.upscaler == XESS && x.resolution == 6);
+            x = ur::step_engine(XESS, 6, 1, all);
+            CHECK("XeSS to Off", x.upscaler == ur::OFF);
+            x = ur::step_engine(FSR4, 6, 1, every | ur::bit(ur::OFF));
+            CHECK("XeSS left out where it cannot run", x.upscaler == ur::OFF);
+            x = ur::step_engine(XESS_AA, 6, 1, all);
+            CHECK("XeSS's Native AA to Off at 100%", x.upscaler == ur::OFF && x.resolution == 1);
+            x = ur::step_resolution(XESS, 0, 1);
+            CHECK("XeSS: Auto to Native", x.upscaler == XESS_AA && x.resolution == 0);
+            x = ur::step_resolution(XESS_AA, 0, 1);
+            CHECK("XeSS: Native to Ultra Quality (67%)", x.upscaler == XESS && x.resolution == 3);
+            CHECK("XeSS's names", !std::strcmp(ur::xess_mode_name(3), "Ultra Quality") &&
+                                      !std::strcmp(ur::xess_mode_name(4), "Balanced") && !ur::xess_mode_name(0));
+        }
         // the Upscaler: Game, DLSS, FSR 3.1, FSR 4 and back, the resolution left to snap
         ur::Scaling s = ur::step_engine(GAME, 3, 1, every);
         CHECK("game to DLSS", s.upscaler == DLSS && s.resolution == 3);

@@ -195,6 +195,7 @@ FUNCTION_TEST = r'''
 #include <cstring>
 #include <string>
 #include <vector>
+#include "evil_hd.h"
 #include "foliage_shadow.h"
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); std::exit(1); } } while (0)
 enum { NVN_FACE_NONE = 0, NVN_FACE_FRONT = 1, NVN_FACE_BACK = 2, NVN_FACE_FRONT_AND_BACK = 3 };
@@ -224,6 +225,8 @@ struct Texture { int id; };
 struct Targets { int n = 0; Texture* depth = nullptr; uint32_t width = 0, height = 0, depth_layer = 0; VkFormat depth_format = VK_FORMAT_UNDEFINED; };
 struct Program { bool mesh = false, fallback = false; uint64_t key = 0; };
 struct Device { bool foliage_rate = false; } dev;
+struct Options { int evil_hd = 0; } opts;   // ((Triforce, 11-23) Evil HD: TEST_EVIL_HD=1)
+int evil_hd_now() { return opts.evil_hd; }
 bool depth_aspect(VkFormat f) { return f == VK_FORMAT_D32_SFLOAT; }
 thread_local const Program* cur_program = nullptr;
 thread_local VkCommandBuffer rate_cmd = VK_NULL_HANDLE;
@@ -233,6 +236,7 @@ thread_local uint32_t rate_size = 0;
 using namespace mkwvk;
 int main(int argc, char** argv) {
     CHECK(argc == 4);
+    opts.evil_hd = std::getenv("TEST_EVIL_HD") != nullptr;
     const int want = std::atoi(argv[1]);        // (the face the far cascades' foliage gets: 0 the game's none, 1 front, 2 back)
     const int near_face = std::atoi(argv[2]);   // (and the near cascade's, layer 0)
     const int rate_from = std::atoi(argv[3]);   // (the first layer at 2 x 2; -1 none)
@@ -263,8 +267,11 @@ int main(int argc, char** argv) {
     at.n = 0, at.width = at.height = 768;   // (a character's own shadow map)
     CHECK(draw_cull(s, at) == NVN_FACE_NONE);
     const bool on = want != 0;
-    CHECK((logged.find("faces culled (=off: as the game draws them)") != std::string::npos) == on);
-    CHECK((logged.find("cull as the game asks") != std::string::npos) == !on);
+    // ((Triforce, 11-23) with Evil HD on the switch's rule is still said at the start (EVIL_RUNS' switches all cull), and no
+    // draw is culled: the program lines below are not said)
+    const bool said = on || opts.evil_hd;
+    CHECK((logged.find("faces culled (=off: as the game draws them)") != std::string::npos) == said);
+    CHECK((logged.find("cull as the game asks") != std::string::npos) == !said);
     CHECK((logged.find("vk: foliage shadow cull: program 0000000000001111") != std::string::npos) == on);
     CHECK((logged.find("vk: foliage shadow cull: program 0000000000002222") != std::string::npos) == on);
     CHECK(logged.find("0000000000003333") == std::string::npos);
@@ -326,6 +333,8 @@ int main(int argc, char** argv) {
 # and the first layer at 2 x 2 (-1 none)
 RUNS = [(None, None, 2, 0, 2), ("1", "2", 2, 0, 2), ("1f", None, 1, 0, 2), ("0", "1", 2, 2, 1), ("off", "off", 0, 0, -1),
         ("", "", 2, 0, 2), (None, "3", 2, 0, 3)]
+# ((Triforce, 11-23) Evil HD on (gpu/vk/evil_hd.h): the far foliage shadows as the game draws them, whatever the switches say)
+EVIL_RUNS = [(None, None, 0, 0, -1), ("0", "1", 0, 0, -1), ("1f", "3", 0, 0, -1)]
 
 
 def main():
@@ -345,8 +354,11 @@ def main():
             cpp.write_text(text, encoding="utf-8")
             subprocess.run([a.cxx, "-std=c++20", "-Wall", "-Wextra", "-Werror", "-I" + vk, str(cpp), "-o", str(exe)], check=True)
         subprocess.run([str(tmp / "header.exe")], check=True)
-        for cull, vrs, want, near, rate_from in RUNS:
-            env = {k: v for k, v in os.environ.items() if k not in ("RX_VK_FOLIAGE_SHADOW_CULL", "RX_VK_FOLIAGE_SHADOW_VRS")}
+        for evil, (cull, vrs, want, near, rate_from) in [(False, r) for r in RUNS] + [(True, r) for r in EVIL_RUNS]:
+            env = {k: v for k, v in os.environ.items()
+                   if k not in ("RX_VK_FOLIAGE_SHADOW_CULL", "RX_VK_FOLIAGE_SHADOW_VRS", "TEST_EVIL_HD")}
+            if evil:
+                env["TEST_EVIL_HD"] = "1"
             if cull is not None:
                 env["RX_VK_FOLIAGE_SHADOW_CULL"] = cull
             if vrs is not None:

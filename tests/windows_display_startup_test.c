@@ -55,6 +55,7 @@ void hos_log(const char *format, ...) {
     va_list args; va_start(args, format); vsnprintf(log_line, sizeof log_line, format, args); va_end(args);
 }
 void hos_log_flush(void) { flush_calls++; }
+void hos_crash_clean_end(void) {}   /* (host/hos_crash_record.c: no record here) */
 
 /* ACTUAL_DISPLAY_STARTUP */
 

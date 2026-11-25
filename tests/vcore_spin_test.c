@@ -59,7 +59,7 @@ typedef struct HosThread {
     int priority, ideal_core;
     uint64_t core_mask;
     char name[48];
-    int vc_held, vc_last, vc_queued;
+    int vc_held, vc_last, vc_queued, vc_escaped;
     volatile int vc_kick;
     int64_t vc_since, vc_grant_at;
     CONDITION_VARIABLE vc_cv;
@@ -137,6 +137,9 @@ static int hos_thread_core(HosThread *t) {   /* (host/hos_thread.c's) */
 /* ((Triforce, 11-22, OS-49) host/hos_thread.c's: the mask HOS_SIM_CPU holds the process to, none here; hos_sim_cpu.h's count) */
 static uint64_t sim_cpu_mask;
 static int hos_sim_cpu_count(uint64_t mask) { return __builtin_popcountll(mask); }
+/* ((Triforce) host/hos.h's HOS_CHAIN recorder (host/hos_chain.c), off: its notes made nowhere */
+enum { HOS_CHAIN_WAIT = 1, HOS_CHAIN_WOKE, HOS_CHAIN_SIGNAL, HOS_CHAIN_SLEEP, HOS_CHAIN_AWAKE, HOS_CHAIN_PRESENT };
+#define HOS_CHAIN(kind, key) ((void)(kind), (void)(key))
 
 #include "vcore_block.inc"
 

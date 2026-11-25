@@ -69,6 +69,7 @@ using DWORD = unsigned;
 static int down_key, queued_key;
 static bool focused, pad_last;
 static struct { int menu_shortcut; } opts;
+static void mic_test_tick(bool) {}   // (the Test microphone row's test as menu_tick ends: not this test's)
 static HWND GetForegroundWindow() { return 1; }
 static DWORD GetCurrentProcessId() { return 1; }
 static void GetWindowThreadProcessId(HWND, DWORD* pid) { *pid = focused ? 1 : 2; }
@@ -96,9 +97,9 @@ static bool keyboard_toggle(int mode, int key, bool queued, bool has_focus = tru
 
 static void test_keyboard() {
     for (bool queued : {false, true}) {
-        for (int mode = 0; mode <= 1; mode++) {
+        for (int mode = 0; mode <= 4; mode++) {   // (2 and 4 with Esc, 3 and 4 the touchpad; Esc's own opening is menu_tick's, past this block)
             CHECK(!keyboard_toggle(mode, 0, queued));
-            CHECK(keyboard_toggle(mode, VK_INSERT, queued) == (mode == 0));
+            CHECK(keyboard_toggle(mode, VK_INSERT, queued) == (mode != 1));
             CHECK(!keyboard_toggle(mode, VK_INSERT, queued, false));
             CHECK(keyboard_toggle(mode, VK_F1, queued));   // (F1 always opens the menu)
             CHECK(!keyboard_toggle(mode, VK_F1, queued, false));
@@ -132,11 +133,21 @@ def main():
         subprocess.run([a.cxx, "-std=c++20", "-Wall", "-Wextra", "-Werror", "-I" + str(ROOT), str(cpp), "-o", str(exe)], check=True)
         subprocess.run([str(exe)], check=True)
 
-    need(menu, r'\{TAB_CONTROLS, "Menu shortcut", &opts\.menu_shortcut, 0, 1, 1, tx_menu_shortcut,[^}]*nullptr, false, true\}',
+    need(menu, r'\{TAB_CONTROLS, "Menu shortcut", &opts\.menu_shortcut, 0, 4, 1, tx_menu_shortcut,[^}]*nullptr, false, true\}',
          "the shortcut choice must be saved in Controls and exempt from presets")
     header = (ROOT / "gpu/vk/vk_menu.h").read_text(encoding="utf-8")
     if "int menu_shortcut = 0;" not in header:
         raise SystemExit("FAIL: existing options must keep both shortcuts")
+    # (Menu shortcut "Insert, F1 or Esc": Esc opens a closed menu where the keys open it at all, and that press goes back no page)
+    need(tick, r"const bool esc_opens = \(opts\.menu_shortcut == 2 \|\| opts\.menu_shortcut == 4\) && menu_allowed && press\[5\] && !open_now\.load\(\);\s*"
+               r"if \(esc_opens\) press\[5\] = false;", "Esc does not open the closed menu with its choice")
+    need(tick, r"\|\| esc_opens\) \{", "Esc's press does not open the menu")
+    # (the touchpad choices: its click is F1; the bit is a menu bit no binding takes)
+    need(tick, r"if \(opts\.menu_shortcut >= 3 && pad\(HOS_PAD_TOUCHPAD\)\) press\[6\] = true;", "the touchpad is not F1 with its choice")
+    api = (ROOT / "gpu/vk/vk_api.h").read_text(encoding="utf-8")
+    m = re.search(r"enum \{ HOS_PAD_TOUCHPAD = (\d+) \};", api)
+    if not m or int(m.group(1)) <= 25 or int(m.group(1)) > 31:
+        raise SystemExit("FAIL: vk_api.h: the touchpad's bit must be past the sticks' menu bits (20 to 25)")
     # (the pad: confirm and back from A's and B's bindings, every tick, not fixed positions)
     need(tick, r"menu_keys::confirm_back\(host->binding\(HOS_BIND_PAD, HOS_SW_A, 0\), host->binding\(HOS_BIND_PAD, HOS_SW_B, 0\)",
          "confirm and back are not taken from A's and B's bindings")

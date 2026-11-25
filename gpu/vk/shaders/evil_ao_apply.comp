@@ -1,0 +1,64 @@
+#version 450
+// (Triforce, 11-23) Evil HD's ambient occlusion put on the picture (gpu/vk/vk_aa.cpp ao_after): evil_ao.comp's estimate
+// blurred over 4 x 4 pixels, each weighted by how near its depth is to this one's (the noise of its spiral goes; an edge does
+// not bleed into what is behind it), then the picture darkened by it. The picture is the target of the game's SMAA
+// composition as the passes before stored it: the RGB9E5 words of each channel's square root (aa_common.glsl), read and
+// written again through the same R32_UINT view: the square root of the occlusion times each. The brightest parts keep a
+// little more of their light (a sunlit crease is still lit).
+// ((Triforce, 11-24) and the bounce: the light the surfaces around throw on it (evil_ao.comp's rgb, blurred the same way),
+// times the pixel's own colour as its surface's, by bounce_strength)
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D ao_tex;
+layout(binding = 1) uniform sampler2D depth_tex;
+layout(binding = 2, r32ui) uniform uimage2D dst;
+layout(push_constant) uniform Push {
+    vec2 inv;
+    ivec2 size;
+    vec4 cam;   // (as evil_ao.comp's)
+    vec4 k;
+    float bounce_strength;   // ((Triforce, 11-24) the bounce's share)
+} pc;
+
+#include "aa_common.glsl"
+
+float distance_at(ivec2 p) {
+    float d = texelFetch(depth_tex, clamp(p, ivec2(0), pc.size - 1), 0).r;
+    if ((int(pc.k.w) & 1) != 0) d = 1.0 - d;
+    return pc.cam.y / max(d - pc.cam.x, 1e-7);
+}
+vec3 unpack_rgb9e5(uint w) {
+    const float scale = exp2(float(w >> 27) - 24.0);
+    return vec3(float(w & 511u), float((w >> 9) & 511u), float((w >> 18) & 511u)) * scale;
+}
+
+void main() {
+    const ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x >= pc.size.x || c.y >= pc.size.y) return;
+    const float z = distance_at(c);
+    float sum = 0.0, weight = 0.0;
+    vec3 bounce = vec3(0.0);
+    for (int y = -2; y <= 1; y++)
+        for (int x = -2; x <= 1; x++) {
+            const ivec2 q = clamp(c + ivec2(x, y), ivec2(0), pc.size - 1);
+            const float w = exp(-abs(distance_at(q) - z) / max(0.03 * z, 1e-4));
+            const vec4 a = texelFetch(ao_tex, q, 0);
+            sum += w * a.a;
+            bounce += w * a.rgb;
+            weight += w;
+        }
+    const float ao = weight > 0.0 ? sum / weight : 1.0;
+    bounce = weight > 0.0 ? bounce / weight : vec3(0.0);
+    if ((int(pc.k.w) & 2) != 0) {   // (RX_VK_EVIL_AO_SHOW=1, the lab's: the occlusion alone, white open, black closed)
+        imageStore(dst, c, uvec4(aa_pack_rgb9e5(vec3(sqrt(ao))), 0u, 0u, 0u));
+        return;
+    }
+    if (ao >= 0.999 && dot(bounce, vec3(1.0)) < 1e-4) return;
+    const vec3 e = unpack_rgb9e5(imageLoad(dst, c).r);   // (square roots of the linear picture)
+    const float luma = dot(e * e, vec3(0.2126, 0.7152, 0.0722));
+    const float kept = mix(ao, 1.0, 0.5 * smoothstep(0.5, 1.0, luma));
+    // (the bounce: the light around, on this surface's colour; the occluded part of the pixel is what it lights)
+    const vec3 lin = e * e * kept + bounce * e * e * pc.bounce_strength * (1.0 - kept + 0.25);
+    imageStore(dst, c, uvec4(aa_pack_rgb9e5(sqrt(lin)), 0u, 0u, 0u));
+}

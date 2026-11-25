@@ -186,6 +186,16 @@ VkImageView texture_view(Texture *t, const nvn_tex *, const nvn_view *v, VkImage
 bool fsr3_on = false;
 unsigned fsr3_calls = 0;
 bool fsr3_wanted() { return fsr3_on; }
+// ((Triforce) 11-24) AMD FSR 3.1's frame interpolation asked (the Frame generation by row): off here, so the pass is as before;
+// its HUD copy of the stub's picture (a null picture: nothing) and the draw state its redraws disturb
+namespace fsr3fi { unsigned frames_wanted() { return 0; } }
+void framegen_hud_before(VkCommandBuffer, Texture* picture, uint32_t) { assert(!picture); }
+// ((Triforce) the ReShade preset row Off: no picture kept for it (vk_draw.cpp stub_picture_written)
+namespace reshade { struct Off { template <class T> bool load(T) const { return false; } }; Off enabled; }
+void stub_picture_written(VkCommandBuffer cmd, Texture* hud, Texture*) { framegen_hud_before(cmd, hud, 0); }
+bool last_dyn_valid = true, last_desc_valid = true, last_vb_valid = true;
+unsigned long long last_pipeline = 0;   // (VK_NULL_HANDLE is a plain number here)
+struct { bool on = false; } vertex_set, last_ib;
 bool fsr3_upscale(VkCommandBuffer, uint64_t, bool known, Texture *in, VkImageView in_view, Texture *out, VkImageView out_view,
                   uint32_t level) {
     assert(lock_depth == 0 && !known && in == &src && out == &dst && in_view == (VkImageView)101 &&

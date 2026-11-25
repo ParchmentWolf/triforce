@@ -49,7 +49,8 @@ def check_sources():
     order = [prepare.find(n) for n in (
         'static const bool slack_env = !(getenv("RX_VK_DLSS_MODE_SLACK") && atoi(getenv("RX_VK_DLSS_MODE_SLACK")) == 0);',
         'dlss_checks::mode_for(ranges, nmodes, rw, rh, ow, oh, slack_env && !lab_ab::on("dlssstrict"), &widened);',
-        'if (!found) return *fail = "no DLSS mode takes this render size", 0;',
+        'snprintf(refused[at], sizeof refused[at], "no DLSS mode takes the render size %ux%u for %ux%u", rw, rh, ow, oh);',
+        'if (s.refused == key) return *fail = "its feature was not made", 0;',
         "temporal_later([old] { NVSDK_NGX_VULKAN_ReleaseFeature(old); });",
         "NGX_VULKAN_CREATE_DLSS_EXT(cmd, 1, 1, &s.feature, s.params, &cp);")]
     assert min(order) >= 0 and order == sorted(order), \

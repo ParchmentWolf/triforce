@@ -24,7 +24,8 @@ def read(*parts):
 def main():
     menu, replay, api = read("gpu", "vk", "vk_menu.cpp"), read("gpu", "vk", "vk_replay.cpp"), read("gpu", "vk", "vk_api.h")
     hid, native, backend = read("host", "nn_hid.c"), read("host", "mouse_native.c"), read("host", "rx_backend.c")
-    for row in ('"Mouse sensitivity", &opts.mouse_sens, 10, 500,', '"Invert mouse vertical", &opts.mouse_invert, 0, 1,'):
+    for row in ('"Mouse sensitivity", &opts.mouse_sens, 10, 500,', '"Invert mouse vertical", &opts.mouse_invert, 0, 1,',
+                '"Invert mouse horizontal", &opts.mouse_invert_x, 0, 1,'):
         if row not in menu:
             raise SystemExit("the menu lost a mouse row: " + row)
     if "id == 7 ? opts.mouse_sens" not in replay or "id == 8 ? opts.mouse_invert" not in replay:
@@ -43,6 +44,18 @@ def main():
         raise SystemExit("HOS_MOUSE_SENS no longer wins over the menu")
     if "rx_option(8, 0)" not in hid or "rx_option(8, 0)" not in native:
         raise SystemExit("the menu's inversion is not read by both mouse paths")
+    # ((Triforce) 11-24: Invert mouse horizontal, option 190: answered by the renderer, read by both mouse paths, and
+    # applied where each takes the mouse's sideways motion)
+    if "enum { HOS_OPT_MOUSE_INVERT_X = 190 };" not in api or \
+            "if (id == HOS_OPT_MOUSE_INVERT_X) return opts.mouse_invert_x != 0;" not in replay:
+        raise SystemExit("option 190, Invert mouse horizontal, does not reach the host")
+    if "rx_option(HOS_OPT_MOUSE_INVERT_X, 0)" not in hid or "rx_option(190, 0)" not in native:
+        raise SystemExit("the menu's horizontal inversion is not read by both mouse paths")
+    for text, where in (("dyaw = (float)((invert_x() ? -dx : dx) * k);", native),
+                        ("look_x += (invert_x ? -dx : dx) * k;", hid),
+                        ("mouse_look_move(invert_x ? -dx : dx, invert ? dy : -dy);", hid)):
+        if text not in where:
+            raise SystemExit("the mouse's left and right are not swapped where it is read: " + text)
     if not preset_exempt(menu, "mouse_sens"):
         raise SystemExit("a mouse setting turns the quality preset to Custom")
     print("PASS: the mouse's settings are the menu's")

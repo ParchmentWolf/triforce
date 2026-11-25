@@ -71,7 +71,8 @@ cache_set::Record this_start() {
     r.build = program_cache_build_part();
     const uint32_t depth = host && host->depth_minus_w && host->depth_minus_w() != 0;
     r.parts.push_back({"depth", depth});
-    const uint32_t mesh = (dev.mesh_shader ? 1u : 0u) | (dev.mesh_fallback ? 2u : 0u) | (dev.task_mesh_fallback ? 4u : 0u);
+    const uint32_t mesh = (dev.mesh_shader ? 1u : 0u) | (dev.mesh_fallback ? 2u : 0u) | (dev.task_mesh_fallback ? 4u : 0u) |
+                          (dev.mesh_only_fallback ? 8u : 0u);
     r.parts.push_back({"mesh", mesh});
     const uint32_t lanes[] = {dev.subgroup_max, (uint32_t)dev.driver_id, (uint32_t)dev.sg32_stages,
                               (uint32_t)storage_binding_align(), getenv("RX_VK_WARP64") ? 1u : 0u};
@@ -85,7 +86,9 @@ cache_set::Record this_start() {
     r.parts.push_back({"robust", dev.features.robustBufferAccess ? 1u : 0u});
     uint64_t env = 0xCBF29CE484222325ull;
     for (char** e = _environ; e && *e; e++)
-        for (const char* pre : {"RX_VK_OOT", "RX_VK_MMA", "RX_VK_NATIVE", "RX_VK_NAN", "RX_VK_TASK_CAP", "RX_VK_NETWORK", "RX_VK_GP_", "RX_VK_FOLLOW", "RX_VK_NO_FOLLOW", "RX_VK_NO_F16", "RX_VK_SHARED", "RX_VK_MESH", "RX_VK_NO_INVARIANT", "RX_VK_NO_NAN_GUARD", "RX_VK_MARKERS", "RX_VK_HANDLE_TABLE", "RX_VK_DLSS_CAPTURE", "EDEN_"})
+        for (const char* pre : {"RX_VK_OOT", "RX_VK_MMA", "RX_VK_NATIVE", "RX_VK_NAN", "RX_VK_TASK_CAP", "RX_VK_NETWORK", "RX_VK_GP_", "RX_VK_FOLLOW", "RX_VK_NO_FOLLOW", "RX_VK_NO_F16", "RX_VK_SHARED", "RX_VK_MESH", "RX_VK_NO_INVARIANT", "RX_VK_NO_NAN_GUARD", "RX_VK_MARKERS", "RX_VK_HANDLE_TABLE", "RX_VK_DLSS_CAPTURE",
+                                "RX_VK_NO_CBUF_LOAD_RULE", "RX_VK_PTR_SPLIT_FALLBACK", "RX_VK_ALL_GLOBAL_PROGS", "RX_VK_NO_EXTREGS",
+                                "RX_VK_NO_DRAW_PARAMS", "RX_VK_MISS_LOG", "RX_VK_BLOCK_PROBE", "RX_VK_SIM_TURF_POOLS", "EDEN_"})   // (disk_stamp's)
             if (!strncmp(*e, pre, strlen(pre))) {
                 env = fnv(*e, strlen(*e), env);
                 const char* eq = strchr(*e, '=');

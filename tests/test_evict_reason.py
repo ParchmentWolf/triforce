@@ -171,7 +171,7 @@ def check_source(tex):
         BATCHES,
         "            if (!e.flush) continue;\n            batch.push_back(Flush{e.tex, e.tex->gpu, e.tex->gpu + e.tex->guest_size});",
         "    for (const Evict& e : evict) {   // (and each one's bookkeeping and its end, as before)",
-        "        destroy_later(*tex);\n        forget_gpu(tex);\n        gone.push_back(tex);")]
+        "        destroy_later(*tex);\n        forget_gpu(tex);\n        gone.insert(tex);")]
     check(at == sorted(at), "the stale write-backs are not left out between the loop that chooses and the batches that write back")
     check(sweep.count("drawn_others(") == 1 and sweep.count("for (auto& [last, tex] : order)") == 6,
           "texture_sweep asks drawn_others more than once, or walks its ordered list a new time")

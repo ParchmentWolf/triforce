@@ -70,12 +70,27 @@ static size_t sweep_overwritten_copies(void) {   /* (copy_lock held: every third
     return 5;
 }
 static size_t live_at_made[4];
+static void line_logged(const char *line);
 static void hos_log(const char *fmt, ...) {
     char line[512];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(line, sizeof line, fmt, ap);
     va_end(ap);
+    line_logged(line);
+}
+/* ((Triforce) host/hos.h's levels: the sweep's line is a debug one) */
+enum { HOS_LOG_ERROR, HOS_LOG_WARN, HOS_LOG_INFO, HOS_LOG_DEBUG, HOS_LOG_TRACE };
+static void hos_log_at(int level, const char *fmt, ...) {
+    char line[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    if (level != HOS_LOG_DEBUG || !strstr(line, "let go")) FAIL("a line at level %d: %s", level, line);
+    line_logged(line);
+}
+static void line_logged(const char *line) {
     if (held) FAIL("logged with copy_lock held: %s", line);
     if (!away_now || vcore_held) FAIL("logged with the virtual core held: %s", line);
     if (strstr(line, "let go")) {
@@ -158,7 +173,7 @@ def check_writer(thread_c):
 
 def check_recordings(nvn_c):
     sweep = block(nvn_c, "static size_t sweep_overwritten_copies(void) {", "host/nvn_native.c")
-    if "hos_log(" in sweep or "return swept;" not in sweep or "if (off || !rec_buckets) return 0;" not in sweep:
+    if "hos_log" in sweep or "return swept;" not in sweep or "if (off || !rec_buckets) return 0;" not in sweep:
         raise SystemExit("FAIL: sweep_overwritten_copies (copy_lock held) must return its count and log nothing")
     if "static void sweep_overwritten_copies(" in nvn_c:
         raise SystemExit("FAIL: sweep_overwritten_copies still returns nothing")
@@ -166,7 +181,7 @@ def check_recordings(nvn_c):
     if end.count("AcquireSRWLockExclusive(&copy_lock);") != 1 or end.count("ReleaseSRWLockExclusive(&copy_lock);") != 1:
         raise SystemExit("FAIL: nvnCommandBufferEndRecording no longer takes and releases copy_lock once")
     locked = end[end.index("AcquireSRWLockExclusive(&copy_lock);"):end.index("ReleaseSRWLockExclusive(&copy_lock);")]
-    if "hos_log(" in locked or "fprintf(" in locked or "fputs(" in locked:
+    if "hos_log" in locked or "fprintf(" in locked or "fputs(" in locked:
         raise SystemExit("FAIL: nvnCommandBufferEndRecording writes a log line with copy_lock held")
     if "sweep_overwritten_copies()" not in locked:
         raise SystemExit("FAIL: nvnCommandBufferEndRecording no longer sweeps under copy_lock")

@@ -50,7 +50,7 @@ def main():
     # the menu's rules are upscaler_rows.h's, checked by behaviour in test_upscaler_rows.cpp: here only that the menu uses them
     uses = {
         "row_fixed": ("ur::upscaler_fixed(", "ur::model_fixed("),
-        "row_shown": ("ur::upscaler_shown(dlss_built() || fsr4_built(), fsr3::supported())", "ur::model_shown(dlss_built())",
+        "row_shown": ("ur::upscaler_shown(true)", "ur::model_shown(dlss_built())",   # ((Triforce) 11-24: Off runs everywhere)
                       "ur::is_dlss(up)"),
         "set_row": ("ur::step_engine(", "ur::step_resolution(", "ur::snap(", "row_fixed("),
     }
@@ -72,7 +72,8 @@ def main():
     resolution = function(menu, "const char* hn_resolution(int v, int variant) {")
     if "Sharpness to" in upscaler or "Sharpness to" in resolution or "80%" in upscaler or "upscaler()" not in resolution:
         raise SystemExit("hn_upscaler or hn_resolution: a line still asks for a Sharpness, or not for the Upscaler shown")
-    if upscaler.count("Sharpness sharpens its 3D before the HUD") != 1 or "v = ur::engine(v);" not in upscaler:
+    # ((Triforce) and Intel XeSS's line, which goes through the same RCAS)
+    if upscaler.count("Sharpness sharpens its 3D before the HUD") != 2 or "v = ur::engine(v);" not in upscaler:
         raise SystemExit("hn_upscaler: NVIDIA DLSS (and DLAA, its engine's line) does not say that Sharpness sharpens its 3D "
                          "before the HUD")
     measure = function(menu, "float measure_help(ui::Ctx& c, float width) {")

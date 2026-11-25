@@ -552,8 +552,8 @@ def cut_source():
     # (RX_VK_ACQUIRE_FENCE's helpers, from its switch to the note of a surface lost on the present thread)
     helpers = between(replay, "bool acquire_fence_on() {", "std::atomic<bool> surface_lost_noted{false};") + "\n"
     check("std::atomic<bool> surface_lost_noted{false};" in replay, "vk_replay.cpp has no note of a surface lost on the present thread")
-    parts["HELPERS"] = helpers
-    out = block(replay, "static void present_out(const PresentOut& o, std::unique_lock<std::mutex>& qk, bool on_thread) {")
+    parts["HELPERS"] = "// ((Triforce) RX_VK_PRESENT_CHECK's note of an acquire: nothing here)\nstatic void present_check_acquired(uint32_t, uint64_t) {}\n" + helpers
+    out = block(replay, "static void present_out(const PresentOut& o, std::unique_lock<QueueMutex>& qk, bool on_thread) {")
     parts["OUT"] = between(out, "    if (surface_recover(res)) {", "    if (res == VK_ERROR_OUT_OF_DATE_KHR || res == VK_SUBOPTIMAL_KHR) {",
                            inclusive=False)
     return main, replay, swap, image, out, parts

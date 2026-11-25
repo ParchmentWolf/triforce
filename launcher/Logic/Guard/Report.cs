@@ -43,8 +43,26 @@ public static class Report
         return NoName(s.ToString(), folders);
     }
 
+    /// <summary>((Triforce) 11-24) The PC as a problem report asks for it, beside the OS: the CPU's threads and the RAM, what a
+    /// build's compile needs most of.</summary>
+    public static string Pc()
+    {
+        var ram = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+        return "PC: " + Environment.ProcessorCount + " threads" + (ram > 0 ? ", " + ((ram + (1L << 29)) >> 30) + " GB of RAM" : "");
+    }
+
+    /// <summary>((Triforce) 11-24) The switches set in the launcher's environment that the build and the game read (RX_, HOS_,
+    /// HOOKSHOT_, TRIFORCE_), by their names alone: a value can be a path or something private, and is never in a report.</summary>
+    public static string Switches(IEnumerable<string> names)
+    {
+        var set = names.Where(n => new[] { "RX_", "HOS_", "HOOKSHOT_", "TRIFORCE_" }.Any(p => n.Length > p.Length && n.StartsWith(p, StringComparison.Ordinal)))
+                       .Distinct().OrderBy(n => n, StringComparer.Ordinal).ToList();
+        return "Switches set: " + (set.Count == 0 ? "none" : string.Join(", ", set) + " (their values are left out)");
+    }
+
     /// <summary>The report for a build that stopped (old Shell.cs CopyTheReport): the launcher's and tools' versions, the OS, the
-    /// step it stopped at, why, the command, the game folder and the install with their free space, then the logs.</summary>
+    /// step it stopped at, why, the command, the game folder and the install with their free space, the PC and the switches
+    /// set, then the logs.</summary>
     public static string ForBuild(TriforceContext ctx, BuildResult? result, string buildLines, string? toolsVersion, string? failure = null)
     {
         string Room(string folder) => ctx.FreeBytes(folder) is { } free ? " (" + ctx.Platform.Disk(folder) + " has " + (free >> 30) + " GB free)" : "";
@@ -58,6 +76,8 @@ public static class Report
             result?.CommandLine ?? "",
             "Game folder: " + (result?.OutFolder ?? "") + (result?.OutFolder is { } o ? Room(o) : ""),
             "Launcher: " + ctx.Home + Room(ctx.Home),
+            Pc(),
+            Switches(Environment.GetEnvironmentVariables().Keys.Cast<object>().Select(k => k.ToString() ?? "")),
         };
         var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         string? shortName = null;

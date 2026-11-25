@@ -158,7 +158,8 @@
     X(vkCmdSetDepthClipEnableEXT) X(vkCmdSetLogicOpEXT) X(vkCmdClearAttachments) X(vkCmdSetDepthBoundsTestEnable) \
     X(vkCmdSetCheckpointNV) X(vkGetQueueCheckpointDataNV) X(vkGetDeviceFaultInfoEXT) X(vkCmdWriteBufferMarkerAMD) \
     X(vkCreateDescriptorUpdateTemplate) X(vkUpdateDescriptorSetWithTemplate) X(vkCmdPushDescriptorSetWithTemplateKHR) \
-    X(vkCmdSetFragmentShadingRateKHR)
+    X(vkCmdSetFragmentShadingRateKHR) \
+    X(vkGetDeviceImageMemoryRequirements)
 
 namespace vkx {
 #define VKX_DECLARE(f) extern PFN_##f f;

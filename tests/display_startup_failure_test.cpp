@@ -28,6 +28,9 @@ static std::string mode;
 static unsigned loads, inits, windows, threads, offscreen, signals, sleeps, flushes, waited, prepares;
 static std::vector<std::string> logs;
 void hos_discord_start() {} // Inert optional IPC startup; the fixture exercises display startup only.
+// (host/hos_crash_dialog.c, host/hos_crash_record.c: the game itself, never a crash window's helper; no record here)
+int hos_crash_helper_main(int, char**) { return -1; }
+void hos_crash_clean_end() {}
 
 static void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -101,6 +104,7 @@ static void WaitForSingleObject(HANDLE h, unsigned timeout) {
     ++waited;
 }
 static void load_hookshot_env() {}
+#include "prepare_args.h"   // ((Triforce, 11-24) main takes a supervised preparation's arguments for no image: host/prepare_args.h
 
 #include "display_startup_actual.inc"
 
