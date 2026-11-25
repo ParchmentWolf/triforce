@@ -1,10 +1,11 @@
 #version 450
-// VR's HUD panel (runtime/vk_xr.cpp vk_xr_capture). The game upscales its scene into a float target and draws the HUD
-// over it there; vk_draw.cpp keeps that target as the upscaler left it (scene), and at the present it holds the HUD
-// too (hud). Both linear. Out, sRGB-encoded as the window's texture holds the game's picture: the scene without the HUD
-// for the head's view, and the panel, what the HUD changed, premultiplied, transparent where nothing changed. keep_hud
-// (the HUD left in the picture, depth stereo on): the scene out is the picture with its HUD.
-// glslangValidator -V --target-env vulkan1.3 --vn XR_HUD_COMP_SPV -o xr_hud_comp_spv.h xr_hud.comp
+// VR's HUD panel (vk_xr.cpp make_panel). layer: the game's HUD drawn apart (vk_draw.cpp xr_hud_again) over black in the picture's left
+// half and over white in its right: what both show alike is solid, what the white half adds is how much of what is behind shows
+// through, and the black half is its own light, so nothing of the world is in it. Else (no such picture) hud is the game's target
+// with its HUD and the panel what changed from the scene, which the upscaler left there before (scene). Both linear. Out,
+// sRGB-encoded as the window's texture holds the game's picture: the scene without the HUD for the head's view, and the panel,
+// premultiplied.
+// glslc --target-env=vulkan1.3 -mfmt=num xr_hud.comp (xr_hud_comp_spv.h)
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D hud;
 layout(binding = 1) uniform sampler2D scene;
@@ -12,7 +13,7 @@ layout(binding = 2, rgba8) uniform writeonly image2D scene_out;
 layout(binding = 3, rgba8) uniform writeonly image2D panel_out;
 layout(push_constant) uniform Push {
     ivec2 size;
-    int keep_hud;
+    int layer;
     int cut;   // the panel left clear within this many pixels of its middle (the game's reticle while Link aims), 0 none
 } p;
 
@@ -24,10 +25,20 @@ vec3 encode(vec3 c) {
 void main() {
     const ivec2 at = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(at, p.size))) return;
-    const vec3 h = encode(texelFetch(hud, at, 0).rgb), s = encode(texelFetch(scene, at, 0).rgb);
-    const vec3 d = abs(h - s);
-    float a = smoothstep(0.01, 0.06, max(d.r, max(d.g, d.b)));
-    if (p.cut > 0 && length(vec2(at) + 0.5 - vec2(p.size) * 0.5) < float(p.cut)) a = 0.0;
-    imageStore(scene_out, at, vec4(p.keep_hud != 0 ? h : s, 1.0));
-    imageStore(panel_out, at, vec4(h * a, a));
+    const vec3 s = encode(texelFetch(scene, at, 0).rgb);
+    vec4 panel;
+    if (p.layer != 0) {
+        const vec3 black = max(texelFetch(hud, at, 0).rgb, 0.0), white = max(texelFetch(hud, at + ivec2(p.size.x, 0), 0).rgb, 0.0);
+        const float a = clamp(1.0 - dot(white - black, vec3(1.0 / 3.0)), 0.0, 1.0);
+        // (its own colour, not darkened by how thin it is, put back at that thinness; a glow adds light with nothing solid under it)
+        const vec3 c = a > 1.0 / 512.0 ? encode(black / a) * a : vec3(0.0);
+        panel = vec4(max(c, encode(black) * (1.0 - a)), a);
+    } else {
+        const vec3 h = encode(texelFetch(hud, at, 0).rgb), d = abs(h - s);
+        const float a = smoothstep(0.01, 0.06, max(d.r, max(d.g, d.b)));
+        panel = vec4(h * a, a);
+    }
+    if (p.cut > 0 && length(vec2(at) + 0.5 - vec2(p.size) * 0.5) < float(p.cut)) panel = vec4(0.0);
+    imageStore(scene_out, at, vec4(s, 1.0));
+    imageStore(panel_out, at, panel);
 }

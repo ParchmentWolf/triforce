@@ -400,6 +400,7 @@ typedef struct MkwVkXr {
     void (*child)(int child);
     void (*hand_item)(const char *model);
     void (*in_play)(int on);
+    void (*item_bar)(int open);
     void (*aim_freeze)(int on);
     int (*pointer)(double dir[3]);
     void (*aim)(int on, const double origin[3], const double dir[3]);

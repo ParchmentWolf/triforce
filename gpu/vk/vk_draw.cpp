@@ -9127,6 +9127,82 @@ static bool fallback_list_held(uint64_t list) {
 }
 
 static bool program_writes_memory(const Program& p);   // ((Triforce) writes_memory, kept per program: below draw())
+/// (Triforce VR) the scene's picture of this frame, once it is upscaled, and the HUD's own layer (xr_hud_begin)
+struct XrHud {
+    std::mutex mu;   // (the replay's helpers draw too)
+    const Texture* out = nullptr;
+    VkImageView view = VK_NULL_HANDLE;
+    uint64_t frame = 0;
+};
+static XrHud xr_hud;
+/// (Triforce VR) the HUD's own layer cleared: its left half black, its right white (a clear covers its render area alone)
+static void xr_hud_clear(VkCommandBuffer cmd, VkImageView view, uint32_t width, uint32_t height) {
+    for (int half = 0; half < 2; half++) {
+        VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        ca.imageView = view, ca.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        ca.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        for (int k = 0; k < 4; k++) ca.clearValue.color.float32[k] = half ? 1.0f : 0.0f;
+        VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+        ri.renderArea = {{(int32_t)(half * width), 0}, {width, height}};
+        ri.layerCount = 1, ri.colorAttachmentCount = 1, ri.pColorAttachments = &ca;
+        vkCmdBeginRendering(cmd, &ri);
+        vkCmdEndRendering(cmd);
+        full_barrier(cmd);
+    }
+}
+/// (Triforce VR) the draw just made shows a picture of the scene (the item bar's background: the paused game's, the HUD's own target's
+/// format, which holds no transparency)
+static bool xr_hud_scene_picture(const Targets& at) {
+    for (const Texture* t : gfx_sampled())
+        if (t && t->format == at.color[0]->format && t->width * 4 >= at.width && t->height * 4 >= at.height) return true;
+    return false;
+}
+/// (Triforce VR) a HUD draw just recorded (into the upscale's output alone, no depth: none of the HUD's has one, nor reads the picture),
+/// recorded again (issue) into both halves of the HUD's own layer, with the same pipeline, descriptors and state but the viewport and
+/// the scissor, each kept to its half; those two set back after
+template <class Issue>
+static void xr_hud_again(VkCommandBuffer cmd, const Targets& at, Issue&& issue) {
+    if (at.n != 1 || at.depth || !last_dyn_valid) return;
+    VkImageView view;
+    const bool bar = vk_xr_item_bar_open();
+    bool fresh = false;
+    {
+        std::lock_guard<std::mutex> g(xr_hud.mu);
+        if (!xr_hud.out || at.color[0] != xr_hud.out) return;
+        if (xr_hud.frame != texture_frame_no()) {   // (the game paused, no scene drawn: the layer is the item bar's alone)
+            if (!bar || !vk_xr_item_bar_layer(at.color[0]->image, at.width, at.height)) return;
+            xr_hud.frame = texture_frame_no(), fresh = true;
+        }
+        view = xr_hud.view;
+    }
+    const bool behind = bar && xr_hud_scene_picture(at);
+    const VkViewport vp = last_dyn.vp;
+    const VkRect2D sc = last_dyn.sc;
+    end_pass(cmd);
+    full_barrier(cmd);
+    if (fresh || behind) xr_hud_clear(cmd, view, at.width, at.height);
+    if (behind) return;   // the item bar's background, and the HUD it covers
+    VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    ca.imageView = view, ca.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    ca.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    ri.renderArea = {{0, 0}, {at.width * 2, at.height}};
+    ri.layerCount = 1, ri.colorAttachmentCount = 1, ri.pColorAttachments = &ca;
+    vkCmdBeginRendering(cmd, &ri);
+    for (int half = 0; half < 2; half++) {
+        VkViewport v = vp;
+        v.x += (float)(half * at.width);
+        const int64_t x0 = std::clamp<int64_t>(sc.offset.x, 0, at.width), x1 = std::clamp<int64_t>((int64_t)sc.offset.x + sc.extent.width, x0, at.width);
+        const VkRect2D r{{(int32_t)(x0 + half * (int64_t)at.width), sc.offset.y}, {(uint32_t)(x1 - x0), sc.extent.height}};
+        vkCmdSetViewportWithCount(cmd, 1, &v);
+        vkCmdSetScissorWithCount(cmd, 1, &r);
+        issue();
+    }
+    vkCmdEndRendering(cmd);
+    full_barrier(cmd);
+    vkCmdSetViewportWithCount(cmd, 1, &vp);
+    vkCmdSetScissorWithCount(cmd, 1, &sc);
+}
 void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     Pass& ps = pass();   // ((Triforce, 11-22, DESC-20) once a call: the thread's one Pass, reset in place, never swapped (TLS_OBJECT(pass))
     lab_ab::each(lab_ab::E_DRAW);   // ((Triforce, 11-22, REPLAY-51) the lab's e_draw: a wait at each draw, before the profile's clock
@@ -10031,8 +10107,12 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
                          (uint32_t)d.base_instance);
         st_draws++, ps.draws++;
         if (occ_live) occ_draw_issued();
+        xr_hud_again(cmd, at, [&] {
+            vkCmdDrawIndexed(cmd, quads * 6, (uint32_t)std::max(1, d.instances), 0, d.indexed ? d.base_vertex : 0, (uint32_t)d.base_instance);
+        });
         return;
     }
+    uint32_t again_first = 0;   // ((Triforce VR) an indexed draw's first index, as issued: xr_hud_again)
     if (d.indirect) {
         // (hookshot) the records the draw reads, at the stride it reads them with (20 for indexed draws), all bound; a
         // negative count or stride from the game is no draw
@@ -10070,6 +10150,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         }
         push_capture(cmd, p, s, d, at, topo, true);
         FINE_SCOPE(FT_DRAWCALL);
+        again_first = first_index;
         vkCmdDrawIndexed(cmd, (uint32_t)d.count, (uint32_t)std::max(1, d.instances), first_index, d.base_vertex, (uint32_t)d.base_instance);
     } else {
         push_capture(cmd, p, s, d, at, topo, true);
@@ -10078,6 +10159,11 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     }
     st_draws++, ps.draws++;
     if (occ_live) occ_draw_issued();
+    if (!d.indirect)
+        xr_hud_again(cmd, at, [&] {
+            if (d.indexed) vkCmdDrawIndexed(cmd, (uint32_t)d.count, (uint32_t)std::max(1, d.instances), again_first, d.base_vertex, (uint32_t)d.base_instance);
+            else vkCmdDraw(cmd, (uint32_t)d.count, (uint32_t)std::max(1, d.instances), (uint32_t)d.first, (uint32_t)d.base_instance);
+        });
 }
 // ((Triforce, redrawn.h) asked at every draw: a walk of the stages' few descriptor lists. Not kept in the Program: a field
 // there changes sizeof(Program), which the program cache's stamp holds (vk_shader.cpp disk_stamp), and every player's
@@ -10242,6 +10328,29 @@ static Texture* xr_keep_scene_depth(VkCommandBuffer cmd, Texture* out, uint32_t 
     }
     return out;
 }
+/// (Triforce VR) The HUD's own layer (vk_xr_hud_layer) begun for this frame: its left half black, its right white. From here on the
+/// draws into the upscale's output (the HUD's) are drawn into both halves too (xr_hud_again)
+static void xr_hud_begin(VkCommandBuffer cmd, const Texture* out) {
+    VkImage image = VK_NULL_HANDLE;
+    int init = 0;
+    const VkImageView view = vk_xr_hud_layer(&image, &init);
+    std::lock_guard<std::mutex> g(xr_hud.mu);
+    xr_hud.out = nullptr;
+    if (!view) return;
+    if (init) {
+        VkImageMemoryBarrier2 ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        ib.srcStageMask = ib.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        ib.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+        ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        ib.image = image, ib.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        dep.imageMemoryBarrierCount = 1, dep.pImageMemoryBarriers = &ib;
+        vkCmdPipelineBarrier2(cmd, &dep);
+    }
+    xr_hud_clear(cmd, view, out->width, out->height);
+    xr_hud.out = out, xr_hud.view = view, xr_hud.frame = texture_frame_no();
+}
 /// (Triforce VR) the gameplay upscale's output, once recorded, copied for VR's HUD panel and depth stereo (vk_xr_scene_image)
 struct XrAfterUpscale {
     VkCommandBuffer cmd;
@@ -10268,6 +10377,7 @@ struct XrAfterUpscale {
         cp.extent = {out->width, out->height, 1};
         vkCmdCopyImage(cmd, out->image, VK_IMAGE_LAYOUT_GENERAL, keep, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
         full_barrier(cmd);
+        xr_hud_begin(cmd, out);
     }
 };
 bool upscale_stub(VkCommandBuffer cmd, const NvnState& s, uint64_t key) {

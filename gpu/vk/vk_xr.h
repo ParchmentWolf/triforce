@@ -81,6 +81,7 @@ void vk_xr_child(int child);
 void vk_xr_hand_item(const char *model);
 // vr_game.c, the game's thread: in play now (not a menu, a pause, an event), the Touch controllers' play roles on
 void vk_xr_in_play(int on);
+void vk_xr_item_bar(int open);
 // vr_game.c, the gameplay camera's update: while the controller steers the aim, the view's base yaw held (on); and
 // where the sword hand's controller points, a unit direction in the game's world; 0 when its pose is not known
 void vk_xr_aim_freeze(int on);
@@ -100,6 +101,13 @@ int vk_xr_hands(double pos[6], double point[6], double palm[6]);
 // be drawn over it: the image VR keeps it in (the caller copies it there in its stream), VK_NULL_HANDLE when the HUD's
 // panel is not made now. *init 1: the image is new (UNDEFINED; the caller makes it GENERAL first)
 VkImage vk_xr_scene_image(VkImage target, uint32_t w, uint32_t h, VkFormat format, int *init);
+// after it: the picture the HUD is drawn apart in (vk_draw.cpp xr_hud_again), twice as wide as the scene, over black in its left half
+// and over white in its right; *init as the scene's. Null: none, the panel is made from what the HUD changed
+VkImageView vk_xr_hud_layer(VkImage *image, int *init);
+/* the game's item bar is open (its background screen: vr_game.c); and while the game is paused for it, its frame's first draw
+   into the HUD's target: 1 while that is the target the layer is for, the layer then this frame's panel */
+int vk_xr_item_bar_open(void);
+int vk_xr_item_bar_layer(VkImage target, uint32_t w, uint32_t h);
 // (diagnostics) a gameplay upscale's dispatch seen while VR is on; taken: its output found and kept for VR
 void vk_xr_note_upscale(int taken);
 // the hand controllers' buttons (HOS_SW_* bits, as labelled) and sticks while they are a menu's (not in play): 1, for this

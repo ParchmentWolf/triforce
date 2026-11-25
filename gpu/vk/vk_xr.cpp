@@ -169,6 +169,7 @@ struct Xr {
     // inventory) draws flat pictures while the camera stands still, and those go on the screen
     std::atomic<uint32_t> updates{0};
     int stale = 0;   // the present's thread alone
+    int moving = 0;   // (so is this: the pictures since the game's camera last stood still)
     // the HUD's panel. The game draws its HUD over its upscaled scene in one float target; the
     // scene as the upscaler left it is kept (vk_xr_scene_image, the replay's stream), and at the present, when the
     // target holds the HUD too, shaders/xr_hud.comp makes the scene without the HUD and the HUD's panel from the two
@@ -176,6 +177,10 @@ struct Xr {
     VkImage hud_target = VK_NULL_HANDLE, scene = VK_NULL_HANDLE, scene8 = VK_NULL_HANDLE, panel8 = VK_NULL_HANDLE;
     VkImageView target_view = VK_NULL_HANDLE, scene_view = VK_NULL_HANDLE, scene8_view = VK_NULL_HANDLE, panel8_view = VK_NULL_HANDLE;
     VkImage target_viewed = VK_NULL_HANDLE;   // the target target_view is of
+    VkImage layer = VK_NULL_HANDLE;   // ((Triforce VR) the HUD drawn apart, over black and over white (vk_xr_hud_layer)
+    VkImageView layer_view = VK_NULL_HANDLE;
+    std::atomic<bool> item_bar{false};    // vr_game.c: the game's item bar is open
+    std::atomic<bool> bar_drawn{false};   // the paused frame's item bar drawn into the layer (vk_xr_item_bar_layer), not shown yet
     uint32_t hud_w = 0, hud_h = 0;
     VkFormat hud_format = VK_FORMAT_UNDEFINED;
     uint64_t kept = 0, used = 0;   // scenes kept, and the last one a panel was made from
@@ -759,13 +764,13 @@ bool stereo_turns() { return stereo_balanced(); }
 bool stereo_accurate() { return strcmp(cfg_value("VR_STEREO"), "accurate") == 0; }
 std::atomic<double> update_step{-1};
 
-// (vk_xr_capture, hud_mu held) the scene without the HUD (with it: keep_hud) and the HUD's panel made from the target as
-// it is now and the scene kept from before the HUD, the panel clear within `cut` pixels of its middle (the game's
+// (vk_xr_capture, hud_mu held) the scene without the HUD and the HUD's panel, made from the HUD's own layer (without one: from
+// the target as it is now and the scene kept from before the HUD), the panel clear within `cut` pixels of its middle (the game's
 // reticle while Link aims); false when there is nothing new to make them from
-bool make_panel(VkCommandBuffer cb, bool keep_hud, int cut, VkImageView tview = VK_NULL_HANDLE, VkImageView sview = VK_NULL_HANDLE) {
+bool make_panel(VkCommandBuffer cb, int cut, VkImageView tview = VK_NULL_HANDLE, VkImageView sview = VK_NULL_HANDLE, bool again = false) {
     Xr &x = xr();
     if (!x.scene || !x.hud_target) return x.panel_no_scene++, false;
-    if (x.kept == x.used && !tview) return x.panel_not_new++, false;
+    if (x.kept == x.used && !tview && !again) return x.panel_not_new++, false;
     if (!x.hud_tried) {
         x.hud_tried = true;
         if (!make_hud_pipeline()) {
@@ -793,10 +798,11 @@ bool make_panel(VkCommandBuffer cb, bool keep_hud, int cut, VkImageView tview = 
         x.target_viewed = x.hud_target;
     }
     x.used = x.kept;
+    if (x.layer) barrier(cb, x.layer, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
     barrier(cb, x.scene8, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     barrier(cb, x.panel8, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.hud_pipe);
-    const VkDescriptorImageInfo info[4] = {{x.nearest, tview ? tview : x.target_view, VK_IMAGE_LAYOUT_GENERAL},
+    const VkDescriptorImageInfo info[4] = {{x.nearest, x.layer ? x.layer_view : tview ? tview : x.target_view, VK_IMAGE_LAYOUT_GENERAL},
                                            {x.nearest, sview ? sview : x.scene_view, VK_IMAGE_LAYOUT_GENERAL},
                                            {VK_NULL_HANDLE, x.scene8_view, VK_IMAGE_LAYOUT_GENERAL},
                                            {VK_NULL_HANDLE, x.panel8_view, VK_IMAGE_LAYOUT_GENERAL}};
@@ -807,7 +813,7 @@ bool make_panel(VkCommandBuffer cb, bool keep_hud, int cut, VkImageView tview = 
         w[i].pImageInfo = &info[i];
     }
     vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.hud_layout, 0, 4, w);
-    const int32_t pc[4] = {(int32_t)x.hud_w, (int32_t)x.hud_h, keep_hud ? 1 : 0, cut};
+    const int32_t pc[4] = {(int32_t)x.hud_w, (int32_t)x.hud_h, x.layer ? 1 : 0, cut};
     vkCmdPushConstants(cb, x.hud_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
     vkCmdDispatch(cb, (x.hud_w + 7) / 8, (x.hud_h + 7) / 8, 1);
     barrier(cb, x.scene8, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
@@ -2777,7 +2783,7 @@ extern "C" VkImage vk_xr_scene_image(VkImage target, uint32_t w, uint32_t h, VkF
     if (x.hud_tried && !x.hud_pipe) return VK_NULL_HANDLE;   // the panel could not be made: the HUD stays in the picture
     if (!x.scene || x.hud_w != w || x.hud_h != h || x.hud_format != format) {
         // (images of another size are left behind: the picture's size changes rarely, at a setting)
-        x.scene = x.scene8 = x.panel8 = VK_NULL_HANDLE, x.used = x.kept;
+        x.scene = x.scene8 = x.panel8 = x.layer = VK_NULL_HANDLE, x.used = x.kept;
         if (!make_image(w, h, format, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, x.scene, x.scene_view)) {
             static int told_fail;
             if (told_fail++ < 4) rt_log("vr: the HUD panel's scene image %ux%u format %d could not be made", w, h, (int)format);
@@ -2800,6 +2806,36 @@ extern "C" VkImage vk_xr_scene_image(VkImage target, uint32_t w, uint32_t h, VkF
     x.kept++;
     x.scenes_kept++;
     return x.scene;
+}
+
+extern "C" VkImageView vk_xr_hud_layer(VkImage *image, int *init) {
+    Xr &x = xr();
+    std::lock_guard<std::mutex> lk(x.hud_mu);
+    *init = 0;
+    static const bool on = !(getenv("RX_VK_XR_HUD_LAYER") && atoi(getenv("RX_VK_XR_HUD_LAYER")) == 0);
+    static bool failed;
+    if (!on || failed || !x.scene || !x.hud_w) return VK_NULL_HANDLE;
+    if (!x.layer) {
+        if (!make_image(x.hud_w * 2, x.hud_h, x.hud_format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, x.layer, x.layer_view)) {
+            x.layer = VK_NULL_HANDLE, failed = true;
+            rt_log("vr: the HUD's own layer could not be made: the panel is what the HUD changed, as before");
+            return VK_NULL_HANDLE;
+        }
+        rt_log("vr: the HUD's own layer: %ux%u format %d", x.hud_w * 2, x.hud_h, (int)x.hud_format);
+        *init = 1;
+    }
+    *image = x.layer;
+    return x.layer_view;
+}
+
+extern "C" int vk_xr_item_bar_open(void) { return xr().item_bar.load(std::memory_order_relaxed); }
+extern "C" void vk_xr_item_bar(int open) { xr().item_bar.store(open != 0); }
+extern "C" int vk_xr_item_bar_layer(VkImage target, uint32_t w, uint32_t h) {
+    Xr &x = xr();
+    std::lock_guard<std::mutex> lk(x.hud_mu);
+    if (!x.layer || x.hud_target != target || x.hud_w != w || x.hud_h != h) return 0;
+    x.bar_drawn.store(true);
+    return 1;
 }
 
 // Stereo Accurate: the right eye's pass begins (phase 1: the left eye's target, picture and HUD, copied apart first) or ends (0)
@@ -2921,6 +2957,8 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
     // gameplay camera update put on it; else the window for the screen
     Drawn d;
     x.stale = x.updates.exchange(0) ? 0 : x.stale + 1;
+    x.moving = x.stale ? 0 : x.moving + 1;
+    if (x.moving > 60) x.item_bar.store(false);   // (play goes on: the bar is closed, however it went)
     const bool head = x.head_view.load(std::memory_order_relaxed) && have_picture;
     if (head && x.stale < 3) {
         std::lock_guard<std::mutex> lk(x.frame_mu);
@@ -2960,7 +2998,16 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
         barrier(cb, hb, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         // this menu open over the game's Options screen, or that screen on its own tab with ours drawn over its header: the
         // window's picture, with them ((Triforce VR) at once, not only after L or R opens one of ours)
-        if (menu_embedded() || mkwvk::menu_game_options()) {
+        bool bar = x.bar_drawn.exchange(false) && x.item_bar.load() && !menu_embedded();
+        if (bar) {   // the item bar, apart from its background
+            std::lock_guard<std::mutex> lk(x.hud_mu);
+            bar = x.layer && make_panel(cb, 0, VK_NULL_HANDLE, VK_NULL_HANDLE, true);
+            b.srcOffsets[0] = {0, 0, 0};
+            b.srcOffsets[1] = {(int32_t)x.hud_w, (int32_t)x.hud_h, 1};
+            if (bar) vkCmdBlitImage(cb, x.panel8, VK_IMAGE_LAYOUT_GENERAL, hb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+        }
+        if (bar) {
+        } else if (menu_embedded() || mkwvk::menu_game_options()) {
             int wr[4];
             gfx_fit_rect(rect[2], rect[3], (int)extent.width, (int)extent.height, wr);
             b.srcOffsets[0] = {wr[0], wr[1], 0};
@@ -2988,7 +3035,7 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
     if (d.tracked) {
         std::lock_guard<std::mutex> lk(x.hud_mu);
         const bool pair = d.eye == 0 && stereo_accurate() && x.acc_ready;   // (Accurate: the left eye's target as its pass left it)
-        made = make_panel(cb, false, d.aim ? (int)(0.06f * (float)x.hud_h) : 0, pair ? x.target_l_view : VK_NULL_HANDLE);
+        made = make_panel(cb, d.aim ? (int)(0.06f * (float)x.hud_h) : 0, pair ? x.target_l_view : VK_NULL_HANDLE);
         hw = x.hud_w, hh = x.hud_h;
         if (made) make_aim(cb, d);
         if (made && depth && d.eye < 0) d.stereo = make_eyes(cb, d);
@@ -3003,7 +3050,7 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
             rotate(d.pose.q, right, hr2);
             const float shift = x.acc_shift.load(std::memory_order_relaxed);
             for (int c = 0; c < 3; c++) r.pose.p[c] += shift * hr2[c];
-            if (make_panel(cb, false, d.aim ? (int)(0.06f * (float)x.hud_h) : 0, x.target_view, x.scene_r_view)) {
+            if (make_panel(cb, d.aim ? (int)(0.06f * (float)x.hud_h) : 0, x.target_view, x.scene_r_view)) {
                 desat_right(cb);   // (its colours down to the left eye's)
                 keep_eye(cb, r);
                 d = r;
@@ -3126,7 +3173,7 @@ extern "C" const MkwVkXr *vk_xr_table(void) {
     static const MkwVkXr t = {
         vk_xr_cfg, vk_xr_head_active, vk_xr_camera, vk_xr_lens, vk_xr_holds_time, vk_xr_update_step, vk_xr_pad,
         vk_xr_ocarina, vk_xr_weapon_out, vk_xr_child,
-        vk_xr_hand_item, vk_xr_in_play, vk_xr_aim_freeze, vk_xr_pointer, vk_xr_aim, vk_xr_untracked, vk_xr_hands,
+        vk_xr_hand_item, vk_xr_in_play, vk_xr_item_bar, vk_xr_aim_freeze, vk_xr_pointer, vk_xr_aim, vk_xr_untracked, vk_xr_hands,
         vk_xr_active, vk_xr_head_worn, vk_xr_hud_hidden, vk_xr_carrying, vk_xr_head_request};
     return &t;
 }
@@ -3247,7 +3294,7 @@ extern "C" void vk_xr_flat3d(VkCommandBuffer cb, VkImage window, int hdr, const 
     const float p00 = lens_p00.load(std::memory_order_relaxed);
     const bool cam = vk_xr_planes(planes) && p00 > 0.0f && x.depth_kept;
     bool made = false;
-    if (cam && make_panel(cb, false, 0)) {
+    if (cam && make_panel(cb, 0)) {
         if (!x.flat_tried) {
             x.flat_tried = true;
             if (!make_flat_pipelines()) {

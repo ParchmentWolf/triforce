@@ -213,6 +213,27 @@ def patch_after_anim(source):
     return source, sites
 
 
+# (Triforce VR) The sequence's open-screen and close-screen nodes, f_80c86420 and f_80ba0e60 (the node in x0, its screen's name a
+# parameter): VR keeps the item bar's background off the HUD's panel (host/vr_game.c hos_vr_screen).
+VR_SCREEN_HEADS = (("void f_80c86420(Ctx *__restrict A64_NOESC c) {\n", 1), ("void f_80ba0e60(Ctx *__restrict A64_NOESC c) {\n", 0))
+
+
+def patch_vr_screens(source):
+    """(source, the nodes with the hook: made here or before)"""
+    sites = 0
+    for head, opens in VR_SCREEN_HEADS:
+        hook = "    hos_vr_screen(c, %d);   /* (nx2/oot_patches.py: VR) */\n" % opens
+        at = source.find(head)
+        if at < 0:
+            continue
+        sites += 1
+        if hook not in source:
+            source = source[:at + len(head)] + hook + source[at + len(head):]
+    if sites and "extern void hos_vr_screen(Ctx *c, int open);" not in source:
+        source = source.replace('#include "a64.h"\n', '#include "a64.h"\nextern void hos_vr_screen(Ctx *c, int open);\n', 1)
+    return source, sites
+
+
 def patch_vr(source):
     start = source.find(VIEW_HEAD)
     if start < 0:
@@ -1082,6 +1103,9 @@ def apply(gen, *, protect_hearts=False, required=False):
             if n:
                 anim_sites += n
                 print("oot_patches: the late bone pass's VR hook at %d call(s) in %s" % (n, os.path.basename(path)))
+            out, n = patch_vr_screens(out)
+            if n:
+                print("oot_patches: VR's screen hooks at %d node(s) in %s" % (n, os.path.basename(path)))
             out, n = patch_sword(out)
             if n:
                 sword_sites += n

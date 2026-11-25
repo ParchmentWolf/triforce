@@ -132,6 +132,16 @@ static int oot_paused(void) {
 }
 
 int vr_game_paused(void) { return oot_paused(); }
+void hos_vr_screen(Ctx *c, int open) {
+    if (!xr()) return;
+    const uint64_t param = oot_data_ptr(gw(), c->x[0] + 32) & ~3ULL, text = param ? oot_data_ptr(gw(), param) : 0;
+    char name[16] = "";
+    if (!text || !oot_data_rd(gw(), text, name, sizeof name - 1)) return;
+    name[sizeof name - 1] = 0;
+    if (strncmp(name, "ShortCutBG_00", 13)) return;
+    xr()->item_bar(open);
+    hos_log("vr: the item bar %s", open ? "opened" : "closed");
+}
 int vr_game_two_handed(void) {
     char weapon[64] = "";
     oot_data_text(gw(), "PlayerStatus.EquipWeapon", weapon);
@@ -687,8 +697,10 @@ static int event_view(uint64_t event) {
     char state[48];
     oot_link_state_at(state, 0x244);
     const size_t n = strlen(name);
-    /* the system's events (a load zone's two halves, Dm_SY_BancChangeGo and ..._Arrive_<place>; a void out, DmF_SY_FallDown) */
-    if (strstr(name, "_SY_") || strstr(name, "BancChange")) return EV_EYES_NO_HUD;
+    /* a load zone's two halves (Dm_SY_BancChangeGo and ..._Arrive_<place>) and a void out (DmF_SY_FallDown): no HUD; the system's
+       others (the ocarina, Dm_SY_Ocarina) with it */
+    if (strstr(name, "BancChange") || strstr(name, "FallDown")) return EV_EYES_NO_HUD;
+    if (strstr(name, "_SY_")) return EV_EYES;
     /* caught by the castle's guards: the talk, then the throw-out to the gate (from his flinch's end on) */
     if (!strcmp(name, "HyruleCastle_FoundBySecurity")) {
         if (!strcmp(state, "EvtFlinchLong")) flinched = 1;

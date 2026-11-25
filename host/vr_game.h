@@ -13,6 +13,8 @@
 void hos_vr_camera(Ctx *c);
 /* the same update's load of the camera's vertical angle into s0 (from x19 + 0x13c): the headset's lens in its place */
 void hos_vr_lens(Ctx *c);
+/* the sequence's open-screen and close-screen nodes (x0): the item bar's background, for its place off the HUD's panel */
+void hos_vr_screen(Ctx *c, int open);
 /* nn_hid.c npad_states: the Touch controllers onto the pad (buttons, stick[0..1] left, [2..3] right), then first person's
    strafe (the game's thread) */
 void vr_pad_read(Ctx *c, uint64_t *buttons, int32_t stick[4]);
