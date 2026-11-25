@@ -406,8 +406,9 @@ typedef struct MkwVkXr {
     void (*untracked)(void);
     int (*hands)(double pos[6], double point[6], double palm[6]);   /* (Triforce VR) the controllers in the game's world */
     int (*active)(void);   /* (Triforce VR) a session runs: without one the game's side does nothing (vk_xr_active) */
-    void (*head_worn)(int what);   /* (Triforce VR) what Link wears on his head: 0 nothing, 1 a mask, 2 the Lens of Truth */
+    void (*head_worn)(int what);   /* (Triforce VR) his head's item: 0 none, 1 a mask, 2 the Lens of Truth; +4 while worn; +8 a mask was in it before */
     void (*hud_hidden)(int hidden);   /* (Triforce VR) 1: no HUD panel now (a load zone's transition) */
+    int (*head_request)(void);   /* (Triforce VR) the gestures' ask for his head, taken: 0 none, 1 the mask on, 2 the Lens of Truth on, 3 off */
 } MkwVkXr;
 
 /* the DLL's one export: null when Vulkan is not usable (the executable then falls back to WebGPU) */

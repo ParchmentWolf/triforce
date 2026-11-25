@@ -659,11 +659,15 @@ static int ma_wanted(void) {
         if (file < 0) file = hos_ini_option("right_handed_link", 0);
         opt = rx_option(HOS_OPT_RIGHT_HANDED, file) != 0;
     }
+    /* ((Triforce VR) a quest item shown is held in the other hand from the sword's: the mirror the other way meanwhile) */
+    static int64_t show_at;
+    static int showing;
+    if (now - show_at > 50000000LL) show_at = now, showing = vr_game_showing_item();
     {   /* (in VR what the hands last did decides: the sword's hand, an item's, the ocarina's pointing) */
         const char *m = body_cfg("VR_MIRROR");
-        if (m[0]) return !strcmp(m, "on");
+        if (m[0]) return !strcmp(m, "on") != showing;
     }
-    return opt || vr_sword_right();
+    return (opt || vr_sword_right()) != showing;
 }
 static void xf_id(Xf *x) {
     memset(x, 0, sizeof *x);

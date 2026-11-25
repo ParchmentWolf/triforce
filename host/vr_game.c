@@ -132,6 +132,107 @@ static int oot_paused(void) {
 }
 
 int vr_game_paused(void) { return oot_paused(); }
+
+/* ---- ((Triforce VR) his head's item for the gestures: a mask or the Lens of Truth, worn by a flag of the game data beside
+   PlayerStatus.EquipHeadArmor, which keeps the item while it is off (the game's own D-pad up sets and clears it). The flag set
+   through the game's setter for a Bool (f_806a2b20: the manager, the value, the hash); another item put in the member through
+   the game's setter for a struct's text member (f_80464840), and the pouch then takes the equipment again (f_80f401b0), as the
+   game's own Equipment page does ---- */
+#define WORN_HEAD 0xc27c80fbu
+static int worn_head(void) {
+    const uint64_t e = oot_data_entry(gw(), 0, 0x18, WORN_HEAD);
+    uint8_t b = 0;
+    return e && rd(e + 0x16, &b, 1) && (b & 1);
+}
+static void game_call(Ctx *c, uint64_t fn, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3) {
+    A64Fn f = a64_lookup(fn);
+    if (!f) return;
+    const Ctx saved = *c;
+    c->x[31] = (c->x[31] - 0x100) & ~0xfULL;
+    c->x[0] = a0, c->x[1] = a1, c->x[2] = a2, c->x[3] = a3;
+    f(c);
+    *c = saved;
+}
+static void worn_head_set(Ctx *c, int on) {
+    const uint64_t mgr = oot_data_gdm(gw());
+    if (mgr) game_call(c, 0x806a2b20ULL, mgr, (uint64_t)(on != 0), WORN_HEAD, 0);
+}
+static void head_item_set(Ctx *c, const char *value) {
+    A64Fn set = a64_lookup(0x80464840ULL);
+    const uint64_t mgr = oot_data_gdm(gw()), desc = oot_data_entry(gw(), 32, 0x20, oot_data_hash("PlayerStatus"));
+    const size_t n = strlen(value) + 1;
+    if (!set || !mgr || !desc || n > 64) return;
+    const Ctx saved = *c;
+    c->x[31] = (c->x[31] - 0x100) & ~0xfULL;
+    const uint64_t handle = c->x[31] + 0x80, ptr = handle + 0x10, text = ptr + 0x10;
+    recomp_store64(c, handle, desc), recomp_store64(c, handle + 8, 0);
+    for (size_t i = 0; i < n; i++) recomp_store8(c, text + i, (uint8_t)value[i]);
+    recomp_store64(c, ptr, text);
+    c->x[0] = mgr, c->x[1] = ptr, c->x[2] = handle, c->x[3] = oot_data_hash("EquipHeadArmor");
+    set(c);
+    *c = saved;
+}
+/* an item got once (struct 0xade0ef78's Bool of its name): the Lens of Truth only once it is his */
+static int got_once(const char *name) {
+    const uint64_t desc = oot_data_entry(gw(), 32, 0x20, 0xade0ef78u), members = desc ? rd_ptr(desc + 8) : 0;
+    uint32_t size = 0;
+    if (!members || !rd(desc + 20, &size, 4) || !size) return 0;
+    const uint32_t h = oot_data_hash(name);
+    for (uint32_t k = 0, i = h % size; k < size; k++, i = (i + 1) % size) {
+        uint32_t pair[2];
+        if (!rd(members + (uint64_t)i * 8, pair, 8) || !pair[0]) return 0;
+        if (pair[0] != h) continue;
+        const uint64_t e = oot_data_entry(gw(), 0, 0x18, pair[1]);
+        uint8_t b = 0;
+        return e && rd(e + 0x16, &b, 1) && (b & 1);
+    }
+    return 0;
+}
+static int head_sync;   /* (pad reads left to wait for the manager to take the new item: then the pouch takes it) */
+static char head_want[64];   /* (the item head_sync waits for) */
+static char last_mask[64];   /* (the last mask in the member: dragged on again after the Lens of Truth took its place) */
+static void head_take(Ctx *c, int request) {
+    char now[64] = "";
+    oot_data_text(gw(), "PlayerStatus.EquipHeadArmor", now);
+    if (request == 3) worn_head_set(c, 0), hos_log("vr: head: off");
+    else if (request == 1 && strstr(now, "Mask")) worn_head_set(c, 1), hos_log("vr: head: %s on", now);
+    else if (request == 1 && last_mask[0]) {   /* (the Lens in its place: the last mask back) */
+        head_item_set(c, last_mask), snprintf(head_want, sizeof head_want, "%s", last_mask), head_sync = 60;
+        worn_head_set(c, 1), hos_log("vr: head: %s on (in place of the Lens of Truth)", last_mask);
+    }
+    else if (request == 2) {
+        static const char lens[] = "Armor_GlassTruth";
+        if (!got_once(lens)) {
+            hos_log("vr: head: the Lens of Truth asked for, not his yet");
+            return;
+        }
+        if (strcmp(now, lens)) head_item_set(c, lens), snprintf(head_want, sizeof head_want, "%s", lens), head_sync = 60;
+        worn_head_set(c, 1), hos_log("vr: head: the Lens of Truth on%s", strcmp(now, lens) ? " (in place of the mask)" : "");
+    }
+}
+static void head_sync_step(Ctx *c) {
+    if (head_sync <= 0) return;
+    char now[64] = "";
+    oot_data_text(gw(), "PlayerStatus.EquipHeadArmor", now);
+    if (!strcmp(now, head_want) || --head_sync == 0) {
+        head_sync = 0;
+        const uint64_t ps = rd_ptr(0x84c9e0d0ULL), pch = ps ? rd_ptr(ps) : 0;   /* (the pouch at [[main 0x84c9e0d0]]) */
+        if (pch) game_call(c, 0x80f401b0ULL, pch, 0, 0, 0);
+    }
+}
+/* ((Triforce VR) Link shows an item (a quest item: EvtShowItemSuccess, EvtShowItemFailure, and putting it back, EvtGet, in
+   the ShowItem event) */
+int vr_game_showing_item(void) {
+    char state[48];
+    oot_link_state_at(state, 0x244);
+    if (!strncmp(state, "EvtShowItem", 11)) return 1;
+    if (!strcmp(state, "EvtGet")) {
+        char name[64];
+        oot_event_name(oot_event(), name);
+        return !strcmp(name, "ShowItem");
+    }
+    return 0;
+}
 int vr_game_childhood(void) { return oot_childhood(); }
 
 static uint64_t head_camera;   /* x19 of the update the head's view was put on (0: none); the game's thread alone */
@@ -258,7 +359,7 @@ static int hand_item(char out[96]) {
         {"SlingShot", "Weapon_Range_SlingShot"}, {"Bow", "Weapon_Range_Bow"}, {"Hookshot", "Item_Hookshot.Item_Hookshot_Body"},
         {"Longshot", "Item_Hookshot.Item_Hookshot_Body"}, {"Boomerang", "Item_Boomerang"}, {"Hammer", "Item_Hammer"},
         {"DekuStick", "Item_DekuStick"}, {"BottleA", "A"}, {"BottleB", "B"}, {"BottleC", "C"}, {"BottleD", "D"},
-        {"BottleE", "E"}};
+        {"BottleE", "E"}, {"Bomb", "Item_Bomb"}, {"Bombchu", "Item_Bombchu"}};
     const char *now_item = NULL;
     for (size_t i = 0; i < sizeof items / sizeof *items && !now_item; i++)
         if (item == oot_data_hash(items[i].value)) now_item = items[i].model;
@@ -334,13 +435,20 @@ static void vr_tick(Ctx *c, const MkwVkXr *x) {
         x->weapon_out(hand_item(item));
         x->hand_item(item);
     }
-    if (x->head_worn) {   /* what he wears on his head: the mask's and the Lens of Truth's gestures */
+    if (x->head_worn) {   /* his head's item and whether it is worn: the mask's and the Lens of Truth's gestures */
         char head[64] = "";
         oot_data_text(gw(), "PlayerStatus.EquipHeadArmor", head);
-        x->head_worn(strstr(head, "Mask") ? 1 : strstr(head, "GlassTruth") ? 2 : 0);
+        if (strstr(head, "Mask")) snprintf(last_mask, sizeof last_mask, "%s", head);
+        x->head_worn((strstr(head, "Mask") ? 1 : strstr(head, "GlassTruth") ? 2 : 0) | (worn_head() ? 4 : 0) | (last_mask[0] ? 8 : 0));
+    }
+    head_sync_step(c);
+    if (x->head_request) {
+        const int request = x->head_request();
+        if (request) head_take(c, request);
     }
     const int camera = !hooks_on || now_ns() - play_at < 200000000ull;   /* (without the hooks: Link's state alone) */
-    const int play = camera && !oot_event_playing() && state[0] && strncmp(state, "Demo", 4);
+    /* ((Triforce VR) aiming counts as play whatever camera the aim has: the hookshot's trigger is its aim, not an item bar) */
+    const int play = (camera || link_aims()) && !oot_event_playing() && state[0] && strncmp(state, "Demo", 4);
     x->in_play(play && !oot_paused());
 }
 
@@ -555,8 +663,17 @@ static void steer_aim(const MkwVkXr *x, const double d[3]) {
 static int scene_camera(uint64_t state) {
     char name[16] = "";
     const uint64_t actor = rd_ptr(state + 0x10), np = actor ? rd_ptr(actor + 0x20) : 0;
-    if (!np || !rd(np, name, 13)) return 0;
-    return !memcmp(name, "PlayerCamera", 13) ? 1 : !memcmp(name, "EventCamera", 12) ? 2 : 0;
+    if (!np || !rd(np, name, 15)) return 0;
+    name[15] = 0;
+    const int kind = !memcmp(name, "PlayerCamera", 13) ? 1 : !memcmp(name, "EventCamera", 12) ? 2 : 0;
+    if (!kind) {   /* ((Triforce VR) a camera of another name: said once each (one the head's view does not follow) */
+        static char seen[16][16];
+        static int n;
+        int known = 0;
+        for (int i = 0; i < n; i++) known |= !strcmp(seen[i], name);
+        if (!known && n < 16) memcpy(seen[n++], name, 16), hos_log("vr: a camera named \"%s\" updates", name);
+    }
+    return kind;
 }
 
 static volatile double step_seconds = -1;   /* (nn_vi.c realtime_step: the seconds the next update steps, -1 the game's own) */
@@ -592,6 +709,7 @@ static int event_view(uint64_t event) {
     if (event != was) {
         oot_event_name(event, name);
         was = event, shot = flinched = 0;
+        hos_log("vr: event \"%s\"", name);
     }
     char state[48];
     oot_link_state_at(state, 0x244);
@@ -628,6 +746,12 @@ void hos_vr_camera(Ctx *c) {
     const int event = event_now != 0;
     const int view = event ? event_view(event_now) : EV_CUTSCENE;
     if (x->hud_hidden) x->hud_hidden(view == EV_EYES_NO_HUD);
+    {
+        static int was_view = -1, was_event = -1;
+        if (view != was_view || event != was_event)
+            hos_log("vr: event view: %s", !event ? "none (play)" : view == EV_EYES_NO_HUD ? "Link's eyes, no HUD" : view == EV_EYES ? "Link's eyes" : "the cutscene's");
+        was_view = view, was_event = event;
+    }
     const int k = scene - 1;
     if (scene == 1) head_camera = 0;
     if (scene == 2 ? !event : event) return;   /* the camera that shows: Link's in play, the events' in an event */
