@@ -390,7 +390,7 @@ typedef struct MkwVkRenderer {
 typedef struct MkwVkXr {
     const char *(*cfg)(const char *key);   /* a VR row's value as text ("head", "65"), "" for a key it does not know */
     int (*head_active)(void);
-    int (*camera)(double pos[3], double at[3], float up[3]);
+    int (*camera)(double pos[3], double at[3], float up[3], int in_place);   /* (in_place: the headset turns the view, never moves it) */
     int (*lens)(float *angle);
     int (*holds_time)(void);
     void (*update_step)(double seconds);
@@ -408,6 +408,7 @@ typedef struct MkwVkXr {
     int (*active)(void);   /* (Triforce VR) a session runs: without one the game's side does nothing (vk_xr_active) */
     void (*head_worn)(int what);   /* (Triforce VR) his head's item: 0 none, 1 a mask, 2 the Lens of Truth; +4 while worn; +8 a mask was in it before */
     void (*hud_hidden)(int hidden);   /* (Triforce VR) 1: no HUD panel now (a load zone's transition) */
+    void (*carrying)(int on);   /* (Triforce VR) Link lifts, carries, throws or puts down something of the world's (a pot, a rock, a bomb flower) */
     int (*head_request)(void);   /* (Triforce VR) the gestures' ask for his head, taken: 0 none, 1 the mask on, 2 the Lens of Truth on, 3 off */
 } MkwVkXr;
 

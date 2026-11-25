@@ -13796,15 +13796,6 @@ bool xr_draw_mirrored(const NvnState& s) {
         bool same = true;
         for (int q = 0; q < 12 && same; q++) same = fabsf(r[q] - t[q]) < 2e-3f;   // (rows with their places: no other thing shares one)
         if (!same) continue;
-        {   // (research: each match, to tell the things' own draws from others that happen to match)
-            static int told = 0;
-            if (told < 80) {
-                told++;
-                logf("vk: xr mirror match: program %#llx, buffer %#llx (+%u, size %u), set %d of %d, frame %llu: %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f",
-                     (unsigned long long)cur_program->key, (unsigned long long)b.addr, 0u, (unsigned)b.size, k, xr_mirror_n, (unsigned long long)texture_frame_no(), r[0], r[1], r[2], r[3], r[4],
-                     r[5], r[6], r[7], r[8], r[9], r[10], r[11]);
-            }
-        }
         static uint64_t frame_at = 0;
         static int flips = 0, frames = 0;
         if (texture_frame_no() != frame_at) {

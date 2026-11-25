@@ -169,7 +169,7 @@ struct Xr {
     // inventory) draws flat pictures while the camera stands still, and those go on the screen
     std::atomic<uint32_t> updates{0};
     int stale = 0;   // the present's thread alone
-    // the HUD's panel (VR_HUD=panel). The game draws its HUD over its upscaled scene in one float target; the
+    // the HUD's panel. The game draws its HUD over its upscaled scene in one float target; the
     // scene as the upscaler left it is kept (vk_xr_scene_image, the replay's stream), and at the present, when the
     // target holds the HUD too, shaders/xr_hud.comp makes the scene without the HUD and the HUD's panel from the two
     std::mutex hud_mu;
@@ -274,6 +274,7 @@ struct Xr {
     std::atomic<bool> child{true};         // vr_game.c: Link is a child (his hands' model)
     std::atomic<int> hud_hidden{0};        // ((Triforce VR) vr_game.c: no HUD panel now (a load zone's transition)
     std::atomic<int> head_worn{0};
+    std::atomic<bool> carrying{false};     // ((Triforce VR) vr_game.c: Link has something of the world's in his hands
     std::atomic<int> head_request{0};      // ((Triforce VR) the gestures' ask for his head (vr_game.c takes it): 1 mask on, 2 Lens on, 3 off         // ((Triforce VR) vr_game.c: 0 nothing on his head, 1 a mask, 2 the Lens of Truth)
     std::atomic<bool> in_play{false};      // vr_game.c: play (not a menu, a pause, an event): the grips' and swing's play roles
     // the last picture drawn from the head whose world scene8 and eye8 still hold (the present's thread alone): a paused
@@ -293,6 +294,10 @@ static std::atomic<int> g_item_hand{-1};
 // space, the grips' places), not where a controller points; g_draw_on 1 while it holds)
 static std::atomic<bool> g_draw_on{false};
 static float g_draw_dir[3];   // (under hands_mu)
+// ((Triforce VR) both his hands on what one holds: the hammer's or the Deku Stick's hand (0 left, 1 right), -1 neither out; 2 the
+// shield raised alone, until the sword is swung or drawn: a two-handed sword on his back is not in them
+static std::atomic<int> g_two_hands{-1};
+extern "C" int vk_xr_two_hands(void) { return g_two_hands.load(); }
 extern "C" int vk_xr_live_mirror(void) { return g_live_mirror.load(); }
 // ((Triforce VR) what Link holds in his right hand mirrored (1) or as made (0), by the item's name; the left hand the other.
 // Her table: the shield, Deku Nuts, the business seed, the slingshot and the bow as made; the rest mirrored. (Bombs: as made,
@@ -742,7 +747,6 @@ int sword_hand_now() {
     const int live = g_live_sword.load();
     return live >= 0 ? live : strcmp(cfg_value("VR_HANDEDNESS"), "right") == 0 ? 1 : 0;
 }
-bool hud_wanted() { return true; }   // ((Triforce VR) the HUD always on its panel: the in-picture placement is gone)
 
 // VR_STEREO=balanced: each game frame drawn from one eye in turn (true geometry), the game's time held for the right
 // eye's update so both eyes show one moment, rather than performant's depth stereo from the head
@@ -1180,7 +1184,7 @@ bool eyes_from(VkCommandBuffer cb, const float shift[2], const float planes[2]) 
 // its left (the ocarina), both hands beside the head its right (Navi), a hand shaken sideways above the head its up
 // (the mask). Both hands brought together behind the head draw the sword and shield (a tap of Y) or, while they are out,
 // put them away (B). While Link plays the ocarina (vk_xr_ocarina) the notes swap places: the right stick's left, up, right and
-// down play Y, X, A and R, the A button L; no sword or jump meanwhile. VR_CONTROLS=meta puts them on the
+// down play Y, X, A and R, the A button L; no sword or jump meanwhile. They go on the
 // pad (vk_xr_pad); gamepad leaves the pad to the gamepad.
 struct Controls {
     enum { A = 0, B, X, Y, STICK_L, STICK_R, L, R, ZL, ZR, PLUS, MINUS, LEFT, UP, RIGHT, DOWN };
@@ -1218,8 +1222,7 @@ struct Controls {
     // the draw: both grips behind the head's eyes (behind_on), no lower than shoulder_drop under them and within
     // together_on of each other; once a draw, again only after the hands parted (apart_off) and refractory
     // ((Triforce VR) behind_on 12 cm: a hand only just behind the eyes is often still before the body)
-    static constexpr float behind_on = 0.12f, shoulder_drop = 0.30f, together_on = 0.15f, apart_off = 0.35f;
-    static constexpr uint64_t draw_refractory_ns = 800000000ull;
+    static constexpr float behind_on = 0.12f, shoulder_drop = 0.30f;
     // the D-pad's gestures (in play): both arms shaken upward the boots (down), both hands together before the face the
     // ocarina (left), both hands beside the head Navi (right), a hand shaken sideways above the head the mask (up); each
     // once, then not again for dpad_refractory_ns; the poses held dwell_ns first
@@ -1240,7 +1243,6 @@ struct Controls {
     // (hook_hand: kept while the hookshot is out; pull_hand: the last item pull's, kept after its grip is let go)
     int draw_sword = -1, item_arm = -1, item_hand = -1, hook_hand = -1, pull_hand = -1;
     uint64_t empty_since = 0;   // ((Triforce VR) since when no item has read as held, or the last pull (0: one reads as held)
-    bool play_was = false;
     bool boom_wait = false;     // ((Triforce VR) the boomerang aimed, its trigger let go without a throw: ZR kept until one
     uint64_t a_until = 0;       // ((Triforce VR) a bomb's or a Bombchu's drop or release (A), its grip let go
     static constexpr float throw_speed = 0.8f;   // ((Triforce VR) the boomerang's throw: its hand ahead this fast, m/s
@@ -1250,6 +1252,12 @@ struct Controls {
     // take it off only while on, never put it on)
     bool head_on = false;   // (the game's own worn flag, as vr_game.c tells it: head_worn's 4)
     uint64_t zr_until = 0, b_until = 0;
+    // ((Triforce VR) something of the world's carried: in both his hands, each put on its own side of it by the game, so not mirrored
+    // from then on (the next item, draw or shield sets it), or they cross; thrown by both hands together (carry_share of a
+    // swing's speed each, much the same way: carry_same, the cosine between them)
+    bool carry = false;
+    bool shield_alone = false;   // ((Triforce VR) the shield raised with no sword out, and none drawn since (Y)
+    static constexpr float carry_share = 0.6f, carry_same = 0.6f;
     // the bow's and the slingshot's draw: the other hand's grip squeezed within draw_reach of the holding hand arms it (about
     // where the string is: no need to touch the hands); drawn away past draw_far still squeezed, ZR held (the aim, its direction
     // from the drawing hand to the holding hand); let go, or brought back within draw_near, the shot
@@ -1421,8 +1429,6 @@ struct Controls {
             squeeze_on[h] = squeeze_on[h] ? s > 0.4f : s > 0.6f;
         }
         const bool in_play = x.in_play.load() && !menu_is_open();   // (this menu over play: its buttons, no play roles)
-        if (hook_hand >= 0 && in_play != play_was) rt_log("vr: grips: play %s with the hookshot out", in_play ? "on" : "off");
-        play_was = in_play;
         if (!in_play) {
             // menus, pauses and events (and this menu over play): a pad's buttons as labelled, the triggers L and R, the grips
             // ZL and ZR, each stick's click its own
@@ -1625,7 +1631,8 @@ struct Controls {
         }
         pose_since[0] = at_face ? (pose_since[0] ? pose_since[0] : now) : 0;
         pose_since[1] = beside ? (pose_since[1] ? pose_since[1] : now) : 0;
-        if (in_play && !x.ocarina.load() && now - dpad_gesture_at >= dpad_refractory_ns) {
+        if (x.carrying.load()) pose_since[0] = pose_since[1] = 0;   // ((Triforce VR) his hands are full: none of these
+        else if (in_play && !x.ocarina.load() && now - dpad_gesture_at >= dpad_refractory_ns) {
             int bit = -1;
             (void)wave;   // ((Triforce VR) the mask: the grips on and before the head now, below)
             if (both_up) bit = DOWN;
@@ -1717,7 +1724,7 @@ struct Controls {
             }
             if (gone && item_seen[0]) {   // (an item put away for good: back to the sword's hand; not each frame, the ocarina's own kept)
                 item_seen[0] = 0;
-                if (g_live_sword.load() >= 0) g_live_mirror.store(g_live_sword.load());
+                if (g_live_sword.load() >= 0 && !x.carrying.load()) g_live_mirror.store(g_live_sword.load());
             }
             for (int h = 0; h < 2; h++) {   // masks: a grip on top of the head puts it on; squeezed before the face and drawn up, off
                 if (!pose_ok[h] || !sq[h]) {
@@ -1826,8 +1833,8 @@ struct Controls {
                 if (shielding && squeeze_on[shield] && raised(shield, true)) keep = true;
                 for (int hd = 0; hd < 2 && !keep; hd++)
                     if (squeeze_on[hd] && raised(hd, false)) {
-                        keep = true, shield = hd;
-                        if (g_live_sword.load() != 1 - hd) {
+                        keep = shield_alone = true, shield = hd;
+                        if (g_live_sword.load() != 1 - hd || g_live_mirror.load() != (hd == 0 ? 1 : 0)) {
                             g_live_sword.store(1 - hd), g_live_mirror.store(hd == 0 ? 1 : 0);
                             rt_log("vr: shield raised alone in the %s hand: %s", hd ? "right" : "left", hd == 0 ? "mirrored" : "as made");
                         }
@@ -1841,6 +1848,11 @@ struct Controls {
         bool swung = false;
         float out = 0.0f;   // the hand's distance from the head's upright line
         // the swinging hand: the item's when one was taken out by a hand, else the sword's
+        {
+            const bool carries = x.carrying.load();
+            if (carries && !carry) g_live_mirror.store(0), rt_log("vr: carry: lifted");
+            carry = carries;
+        }
         const int sword = held_item[0] && pull_hand >= 0 ? pull_hand : held_item[0] && item_hand >= 0 ? item_hand : sword_hand_now();
         if (sword != swing_hand) swing_hand = sword, swing_n = 0, swinging = false;
         if (pose_ok[sword]) {   // the velocity over the last 4 frames
@@ -1888,6 +1900,16 @@ struct Controls {
                 }
             }
         } else swing_n = 0, swinging = false;
+        if (carry) {   // (both hands together, neither back toward the body nor down, as it is put down; one alone throws nothing)
+            swung = outward = charging = false;
+            const float least = carry_share * swing_on;
+            float vm[3], dot = 0;
+            for (int c = 0; c < 3; c++) vm[c] = 0.5f * (hv[0][c] + hv[1][c]), dot += hv[0][c] * hv[1][c];
+            const float m = std::sqrt(vm[0] * vm[0] + vm[1] * vm[1] + vm[2] * vm[2]);
+            if (pose_ok[0] && pose_ok[1] && hspeed[0] > least && hspeed[1] > least && dot > carry_same * hspeed[0] * hspeed[1] &&
+                vm[0] * fx + vm[2] * fz > -0.5f * m && vm[1] > -0.7f * m && now - swing_at >= refractory_ns)
+                swung = true, swing_at = now, rt_log("vr: carry: thrown by both hands");
+        }
         if (swung) queued = true;
         if (charging) {
             queued = false;   // (the hand brought back in fast is the release, not a swing)
@@ -1904,11 +1926,18 @@ struct Controls {
             // ((Triforce VR) a bomb or a Bombchu: the swing throws it (ZR, the game's RT))
             const bool swinger = strstr(held_item, "Hammer") || strstr(held_item, "DekuStick") || !strcmp(held_item, "Item_Bottle") ||
                                  strstr(held_item, "Item_Bomb");
-            tap_bit = !in_play ? -1 : swinger ? ZR : !held_item[0] && x.weapon_out.load() ? Y : -1;   // (no swing in menus)
+            // (something of the world's carried: the throw, Y, whatever item was out before)
+            tap_bit = !in_play ? -1 : carry ? Y : swinger ? ZR : !held_item[0] && x.weapon_out.load() ? Y : -1;   // (no swing in menus)
             queued = false;
-            if (tap_bit >= 0) y_down = now, outward = outward && swinging && tap_bit == Y;   // (the charge: the sword's)
+            if (tap_bit >= 0) y_down = now, outward = outward && swinging && tap_bit == Y && !carry;   // (the charge: the sword's)
         }
         if (tap_bit >= 0) set_bit(tap_bit, y_down != 0);
+        if (bits & 1ull << Y || (now < draw_until && draw_bit == Y)) shield_alone = false;
+        {   // ((Triforce VR) (an item a gamepad took out: in the hand the mirror puts it)
+            const bool hammer = strstr(held_item, "Hammer"), stick = strstr(held_item, "DekuStick");
+            const int by_mirror = item_mirrored_right(held_item) ? g_live_mirror.load() == 1 : g_live_mirror.load() != 1;
+            g_two_hands.store(hammer || stick ? (pull_hand >= 0 ? pull_hand : by_mirror) : shield_alone ? 2 : -1);
+        }
         if (now < draw_until) set_bit(draw_bit, true);
         if (ocarina) {   // the notes: the right stick's left, up, right and down Y, X, A and R; the A button L
             const bool a_down = bits & (1ull << A);
@@ -2476,7 +2505,7 @@ extern "C" int vk_xr_head_active(void) {
 
 extern "C" int vk_xr_pad(uint64_t *buttons, int32_t left[2], int32_t right[2]) {
     Xr &x = xr();
-    if (!x.ok || !x.running.load() || strcmp(cfg_value("VR_CONTROLS"), "meta") != 0) return 0;
+    if (!x.ok || !x.running.load()) return 0;
     uint64_t bits;
     float sticks[2][2];
     {
@@ -2623,7 +2652,7 @@ extern "C" int vk_xr_holds_time(void) {
 
 extern "C" void vk_xr_update_step(double seconds) { update_step.store(seconds, std::memory_order_relaxed); }
 
-extern "C" int vk_xr_camera(double pos[3], double at[3], float up[3]) {
+extern "C" int vk_xr_camera(double pos[3], double at[3], float up[3], int in_place) {
     Xr &x = xr();
     if (!x.ok || !x.head_view.load(std::memory_order_relaxed) || !x.running.load(std::memory_order_relaxed)) {
         vk_xr_untracked();
@@ -2660,6 +2689,12 @@ extern "C" int vk_xr_camera(double pos[3], double at[3], float up[3]) {
     static const float ahead[3] = {0, 0, -1}, upward[3] = {0, 1, 0}, rightward[3] = {1, 0, 0};
     float hf[3], hu[3], hr[3];
     rotate(head.q, ahead, hf), rotate(head.q, upward, hu), rotate(head.q, rightward, hr);
+    if (in_place) {   // ((Triforce VR) Link's eyes: the view stays on them wherever the headset is, turned by it alone; the base
+                      // moved back by the headset's place, so the hands (vk_xr_hands) keep theirs about the head)
+        double place[3];
+        world(head.p, place);
+        for (int c = 0; c < 3; c++) pos[c] -= place[c];
+    }
     // Stereo Balanced: this picture from one eye, the other the next (eyes in turn): the head moved half the eyes'
     // distance (VR_DEPTH percent of it, as depth stereo's) to that eye's side, the game's camera with it
     int eye = -1;
@@ -2733,7 +2768,7 @@ extern "C" void vk_xr_untracked(void) {
 extern "C" VkImage vk_xr_scene_image(VkImage target, uint32_t w, uint32_t h, VkFormat format, int *init) {
     Xr &x = xr();
     *init = 0;
-    const bool vr = x.ok && x.head_view.load(std::memory_order_relaxed) && (hud_wanted() || vk_xr_depth_wanted());
+    const bool vr = x.ok && x.head_view.load(std::memory_order_relaxed);
     if (!(vr || flat_on()) || !target || !w || !h) return VK_NULL_HANDLE;
     // other pictures pass through the upscaler too (a 2560x1440 sRGB one): only the one of the presented picture's size
     // is the scene the HUD is drawn over
@@ -2821,7 +2856,7 @@ extern "C" float vk_xr_accurate_shift(void) {
 
 extern "C" int vk_xr_menu_buttons(uint64_t *buttons, float sticks[2][2]) {
     Xr &x = xr();
-    if (!x.ok || !x.running.load() || strcmp(cfg_value("VR_CONTROLS"), "meta") != 0) return 0;
+    if (!x.ok || !x.running.load()) return 0;
     std::lock_guard<std::mutex> lk(x.hands_mu);
     if (!x.hand_menu) return 0;
     *buttons = x.hand_buttons;
@@ -2945,15 +2980,15 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
         signal->stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
         return;
     }
-    // the HUD apart (VR_HUD=panel) and depth stereo (VR_DEPTH) start from the scene kept before the HUD:
+    // the HUD apart and depth stereo (VR_DEPTH) start from the scene kept before the HUD:
     // the head's view without the HUD (with it where it stays in the picture), the HUD on its panel, each eye's picture
-    const bool panel = hud_wanted(), depth = d.tracked && vk_xr_depth_wanted();
+    const bool depth = d.tracked && vk_xr_depth_wanted();
     bool made = false;
     uint32_t hw = 0, hh = 0;
-    if (d.tracked && (panel || depth)) {
+    if (d.tracked) {
         std::lock_guard<std::mutex> lk(x.hud_mu);
         const bool pair = d.eye == 0 && stereo_accurate() && x.acc_ready;   // (Accurate: the left eye's target as its pass left it)
-        made = make_panel(cb, !panel, d.aim && panel ? (int)(0.06f * (float)x.hud_h) : 0, pair ? x.target_l_view : VK_NULL_HANDLE);
+        made = make_panel(cb, false, d.aim ? (int)(0.06f * (float)x.hud_h) : 0, pair ? x.target_l_view : VK_NULL_HANDLE);
         hw = x.hud_w, hh = x.hud_h;
         if (made) make_aim(cb, d);
         if (made && depth && d.eye < 0) d.stereo = make_eyes(cb, d);
@@ -2968,7 +3003,7 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
             rotate(d.pose.q, right, hr2);
             const float shift = x.acc_shift.load(std::memory_order_relaxed);
             for (int c = 0; c < 3; c++) r.pose.p[c] += shift * hr2[c];
-            if (make_panel(cb, !panel, d.aim && panel ? (int)(0.06f * (float)x.hud_h) : 0, x.target_view, x.scene_r_view)) {
+            if (make_panel(cb, false, d.aim ? (int)(0.06f * (float)x.hud_h) : 0, x.target_view, x.scene_r_view)) {
                 desat_right(cb);   // (its colours down to the left eye's)
                 keep_eye(cb, r);
                 d = r;
@@ -2976,7 +3011,7 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
             x.acc_ready = false;
         }
     }
-    d.hud = made && panel;
+    d.hud = made;
     if (d.tracked && made) x.frozen = d;   // its world stays in scene8 and eye8 until the next one made
     x.box_drawn[slot] = d;
     if (d.tracked) x.tracked_pictures++;
@@ -3083,6 +3118,7 @@ extern "C" int vk_xr_planes(float planes[2]) {
 
 extern "C" int vk_xr_active(void) { return xr().ok && xr().timeline; }
 extern "C" void vk_xr_head_worn(int what) { xr().head_worn.store(what); }
+extern "C" void vk_xr_carrying(int on) { xr().carrying.store(on != 0); }
 extern "C" int vk_xr_head_request(void) { return xr().head_request.exchange(0); }
 extern "C" void vk_xr_hud_hidden(int hidden) { xr().hud_hidden.store(hidden != 0); }
 
@@ -3091,7 +3127,7 @@ extern "C" const MkwVkXr *vk_xr_table(void) {
         vk_xr_cfg, vk_xr_head_active, vk_xr_camera, vk_xr_lens, vk_xr_holds_time, vk_xr_update_step, vk_xr_pad,
         vk_xr_ocarina, vk_xr_weapon_out, vk_xr_child,
         vk_xr_hand_item, vk_xr_in_play, vk_xr_aim_freeze, vk_xr_pointer, vk_xr_aim, vk_xr_untracked, vk_xr_hands,
-        vk_xr_active, vk_xr_head_worn, vk_xr_hud_hidden, vk_xr_head_request};
+        vk_xr_active, vk_xr_head_worn, vk_xr_hud_hidden, vk_xr_carrying, vk_xr_head_request};
     return &t;
 }
 

@@ -178,13 +178,9 @@ struct Options {
     int vr_eye_up = 0, vr_eye_side = 0, vr_eye_forward = 0;   // first person: the eyes moved from Link's, cm (-30 to 30)
     int vr_event_up = 0;        // cutscenes: the eyes raised this many cm (-50 to 50)
     int vr_cutscenes = 1;       // Full Dive: cutscenes from 0 the game's camera (Classic), 1 Link's eyes
-    int vr_controls = 0;        // 0 a gamepad, 1 the Touch controllers
-    int vr_handedness = 0;      // the sword hand: 0 left, 1 right
-    int vr_play = 0;            // 0 Stationary (the game's own gear and aim), 1 Motion (the gear in the hands)
     int vr_aim_tilt = 35;       // Motion's pointed aim: the controller's ray tilted down, degrees (0 to 60)
     int vr_swing_speed = 230;   // a sword swing's hand speed, cm a second (100 to 500)
     int vr_charge_reach = 35;   // how far out from the head a swing must leave the hand to hold the charge, cm (25 to 70)
-    int vr_hud = 0;             // 0 a panel in front of the head, 1 left in the picture
     int vr_hud_size = 100;      // the HUD panel's width, cm a metre away (40 to 200)
     int vr_scheme = 0;          // the VR hand controllers' control scheme: 0 Full Gesture, 1 [PlaceHolder] (vk_xr.cpp)
     int vr_body = 1;            // first person: 0 Link hidden, 1 his arms on the controllers and his head hidden (host/vr_body.c)

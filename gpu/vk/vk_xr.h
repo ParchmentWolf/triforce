@@ -57,7 +57,7 @@ int vk_xr_head_active(void);
 // vr_game.c, the gameplay camera's update: 1 when the head's view applies now, the camera's position, target and up
 // (game units) then turned and moved by the head (its yaw kept, the horizon level); the pose is kept for the picture
 // drawn from it
-int vk_xr_camera(double pos[3], double at[3], float up[3]);
+int vk_xr_camera(double pos[3], double at[3], float up[3], int in_place);
 // Stereo Balanced (host/nn_vi.c realtime_step): 1 while the game's time is held for every second update, the right eye's
 int vk_xr_holds_time(void);
 // vr_game.c, before vk_xr_camera: the game seconds the update running now steps (-1 unknown), which tells Stereo

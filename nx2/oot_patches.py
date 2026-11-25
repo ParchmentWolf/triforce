@@ -158,63 +158,14 @@ ANIM_ANCHORS = tuple("c->x[30] = 0x%xULL; f_8030a320(c);\n" % r
 WORLD_HEAD = "void f_81501400(Ctx *__restrict A64_NOESC c) {\n"   # (a skeleton's world pass over bones x1..x2, the skeleton x0)
 
 
-WORLD_RET = "\nreturn;\n}\n"   # (f_81501400's one return: the first after its start)
-WORLD_END_CALL = "\n    hos_oot_world_pass_end(c);\nreturn;\n}\n"
-
-
 def patch_world_pass(source):
-    """(source, 1 when the hooks are in: made here or before; at its start and at its end)"""
+    """(source, 1 when the hook is in: made here or before)"""
     if source.count(WORLD_HEAD) != 1:
         return source, 0
     if WORLD_HEAD + "    hos_oot_world_pass(c);\n" not in source:
         source = source.replace(WORLD_HEAD, WORLD_HEAD + "    hos_oot_world_pass(c);\n", 1)
-    at = source.index(WORLD_HEAD)
-    ret = source.find(WORLD_RET, at)
-    if ret < 0:
-        return source, 0
-    if not source.startswith(WORLD_END_CALL, ret - len("\n    hos_oot_world_pass_end(c);")):
-        source = source[:ret] + WORLD_END_CALL + source[ret + len(WORLD_RET):]
-    for decl in ("extern void hos_oot_world_pass(Ctx *c);", "extern void hos_oot_world_pass_end(Ctx *c);"):
-        if decl not in source:
-            source = source.replace('#include "a64.h"\n', '#include "a64.h"\n' + decl + "\n", 1)
-    return source, 1
-
-
-BIND_HEAD = "void f_803f5b40(Ctx *__restrict A64_NOESC c) {\n"   # (an object's field bound by name for its animation's queries)
-
-
-BIND_HEADS = [BIND_HEAD] + ["void f_%s(Ctx *__restrict A64_NOESC c) {\n" % a for a in ("805bd1b0", "806b6540", "803f94c0")]
-# (the other binders of the same arguments: object x0, the name at [x1], the field x2, its kind x3)
-
-
-def patch_bind(source):
-    """(source, how many of the binders' hooks are in here: made here or before)"""
-    n = 0
-    for head in BIND_HEADS:
-        if head + "    hos_oot_bind_param(c);\n" in source:
-            n += 1
-            continue
-        if source.count(head) != 1:
-            continue
-        source = source.replace(head, head + "    hos_oot_bind_param(c);\n", 1)
-        n += 1
-    if n and "extern void hos_oot_bind_param(Ctx *c);" not in source:
-        source = source.replace('#include "a64.h"\n', '#include "a64.h"\nextern void hos_oot_bind_param(Ctx *c);\n', 1)
-    return source, n
-
-
-ROOT_HEAD = "void f_81500ff0(Ctx *__restrict A64_NOESC c) {\n"   # (a skeleton's root placed from the model's base matrix x1, then its world pass)
-
-
-def patch_root(source):
-    """(source, 1 when the hook is in: made here or before)"""
-    if ROOT_HEAD + "    if (hos_oot_root_place(c)) return;\n" in source:
-        return source, 1
-    if source.count(ROOT_HEAD) != 1:
-        return source, 0
-    source = source.replace(ROOT_HEAD, ROOT_HEAD + "    if (hos_oot_root_place(c)) return;\n", 1)
-    if "extern int hos_oot_root_place(Ctx *c);" not in source:
-        source = source.replace('#include "a64.h"\n', '#include "a64.h"\nextern int hos_oot_root_place(Ctx *c);\n', 1)
+    if "extern void hos_oot_world_pass(Ctx *c);" not in source:
+        source = source.replace('#include "a64.h"\n', '#include "a64.h"\nextern void hos_oot_world_pass(Ctx *c);\n', 1)
     return source, 1
 
 
@@ -230,22 +181,6 @@ def patch_shield(source):
     source = source.replace(SHIELD_HEAD, SHIELD_HEAD + "    if (hos_oot_shield_attach(c)) return;\n", 1)
     if "extern int hos_oot_shield_attach(Ctx *c);" not in source:
         source = source.replace('#include "a64.h"\n', '#include "a64.h"\nextern int hos_oot_shield_attach(Ctx *c);\n', 1)
-    return source, 1
-
-
-JOINT_TAIL = "L_803a13d0:;\nreturn;\n}\n"   # (the end of f_803a1360, a bone's world 3x4 (x1) of an instance (x0), bone x2)
-
-
-def patch_joint(source):
-    """(source, 1 when the hook is in: made here or before)"""
-    hooked = "L_803a13d0:;\n    hos_oot_joint_world(c);\nreturn;\n}\n"
-    if hooked in source:
-        return source, 1
-    if source.count(JOINT_TAIL) != 1:
-        return source, 0
-    source = source.replace(JOINT_TAIL, hooked, 1)
-    if "extern void hos_oot_joint_world(Ctx *c);" not in source:
-        source = source.replace('#include "a64.h"\n', '#include "a64.h"\nextern void hos_oot_joint_world(Ctx *c);\n', 1)
     return source, 1
 
 
@@ -1068,12 +1003,9 @@ def apply(gen, *, protect_hearts=False, required=False):
     tex_compact_sites = 0   # ((Triforce) patch_tex_compact: its one call, the supported build's alone)
     tex_ask_sites = 0   # ((Triforce) patch_tex_ask: its one test, the supported build's alone)
     shadow_step_sites = 0   # ((Triforce, 11-21, GAME-05) patch_shadow_step: the one read of a shadow map's side)
-    joint_sites = 0   # ((Triforce VR) patch_joint: f_803a1360's end
     sword_sites = 0   # ((Triforce VR) patch_sword: f_81500720
     shield_sites = 0   # ((Triforce VR) patch_shield: f_81500960
     world_sites = 0   # ((Triforce VR) patch_world_pass: the mirrored animation's hook, in f_81501400
-    bind_sites = 0   # ((Triforce VR) patch_bind: f_803f5b40, left/right queries turned for the mirror
-    root_sites = 0   # ((Triforce VR) patch_root: f_81500ff0, the model's turn mirrored
     anim_sites = 0   # ((Triforce VR) patch_after_anim: the late bone pass's calls with the arms' hook, 5 in the supported build)
     for path in sorted(glob.glob(os.path.join(glob.escape(gen), "code_*.c"))):
         with open(path, encoding="utf-8", newline="") as f:
@@ -1150,10 +1082,6 @@ def apply(gen, *, protect_hearts=False, required=False):
             if n:
                 anim_sites += n
                 print("oot_patches: the late bone pass's VR hook at %d call(s) in %s" % (n, os.path.basename(path)))
-            out, n = patch_joint(out)
-            if n:
-                joint_sites += n
-                print("oot_patches: the mirrored hands' hook in the bone world accessor in %s" % os.path.basename(path))
             out, n = patch_sword(out)
             if n:
                 sword_sites += n
@@ -1162,14 +1090,6 @@ def apply(gen, *, protect_hearts=False, required=False):
             if n:
                 shield_sites += n
                 print("oot_patches: the mirrored shield's hook in %s" % os.path.basename(path))
-            out, n = patch_bind(out)
-            if n:
-                bind_sites += n
-                print("oot_patches: the mirrored left/right queries' hook in the binder in %s" % os.path.basename(path))
-            out, n = patch_root(out)
-            if n:
-                root_sites += n
-                print("oot_patches: the mirrored model turn's hook in the root's placing in %s" % os.path.basename(path))
             out, n = patch_world_pass(out)
             if n:
                 world_sites += n
@@ -1266,16 +1186,10 @@ def apply(gen, *, protect_hearts=False, required=False):
               % (record_sites, sum(n for _, n in RECORD_SITES)))
     if battle_sites != len(BATTLE_SITES):   # (without them, above 60 fps the battle music keeps playing after the last enemy)
         print("oot_patches: WARNING: Link's state steps were found at %d of %d places" % (battle_sites, len(BATTLE_SITES)))
-    if protect_hearts and joint_sites != 1:
-        print("oot_patches: WARNING: the bone world accessor's hook was found in %d places, not 1" % joint_sites)
     if protect_hearts and sword_sites != 1:
         print("oot_patches: WARNING: the sword placing's hook was found in %d places, not 1" % sword_sites)
     if protect_hearts and shield_sites != 1:
         print("oot_patches: WARNING: the shield's hook was found in %d places, not 1" % shield_sites)
-    if protect_hearts and bind_sites != len(BIND_HEADS):
-        print("oot_patches: WARNING: the binders' hooks were found in %d places, not %d" % (bind_sites, len(BIND_HEADS)))
-    if protect_hearts and root_sites != 1:
-        print("oot_patches: WARNING: the root placing's hook was found in %d places, not 1" % root_sites)
     if protect_hearts and world_sites != 1:   # ((Triforce VR) without it right-handed play shows his animations unmirrored)
         print("oot_patches: WARNING: the world pass's hook was found in %d places, not 1" % world_sites)
     if protect_hearts and anim_sites != len(ANIM_ANCHORS):   # ((Triforce VR) without them the arms do not follow the hands)

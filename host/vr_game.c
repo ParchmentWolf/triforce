@@ -132,6 +132,11 @@ static int oot_paused(void) {
 }
 
 int vr_game_paused(void) { return oot_paused(); }
+int vr_game_two_handed(void) {
+    char weapon[64] = "";
+    oot_data_text(gw(), "PlayerStatus.EquipWeapon", weapon);
+    return strstr(weapon, "Biggoron") != NULL;
+}
 
 /* ---- ((Triforce VR) his head's item for the gestures: a mask or the Lens of Truth, worn by a flag of the game data beside
    PlayerStatus.EquipHeadArmor, which keeps the item while it is off (the game's own D-pad up sets and clears it). The flag set
@@ -265,11 +270,10 @@ static int first_person_eye(double eye[3]) {
     double fx = m[2], fz = m[8], n = sqrt(fx * fx + fz * fz);   /* his facing: the rotation's third column, level */
     if (!(n > 1e-4)) return 0;
     fx /= n, fz /= n;
-    /* (the eyes at his own head, with his arms shown or not: adult 1.73 m and 6 cm ahead of his feet, found right in a
-       Quest 3 against his body with only his head hidden (the earlier 1.45 m and 18 cm sat 28 cm low and 12 cm ahead of
-       it; hidden's 1.80 m and 8 cm was a guess with his model in the way); young Link scaled alike, 1.19 m and 4 cm) */
+    /* (the eyes on Link whatever the headset's own place (vk_xr_camera in_place): adult 1.43 m and 16 cm ahead of his feet, young
+       Link 0.97 m and 12 cm, both found right in a Quest 3) */
     const int child = oot_childhood();
-    double up = (child ? 1.19 : 1.73) + cfg_int("VR_EYE_UP") / 100.0;
+    double up = (child ? 0.97 : 1.43) + cfg_int("VR_EYE_UP") / 100.0;
     {   /* ((Triforce VR) crouched (a crawlspace too: Crouch, CrouchLockOnMove...): the eyes down by as much as his neck is
            below its height standing still, eased over about a tenth of a second) */
         static double stand = -1, drop, target;
@@ -290,7 +294,7 @@ static int first_person_eye(double eye[3]) {
         drop += (target - drop) * (dt > 0 && dt < 0.5 ? 1.0 - exp(-dt / 0.1) : 1.0);
         up -= drop;
     }
-    const double ahead = (child ? 0.04 : 0.06) + cfg_int("VR_EYE_FORWARD") / 100.0, side = cfg_int("VR_EYE_SIDE") / 100.0;
+    const double ahead = (child ? 0.12 : 0.16) + cfg_int("VR_EYE_FORWARD") / 100.0, side = cfg_int("VR_EYE_SIDE") / 100.0;
     eye[0] = feet[0] + ahead * fx - side * fz;   /* his right: (-fz, 0, fx) */
     eye[1] = feet[1] + up;
     eye[2] = feet[2] + ahead * fz + side * fx;
@@ -435,6 +439,21 @@ static void vr_tick(Ctx *c, const MkwVkXr *x) {
         x->weapon_out(hand_item(item));
         x->hand_item(item);
     }
+    if (x->carrying) {   /* ((Triforce VR) something of the world's in his hands: from its lift (LiftReady, LiftUp) while his arms carry
+                            it (CommonUpper among his states' names, an item's too: so only after a lift), through LiftThrow or LiftPut */
+        static int carry, ending;   /* (ending: thrown or put down: over with that state, whatever his arms hold next) */
+        static uint64_t arms_at;
+        int arms = 0;
+        char b[0x300];
+        const uint64_t actor = player(), comps = actor ? rd_ptr(actor + 0x270) : 0, c107 = comps ? rd_ptr(comps + 107 * 8) : 0;
+        if (c107 && rd(c107 + 0x200, b, sizeof b))
+            for (int o = 0; o + 12 <= (int)sizeof b && !arms; o++) arms = !memcmp(b + o, "CommonUpper", 12);
+        if (arms) arms_at = now_ns();
+        if (!strcmp(state, "LiftReady") || !strcmp(state, "LiftUp") || (carry && !strncmp(state, "Lift", 4)))   /* (a pulled bomb's throw is LiftThrow too) */
+            carry = 1, arms_at = now_ns(), ending = !strcmp(state, "LiftThrow") || !strcmp(state, "LiftPut") || !strcmp(state, "LiftStand");
+        else if (ending || now_ns() - arms_at > 300000000ull) carry = ending = 0;
+        x->carrying(carry);
+    }
     if (x->head_worn) {   /* his head's item and whether it is worn: the mask's and the Lens of Truth's gestures */
         char head[64] = "";
         oot_data_text(gw(), "PlayerStatus.EquipHeadArmor", head);
@@ -536,8 +555,7 @@ static void turn_link(const double ahead[3]) {
    controller points, through the game's own motion aiming: its six-axis sensor (vr_motion_history) is given turn rates
    proportional to the yaw and pitch between the two, every camera update, so the aim follows the controller wherever it
    points and does not drift; the right stick still adds to it. The view's base yaw is held meanwhile (aim_freeze), else it
-   would turn with the aim it chases. The sensor's axes that turn the aim's pitch and yaw: x and z (VR_GYRO=x+z+, a sign or
-   an axis changed for a test). */
+   would turn with the aim it chases. The sensor's axes that turn the aim's pitch and yaw: x and z. */
 static SRWLOCK motion_lock = SRWLOCK_INIT;
 static HosMotionSample motion_hist[HOS_MOTION_HISTORY];
 static int motion_head, motion_count;
@@ -604,57 +622,20 @@ int vr_motion_history(HosMotionSample *out, int max) {
 }
 
 static void steer_aim(const MkwVkXr *x, const double d[3]) {
-    const int pointed = d && g_aiming && !strcmp(cfg_value("VR_PLAY"), "motion") && !strcmp(cfg_value("VR_CONTROLS"), "meta") &&
-                        x->head_active();
+    const int pointed = d && g_aiming && !strcmp(cfg_value("VR_PLAY"), "motion") && x->head_active();
     x->aim_freeze(pointed);
     double t[3];
     if (!pointed || !x->pointer(t)) return;
     const double yaw_err = wrap_pi(atan2(t[0], t[2]) - atan2(d[0], d[2]));
     const double pitch_err = asin(fmax(-1, fmin(1, t[1]))) - asin(fmax(-1, fmin(1, d[1])));
-    /* ((Triforce VR) research: ~/.app/pc_port/triforce-runs/vr_gyro.txt "<spec> [flipm]", read once a second: the axes the
-       pitch and yaw go out on (as VR_GYRO, "x+z+" by default), flipm the yaw turned over while his animation is mirrored) */
-    static char file_spec[8];
-    static int flip_m, read_at_s;
-    /* (the pitch's turn rate times pitch_gain: 50, found by eye in the headset (2026-11-24): the game's aim moves up and down far
-       less than across for the same rate; a word "p<n>" in the file sets another) */
-    static double pitch_gain = 50.0;
-    static double yaw_gain = 1.1;   /* (across a little more too, by eye; a word "y<n>" sets another) */
-    {
-        const int s_now = (int)(now_ns() / 1000000000ull);
-        if (s_now != read_at_s) {
-            read_at_s = s_now;
-            char path[512], a[8] = "", b[8] = "", g[8] = "", h[8] = "";
-            snprintf(path, sizeof path, "%s/.app/pc_port/triforce-runs/vr_gyro.txt", getenv("HOME") ? getenv("HOME") : "");
-            FILE *f = fopen(path, "r");
-            if (f) {
-                if (fscanf(f, "%7s %7s %7s %7s", a, b, g, h) < 1) a[0] = 0;
-                fclose(f);
-            }
-            snprintf(file_spec, sizeof file_spec, "%s", strlen(a) == 4 ? a : "");
-            flip_m = !strcmp(b, "flipm") || !strcmp(g, "flipm");
-            pitch_gain = 50.0;
-            if (b[0] == 'p') pitch_gain = atof(b + 1);
-            if (g[0] == 'p') pitch_gain = atof(g + 1);
-            if (!(pitch_gain > 0 && pitch_gain <= 200)) pitch_gain = 50.0;
-            yaw_gain = 1.1;
-            if (b[0] == 'y') yaw_gain = atof(b + 1);
-            if (g[0] == 'y') yaw_gain = atof(g + 1);
-            if (h[0] == 'y') yaw_gain = atof(h + 1);
-            if (!(yaw_gain > 0 && yaw_gain <= 20)) yaw_gain = 1.1;
-        }
-    }
-    const char *spec = file_spec[0] ? file_spec : getenv("VR_GYRO");
-    if (!spec || strlen(spec) < 4) spec = "x+z+";
+    /* (the pitch's turn rate much above the yaw's, found by eye in the headset: the game's aim moves up and down far less than
+       across for the same rate) */
+    const double pitch_gain = 50.0, yaw_gain = 1.1;
     double gyro[3] = {0, 0, 0};
     const double k = 10.0, most = 8.0;
-    int vr_body_mirrored(void);
-    const double yaw_sign = flip_m && vr_body_mirrored() ? -1.0 : 1.0;
     const double rate[2] = {fmax(-most * pitch_gain, fmin(most * pitch_gain, k * pitch_gain * pitch_err)),
-                            yaw_sign * fmax(-most * yaw_gain, fmin(most * yaw_gain, k * yaw_gain * yaw_err))};
-    for (int i = 0; i < 2; i++) {
-        const int axis = spec[2 * i] == 'x' ? 0 : spec[2 * i] == 'y' ? 1 : 2;
-        gyro[axis] += spec[2 * i + 1] == '-' ? -rate[i] : rate[i];
-    }
+                            fmax(-most * yaw_gain, fmin(most * yaw_gain, k * yaw_gain * yaw_err))};
+    gyro[0] = rate[0], gyro[2] = rate[1];
     motion_feed(gyro);
 }
 
@@ -665,15 +646,7 @@ static int scene_camera(uint64_t state) {
     const uint64_t actor = rd_ptr(state + 0x10), np = actor ? rd_ptr(actor + 0x20) : 0;
     if (!np || !rd(np, name, 15)) return 0;
     name[15] = 0;
-    const int kind = !memcmp(name, "PlayerCamera", 13) ? 1 : !memcmp(name, "EventCamera", 12) ? 2 : 0;
-    if (!kind) {   /* ((Triforce VR) a camera of another name: said once each (one the head's view does not follow) */
-        static char seen[16][16];
-        static int n;
-        int known = 0;
-        for (int i = 0; i < n; i++) known |= !strcmp(seen[i], name);
-        if (!known && n < 16) memcpy(seen[n++], name, 16), hos_log("vr: a camera named \"%s\" updates", name);
-    }
-    return kind;
+    return !memcmp(name, "PlayerCamera", 13) ? 1 : !memcmp(name, "EventCamera", 12) ? 2 : 0;
 }
 
 static volatile double step_seconds = -1;   /* (nn_vi.c realtime_step: the seconds the next update steps, -1 the game's own) */
@@ -804,7 +777,7 @@ void hos_vr_camera(Ctx *c) {
         pos[1] += lift, at[1] += lift;
     }
     x->update_step(step_seconds < 0 ? -1 : update_seconds());
-    if (!x->camera(pos, at, up)) return;
+    if (!x->camera(pos, at, up, fp_eye)) return;
     for (int i = 0; i < 3; i++) set_d(c, i, pos[i]), set_d(c, 3 + i, at[i]), set_s(c, up_reg[i], up[i]);
     memcpy(out_pos[k], pos, sizeof pos), memcpy(out_at[k], at, sizeof at), have_out[k] = 1;
     head_camera = c->x[19];

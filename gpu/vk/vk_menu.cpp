@@ -129,9 +129,8 @@ enum MenuTab {
     TAB_AUDIO = 2,
     TAB_CONTROLS = 3,
     TAB_SYSTEM = 4,
-    TAB_VR = 5,      // (Triforce VR: vk_xr.cpp's rows)
-    TAB_DEBUG = 6,   // (the OoT debug tools of #785 and the developer's rows, a tab of their own)
-    TAB_COUNT = 7,
+    TAB_DEBUG = 5,   // (the OoT debug tools of #785 and the developer's rows, a tab of their own)
+    TAB_COUNT = 6,
     TAB_MOTION = TAB_COUNT,   // (hookshot: not a tab of the strip, the Motion page that the Controls tab's Motion row
                               // opens: one past the strip's tabs, so a tab added before TAB_COUNT moves it along)
     TAB_VRPAGE = TAB_MOTION + 1,   // ((Triforce VR) the VR Controls page that the Controls tab's VR Controls row opens)
@@ -2679,13 +2678,9 @@ const VrKey vr_keys[] = {
     {"VR_EYE_FORWARD", &opts.vr_eye_forward, nullptr},
     {"VR_EVENT_UP", &opts.vr_event_up, nullptr},
     {"VR_CUTSCENES", &opts.vr_cutscenes, "classic|first"},
-    {"VR_CONTROLS", &opts.vr_controls, "gamepad|meta"},
-    {"VR_HANDEDNESS", &opts.vr_handedness, "left|right"},
-    {"VR_PLAY", &opts.vr_play, "stationary|motion"},
     {"VR_AIM_TILT", &opts.vr_aim_tilt, nullptr},
     {"VR_SWING_SPEED", &opts.vr_swing_speed, nullptr},
     {"VR_CHARGE_REACH", &opts.vr_charge_reach, nullptr},
-    {"VR_HUD", &opts.vr_hud, "panel|picture"},
     {"VR_HUD_SIZE", &opts.vr_hud_size, nullptr},
     {"VR_BODY", &opts.vr_body, "hidden|arms"},
     {"VR_SCHEME", &opts.vr_scheme, "gesture|placeholder"},
@@ -3271,8 +3266,8 @@ float scroll_at[TAB_N64 + 1];   // (the first row shown, eased toward the select
                                 // the Controls page: kControlsSlot, then the Remembered page)
 constexpr int kControlsSlot = TAB_PAGE;
 int wheel_rows[TAB_N64 + 1];   // (the mouse wheel's notches since the last drawing, a slot each: scroll_rows scrolls by them)
-int scrolled_to[TAB_N64 + 1] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};   // (the selection scroll_rows last brought into view)
-static_assert(TAB_N64 + 1 == 13, "scrolled_to: a slot for each tab, each page a row opens, the Controls page and the Remembered page");
+int scrolled_to[TAB_N64 + 1] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};   // (the selection scroll_rows last brought into view)
+static_assert(TAB_N64 + 1 == 12, "scrolled_to: a slot for each tab, each page a row opens, the Controls page and the Remembered page");
 float scroll_want[TAB_N64 + 1];   // (where scroll_at is going: the wheel moves it, a new selection too)
 float ease_step = 0;     // (this drawing's share of the way: the time since the last one)
 bool ease_live = false;  // ((Triforce) menu_record steps the easing: a window's frames. Without them a still is drawn settled)
@@ -3668,14 +3663,13 @@ void action_cell(ui::Ctx& c, ImVec2 a, ImVec2 b, const std::string& word, bool s
 /// with more than five). sel: the one shown, -1 the game's own. game: "Game" in front of ours, inside the game's Options
 /// screen. hit: the mouse's places noted
 void draw_tabs(ui::Ctx& c, int sel, bool game, bool hit) {
-    static const char* const ours[TAB_COUNT] = {"Display", "Graphics", "Audio", "Controls", "System", "VR", "Debug"};
+    static const char* const ours[TAB_COUNT] = {"Display", "Graphics", "Audio", "Controls", "System", "Debug"};
     const float s = c.s, hh = banner_h(c);
     // (Triforce) the strip's entries in their order: the game's own (-1), ours to System, Debug when shown (Mods is not one:
     // it is an entry of its own under the game's System list and the title's, kModsRowPage)
     int entry[TAB_COUNT + 2], tabs = 0;
     if (game) entry[tabs++] = -1;
-    for (int t = 0; t < TAB_DEBUG; t++)
-        if (t != TAB_VR) entry[tabs++] = t;   // ((Triforce VR) its rows are Display's VR Settings page now
+    for (int t = 0; t < TAB_DEBUG; t++) entry[tabs++] = t;
     if (debug_shown()) entry[tabs++] = TAB_DEBUG;
     const float ty = ui::at(c, 0, 998).y, step = ui::lu(c, tabs > 7 ? 320 : tabs > 6 ? 350 : tabs > 5 ? 400 : 460), tpx = ui::lu(c, 54 * ui::kType);
     const float tx0 = c.w * 0.5f - step * (tabs - 1) * 0.5f;
@@ -7292,8 +7286,7 @@ void mods_open_page();   // ((Triforce) below: the Mods screen opened, its searc
 /// ours to System, Mods, Debug when shown; inside the game's Options, past either end is the game's own tab again
 void tab_move(int dir) {
     int entry[TAB_COUNT + 2], n = 0;
-    for (int t = 0; t < TAB_DEBUG; t++)
-        if (t != TAB_VR) entry[n++] = t;
+    for (int t = 0; t < TAB_DEBUG; t++) entry[n++] = t;
     if (debug_shown()) entry[n++] = TAB_DEBUG;
     const int from = page == kModsPage ? kModsTab : page_parent(cur_tab);
     int at = 0;
@@ -7993,7 +7986,7 @@ void menu_tick() {
         if (go[0] || go[1] || clicked_tab >= 0) {
             const int64_t open0 = prof_now();   // ((Triforce) the open's own work, logged at the first: nothing of it should wait)
             open_now = true, embed_open = true, page = 0, listening = 0;
-            cur_tab = clicked_tab >= 0 ? clicked_tab : go[1] ? TAB_DISPLAY : debug_shown() ? TAB_DEBUG : TAB_SYSTEM;
+            cur_tab = clicked_tab >= 0 ? clicked_tab : go[1] ? TAB_DISPLAY : tabs_shown() - 1;
             auto_pad = pad_last;
             ui::want_glyphs();
             opts.pad_layout = detect_pad_layout();
@@ -8771,10 +8764,9 @@ void menu_record_image(VkCommandBuffer cmd, VkImage image, VkImageView view, uin
 // (Triforce VR) a VR row's value by its key, as text: a choice's name, else the number; "" for a key that is not a VR row
 extern "C" int vk_xr_live_sword(void);
 extern "C" int vk_xr_live_mirror(void);
+extern "C" int vk_xr_two_hands(void);
 extern "C" const char* vk_xr_cfg(const char* key) {
     static thread_local char b[24];
-    // ((Triforce VR) the hand controllers always play, with motion; a gamepad alongside them as a pad (no rows for these now)
-    if (!strcmp(key, "VR_CONTROLS")) return "meta";
     // ((Triforce VR) motion play (the pointed aim, vr_game.c) is Full Gesture's; another scheme starts from none
     if (!strcmp(key, "VR_PLAY")) return mkwvk::opts.vr_scheme == 0 ? "motion" : "stationary";
     // ((Triforce VR) the sword hand before a draw chooses one: Controls' Right handed Link (no VR row for it now)
@@ -8782,6 +8774,10 @@ extern "C" const char* vk_xr_cfg(const char* key) {
     if (!strcmp(key, "VR_MIRROR")) {   // ((Triforce VR) Link mirrored for what the hands last did, "" before: vk_xr.cpp)
         const int v = vk_xr_live_mirror();
         return v < 0 ? "" : v ? "on" : "off";
+    }
+    if (!strcmp(key, "VR_TWO_HANDS")) {   // ((Triforce VR) the hand whose item both hands hold, "alone" the shield's alone, "" neither
+        const int v = vk_xr_two_hands();
+        return v == 2 ? "alone" : v == 1 ? "right" : v == 0 ? "left" : "";
     }
     if (!strcmp(key, "VR_SWORD_HAND")) {   // ((Triforce VR) the last two-grip draw's sword hand, "" before one: vk_xr.cpp)
         const int v = vk_xr_live_sword();
