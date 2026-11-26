@@ -78,9 +78,12 @@ int main(void) {
     evil_hd_foliage(1.0f, out);
     CHECK(same(out, game, 1.0f));
     evil_hd_foliage(2.5f, out);
-    CHECK(same(out, game, 2.5f) && out[0] == 100.0f && out[1] == 150.0f && out[5] == 337.5f);
+    CHECK(out[0] == 100.0f && out[1] == 150.0f && out[5] == 337.5f && out[4] == 100.0f && out[7] == 112.5f);
+    CHECK(out[2] == 75.0f && out[3] == 70.0f);   /* (the ornaments and shoot leaves kept to 75 and 70 m: 11-25 flicker) */
     evil_hd_foliage(4.0f, out);
-    CHECK(same(out, game, 4.0f));
+    CHECK(out[0] == 160.0f && out[1] == 240.0f && out[5] == 540.0f && out[2] == 75.0f && out[3] == 70.0f);
+    evil_hd_foliage(2.0f, out);
+    CHECK(out[2] == 70.0f && out[3] == 60.0f);   /* (under their most: the factor's own) */
     /* which bytes are known: the game's, or what a write of this left (a factor from 1 to 4) */
     CHECK(evil_hd_foliage_known(game));
     for (float f = 1.0f; f <= 4.0f; f += 0.25f) {

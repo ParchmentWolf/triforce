@@ -465,6 +465,40 @@ HLE(_ZN2nn5prepo10PlayReport4SaveERKNS_7account3UidE) { RET(0); }
 /* (hookshot) PlayReport::Send(Uid const&), SDK 22's: kept nowhere, as Save. Left to the SDK it opened the prepo
    service through sm: and aborted on the empty reply (OoT's PlayReporter thread, ~5 minutes into a game). */
 HLE(_ZN2nn5prepo10PlayReport4SendERKNS_7account3UidE) { RET(0); }
+
+/* ((Triforce, 11-25) nn::crypto::GenerateCryptographicallyRandomBytes(void* out, size_t size): the host's own secure random
+   bytes. Left to the SDK it opened the csrng service through sm:, got the empty reply and aborted (svcBreak in
+   nn::diag::detail::Abort): a player's game stopped ~6 s after every start, on OoT's Porter thread (main 0x82507050, the
+   npln online code), on an RX 6800 PC; never seen here, so its call is on a path our runs do not take. */
+#ifdef _WIN32
+#include <ntsecapi.h>   /* (RtlGenRandom, as host/hos_report_run.c) */
+#else
+#include <errno.h>
+#include <sys/random.h>
+#endif
+HLE(_ZN2nn6crypto36GenerateCryptographicallyRandomBytesEPvm) {
+    const uint64_t out = ARG(0), size = ARG(1);
+    if (!out || !size || !hos_guest_range(out, size)) return;
+    uint8_t *p = (uint8_t *)GP(out);
+    uint64_t done = 0;
+    while (done < size) {
+        const uint64_t n = size - done < 0x10000 ? size - done : 0x10000;
+#ifdef _WIN32
+        if (!RtlGenRandom(p + done, (ULONG)n)) break;
+        done += n;
+#else
+        const ssize_t got = getrandom(p + done, (size_t)n, 0);
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) break;
+        done += (uint64_t)got;
+#endif
+    }
+    if (done < size) {   /* (no host randomness: never seen; the bytes still differ from run to run) */
+        uint64_t x = (uint64_t)hos_now_ns() ^ (out << 17) ^ 0x9E3779B97F4A7C15ULL;
+        for (; done < size; done++) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; p[done] = (uint8_t)x; }
+        hos_log("crypto: the host gave no random bytes: %llu made from the clock", (unsigned long long)size);
+    }
+}
 /* (hookshot) prepo::AsyncContext: the report "sent" at once. GetCompletionEvent(SystemEvent* out) gives an event
    already signaled (the SDK's own aborted on the context the empty IPC reply left), GetResult success. */
 void hos_system_event_init(uint64_t key, int autoclear);   /* nn_os_sync.c */

@@ -537,6 +537,7 @@ void split_part_submitted(VkCommandBuffer cmd, bool uploads) {
 // again into their captures' buffers, as the take did after its wait. At most 250 ms at a time, 4 times: a submission the event
 // ordering holds behind a later one cannot hold the queue's lock for ever (the fix goes in as it is, counted)
 uint64_t vk_timeline_signal_sent() { return stall_ct.queue_top.load(std::memory_order_relaxed); }
+bool vk_batch_holds() { return batch_on(); }   // ((Triforce, 11-23) vk_memory.cpp late_queue_on: no late pages put off while submits are held)
 bool vk_timeline_wait_sent(uint64_t v) {
     if (!timeline) return true;
     for (int i = 0; i < 4; i++) {

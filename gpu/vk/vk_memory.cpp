@@ -4206,15 +4206,32 @@ inline const uint8_t* cap_page_bytes(const Capture& c, uint32_t slot) {
 // while the GPU finishes the frame before. Not deferred, as before: a value not sent yet, a late page in a texture's storage (its
 // shadow and uploads read the capture at the take), more than kLateFixMax pending. Triforce's earlier experiments that dropped
 // the wait (RX_VK_LATE_NEW, the lab's nolatewait) took the bytes WITHOUT waiting and stepped the exposure; this still waits
+// ((Triforce, 11-23, the Linux RADV lighting flicker: tickets 451323, 973820, 240338, 474460, 626285, 374015) NOT with held
+// submits (RX_VK_BATCH, on by default with Mesa's RADV). A held submit goes into the batch without late_fix_flush_locked (only
+// the batch's flush applies the fixes: a poll 2 ms on, a present, a wait), so the fixes stay pending far longer than "until the
+// next submit". Meanwhile the replay's reads of those slots read guest memory as it is then (memory_read_as_submitted), and the
+// fix itself copies guest memory as it is at the flush: by then the game's CPU has gone on into the next frame and written those
+// pages again, so the capture carries another frame's bytes there (OoT's exposure meter and the per-frame pools beside it). In
+// every RADV log of the tickets the flicker starts where the late pages stop being texture storage (the take waited until then)
+// and are put off to the queue instead: the RX_VK_LATE_QUEUE line goes from "0 put off, 60-100 texture storage, 0 replay reads
+// of a pending slot" to "150-230 put off, 0 texture storage, 250-2100 replay reads of a pending slot", 50-90 s into play, and
+// stays there until the game ends. NVIDIA on Linux defers as many with 0 such reads (no held submits: the next submit applies
+// them); AMD on Windows has none. So while submits are held the take waits, as before 11-20. RX_VK_LATE_QUEUE unset: moved to
+// the queue unless submits are held; =1: moved to the queue with held submits too (v0.7.0 as shipped); =0: the take waits, on
+// any driver, as before. Asked at each take: whether submits are held is known once the replay has its batch timeline
 bool late_queue_on() {
-    static const bool v = [] {
-        // (on by default since 11-20: 79.8 -> 80.4 fps, three alternating rounds each at the owner's save (every round ahead),
-        // frame log clean: no cell blinks or whole-frame steps against none. RX_VK_LATE_QUEUE=0: the take waits, as before)
-        const bool on = !(getenv("RX_VK_LATE_QUEUE") && atoi(getenv("RX_VK_LATE_QUEUE")) == 0);
-        logf("vk: late pages' wait %s (RX_VK_LATE_QUEUE)", on ? "moved to the queue" : "at the capture's take, as before");
-        return on;
+    static const int env = [] {   // (-1 unset, 0 off, 1 on)
+        const char* e = getenv("RX_VK_LATE_QUEUE");
+        return e && *e ? (atoi(e) != 0 ? 1 : 0) : -1;
     }();
-    return v;
+    const bool on = env == 1 || (env == -1 && !vk_batch_holds());
+    static std::atomic<int> said{-1};   // (the last answer logged: a line when it is first asked and when it changes)
+    if (said.exchange(on ? 1 : 0, std::memory_order_relaxed) != (on ? 1 : 0))
+        logf("vk: late pages' wait %s (RX_VK_LATE_QUEUE%s)",
+             on ? "moved to the queue" : "at the capture's take, as before",
+             env == -1 ? (on ? "; =0: at the take" : ": submits are held (RX_VK_BATCH), so the take waits; =1: moved to the queue, as v0.7.0")
+             : env == 1 ? "=1" : "=0");
+    return on;
 }
 struct LateFix {
     uint64_t value = 0;                                  // (the late pages' write-back: their slots copied again once it is done)

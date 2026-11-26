@@ -21,10 +21,11 @@ int main() {
     // (what it was: half the processors, 1 to 32)
     expect(half(1) == 1 && half(2) == 1 && half(12) == 6 && half(24) == 12 && half(64) == 32 && half(128) == 32, "half, as before");
     // (a player's PC: normal priority, RAM free at the start)
-    expect(count(12, 24 * GB, false, 0) == 12, "12 processors, 24 GB free: all 12");
-    expect(count(24, 26 * GB, false, 0) == 24, "24 processors, 26 GB free: all 24");
+    expect(count(12, 24 * GB, false, 0) == 9, "12 processors, 24 GB free: three quarters, 9");
+    expect(count(24, 26 * GB, false, 0) == 18, "24 processors, 26 GB free: three quarters, 18");
+    expect(count(8, 16 * GB, false, 0) == 6 && count(4, 16 * GB, false, 0) == 3, "8 and 4 processors: 6 and 3");
     expect(count(1, 8 * GB, false, 0) == 1 && count(2, 8 * GB, false, 0) == 2, "one and two processors");
-    expect(count(128, 256 * GB, false, 0) == 64, "64 at most");
+    expect(count(128, 256 * GB, false, 0) == 64 && count(64, 256 * GB, false, 0) == 48, "64 at most; 64 processors: 48");
     // (1 GB free a worker past half)
     expect(count(24, 16 * GB, false, 0) == 16, "24 processors, 16 GB free: 16");
     expect(count(32, 11 * GB, false, 0) == 16, "32 processors, 11 GB free: half, 16, not fewer");
@@ -46,16 +47,16 @@ int main() {
     expect(count(24, 2 * GB, true, 20) == 20, "the switch decides, whatever the RAM and the priority");
     expect(count(4, 64 * GB, false, 1) == 1, "the switch: one");
     expect(count(8, 64 * GB, false, 1000) == 64, "the switch: 64 at most");
-    expect(count(24, 26 * GB, false, -3) == 24 && count(24, 26 * GB, false, 0) == 24, "the switch not set, or not a count: the rule");
+    expect(count(24, 26 * GB, false, -3) == 18 && count(24, 26 * GB, false, 0) == 18, "the switch not set, or not a count: the rule");
     // (the translation pass on AMD's Windows driver for RDNA 1 and 2: kAmdOlderMost at most, fewer where count gives fewer;
     // other drivers and the switch: count's number)
     using prepare_threads::translate;
     const unsigned most = prepare_threads::kAmdOlderMost;
     expect(translate(count(24, 26 * GB, false, 0), true, false) == most, "AMD's older driver, 24 processors: the cap");
     expect(translate(count(24, 64 * GB, true, 0), true, false) == most, "AMD's older driver, above normal: the cap over half");
-    expect(translate(count(4, 64 * GB, false, 0), true, false) == 4 && translate(2, true, false) == 2, "AMD's older driver, few processors: count's");
+    expect(translate(count(4, 64 * GB, false, 0), true, false) == count(4, 64 * GB, false, 0) && translate(2, true, false) == 2, "AMD's older driver, few processors: count's");
     expect(translate(count(24, 26 * GB, false, 20), true, true) == 20, "AMD's older driver: the switch still decides");
-    expect(translate(count(24, 26 * GB, false, 0), false, false) == 24, "other drivers: count's");
+    expect(translate(count(24, 26 * GB, false, 0), false, false) == 18, "other drivers: count's");
     // ((Triforce) the process heap's signature: the segment heap's, the NT heap's, anything else not known)
     expect(prepare_threads::segment_heap(0xDDEEDDEEu) && !prepare_threads::segment_heap(0xFFEEFFEEu) && !prepare_threads::segment_heap(0),
            "segment_heap: the segment heap's signature only");

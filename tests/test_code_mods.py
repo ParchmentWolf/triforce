@@ -410,6 +410,37 @@ class Apply(Folder):
         self.apply()
         self.assertEqual(self.image()[0x10:0x12], b"\xaa\xbb")
 
+    def test_a_mod_goes_in_whole_or_not_at_all(self):
+        # (11-25: a mod's file built in branched into the code cave its other file was refused for, and the game crashed)
+        before = (self.exefs / "main").read_bytes()
+        self.patch("cave/exefs/a.pchtxt", "@nsobid-%s\n@enabled\n00000110 AAAA\n" % MAIN_HEX)
+        self.patch("cave/exefs/%s.ips" % MAIN_HEX, ips([(0x100 + 0x400, b"\x1f\x20\x03\xd5")]))   # (the code cave)
+        entries = self.apply()
+        self.assertEqual([e["state"] for e in entries], ["refused", "refused"])
+        self.assertEqual((self.exefs / "main").read_bytes(), before)
+        cave = "cave/exefs/%s.ips" % MAIN_HEX
+        refused = next(e for e in entries if e["path"] == "cave/exefs/a.pchtxt")
+        self.assertIn("another patch of the same mod is not applied (%s)" % cave, refused["why"])
+        self.assertTrue(any(line.startswith("code mods: cave/exefs/a.pchtxt is not applied: another patch") for line in self.said),
+                        self.said)
+        # (another mod beside it is applied as before)
+        self.patch("other/exefs/b.pchtxt", "@nsobid-%s\n@enabled\n00000120 BB\n" % MAIN_HEX)
+        self.fresh()
+        entries = self.apply()
+        self.assertEqual({e["path"]: e["state"] for e in entries},
+                         {"cave/exefs/a.pchtxt": "refused", cave: "refused", "other/exefs/b.pchtxt": "applied"})
+        self.assertNotEqual(self.image()[0x10:0x12], b"\xaa\xaa")   # (the refused mod's bytes are not in)
+        self.assertEqual(self.image()[0x20], 0xBB)
+
+    def test_a_patch_for_another_build_holds_nothing_back(self):
+        # (mods carry one patch per game version: the others' refusal leaves this build's file applied)
+        self.patch("multi/exefs/a.pchtxt", "@nsobid-%s\n@enabled\n00000110 AAAA\n" % MAIN_HEX)
+        self.patch("multi/exefs/0123456789abcdef0123456789abcdef01234567.ips", ips([(0x100 + 0x10, b"\x01")]))
+        entries = self.apply()
+        self.assertEqual({e["path"].split("/")[-1]: e["state"] for e in entries},
+                         {"a.pchtxt": "applied", "0123456789abcdef0123456789abcdef01234567.ips": "refused"})
+        self.assertEqual(self.image()[0x10:0x12], b"\xaa\xaa")
+
     def test_a_patch_that_changes_nothing_leaves_the_file(self):
         before = (self.exefs / "main").read_bytes()
         self.patch("same/exefs/%s.ips" % MAIN_HEX, ips([(0x100 + 0x40, b"\x11\x11"), (0x100 + 0x1040, (3, 0x12))]))

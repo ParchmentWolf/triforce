@@ -204,8 +204,9 @@ static void code_record_load(void) {
     if (built) nbuilt = mod_code_parse(text, built, BUILT_MOST);
     free(text);
 }
-/* (returns how many of this mod's patches wait for a build: new since it, or changed) */
-static int code_patches(const Mod *mod) {
+/* (returns how many of this mod's patches wait for a build: new since it, or changed; *refused: how many the build refused) */
+static int code_patches(const Mod *mod, int *refused) {
+    *refused = 0;
     char pat[MAX_PATH];
     snprintf(pat, sizeof pat, "%s\\exefs\\*", mod->path);
     WIN32_FIND_DATAA fd;
@@ -227,6 +228,8 @@ static int code_patches(const Mod *mod) {
         else if (state == MOD_CODE_CHANGED) hos_log("mods: %s changed since the game was built: the game has it as it was then", rel);
         else hos_log("mods: %s is not built into the game", rel);
         waits += state == MOD_CODE_CHANGED || state == MOD_CODE_WAITS;
+        /* (one for another build of the game holds nothing back: mods carry a patch per game version, nx2/code_mods.py OtherBuild) */
+        *refused += state == MOD_CODE_REFUSED && strncmp(why, "it is for build ", 16) != 0;
     } while (FindNextFileA(f, &fd));
     FindClose(f);
     code_waits += waits;
@@ -289,13 +292,20 @@ static void mods_scan(void) {
            files waiting too: the game crashed at its start with a mod's new files over its old code (Classic Item Slots
            put in by the Mods menu, #bug-tracker "Crashing on startup"; a build put them in step). They come with the code,
            at the next build. HOS_MODS_SPLIT=1: the files now anyway, as before) */
-        const int waits = code_patches(&mods[i]);
+        /* ((Triforce, 11-25) and a mod whose code the build refused (a code cave, another build) is off whole: its RomFS
+           files were made for its code. A player's "More Tunics" had its two code-cave patches refused and its 172 files
+           (new tunics in the actor and game data tables) loaded over the game's own code; crashes at every loading screen) */
+        int refused = 0;
+        const int waits = code_patches(&mods[i], &refused);
         static int split = -1;
         if (split < 0) split = getenv("HOS_MODS_SPLIT") && atoi(getenv("HOS_MODS_SPLIT")) == 1;
-        const int hold = waits > 0 && !split;
-        const int files = hold ? 0 : index_romfs(dir, "", 0);
-        cheat_files(&mods[i]);    /* (and its cheat file) */
-        if (hold)
+        const int hold = waits > 0 && !split, off = refused > 0 && !split;
+        const int files = hold || off ? 0 : index_romfs(dir, "", 0);
+        if (!off) cheat_files(&mods[i]);    /* (and its cheat file) */
+        if (off)
+            hos_log("mods: %s is off: %d of its code patch(es) could not be built in, and its RomFS files and cheats go with its code "
+                    "(HOS_MODS_SPLIT=1: its files anyway)", mods[i].name, refused);
+        else if (hold)
             hos_log("mods: %s: its RomFS files wait for the build too, with its code (%d patch(es) not built in yet)", mods[i].name, waits);
         else
             hos_log("mods: %s: %d RomFS files", mods[i].name, files);
