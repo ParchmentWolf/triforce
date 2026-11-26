@@ -95,6 +95,7 @@ int hos_sdl_pads(uint64_t *buttons, int32_t stick[4]) {
     bootstrap_polls++; *buttons = 1ULL << B_Y; stick[0] = -31000; return 1;
 }
 int hos_sdl_pads_deck_builtin(void) { return deck_builtin; }   /* (host/pad_sdl.c's: the "deck-mouse" case) */
+int vr_session_on(void) { return 0; }   /* ((Triforce VR) host/vr_game.c's: no headset here */
 /* (the pads' inputs still held after the Insert menu: none here, pad_raw_now staying 0, so the bindings are never asked) */
 static uint64_t pad_raw_game;
 static uint64_t bound_pad_buttons(uint64_t raw) { (void)raw; CHECK(!"no pad input was held after the menu"); return 0; }

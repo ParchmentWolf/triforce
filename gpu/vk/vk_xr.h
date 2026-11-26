@@ -75,6 +75,8 @@ void vk_xr_ocarina(int on);
 // vr_game.c, the game's thread: Link holds his sword and shield (or another weapon) out now, so the draw gesture puts
 // them away
 void vk_xr_weapon_out(int out);
+void vk_xr_two_handed_sword(int on);   // ((Triforce VR) vr_game.c: his sword is the Biggoron's, for the head tilt's Z-target
+int vk_xr_arms_own(void);   // ((Triforce VR) vr_body.c: his arms the animation's now (a bow or slingshot drawn, a hammer swing)
 // vr_game.c, each frame: Link is a child (VR's hands draw his own for his age on a hand that holds nothing)
 void vk_xr_child(int child);
 // vr_game.c, the game's thread: the item Link uses now, by its model's name ("Item_DekuStick"), "" none

@@ -198,6 +198,7 @@ const char* tx_framegen(int v) {
 const char* tx_onoff(int v) { return v ? "On" : "Off"; }
 // (Triforce VR) the VR tab's values
 const char* tx_vr_view(int v) { return v ? "Immersive" : "Theater"; }
+const char* tx_normal_inverted(int v) { return v ? "Inverted" : "Normal"; }
 const char* tx_vr_mode(int v) { return v >= 2 ? "Full Dive" : v ? "Immersive" : "Theater"; }
 const char* tx_view3d(int v) {
     static const char* const t[] = {"Flatscreen", "VR", "Red/cyan glasses", "Side by side (3D TV)", "Crossed eyes", "Above and below",
@@ -2439,6 +2440,9 @@ Row rows[] = {
      "How the hand controllers play. Full Gesture: Link's moves from your own: draw from behind your head, swing to slash, "
      "raise the shield, pull back the bow, point to aim. [PlaceHolder]: a scheme still to come.", nullptr, false, true, -1,
      false, "vr_scheme"},
+    {TAB_VRPAGE, "Immersive Camera X", &opts.vr_orbit_invert, 0, 1, 1, tx_normal_inverted,
+     "Immersive: how the right stick moves you around Link. Normal: the way you push it, as if on a rail. Inverted: the "
+     "other way, as the game's camera turns on a flat screen.", nullptr, false, true, -1, false, "vr_orbit_invert"},
     MENU_HEADING(TAB_VRPAGE, "Body"),
     {TAB_VRPAGE, "Visibility", &opts.vr_body, 0, 1, 1, tx_vr_body,
      "Full Dive: Shown: Link stays drawn, his arms follow your hands with what they hold, and his head is hidden. "
@@ -3396,6 +3400,7 @@ const VrKey vr_keys[] = {
     {"VR_EVENT_UP", &opts.vr_event_up, nullptr},
     {"VR_CUTSCENES", &opts.vr_cutscenes, "classic|first"},
     {"VR_AIM_TILT", &opts.vr_aim_tilt, nullptr},
+    {"VR_ORBIT_INVERT", &opts.vr_orbit_invert, nullptr},
     {"VR_SWING_SPEED", &opts.vr_swing_speed, nullptr},
     {"VR_CHARGE_REACH", &opts.vr_charge_reach, nullptr},
     {"VR_HUD_SIZE", &opts.vr_hud_size, nullptr},
@@ -9362,7 +9367,8 @@ void menu_tick() {
     // only here, so with the row on and another window in front the game took the pad and the menu did not: L and R did not
     // reach our tabs from the game's Options screen, the owner's for a while. The keys stay the front window's)
     static const char* pad_bg_env = getenv("HOS_INPUT_BACKGROUND");
-    const bool pads_ok = mine || (pad_bg_env ? atoi(pad_bg_env) != 0 : opts.pad_background != 0);
+    // ((Triforce VR) in the headset the window is seldom in front: a VR session in focus counts as in front for the pads)
+    const bool pads_ok = mine || vk_xr_head_active() || (pad_bg_env ? atoi(pad_bg_env) != 0 : opts.pad_background != 0);
     uint32_t raw = pads_ok && host && host->pad_raw ? host->pad_raw() : 0;
     {   // ((Triforce VR) the hand controllers in a menu: their buttons as the pad inputs those Switch buttons are bound to, the
         // left stick as the menus' stick bits, the right's up and down too)

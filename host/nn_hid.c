@@ -38,7 +38,7 @@
 #include "../gpu/vk/vk_api.h"   /* (the controls' names: HOS_SW_*, HOS_PAD_*) */
 #include "hold_toggle.h"   /* ((Triforce) 11-24: hold-to-toggle's latch) */
 #include "hos_motion.h"
-#include "vr_game.h"   /* ((Triforce VR) vr_pad_read, vr_motion_history) */
+#include "vr_game.h"   /* ((Triforce VR) vr_pad_read, vr_session_on) */
 #include "input_movie.h"   /* ((Triforce) MoviePad, MovieMotion: input recordings, host/input_movie.c) */
 _Static_assert(sizeof(HosMotionState) == sizeof(((MovieMotion *)0)->v), "a motion reading is 18 floats in a recording");
 #include "flight_jump.h"   /* ((Triforce, 11-24) the no-clip flight's Jump) */
@@ -1203,6 +1203,8 @@ int hos_xinput_connected(void) {
 static int pads_in_background(const char *env, int menu) {
     return env ? atoi(env) != 0 : menu != 0;
 }
+/* ((Triforce VR) vr_game.c: in the headset the window is seldom in front, so a gamepad counts beside the hand controllers */
+int vr_session_on(void);
 
 /* (hookshot) Whether a pad's motion counts: when its buttons do, with the game's window in front, or behind another
    window when the player asked for the pads there. Otherwise GetSixAxisSensorStates hands out the pad at rest, so a
@@ -1473,7 +1475,9 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
         scripted_background = getenv("HOS_INPUT_SCRIPT_BACKGROUND") != NULL;
         if (scripted_background) hos_log("hid: scripted input runs with the game in the background (HOS_INPUT_SCRIPT_BACKGROUND)");
     }
-    if (!game_in_front() && !scripted_background) {   /* (the pads alone, when the player asked for them behind other windows) */
+    /* ((Triforce VR) in the headset the window is seldom in front: a VR session in focus reads as in front, so a gamepad
+       beside the hand controllers is the game's in its menus too, not only the bare pads below) */
+    if (!game_in_front() && !scripted_background && !vr_session_on()) {   /* (the pads alone, when the player asked for them behind other windows) */
         static const char *env;
         static int looked;
         if (!looked) looked = 1, env = getenv("HOS_INPUT_BACKGROUND");
@@ -1757,7 +1761,7 @@ static void npad_states(Ctx *c) {
         static const char *env;
         static int looked;
         if (!looked) looked = 1, env = getenv("HOS_INPUT_BACKGROUND");
-        if (game_in_front() || pads_in_background(env, rx_option(4, 0))) {
+        if (game_in_front() || vr_session_on() || pads_in_background(env, rx_option(4, 0))) {
             uint64_t menu_buttons = 0;
             int32_t menu_stick[4] = {0, 0, 0, 0};
             pads_read(&menu_buttons, menu_stick);
@@ -1774,7 +1778,7 @@ static void npad_states(Ctx *c) {
             const uint64_t enabled = (uint64_t)(uint32_t)rx_option(HOS_OPT_HOLD_TOGGLE, 0) & ((1ULL << B_PLUS) - 1) & ~stay;
             const uint64_t taps = host_taps_now, own = buttons & ~taps;
             const int reset = InterlockedExchange(&toggle_reset, 0) || rx_option(1, 0) ||
-                              (enabled && !game_in_front() && !pads_in_background(getenv("HOS_INPUT_BACKGROUND"), rx_option(4, 0)));
+                              (enabled && !game_in_front() && !(vr_session_on() || pads_in_background(getenv("HOS_INPUT_BACKGROUND"), rx_option(4, 0))));
             const uint64_t pause = own & ~toggles.previous & stay;
             if (enabled || toggles.latched) buttons = hold_toggle_apply(&toggles, own, enabled, reset || pause != 0) | taps;
             else toggles.previous = own, toggles.blocked = 0;
@@ -1909,9 +1913,7 @@ HLE(_ZN2nn3hid22GetSixAxisSensorStatesEPNS0_18SixAxisSensorStateEiRKNS0_19SixAxi
     int hos_input_movie_gyro(MovieMotion *h, int max, int live);
     const int movie = hos_input_movie_active();
     const int counts = motion_counts(game_in_front(), background_env, rx_option(4, 0)) && !(movie && hos_input_movie_playing());
-    /* ((Triforce VR) while VR's pointed aim steers the game's motion aim, its readings in place of the pad's: vr_game.c) */
-    int live = count && !(movie && hos_input_movie_playing()) ? vr_motion_history(h, count) : 0;
-    if (!live) live = count && counts ? hos_sdl_motion_history(h, count) : 0;
+    int live = count && counts ? hos_sdl_motion_history(h, count) : 0;
     if (movie) {
         MovieMotion mm[HOS_MOTION_HISTORY];
         for (int i = 0; i < live; i++) {

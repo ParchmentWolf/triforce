@@ -142,7 +142,11 @@ void hos_vr_screen(Ctx *c, int open) {
     xr()->item_bar(open);
     hos_log("vr: the item bar %s", open ? "opened" : "closed");
 }
+static volatile int g_item_out;   /* (vr_tick: an item in his hand, not the sword) */
+static char g_held[96];          /* (vr_tick: the item in his hand, its model's name; "" none) */
+const char *vr_game_held(void) { return g_held; }
 int vr_game_two_handed(void) {
+    if (g_item_out) return 0;
     char weapon[64] = "";
     oot_data_text(gw(), "PlayerStatus.EquipWeapon", weapon);
     return strstr(weapon, "Biggoron") != NULL;
@@ -339,8 +343,17 @@ static int link_aims(void) {
 }
 
 
+static volatile int g_held_boomerang;    /* (vr_tick: the boomerang in his hand) */
+static volatile int g_held_hookshot;     /* (vr_tick: the hookshot or the longshot in his hand) */
+static volatile int32_t stick_aim[2];       /* ((Triforce VR) steer_aim: the right stick that turns the aim onto the pointer */
+static volatile uint64_t stick_aim_at;      /* (when it was made; used for 150 ms) */
 static int g_aiming;           /* hand_item: Link aims or holds a ranged item ready now (the bow, slingshot, hookshot, boomerang) */
-int vr_game_aiming(void) { return g_aiming; }   /* ((Triforce VR) vr_body.c: the arms put on the controllers again before the mirror */
+int vr_game_aiming(void) { return g_aiming; }
+/* ((Triforce VR) nn_hid.c: a VR session in focus, so the gamepad counts beside the hand controllers with the window behind */
+int vr_session_on(void) {
+    const MkwVkXr *x = xr();
+    return x && x->active && x->active() && x->head_active && x->head_active();
+}   /* ((Triforce VR) vr_body.c: the arms put on the controllers again before the mirror */
 static uint64_t zr_at, y_at;   /* the item button's (ZR) and the sword's (Y) last presses, vr_pad_read */
 
 /* Whether Link holds something out, and the item in his hand as VR's hands draw it (a model of the game's files), "" for
@@ -444,10 +457,15 @@ static void vr_tick(Ctx *c, const MkwVkXr *x) {
     oot_link_state_at(state, 0x244);
     x->ocarina(!strncmp(state, "DemoOcarina", 11));   /* playing the ocarina (a lesson's too) */
     {   /* what he holds out, for the controllers' gestures */
-        char item[96];
+        char item[96] = "";
         x->child(oot_childhood());
         x->weapon_out(hand_item(item));
         x->hand_item(item);
+        g_item_out = item[0] != 0;
+        snprintf(g_held, sizeof g_held, "%s", item);
+        if (x->two_handed_sword) x->two_handed_sword(vr_game_two_handed());   /* (the head tilt's Z-target: vk_xr.cpp) */
+        g_held_boomerang = strstr(item, "Boomerang") != NULL;
+        g_held_hookshot = strstr(item, "Hookshot") != NULL;
     }
     if (x->carrying) {   /* ((Triforce VR) something of the world's in his hands: from its lift (LiftReady, LiftUp) while his arms carry
                             it (CommonUpper among his states' names, an item's too: so only after a lift), through LiftThrow or LiftPut */
@@ -531,6 +549,13 @@ void vr_pad_read(Ctx *c, uint64_t *buttons, int32_t stick[4]) {
     if (!x || !x->active || !x->active()) return;
     if (!rx_option(1, 0)) x->pad(buttons, stick, stick + 2);   /* the hand controllers, as the pad (the Insert menu's own while it is open) */
     if (!rx_option(1, 0)) vr_pad(buttons, &stick[0], &stick[1]), vr_turn(&stick[2]);   /* (not while the Insert menu is open) */
+    if (!rx_option(1, 0) && now_ns() - __atomic_load_n(&stick_aim_at, __ATOMIC_ACQUIRE) < 150000000ull)
+        stick[2] = stick_aim[0], stick[3] = stick_aim[1];   /* ((Triforce VR) the pointed aim's stick: steer_aim */
+    /* ((Triforce VR) Immersive: the right stick moves the view around Link the way it is pushed, as on a rail (the game's
+       camera turns the other way, which on a flat screen reads right); Invert camera orbit keeps the game's */
+    if (!rx_option(1, 0) && !g_aiming && !strcmp(cfg_value("VR_VIEW"), "head") && !strcmp(cfg_value("VR_CAMERA"), "third") &&
+        !atoi(cfg_value("VR_ORBIT_INVERT")))
+        stick[2] = stick[2] == INT32_MIN ? INT32_MAX : -stick[2];
     /* (the game reads the pad several times a frame, on its workers: what vr_tick tells VR changes at most once a frame,
        so it runs once in 4 ms, whichever reader comes first) */
     static uint64_t tick_at;
@@ -540,6 +565,19 @@ void vr_pad_read(Ctx *c, uint64_t *buttons, int32_t stick[4]) {
         vr_tick(c, x);
 }
 
+/* his facing as the game keeps it, from which his rotation, his physics and the rest are made each frame: the object
+   component 0 points at (+0x60), its 3x4 matrix by rows at +0x1f8 (the position in each row's fourth float); s, co the
+   sine and cosine of the way he faces. 0 when he is not upright now */
+static int face_link(uint64_t actor, float s, float co) {
+    const uint64_t components = rd_ptr(actor + 0x270), c0 = components ? rd_ptr(components) : 0;
+    const uint64_t facing = c0 ? rd_ptr(c0 + 0x60) : 0;
+    float t[12];
+    if (!game_rw(facing, 0x1f8 + sizeof t)) return 0;
+    rd(facing + 0x1f8, t, sizeof t);
+    if (fabsf(t[5] - 1.0f) > 0.01f) return 0;   /* not upright now */
+    const float r[12] = {co, 0, s, t[3], 0, 1, 0, t[7], -s, 0, co, t[11]};
+    return poke(facing + 0x1f8, r, sizeof r);
+}
 static void turn_link(const double ahead[3]) {
     const uint64_t actor = player();
     if (!actor || strcmp(cfg_value("VR_CAMERA"), "first")) return;
@@ -548,105 +586,66 @@ static void turn_link(const double ahead[3]) {
     head_s = ahead[0] / n, head_c = ahead[2] / n;
     const int straight = now_ns() - run_at < 100000000ull;   /* running straight ahead: that way */
     const float s = (float)(straight ? run_s : head_s), co = (float)(straight ? run_c : head_c);
-    /* his facing as the game keeps it, from which his rotation, his physics and the rest are made each frame: the object
-       component 0 points at (+0x60), its 3x4 matrix by rows at +0x1f8 (the position in each row's fourth float) */
-    const uint64_t components = rd_ptr(actor + 0x270), c0 = components ? rd_ptr(components) : 0;
-    const uint64_t facing = c0 ? rd_ptr(c0 + 0x60) : 0;
-    float t[12];
-    if (!game_rw(facing, 0x1f8 + sizeof t)) return;
-    rd(facing + 0x1f8, t, sizeof t);
-    if (fabsf(t[5] - 1.0f) > 0.01f) return;   /* not upright now */
-    const float r[12] = {co, 0, s, t[3], 0, 1, 0, t[7], -s, 0, co, t[11]};
-    poke(facing + 0x1f8, r, sizeof r);
+    if (!face_link(actor, s, co)) return;
     fp_at = now_ns();
 }
-
-/* Play style Motion: while Link aims (g_aiming), the game's aim (its camera's ray, d) steered onto where the sword hand's
-   controller points, through the game's own motion aiming: its six-axis sensor (vr_motion_history) is given turn rates
-   proportional to the yaw and pitch between the two, every camera update, so the aim follows the controller wherever it
-   points and does not drift; the right stick still adds to it. The view's base yaw is held meanwhile (aim_freeze), else it
-   would turn with the aim it chases. The sensor's axes that turn the aim's pitch and yaw: x and z. */
-static SRWLOCK motion_lock = SRWLOCK_INIT;
-static HosMotionSample motion_hist[HOS_MOTION_HISTORY];
-static int motion_head, motion_count;
-static int64_t motion_n, motion_last_ns;
-static double motion_r[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};   /* the controller's orientation: lying face up at the start */
-static float motion_angle[3];
 
 static double wrap_pi(double a) {
     while (a > M_PI) a -= 2 * M_PI;
     while (a < -M_PI) a += 2 * M_PI;
     return a;
 }
-/* one reading: rates in radians a second about the controller's own axes (the Switch's frame), lying face up */
-static void motion_feed(const double gyro[3]) {
-    const int64_t now = hos_now_ns();
-    AcquireSRWLockExclusive(&motion_lock);
-    double dt = motion_last_ns && now > motion_last_ns ? (now - motion_last_ns) / 1e9 : 0.005;
-    if (dt > 0.05) {   /* a new aim: from rest */
-        dt = 0.005, memset(motion_angle, 0, sizeof motion_angle);
-        for (int i = 0; i < 3; i++)
-            for (int j = 0; j < 3; j++) motion_r[i][j] = i == j;
-    }
-    motion_last_ns = now;
-    {   /* R = R * exp(w dt) (the body frame), kept orthonormal */
-        const double a[3] = {gyro[0] * dt, gyro[1] * dt, gyro[2] * dt};
-        const double k[3][3] = {{1, -a[2], a[1]}, {a[2], 1, -a[0]}, {-a[1], a[0], 1}};
-        double m[3][3];
-        for (int i = 0; i < 3; i++)
-            for (int j = 0; j < 3; j++) m[i][j] = motion_r[i][0] * k[0][j] + motion_r[i][1] * k[1][j] + motion_r[i][2] * k[2][j];
-        for (int j = 0; j < 3; j++) {   /* (Gram-Schmidt on the columns) */
-            for (int p = 0; p < j; p++) {
-                const double d = m[0][j] * m[0][p] + m[1][j] * m[1][p] + m[2][j] * m[2][p];
-                for (int i = 0; i < 3; i++) m[i][j] -= d * m[i][p];
-            }
-            const double l = sqrt(m[0][j] * m[0][j] + m[1][j] * m[1][j] + m[2][j] * m[2][j]);
-            for (int i = 0; i < 3; i++) m[i][j] /= l;
-        }
-        memcpy(motion_r, m, sizeof m);
-    }
-    HosMotionSample s;
-    memset(&s, 0, sizeof s);
-    /* ((Triforce VR) gravity as the turned controller would feel it (its frame's view of the world's down, R's third row): with
-       it fixed flat, the game's tilt correction pulled the aim's pitch back to level, so up and down barely moved) */
-    for (int i = 0; i < 3; i++) s.st.accel[i] = (float)-motion_r[2][i];
-    for (int i = 0; i < 3; i++) {
-        const float turns = (float)(gyro[i] / (2 * M_PI));
-        motion_angle[i] += turns * (float)dt;
-        s.st.gyro[i] = turns, s.st.rotation[i] = motion_angle[i];
-        for (int j = 0; j < 3; j++) s.st.direction[i * 3 + j] = (float)motion_r[j][i];   /* (row i: the controller's axis i) */
-    }
-    s.n = ++motion_n, s.dt_ns = (int64_t)(dt * 1e9);
-    motion_head = (motion_head + 1) % HOS_MOTION_HISTORY;
-    motion_hist[motion_head] = s;
-    if (motion_count < HOS_MOTION_HISTORY) motion_count++;
-    ReleaseSRWLockExclusive(&motion_lock);
-}
-int vr_motion_history(HosMotionSample *out, int max) {
-    AcquireSRWLockShared(&motion_lock);
-    const int live = motion_last_ns && hos_now_ns() - motion_last_ns < 100000000LL;
-    const int n = !live ? 0 : motion_count < max ? motion_count : max;
-    for (int i = 0; i < n; i++) out[i] = motion_hist[(motion_head - i + HOS_MOTION_HISTORY) % HOS_MOTION_HISTORY];
-    ReleaseSRWLockShared(&motion_lock);
-    return n;
-}
 
-static void steer_aim(const MkwVkXr *x, const double d[3]) {
+/* ((Triforce VR) the aim set where the pointer is, in the gameplay camera's state (x19) while Link aims: the angles it turns
+   toward (+0xa384, and again at +0xa38c) and its own (+0x1178), in degrees, the way's height's asin held to the game's -85
+   to 70. The yaw beside them (+0xa388, +0x117c) is made again each update, and in third person turns the camera itself.
+   1 when it is set */
+static int set_aim(uint64_t state, const double t[3]) {
+    /* (the game's pitch is down positive: the height's asin taken the other way) */
+    const double pitch = fmax(-85.0, fmin(70.0, -asin(fmax(-1, fmin(1, t[1]))) * 180 / M_PI));
+    /* (the pitch alone: the yaw written there turns the camera itself in third person, not the aim) */
+    const float target = (float)pitch;
+    if (!state || !poke(state + 0xa384, &target, 4) || !poke(state + 0xa38c, &target, 4) || !poke(state + 0x1178, &target, 4)) return 0;
+    return 1;
+}
+static void steer_aim(const MkwVkXr *x, const double d[3], uint64_t state, const double pos[3]) {
     const int pointed = d && g_aiming && !strcmp(cfg_value("VR_PLAY"), "motion") && x->head_active();
     x->aim_freeze(pointed);
     double t[3];
-    if (!pointed || !x->pointer(t)) return;
-    const double yaw_err = wrap_pi(atan2(t[0], t[2]) - atan2(d[0], d[2]));
-    const double pitch_err = asin(fmax(-1, fmin(1, t[1]))) - asin(fmax(-1, fmin(1, d[1])));
-    /* (the pitch's turn rate much above the yaw's, found by eye in the headset: the game's aim moves up and down far less than
-       across for the same rate) */
-    const double pitch_gain = 50.0, yaw_gain = 1.1;
-    double gyro[3] = {0, 0, 0};
-    const double k = 10.0, most = 8.0;
-    const double rate[2] = {fmax(-most * pitch_gain, fmin(most * pitch_gain, k * pitch_gain * pitch_err)),
-                            fmax(-most * yaw_gain, fmin(most * yaw_gain, k * yaw_gain * yaw_err))};
-    gyro[0] = rate[0], gyro[2] = rate[1];
-    motion_feed(gyro);
+    const int pointer = pointed && x->pointer(t);
+    if (!pointer) return;
+    {   /* ((Triforce VR) the aim onto the pointer: the bow's and the slingshot's pitch set in the camera's state (set_aim); the
+           rest through the right stick, which the game's aim always takes (its own yaw, the hookshot's and the boomerang's
+           aim are made again each update from a state not found): full past kStickFull degrees off, in proportion below,
+           none within kStickDead. A full push turns the aim some 49 degrees a second */
+        /* (kStickLeast: the least push off kStickDead, past the game's own dead zone, so the last degrees close too) */
+        static const double kStickFull = 10.0, kStickDead = 0.3, kStickLeast = 0.25;
+        char upper[48];
+        oot_link_state_at(upper, 0x34c);
+        const int pose = link_aims(), boomerang = g_held_boomerang, hookshot = g_held_hookshot || !strncmp(upper, "Hookshot", 8);
+        if (!pose && !boomerang && !hookshot) return;
+        if (boomerang && !pose) {   /* (the boomerang's aim is the game's camera's, behind and above him: in first person that
+                                       camera is turned onto the point 15 m out along the gaze from his eyes) */
+            double eye[3];
+            if (first_person_eye(eye)) {
+                double v[3], n = 0;
+                for (int i = 0; i < 3; i++) v[i] = eye[i] + 15.0 * t[i] - pos[i], n += v[i] * v[i];
+                n = sqrt(n);
+                if (n > 1e-3) for (int i = 0; i < 3; i++) t[i] = v[i] / n;
+            }
+        }
+        const int pitch_set = pose && !hookshot && set_aim(state, t);
+        const double yaw_err = wrap_pi(atan2(t[0], t[2]) - atan2(d[0], d[2])) * 180 / M_PI;
+        const double up_err = (asin(fmax(-1, fmin(1, t[1]))) - asin(fmax(-1, fmin(1, d[1])))) * 180 / M_PI;
+#define STICK_PUSH(e) (fabs(e) < kStickDead ? 0 : copysign(fmax(kStickLeast, fmin(1, fabs(e) / kStickFull)), (e)))
+        const double sx = STICK_PUSH(-yaw_err);
+        /* (out of the aiming pose (the boomerang, the hookshot held) the aim is the third-person camera's, whose up and down go
+           the other way from the aiming pose's) */
+        const double sy = pitch_set ? 0 : STICK_PUSH(pose ? -up_err : up_err);
+#undef STICK_PUSH
+        stick_aim[0] = (int32_t)(sx * 32767), stick_aim[1] = (int32_t)(sy * 32767);
+        __atomic_store_n(&stick_aim_at, now_ns(), __ATOMIC_RELEASE);
+    }
 }
 
 /* the camera's state (x19) has its actor at +0x10, the actor its name at +0x20: 1 the camera that follows Link, 2 the
@@ -769,8 +768,8 @@ void hos_vr_camera(Ctx *c) {
         double d[3] = {at[0] - pos[0], at[1] - pos[1], at[2] - pos[2]};
         const double l = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
         if (l > 1e-6) d[0] /= l, d[1] /= l, d[2] /= l;
-        x->aim(aims && l > 1e-6, pos, d);
-        steer_aim(x, l > 1e-6 ? d : NULL);
+        x->aim((aims || g_aiming) && l > 1e-6, pos, d);   /* ((Triforce VR) the boomerang's and the slingshot's too */
+        steer_aim(x, l > 1e-6 ? d : NULL, c->x[19], pos);
     }
     double eye[3];
     int fp_eye = 0;

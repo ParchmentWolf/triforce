@@ -18,9 +18,6 @@ void hos_vr_screen(Ctx *c, int open);
 /* nn_hid.c npad_states: the Touch controllers onto the pad (buttons, stick[0..1] left, [2..3] right), then first person's
    strafe (the game's thread) */
 void vr_pad_read(Ctx *c, uint64_t *buttons, int32_t stick[4]);
-/* nn_hid.c GetSixAxisSensorStates: while the pointed aim steers the game's motion aim, its readings (newest first) in place
-   of the pad's; 0 otherwise */
-int vr_motion_history(HosMotionSample *out, int max);
 /* nn_vi.c realtime_step: Stereo Balanced's hold of the game's time (1: the update about to run steps two frames' time, the
    next none), and the seconds the update steps, for the eye it draws */
 int vr_holds_time(void);
@@ -40,8 +37,10 @@ int vr_play_anchor(double feet[3]);
 int vr_game_paused(void);
 /* vr_game.c: Link a child now */
 int vr_game_childhood(void);
-/* vr_game.c: his sword is one for both hands (the Biggoron's Sword) */
+/* vr_game.c: his sword is one for both hands (the Biggoron's Sword), and no item is in his hand */
 int vr_game_two_handed(void);
+/* vr_game.c: the item in his hand, its model's name ("" none) */
+const char *vr_game_held(void);
 /* vr_game.c: Link shows an item (a quest item held up) */
 int vr_game_showing_item(void);
 /* vr_body.c: 1 and his neck's height over his feet (metres) as the late bone pass last posed it, while that was a moment ago */

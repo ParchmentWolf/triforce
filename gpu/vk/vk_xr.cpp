@@ -277,6 +277,7 @@ struct Xr {
     std::atomic<bool> ocarina{false};   // vr_game.c: Link plays the ocarina (the controllers' Ocarina mode)
     std::atomic<bool> weapon_out{false};   // vr_game.c: Link holds his sword and shield (or another weapon) out
     std::atomic<bool> child{true};         // vr_game.c: Link is a child (his hands' model)
+    std::atomic<bool> two_handed_sword{false};   // ((Triforce VR) vr_game.c: his sword is the Biggoron's
     std::atomic<int> hud_hidden{0};        // ((Triforce VR) vr_game.c: no HUD panel now (a load zone's transition)
     std::atomic<int> head_worn{0};
     std::atomic<bool> carrying{false};     // ((Triforce VR) vr_game.c: Link has something of the world's in his hands
@@ -308,6 +309,13 @@ extern "C" int vk_xr_live_mirror(void) { return g_live_mirror.load(); }
 // Her table: the shield, Deku Nuts, the business seed, the slingshot and the bow as made; the rest mirrored. (Bombs: as made,
 // the Deku Stick and the hammer mirrored, until looked at in the headset)
 static std::atomic<bool> g_gaze_aim{false};   // ((Triforce VR) the boomerang out: its aim the head's gaze (vk_xr_pointer)
+// ((Triforce VR) the last shot (ZR let go), and the pointer's ways just before it (vk_xr_pointer): kShotHoldNs after a shot
+// the aim is the way it was kShotBeforeNs before it
+static std::atomic<uint64_t> g_shot_at{0};
+// ((Triforce VR) the hammer's last swing (its ZR): his arms the game's own swing for kHammerSwingNs after it (vk_xr_arms_own)
+static std::atomic<uint64_t> g_hammer_swung{0};
+static constexpr uint64_t kHammerSwingNs = 900000000ull;
+static constexpr uint64_t kShotHoldNs = 350000000ull, kShotBeforeNs = 150000000ull;
 static int item_mirrored_right(const char *it) {
     static const char *const as_made[] = {"Shield", "DekuNut", "ScrubBusinessSeed", "Slingshot", "SlingShot", "Pachinko", "Bow", "Bomb", "Hammer"};
     for (const char *n : as_made)
@@ -1265,15 +1273,19 @@ struct Controls {
     bool shield_alone = false;   // ((Triforce VR) the shield raised with no sword out, and none drawn since (Y)
     static constexpr float carry_share = 0.6f, carry_same = 0.6f;
     // the bow's and the slingshot's draw: the other hand's grip squeezed within draw_reach of the holding hand arms it (about
-    // where the string is: no need to touch the hands); drawn away past draw_far still squeezed, ZR held (the aim, its direction
-    // from the drawing hand to the holding hand); let go, or brought back within draw_near, the shot
-    static constexpr float draw_reach = 0.30f, draw_near = 0.15f, draw_far = 0.38f;
+    // where the string is: no need to touch the hands); drawn back bow_pull from where it was taken, still squeezed, ZR held (the aim, its direction
+    // from the drawing hand to the holding hand); let go, or brought back within 4 cm of where it was taken, the shot
+    static constexpr float draw_reach = 0.30f, bow_pull = 0.12f;   // (the bow: its reach, its draw from where it was taken)
+    static constexpr float sling_up = 0.13f, sling_reach = 0.26f, sling_pull = 0.08f;   // (the slingshot's stone over its hand, the reach about it, its draw from where it was taken)
     bool bow_arm = false, bow_drawn = false;
+    float sling_took = 0;   // (how far from the stone or the string the pulling hand took it)
     // a grip let go to put away what the game does not show out yet (it lags): put away once it is, within release_wait_ns
     // (and again every resend_ns while it still shows out and the grip stays let go: a press lost to a stutter is pressed again)
     static constexpr uint64_t release_wait_ns = 3000000000ull, resend_ns = 400000000ull;
     uint64_t sword_release_at = 0, item_release_at = 0, sword_sent_at = 0, item_sent_at = 0;
     char item_seen[96]{};   // the item the mirror was last set for
+    uint64_t take_at = 0;   // ((Triforce VR) a pull the game has not shown yet: when it was pressed, and how often again
+    int take_tries = 0;
     bool mask_pull[2]{};    // a grip squeezed before the face: drawn away (mask_away, any way), the mask comes off (D-Up)
     float mask_from[2][3]{};
     static constexpr float mask_away = 0.15f;
@@ -1696,19 +1708,28 @@ struct Controls {
                 else if (pose_ok[item_arm] && back_any[item_arm] < -ahead_on) {
                     item_hand = pull_hand = item_arm, item_arm = -1, zr_until = now + press_ns;
                     empty_since = now;   // (the game shows it a few frames later: not put away meanwhile)
+                    item_seen[0] = 0;    // ((Triforce VR) a new pull: its hand found again, the same item in the other hand too
+                    take_at = now, take_tries = 0;
                     rt_log("vr: grips: item taken out by the %s hand", item_hand ? "right" : "left");
                 }
             }
             // (an item read as none for a moment, around a shot, is still out: half a second before it counts as put away, or
             // the hookshot's trigger went back to being its item bar)
+            if (held_item[0]) take_at = 0;   // ((Triforce VR) a pull the game ignored (a put-away still playing): pressed again,
+            else if (take_at && pull_hand >= 0 && sq[pull_hand] && now - take_at > 700000000ull && take_tries < 2)   // twice at most
+                zr_until = now + press_ns, take_at = now, take_tries++, empty_since = now,
+                rt_log("vr: grips: the item not out yet: pulled again");
             if (held_item[0]) empty_since = 0;
             else if (!empty_since) empty_since = now;
-            const bool gone = !held_item[0] && now - empty_since > 1000000000ull;
+            // ((Triforce VR) the hookshot or the boomerang: its hand's trigger stays its shot until that grip is let go; the game
+            // shows neither for a while once it is shot or thrown, which is not put away)
+            const bool hook_kept = hook_hand >= 0 && sq[hook_hand];
+            const bool gone = !held_item[0] && now - empty_since > 1000000000ull && !hook_kept;
             const bool bomb = strstr(held_item, "Item_Bomb") != nullptr;   // (a bomb or a Bombchu)
             // (the hookshot and the boomerang: their own hand's trigger is the aim)
             if (strstr(held_item, "Hookshot") || strstr(held_item, "Boomerang")) {
                 if (hook_hand < 0 && pull_hand >= 0) hook_hand = pull_hand;   // (the hand that pulled it, even let go already)
-            } else if (held_item[0] || gone) hook_hand = -1;
+            } else if (!hook_kept && (held_item[0] || gone)) hook_hand = -1;
             if (item_hand >= 0 && !sq[item_hand]) item_release_at = now, item_hand = -1;   // (let go: put away; B a backup)
             if (item_release_at && pull_hand >= 0 && sq[pull_hand] && held_item[0])   // (its own hand gripped again: kept out)
                 item_release_at = 0, item_sent_at = 0, item_hand = pull_hand;
@@ -1723,10 +1744,12 @@ struct Controls {
                 if (gone) item_release_at = 0, item_sent_at = 0;   // (not a moment's none, as around a shot: really put away)
             }
             if (gone) pull_hand = -1;   // (put away for good: either hand may pull the next; a gamepad's item is aimed with the pad)
-            if (item_hand >= 0 && held_item[0] && strcmp(held_item, item_seen)) {   // the item out: Link's hand for it
+            // the item out: Link's hand for it, the hand that pulled it ((Triforce VR) even let go already: the game shows it a
+            // few frames after the pull, often after the grip is let go)
+            if (pull_hand >= 0 && held_item[0] && strcmp(held_item, item_seen)) {
                 snprintf(item_seen, sizeof item_seen, "%s", held_item);
-                g_live_mirror.store(item_mirrored_right(held_item) ? item_hand : 1 - item_hand);
-                rt_log("vr: grips: %s in the %s hand: %s", held_item, item_hand ? "right" : "left", g_live_mirror.load() ? "mirrored" : "as made");
+                g_live_mirror.store(item_mirrored_right(held_item) ? pull_hand : 1 - pull_hand);
+                rt_log("vr: grips: %s in the %s hand: %s", held_item, pull_hand ? "right" : "left", g_live_mirror.load() ? "mirrored" : "as made");
             }
             if (gone && item_seen[0]) {   // (an item put away for good: back to the sword's hand; not each frame, the ocarina's own kept)
                 item_seen[0] = 0;
@@ -1761,12 +1784,22 @@ struct Controls {
                  strstr(held_item, "Pachinko")) && pull_hand >= 0 &&
                 pose_ok[0] && pose_ok[1]) {
                 const int hold = pull_hand, pull = 1 - pull_hand;
-                float d2 = 0, dv[3];
-                for (int c = 0; c < 3; c++) dv[c] = poses[hold].p[c] - poses[pull].p[c], d2 += dv[c] * dv[c];
+                // ((Triforce VR) the slingshot: from its stone, on the string above the handle, not the hand on it)
+                const bool sling = !strstr(held_item, "Bow");
+                static const float out_of_fist[3] = {0, 0, -1};
+                float d2 = 0, dv[3], up_handle[3];
+                rotate(poses[hold].q, out_of_fist, up_handle);
+                for (int c = 0; c < 3; c++)
+                    dv[c] = poses[hold].p[c] + (sling ? sling_up * up_handle[c] : 0.0f) - poses[pull].p[c], d2 += dv[c] * dv[c];
+                const float reach = sling ? sling_reach : draw_reach;
                 if (!sq[pull]) bow_arm = bow_drawn = false;
-                else if (fresh[pull] && d2 < draw_reach * draw_reach) bow_arm = true;
-                if (bow_arm && !bow_drawn && d2 > draw_far * draw_far) bow_drawn = true, rt_log("vr: grips: drawn");
-                if (bow_drawn && d2 < draw_near * draw_near) bow_drawn = bow_arm = false, rt_log("vr: grips: brought back: the shot");
+                else if (fresh[pull]) {
+                    if (d2 < reach * reach) bow_arm = true, sling_took = std::sqrt(d2);
+                    else rt_log("vr: grips: a draw out of reach (%.0f cm of %.0f)", std::sqrt(d2) * 100.0f, reach * 100.0f);
+                }
+                const float far = sling_took + (sling ? sling_pull : bow_pull), near = sling_took + 0.04f;
+                if (bow_arm && !bow_drawn && d2 > far * far) bow_drawn = true, rt_log("vr: grips: drawn");
+                if (bow_drawn && d2 < near * near) bow_drawn = bow_arm = false, rt_log("vr: grips: brought back: the shot");
                 drawing = bow_drawn;
                 if (drawing) {
                     const float n = std::sqrt(d2);
@@ -1786,8 +1819,13 @@ struct Controls {
                 if (trig && !trig_was) rt_log("vr: grips: %s aimed by the %s trigger", boomerang ? "boomerang" : "hookshot", hook_hand ? "right" : "left");
                 trig_was = trig;
                 const float ahead = hv[hook_hand][0] * fx + hv[hook_hand][2] * fz;
+                // ((Triforce VR) a throw: the hand ahead fast after the trigger is let go, or in the 300 ms before (a throw lets go
+                // as the arm ends its swing)
+                static uint64_t ahead_at;
+                if (ahead > throw_speed) ahead_at = now;
                 if (trig) boom_wait = boomerang;
-                else if (boom_wait && ahead > throw_speed) boom_wait = false, rt_log("vr: grips: boomerang thrown");
+                else if (boom_wait && (ahead > throw_speed || now - ahead_at < 300000000ull))
+                    boom_wait = false, rt_log("vr: grips: boomerang thrown");
                 if (!boomerang) boom_wait = false;
                 hook_aim = trig || boom_wait;
                 bits &= ~(1ull << (hook_hand ? R : L));
@@ -1799,7 +1837,14 @@ struct Controls {
                 bits &= ~face;
                 if (any) set_bit(B, true);
             }
-            set_bit(ZR, now < zr_until || hook_aim || drawing);
+            {   // ((Triforce VR) ZR let go: a shot (the bow's or slingshot's release, the hookshot's trigger, the boomerang's throw):
+                // the aim held where it was just before, as the release's own motion would turn it (vk_xr_pointer)
+                static bool zr_was;
+                const bool zr = now < zr_until || hook_aim || drawing;
+                if (zr_was && !zr) g_shot_at.store(now);
+                zr_was = zr;
+                set_bit(ZR, zr);
+            }
             g_item_hand.store(held_item[0] ? (hook_hand >= 0 ? hook_hand : pull_hand) : -1);
             set_bit(B, now < b_until);
             set_bit(A, now < a_until);
@@ -1838,7 +1883,9 @@ struct Controls {
                 // in that hand: the left mirrors him (the sword then the right's), the right does not; the last one kept while held)
                 if (shielding && squeeze_on[shield] && raised(shield, true)) keep = true;
                 for (int hd = 0; hd < 2 && !keep; hd++)
-                    if (squeeze_on[hd] && raised(hd, false)) {
+                    // ((Triforce VR) not a hand that holds an item or owns its trigger: a boomerang aimed up before the face is
+                    // no shield)
+                    if (squeeze_on[hd] && raised(hd, false) && hd != pull_hand && hd != hook_hand) {
                         keep = shield_alone = true, shield = hd;
                         if (g_live_sword.load() != 1 - hd || g_live_mirror.load() != (hd == 0 ? 1 : 0)) {
                             g_live_sword.store(1 - hd), g_live_mirror.store(hd == 0 ? 1 : 0);
@@ -1848,6 +1895,26 @@ struct Controls {
             }
             shielding = keep && !x.ocarina.load() && in_play;   // (no shield, ZL, in the menus)
             if (shielding) set_bit(ZL, true);
+            {   // ((Triforce VR) the shield's Z-target where no hand is free for the shield: tilted past 35 degrees to either side,
+                // until back within 25. The bow, the slingshot or the hookshot: the hand holding it turned on its side; a bomb or a
+                // Bombchu, the Biggoron's Sword out: the head
+                static bool tilt_z;
+                static const float right_of[3] = {1, 0, 0};
+                const auto tilt_of = [](const float q[4]) {
+                    float r[3];
+                    rotate(q, right_of, r);
+                    return std::fabs(std::asin(std::fmax(-1.0f, std::fmin(1.0f, r[1])))) * 57.2958f;
+                };
+                const bool ranged = strstr(held_item, "Bow") || strstr(held_item, "SlingShot") || strstr(held_item, "Slingshot") ||
+                                    strstr(held_item, "Pachinko") || strstr(held_item, "Hookshot");
+                const bool by_head = strstr(held_item, "Item_Bomb") || (!held_item[0] && x.weapon_out.load() && x.two_handed_sword.load());
+                const int hand = ranged ? (hook_hand >= 0 ? hook_hand : pull_hand) : -1;
+                const float tilt = hand >= 0 && pose_ok[hand] ? tilt_of(poses[hand].q) : by_head ? tilt_of(head_pose.q) : 0.0f;
+                const bool was = tilt_z;
+                tilt_z = (hand >= 0 || by_head) && in_play && !x.ocarina.load() && (tilt > 35.0f || (tilt_z && tilt > 25.0f));
+                if (tilt_z != was) rt_log("vr: %s tilt: Z-target %s", hand >= 0 ? "hand" : "head", tilt_z ? "on" : "off");
+                if (tilt_z) set_bit(ZL, true);
+            }
         }
         const float swing_on = 0.01f * (float)cfg_int("VR_SWING_SPEED");   // metres a second
         const float out_on = 0.01f * (float)cfg_int("VR_CHARGE_REACH"), out_off = out_on - 0.1f;   // metres
@@ -1859,7 +1926,10 @@ struct Controls {
             if (carries && !carry) g_live_mirror.store(0), rt_log("vr: carry: lifted");
             carry = carries;
         }
-        const int sword = held_item[0] && pull_hand >= 0 ? pull_hand : held_item[0] && item_hand >= 0 ? item_hand : sword_hand_now();
+        const int item_owner = held_item[0] && pull_hand >= 0 ? pull_hand : held_item[0] && item_hand >= 0 ? item_hand : -1;
+        // ((Triforce VR) the hammer: its head end is Link's other hand, so that hand's swing is the hammer's; the gripping hand's
+        // is none)
+        const int sword = item_owner >= 0 ? (strstr(held_item, "Hammer") ? 1 - item_owner : item_owner) : sword_hand_now();
         if (sword != swing_hand) swing_hand = sword, swing_n = 0, swinging = false;
         if (pose_ok[sword]) {   // the velocity over the last 4 frames
             const float hx = poses[sword].p[0] - head[0], hz = poses[sword].p[2] - head[2];
@@ -1880,7 +1950,22 @@ struct Controls {
                 // ((Triforce VR) the Deku Stick and the hammer: downward swings only; a bottle: inward only (the right hand's
                 // right to left, the left's left to right); the sword any way)
                 bool way = true;
-                if (strstr(held_item, "Hammer") || strstr(held_item, "DekuStick")) way = v[1] < -0.6f * speed;
+                if (strstr(held_item, "Hammer")) way = v[1] < -0.6f * speed;
+                else if (strstr(held_item, "DekuStick")) {
+                    // ((Triforce VR) the Deku Stick in both hands: the other hand at the holding controller's bottom (past its
+                    // handle's end along the controller's own down, within 18 cm, however it is tilted), both swinging down)
+                    const int oh = 1 - sword;
+                    bool under = false;
+                    if (pose_ok[oh]) {
+                        const float d[3] = {poses[oh].p[0] - poses[sword].p[0], poses[oh].p[1] - poses[sword].p[1], poses[oh].p[2] - poses[sword].p[2]};
+                        const float inv[4] = {-poses[sword].q[0], -poses[sword].q[1], -poses[sword].q[2], poses[sword].q[3]};
+                        float l[3];
+                        rotate(inv, d, l);   // (in the holding controller's grip frame: its handle along z, -z out of the fist's top)
+                        under = l[2] > 0.03f && l[0] * l[0] + l[1] * l[1] + l[2] * l[2] < 0.18f * 0.18f;
+                    }
+                    const float os = std::sqrt(hv[oh][0] * hv[oh][0] + hv[oh][1] * hv[oh][1] + hv[oh][2] * hv[oh][2]);
+                    way = v[1] < -0.6f * speed && under && os > 0.5f * speed && hv[oh][1] < -0.6f * os;
+                }
                 else if (!strcmp(held_item, "Item_Bottle")) {
                     const float lat = v[0] * rx + v[2] * rz;
                     way = sword ? lat < -0.5f * speed : lat > 0.5f * speed;
@@ -1936,6 +2021,7 @@ struct Controls {
             tap_bit = !in_play ? -1 : carry ? Y : swinger ? ZR : !held_item[0] && x.weapon_out.load() ? Y : -1;   // (no swing in menus)
             queued = false;
             if (tap_bit >= 0) y_down = now, outward = outward && swinging && tap_bit == Y && !carry;   // (the charge: the sword's)
+            if (tap_bit == ZR && strstr(held_item, "Hammer")) g_hammer_swung.store(now);   // ((Triforce VR) his arms the swing's: vk_xr_arms_own
         }
         if (tap_bit >= 0) set_bit(tap_bit, y_down != 0);
         if (bits & 1ull << Y || (now < draw_until && draw_bit == Y)) shield_alone = false;
@@ -2540,6 +2626,13 @@ extern "C" int vk_xr_pad(uint64_t *buttons, int32_t left[2], int32_t right[2]) {
 extern "C" void vk_xr_ocarina(int on) { xr().ocarina.store(on != 0); }
 
 extern "C" void vk_xr_weapon_out(int out) { xr().weapon_out.store(out != 0); }
+extern "C" void vk_xr_two_handed_sword(int on) { xr().two_handed_sword.store(on != 0); }
+// ((Triforce VR) vr_body.c: Link's arms as the game's animation has them now, not on the controllers: the bow or the slingshot
+// drawn (its ZR), the hammer's swing
+extern "C" int vk_xr_arms_own(void) {
+    const uint64_t swung = g_hammer_swung.load();
+    return g_draw_on.load() || (swung && plat_now_ns() - swung < kHammerSwingNs);
+}
 extern "C" void vk_xr_child(int child) { xr().child.store(child != 0); }
 
 extern "C" void vk_xr_in_play(int on) { xr().in_play.store(on != 0); }
@@ -2587,6 +2680,23 @@ extern "C" int vk_xr_pointer(double dir[3]) {
         if (!x.have_head) return 0;
         static const float ahead_of_head[3] = {0, 0, -1};
         rotate(x.head.q, ahead_of_head, v);
+    }
+    {   // ((Triforce VR) a shot just now: the way from just before it (g_shot_at)
+        static std::mutex mu;
+        static struct { uint64_t at; float v[3]; } past[64];
+        static int head;
+        std::lock_guard<std::mutex> lk(mu);
+        const uint64_t now = plat_now_ns(), shot = g_shot_at.load();
+        if (shot && now - shot < kShotHoldNs) {
+            const uint64_t want = shot - kShotBeforeNs;
+            int best = -1;
+            for (int i = 0; i < 64; i++)
+                if (past[i].at && past[i].at <= want && (best < 0 || past[i].at > past[best].at)) best = i;
+            if (best >= 0) std::memcpy(v, past[best].v, sizeof v);
+        } else {
+            head = (head + 1) % 64;
+            past[head].at = now, std::memcpy(past[head].v, v, sizeof v);
+        }
     }
     double bx, bz;
     {
@@ -3174,7 +3284,7 @@ extern "C" const MkwVkXr *vk_xr_table(void) {
         vk_xr_cfg, vk_xr_head_active, vk_xr_camera, vk_xr_lens, vk_xr_holds_time, vk_xr_update_step, vk_xr_pad,
         vk_xr_ocarina, vk_xr_weapon_out, vk_xr_child,
         vk_xr_hand_item, vk_xr_in_play, vk_xr_item_bar, vk_xr_aim_freeze, vk_xr_pointer, vk_xr_aim, vk_xr_untracked, vk_xr_hands,
-        vk_xr_active, vk_xr_head_worn, vk_xr_hud_hidden, vk_xr_carrying, vk_xr_head_request};
+        vk_xr_active, vk_xr_head_worn, vk_xr_hud_hidden, vk_xr_carrying, vk_xr_head_request, vk_xr_two_handed_sword, vk_xr_arms_own};
     return &t;
 }
 

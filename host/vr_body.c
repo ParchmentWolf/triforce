@@ -892,8 +892,10 @@ static const char mir_items_builtin[] =
     "Weapon_Sheath_070@adult - K -0.8716 0.0385 0.4883 -0.2508 0.0537 0.9978 0.0167 -0.0055 0.4867 -0.0405 0.8723 0.0735\n"
     "Weapon_Sword_Biggoron@adult - K -0.7472 -0.1872 -0.6373 0.2956 -0.1369 0.9819 -0.1291 0.0316 -0.6508 0.0091 0.7598 0.1289\n"
     "Weapon_Sword_Biggoron@child - K -0.3239 0.0716 -0.9434 0.3341 0.0688 0.9969 0.0516 -0.0140 -0.9437 0.0485 0.3272 0.2375\n"
-    "Weapon_Range_Hookshot xy -\n"
-    "Weapon_Range_Bow xy -\n"
+    "Weapon_Range_Hookshot x -\n"
+    "Weapon_Range_Bow x -\n"
+    "Weapon_Range_SlingShot xy -\n"
+    "Item_Boomerang xy -\n"
     "Item_CojiroCucco - P\n"
     "Weapon_Sword_Master@child - K -0.4960 0.1490 0.8549 -0.3230 0.1267 0.9869 -0.0988 0.0337 0.8584 -0.0595 0.5087 0.1821\n"
     "Weapon_Sheath_070@child - K -0.4960 0.1490 0.8549 -0.3230 0.1267 0.9869 -0.0988 0.0337 0.8584 -0.0595 0.5087 0.1821\n"
@@ -974,6 +976,9 @@ static int mirrored_item(Ctx *c, uint64_t bones) {   /* (this skeleton's index i
     static int64_t at;
     static SRWLOCK lock = SRWLOCK_INIT;
     const int64_t now = hos_now_ns();
+    static uint64_t link_was;
+    if (ma.actor != link_was) mi_n = 0, at = 0, link_was = ma.actor;   /* ((Triforce VR) a new Link (an age switch, an area): his
+                                                                         old things' skeletons are being deleted, found again now */
     if (now - at > 500000000LL && TryAcquireSRWLockExclusive(&lock)) {
         at = now;
         mir_items_read();
@@ -1003,8 +1008,9 @@ static int mirrored_item(Ctx *c, uint64_t bones) {   /* (this skeleton's index i
         mi_n = n;
         ReleaseSRWLockExclusive(&lock);
     }
+    /* (the thing still the one found: its instance's skeleton this one, not a deleted thing's place used again) */
     for (int i = 0; i < mi_n; i++)
-        if (mi_bones[i] == bones) return i;
+        if (mi_bones[i] == bones && plausible(mi_inst[i] + 0xf8, 8) && recomp_load64(c, mi_inst[i] + 0xf8) == bones) return i;
     return -1;
 }
 /* his strap (Ph_ArmStrap, a physics bone whose simulation goes astray with the arm mirrored under it) where the mirror wants
@@ -1249,6 +1255,16 @@ static void euro3(Euro *f, double v[3], double dt, double min_cut, double beta) 
 #define HAND_GRIP_DEG (-90.0)
 /* the hands' distance on a two-handed hilt (metres) */
 #define HILT_SPACING 0.10
+/* ((Triforce VR) what both hands hold, as the game's own animation holds it (Link left-handed, the mirror off): the holding
+   (left) wrist's turn in his root's frame (rows), the other (right) wrist's place in the holding wrist's frame (metres), and
+   its turn in that frame (rows). In VR the thing points from the holding hand's controller to the other's, the holding wrist
+   turned the least from the game's hold that does it, and the other wrist set where the game has it on the thing */
+typedef struct { double L[9], o[3], R[9]; } Grip;
+/* (generated from vr_research/hand_capture/*.txt, 2026-11-26: Link hidden, the mirror off, the game's own hold) */
+static const Grip GRIP_BIGGORON_CHILD = {{0.3071, -0.3371, -0.8900, -0.9143, 0.1550, -0.3742, 0.2641, 0.9286, -0.2606}, {-0.1372, 0.1506, 0.3991}, {-0.8102, -0.2075, -0.5483, -0.2055, -0.7753, 0.5972, -0.5490, 0.5965, 0.5855}};
+static const Grip GRIP_STICK_CHILD = {{-0.2794, 0.3076, -0.9096, 0.1452, 0.9499, 0.2767, 0.9491, -0.0548, -0.3101}, {0.0188, -0.0655, 0.0932}, {-0.8138, -0.1347, 0.5653, 0.0676, -0.9881, -0.1381, 0.5772, -0.0742, 0.8132}};
+static const Grip GRIP_BIGGORON_ADULT = {{-0.3929, 0.4328, -0.8114, -0.0885, 0.8605, 0.5018, 0.9153, 0.2689, -0.2998}, {0.0511, -0.2393, 0.1344}, {-0.7637, 0.0385, 0.6445, -0.0131, -0.9989, 0.0442, 0.6455, 0.0253, 0.7633}};
+static const Grip GRIP_HAMMER_ADULT = {{0.0503, 0.2819, 0.9581, -0.9330, -0.3290, 0.1459, 0.3564, -0.9012, 0.2465}, {0.0151, -0.5284, -0.0191}, {-0.3324, 0.0127, -0.9431, 0.0052, -0.9999, -0.0153, -0.9431, -0.0100, 0.3323}};
 /* the head sunk this far into the chest (metres), in the neck's frame */
 #define HEAD_SINK 0.25
 
@@ -1258,6 +1274,38 @@ int vr_body_neck_height(double *height) {
     if (!neck_at || hos_now_ns() - neck_at > 200000000LL) return 0;
     *height = neck_height;
     return isfinite(*height);
+}
+
+/* (HANDS-CAPTURE, research: Link hidden (Visibility Hidden), so his arms are the game's own animation, and a file
+   ~/.app/pc_port/triforce-runs/hand_capture.txt there: twice a second his wrists' and root's world entries (rows of 3x4) and
+   what he holds, for the two-handed things' hands) */
+static void hands_capture(Ctx *c) {
+    static int64_t at, looked;
+    static int on;
+    const int64_t now = hos_now_ns();
+    if (now - looked > 1000000000LL) {
+        looked = now;
+        char path[512];
+        const char *home = getenv("HOME");
+        snprintf(path, sizeof path, "%s/.app/pc_port/triforce-runs/hand_capture.txt", home ? home : "");
+        FILE *f = fopen(path, "r");
+        on = f != NULL;
+        if (f) fclose(f);
+    }
+    if (!on || now - at < 500000000LL) return;
+    at = now;
+    char line[1600];
+    int n = snprintf(line, sizeof line, "vr: hands capture: %s \"%s\" mirror %d", vr_game_childhood() ? "child" : "adult", vr_game_held(), ma.parts && ma_wanted());
+    static const int bones[3] = {OB_ROOT, OB_WRIST_L, OB_WRIST_R};
+    static const char *const names[3] = {"root", "L", "R"};
+    for (int b = 0; b < 3 && n < (int)sizeof line - 200; b++) {
+        Xf w;
+        xf_load(c, ob.world[bones[b]], &w);
+        n += snprintf(line + n, sizeof line - n, " %s", names[b]);
+        for (int r = 0; r < 3; r++)
+            for (int k = 0; k < 4; k++) n += snprintf(line + n, sizeof line - n, " %.4f", w.m[r][k]);
+    }
+    hos_log("%s", line);
 }
 
 void hos_oot_after_anim(Ctx *c) {
@@ -1287,6 +1335,7 @@ void hos_oot_after_anim(Ctx *c) {
         neck_at = hos_now_ns();
     }
     if (!arms) {
+        hands_capture(c);
         ReleaseSRWLockExclusive(&ob_lock);
         return;
     }
@@ -1309,7 +1358,10 @@ void hos_oot_after_anim(Ctx *c) {
         ob_write(c, OB_HEAD, &h);
     }
     double hand[6], point[6], palm[6], cam_feet[3];
-    if (x->hands(hand, point, palm) && vr_play_anchor(cam_feet)) {
+    /* ((Triforce VR) a bow or slingshot drawn, a hammer swing: his arms the game's animation for now (the shot's own pose),
+       his head still hidden */
+    const int arms_own = x->arms_own && x->arms_own();
+    if (!arms_own && x->hands(hand, point, palm) && vr_play_anchor(cam_feet)) {
         /* the hands were placed from where Link stood at the camera update: moved by however far he has gone since (a
            run's frame is ~8 cm), and smoothed relative to him, so only the hand's own motion is smoothed (One-Euro: still
            hands lose their tremor, moving ones keep up) */
@@ -1335,6 +1387,7 @@ void hos_oot_after_anim(Ctx *c) {
             euro3(&f_point[h], point + h * 3, dt, 1.5, 0.4);
             euro3(&f_palm[h], palm + h * 3, dt, 1.5, 0.4);
         }
+        const Grip *grip = NULL;   /* ((Triforce VR) the game's own hold of what both hands hold, NULL: the old placing below */
         {   /* ((Triforce VR) held in both hands: the Biggoron's Sword out (not while it is the shield alone that is), the hammer, the Deku
                Stick: the other hand on its handle under the holding one (along where that one points, the handle's way), its palm
                to it from the other side, wherever its controller is */
@@ -1344,9 +1397,14 @@ void hos_oot_after_anim(Ctx *c) {
             const char *item = body_cfg("VR_TWO_HANDS");
             const int by_item = !strcmp(item, "left") || !strcmp(item, "right");
             const int both = by_item || (big && weapon_drawn && strcmp(item, "alone"));
+            if (both) {
+                const char *held = vr_game_held();
+                grip = strstr(held, "Hammer") ? &GRIP_HAMMER_ADULT : strstr(held, "DekuStick") ? &GRIP_STICK_CHILD
+                       : vr_game_childhood() ? &GRIP_BIGGORON_CHILD : &GRIP_BIGGORON_ADULT;
+            }
             const int sw = by_item ? !strcmp(item, "right") : vr_sword_right() ? 1 : 0, o = 1 - sw;
             double along[3] = {point[sw * 3], point[sw * 3 + 1], point[sw * 3 + 2]};
-            if (both && (hand[sw * 3] != 0 || hand[sw * 3 + 1] != 0 || hand[sw * 3 + 2] != 0) && v3_norm(along))
+            if (both && !grip && (hand[sw * 3] != 0 || hand[sw * 3 + 1] != 0 || hand[sw * 3 + 2] != 0) && v3_norm(along))
                 for (int k = 0; k < 3; k++) {
                     hand[o * 3 + k] = hand[sw * 3 + k] - along[k] * HILT_SPACING;
                     point[o * 3 + k] = along[k], palm[o * 3 + k] = -palm[sw * 3 + k];
@@ -1367,6 +1425,39 @@ void hos_oot_after_anim(Ctx *c) {
         const int mirrored = ma.parts && ma_wanted();
         Xf root_now_inv;
         const int have_inv = xf_inv(&root_now, &root_now_inv);
+        /* ((Triforce VR) a grip: both arms' targets first (as below), the thing's way between them, then each wrist's turn and
+           the other wrist's place (gripped: the wrists' turns in the world, set after each arm's reach) */
+        int gripped = 0;
+        M3 grip_turn[2];
+        double grip_off[3];
+        if (grip && have_inv) {
+            double Tg[2][3];
+            int ok = 1;
+            for (int s = 0; s < 2 && ok; s++) {
+                const int h = mirrored ? 1 - s : s;
+                if (hand[h * 3] == 0 && hand[h * 3 + 1] == 0 && hand[h * 3 + 2] == 0) ok = 0;
+                double pt[3] = {point[h * 3], point[h * 3 + 1], point[h * 3 + 2]};
+                const int have_pt = v3_norm(pt);
+                for (int k = 0; k < 3; k++) Tg[s][k] = hand[h * 3 + k] - origin[k] - (have_pt ? pt[k] * 0.03 : 0);
+                if (mirrored) xf_pt(&root_now_inv, Tg[s], Tg[s]), Tg[s][0] = -Tg[s][0], xf_pt(&root_now, Tg[s], Tg[s]);
+            }
+            double u[3] = {Tg[1][0] - Tg[0][0], Tg[1][1] - Tg[0][1], Tg[1][2] - Tg[0][2]};
+            if (ok && v3_norm(u)) {
+                M3 Rr, Lr, RL, S, relR;
+                m3_of(&root_now, Rr);
+                for (int i = 0; i < 9; i++) Lr[i / 3][i % 3] = grip->L[i], relR[i / 3][i % 3] = grip->R[i];
+                m3_mul(Rr, Lr, RL);
+                double oh[3] = {grip->o[0], grip->o[1], grip->o[2]}, a[3];
+                v3_norm(oh);
+                m3_v(RL, oh, a);
+                m3_between(a, u, S);
+                m3_mul(S, RL, grip_turn[0]);
+                m3_mul(grip_turn[0], relR, grip_turn[1]);
+                m3_v(grip_turn[0], grip->o, grip_off);
+                for (int k = 0; k < 3; k++) grip_off[k] += Tg[0][k];
+                gripped = 1;
+            }
+        }
         if (xf_inv(&root, &root_inv))
             for (int s = 0; s < 2; s++) {   /* (s 0: Link's left arm; 1: his right) */
                 const int h = mirrored ? 1 - s : s;   /* (the controller: 0 left, 1 right) */
@@ -1405,6 +1496,7 @@ void hos_oot_after_anim(Ctx *c) {
                     xf_dir(&root_now_inv, pt, pt), pt[0] = -pt[0], xf_dir(&root_now, pt, pt);
                     xf_dir(&root_now_inv, Nm, Nm), Nm[0] = -Nm[0], xf_dir(&root_now, Nm, Nm);
                 }
+                if (gripped && s == 1) for (int k = 0; k < 3; k++) T[k] = grip_off[k];   /* (the other wrist where the game grips) */
                 xf_pt(&cinv, T, T);
                 /* the elbow's pole in Link's frame: down, out to his side and a little back; then in the clavicle's */
                 double P[3] = {side * 0.35, -1, -0.3}, D[3], N[3] = {Nm[0], Nm[1], Nm[2]};
@@ -1421,6 +1513,13 @@ void hos_oot_after_anim(Ctx *c) {
                     if (len > 0.01 && (ob.rest[s][j] <= 0 || len < ob.rest[s][j])) ob.rest[s][j] = len;
                 }
                 ik_arm(&L1, &L2, &L3, T, P, have_pt ? D : NULL, side, have_pt && have_palm ? N : NULL, off, stretch, ob.rest[s]);
+                if (gripped) {   /* (the wrist turned as the grip has it: its local = (clavicle arm forearm)^-1 the turn) */
+                    M3 Rc, R1, R2, P12, Pc, Pt, W;
+                    m3_of(&cn, Rc), m3_of(&L1, R1), m3_of(&L2, R2);
+                    m3_mul(R1, R2, P12), m3_mul(Rc, P12, Pc), m3_t(Pc, Pt);
+                    m3_mul(Pt, grip_turn[s], W);
+                    m3_set(&L3, W);
+                }
                 ob_write(c, b1, &L1), ob_write(c, b1 + 1, &L2), ob_write(c, b1 + 2, &L3);
             }
         static int arms_logged;

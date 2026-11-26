@@ -607,6 +607,8 @@ typedef struct MkwVkXr {
     void (*hud_hidden)(int hidden);   /* (Triforce VR) 1: no HUD panel now (a load zone's transition) */
     void (*carrying)(int on);   /* (Triforce VR) Link lifts, carries, throws or puts down something of the world's (a pot, a rock, a bomb flower) */
     int (*head_request)(void);   /* (Triforce VR) the gestures' ask for his head, taken: 0 none, 1 the mask on, 2 the Lens of Truth on, 3 off */
+    void (*two_handed_sword)(int on);   /* (Triforce VR) his sword is the Biggoron's (both hands on it), no item in his hand */
+    int (*arms_own)(void);   /* (Triforce VR) his arms as the game's animation has them now: a bow or slingshot drawn, a hammer swing */
 } MkwVkXr;
 
 /* the DLL's one export: null when Vulkan is not usable (the executable then falls back to WebGPU) */
