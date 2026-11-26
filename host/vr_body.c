@@ -1166,6 +1166,16 @@ static void cap_hide(Ctx *c) {
         }
 }
 static int mirror_attach(Ctx *c, uint64_t fn) {
+    /* ((Triforce VR) never on the game's thread that makes and deletes things (BaseProcCreateAndDeleteThread): it places a
+       thing as it is made, its skeleton and his not all there yet at a load or an age switch, and putting ours in there
+       crashed the game; the game places those itself, ours from the next frame on */
+    static __thread int maker = -1;
+    if (maker < 0) {
+        HosThread *t = hos_self();
+        const char *n = t ? hos_thread_name(t) : NULL;
+        maker = n && strstr(n, "CreateAndDelete") != NULL;
+    }
+    if (maker) return 0;
     cap_hide(c);
     if (shield_inside || !ma.parts) return 0;
     const int wanted = ma_wanted();
