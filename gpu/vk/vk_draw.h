@@ -127,13 +127,6 @@ extern XrEyeCam xr_eye;
 bool xr_draw_mirrored(const NvnState& s);
 bool xr_is_camera(uint64_t addr);
 struct Texture;
-/// (Triforce VR, a probe for Accurate's right eye) textures the first walk of a submission wrote, and the second; a read in the
-/// second walk of one the first wrote and the second has not yet: state carried from the left eye into the right, logged
-void xr_detect_reset(bool second);
-void xr_detect_write(const Texture* tex);
-void xr_detect_read(const Texture* tex, uint64_t key, const char* how);
-/// (Triforce VR) the textures found carried (above) that still exist: their images, formats and sizes, at most max; how many
-int xr_carry_images(VkImage* image, VkFormat* format, uint32_t* w, uint32_t* h, VkImageAspectFlags* aspect, int max);
 void xr_eye_shift(float* camera);
 void xr_span_probe(uint32_t op, const uint8_t* a, uint32_t avail, const uint8_t* cb_start, uint64_t rec, NvnState& s);
 void draw_tail_watch(bool on);

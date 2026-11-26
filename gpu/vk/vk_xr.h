@@ -44,9 +44,6 @@ float vk_xr_balanced_prev_shift(void);
 // Flatscreen 3D (the VR tab's Flatscreen 3D rows, no headset): wanted now; the window's picture made in 3D before the menu is
 // drawn over it (window in TRANSFER_DST_OPTIMAL; rect: the game's picture's own size, to: its place in the window)
 int vk_xr_flat_wanted(void);
-// Stereo Accurate: the textures the left eye's pass carries into the right's kept before it (phase 1) and put back before the
-// right's (2)
-void vk_xr_carry(VkCommandBuffer cb, int phase);
 void vk_xr_flat3d(VkCommandBuffer cb, VkImage window, int hdr, const int rect[4], const int to[4]);
 void vk_xr_second_eye(VkCommandBuffer cb, int phase);
 // vk_draw.cpp xr_stand_in, with the depth: the view the scene was drawn with (rows 0-2 of its 3x4 view: right, up, back, each with

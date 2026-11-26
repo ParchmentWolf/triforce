@@ -6607,7 +6607,6 @@ int texture_flush_to_guest(uint64_t lo, uint64_t size) {
 
 void texture_written(Texture* tex, const char* why) {
     if (!tex) return;
-    xr_detect_write(tex);   // ((Triforce VR) Accurate's probe)
     if (tex->upload_value == rec_value && tex->upload_seg > tl_seg) {   // (a parallel replay's order broken: see dry_mark_written)
         static int64_t n;
         if (n++ < 40 || n % 500 == 0)

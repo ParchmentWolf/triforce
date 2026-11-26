@@ -6968,7 +6968,7 @@ void build_descriptors(const NvnState& s, const Program& p, bool keep = false, b
                                tex ? tex->width : 0, tex ? tex->height : 0, tex ? tex->layers : 0, tex ? (void*)tex->image : nullptr,
                                (void*)view, view ? "" : " (dummy)");
                 if (view && tex) built_textures().push_back(tex);   // ((Triforce) a signature skip reads them again, desc_sig.h)
-                if (view && tex && tex->gpu_written) draw_sampled().push_back(tex), xr_detect_read(tex, p.key, "samples");
+                if (view && tex && tex->gpu_written) draw_sampled().push_back(tex);
                 if (!view) {
                     view = dummies.view[(int)vt], st_dummy_textures += handle != 0, st_dummy_known += handle != 0 && view_slot_known;
                     desc_dummies += handle != 0, desc_dummies_known += handle != 0 && view_slot_known;   // ((Triforce) desc_sig.h)
@@ -6990,7 +6990,6 @@ void build_descriptors(const NvnState& s, const Program& p, bool keep = false, b
                 uint32_t level = 0;
                 VkImageView view = handle ? texture_view_of(handle, vt, ViewUse::Storage, image_format(d.format), &tex, &level)
                                           : VK_NULL_HANDLE;
-                if (view && tex) xr_detect_read(tex, p.key, d.is_written ? "reads and writes image" : "reads image");
                 if (view && tex && d.is_written) { ParLock lk; texture_written(tex, "a storage image of a draw"); }
                 if (view && tex) draw_sampled().push_back(tex);
                 if (log_img_wanted(p.key)) {
@@ -16388,55 +16387,6 @@ bool xr_draw_mirrored(const NvnState& s) {
         return true;
     }
     return false;
-}
-namespace {
-std::mutex xr_det_mu;
-std::unordered_set<const Texture*> xr_w1, xr_w2;
-// the textures found carried from the left eye's walk into the right's: put back as they were before the left's (vk_xr_carry)
-struct XrCarried { const Texture* t; uint32_t id; uint64_t noted; };
-std::vector<XrCarried> xr_carry;
-bool xr_det_on() { return vk_xr_accurate_shift() > 0.0f || getenv("RX_VK_XR_DOUBLE"); }
-}  // namespace
-void xr_detect_reset(bool second) {
-    std::lock_guard lk(xr_det_mu);
-    (second ? xr_w2 : xr_w1).clear();
-    if (!second) xr_w2.clear();
-    else xr_carry.clear();   // (the carried ones found anew in each right eye's walk: the next frame keeps those)
-}
-int xr_carry_images(VkImage* image, VkFormat* format, uint32_t* w, uint32_t* h, VkImageAspectFlags* aspect, int max) {
-    std::lock_guard lk(xr_det_mu);
-    int n = 0;
-    for (size_t i = 0; i < xr_carry.size();) {
-        const XrCarried& c = xr_carry[i];
-        if (texture_destroyed_since(c.id, c.noted)) {   // (gone: never looked at again)
-            xr_carry.erase(xr_carry.begin() + (long)i);
-            continue;
-        }
-        if (n < max) image[n] = c.t->image, format[n] = c.t->format, w[n] = c.t->width, h[n] = c.t->height, aspect[n] = c.t->aspect, n++;
-        i++;
-    }
-    return n;
-}
-void xr_detect_write(const Texture* tex) {
-    if (!tex || !xr_det_on()) return;
-    std::lock_guard lk(xr_det_mu);
-    (xr_eye.on ? xr_w2 : xr_w1).insert(tex);
-}
-void xr_detect_read(const Texture* tex, uint64_t key, const char* how) {
-    if (!tex || !xr_eye.on) return;
-    std::lock_guard lk(xr_det_mu);
-    if (!xr_w1.count(tex) || xr_w2.count(tex)) return;
-    if ((tex->aspect == VK_IMAGE_ASPECT_COLOR_BIT || tex->aspect == VK_IMAGE_ASPECT_DEPTH_BIT) && tex->layers == 1 && tex->depth == 1 &&
-        tex->image && xr_carry.size() < 24) {
-        bool have = false;
-        for (const XrCarried& c : xr_carry) have |= c.t == tex && c.id == tex->id;
-        if (!have) xr_carry.push_back({tex, tex->id, texture_destroyed_count()});
-    }
-    static std::unordered_set<uint64_t> told;
-    const uint64_t k = key ^ ((uint64_t)tex->id << 1);
-    if (told.size() >= 80 || !told.insert(k).second) return;
-    logf("vk: xr carried: program %016llx %s #%u %ux%u x%u format %d: written by the left eye's walk, read by the right's before it "
-         "writes it", (unsigned long long)key, how, tex->id, tex->width, tex->height, tex->layers, (int)tex->format);
 }
 /// (Triforce VR) a scene camera block at addr: its target's size the scene's (0x120), its projection's w row (0, 0, -1, 0) at 0xa0
 bool xr_is_camera(uint64_t addr) {

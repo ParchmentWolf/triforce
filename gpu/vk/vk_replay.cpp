@@ -5790,10 +5790,8 @@ bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, 
     const bool xr_double = xr_double_env || vk_xr_accurate_shift() > 0.0f;
     static NvnState xr_began;
     static uint64_t xr_began_value = 0;
-    static int xr_scene_n = -1;   // (the command buffers of the last submission that drew the scene: this one's like it)
     if (xr_double && !p && cb == 0) {
-        xr_began = *cur_state, xr_began_value = value, xr_eye.cb_scene = false, xr_detect_reset(false);
-        if (n == xr_scene_n) vk_xr_carry(cmd, 1);   // (what it will carry into the right eye's pass, kept before it)
+        xr_began = *cur_state, xr_began_value = value, xr_eye.cb_scene = false;
     }
     // ((Triforce VR) Stereo Balanced: the frame before's camera moved onto this picture's eye, the eyes being drawn in turn)
     const float xr_prev = vk_xr_balanced_prev_shift();
@@ -5810,9 +5808,6 @@ bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, 
         end_pass(rec_cur->cmd);
         full_barrier(rec_cur->cmd, "barrier (the other eye's walk)");
         vk_xr_second_eye(rec_cur->cmd, 1);   // (VR: the left eye's target copied apart, the right eye's scene kept apart)
-        vk_xr_carry(rec_cur->cmd, 2);   // (and what the left eye's pass carried, put back as it was before it)
-        xr_scene_n = n;
-        xr_detect_reset(true);
         xr_eye.hits = 0, xr_eye.copies = 0, xr_eye.on = true, second_eye = true;
         xr_swaps_reset();
         VkCommandBuffer c2 = rec_cur->cmd;
