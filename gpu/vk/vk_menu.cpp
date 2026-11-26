@@ -199,6 +199,7 @@ const char* tx_onoff(int v) { return v ? "On" : "Off"; }
 // (Triforce VR) the VR tab's values
 const char* tx_vr_view(int v) { return v ? "Immersive" : "Theater"; }
 const char* tx_normal_inverted(int v) { return v ? "Inverted" : "Normal"; }
+const char* tx_vr_turn(int v) { return v ? "Snap" : "Smooth"; }
 const char* tx_vr_mode(int v) { return v >= 2 ? "Full Dive" : v ? "Immersive" : "Theater"; }
 const char* tx_view3d(int v) {
     static const char* const t[] = {"Flatscreen", "VR", "Red/cyan glasses", "Side by side (3D TV)", "Crossed eyes", "Above and below",
@@ -2443,6 +2444,15 @@ Row rows[] = {
     {TAB_VRPAGE, "Immersive Camera X", &opts.vr_orbit_invert, 0, 1, 1, tx_normal_inverted,
      "Immersive: how the right stick moves you around Link. Normal: the way you push it, as if on a rail. Inverted: the "
      "other way, as the game's camera turns on a flat screen.", nullptr, false, true, -1, false, "vr_orbit_invert"},
+    MENU_HEADING(TAB_VRPAGE, "Comfort"),
+    {TAB_VRPAGE, "Vignette", &opts.vr_vignette, 0, 1, 1, tx_onoff,
+     "Full Dive: the edges of the view darken while you move or turn, more the faster (a run, a roll, a knockback), with "
+     "either turning style, easier on the stomach.", nullptr, false, true, -1, false, "vr_vignette"},
+    {TAB_VRPAGE, "Turning style", &opts.vr_turn, 0, 1, 1, tx_vr_turn,
+     "Full Dive: how the right stick turns you. Smooth: a steady turn while it is held. Snap: one turn of the Snap angle each "
+     "time it is pushed, easier on the stomach.", nullptr, false, true, -1, false, "vr_turn"},
+    {TAB_VRPAGE, "Snap angle", &opts.vr_snap_angle, 15, 90, 15, tx_degrees,
+     "Turning style Snap: how far each push of the right stick turns you.", nullptr, false, true, -1, false, "vr_snap_angle"},
     MENU_HEADING(TAB_VRPAGE, "Body"),
     {TAB_VRPAGE, "Visibility", &opts.vr_body, 0, 1, 1, tx_vr_body,
      "Full Dive: Shown: Link stays drawn, his arms follow your hands with what they hold, and his head is hidden. "
@@ -3401,6 +3411,9 @@ const VrKey vr_keys[] = {
     {"VR_CUTSCENES", &opts.vr_cutscenes, "classic|first"},
     {"VR_AIM_TILT", &opts.vr_aim_tilt, nullptr},
     {"VR_ORBIT_INVERT", &opts.vr_orbit_invert, nullptr},
+    {"VR_TURN", &opts.vr_turn, "smooth|snap"},
+    {"VR_SNAP_ANGLE", &opts.vr_snap_angle, nullptr},
+    {"VR_VIGNETTE", &opts.vr_vignette, "off|on"},
     {"VR_SWING_SPEED", &opts.vr_swing_speed, nullptr},
     {"VR_CHARGE_REACH", &opts.vr_charge_reach, nullptr},
     {"VR_HUD_SIZE", &opts.vr_hud_size, nullptr},

@@ -610,6 +610,8 @@ typedef struct MkwVkXr {
     void (*two_handed_sword)(int on);   /* (Triforce VR) his sword is the Biggoron's (both hands on it), no item in his hand */
     int (*arms_own)(void);   /* (Triforce VR) his arms as the game's animation has them now: a bow or slingshot drawn, a hammer swing */
     void (*game_paused)(int on);   /* (Triforce VR) the game paused by its menus: no full-picture fade looked for in the HUD */
+    void (*rumble)(int side, float strength);   /* (Triforce VR) the game's rumble on a side (0 left, 1 right), 0 to 1: the hand controllers' */
+    void (*turning)(float strength);   /* (Triforce VR) first person's Smooth turn now, 0 to 1 (the Turn vignette) */
 } MkwVkXr;
 
 /* the DLL's one export: null when Vulkan is not usable (the executable then falls back to WebGPU) */

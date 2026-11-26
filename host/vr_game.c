@@ -355,6 +355,20 @@ static volatile int32_t stick_aim[2];       /* ((Triforce VR) steer_aim: the rig
 static volatile uint64_t stick_aim_at;      /* (when it was made; used for 150 ms) */
 static int g_aiming;           /* hand_item: Link aims or holds a ranged item ready now (the bow, slingshot, hookshot, boomerang) */
 int vr_game_aiming(void) { return g_aiming; }
+/* ((Triforce VR) nn_hid.c vibration_send: the game's rumble on a side (0 left, 1 right), 0 to 1, to the hand controllers */
+void vr_rumble(int side, float strength) {
+    const MkwVkXr *x = xr();
+    if (!x || !x->rumble || !x->active || !x->active()) return;
+    /* (as the gamepads have it, host/pad_sdl.c: the Controls tab's Rumble strength (option 9, percent, 0 Off) and Vibration
+       curve, a power on the strength) */
+    const int percent = rx_option(9, 100), curve = rx_option(HOS_OPT_RUMBLE_CURVE, 100);
+    if (percent <= 0 || !(strength > 0.0f)) {
+        x->rumble(side, 0.0f);
+        return;
+    }
+    const double power = curve <= 0 || curve == 100 ? 1.0 : (curve < 20 ? 20 : curve > 150 ? 150 : curve) / 100.0;
+    x->rumble(side, (float)fmin(1.0, pow(fmin(1.0, strength), power) * percent / 100.0));
+}
 /* ((Triforce VR) nn_hid.c: a VR session in focus, so the gamepad counts beside the hand controllers with the window behind */
 int vr_session_on(void) {
     const MkwVkXr *x = xr();
@@ -544,6 +558,23 @@ static void vr_turn(int32_t *rx) {
         return;
     }
     if (!turn_on) turn_w = atan2(base_s, base_c), turn_on = 1;
+    if (!strcmp(cfg_value("VR_TURN"), "snap")) {   /* ((Triforce VR) Snap: one turn a push, again once the stick is back near the middle */
+        static int armed = 1;
+        const int push = abs(*rx);
+        if (push < 9000) armed = 1;
+        else if (armed && push > 22000) {
+            const double a = cfg_int("VR_SNAP_ANGLE") * M_PI / 180.0;
+            turn_w = wrap_pi(turn_w - (*rx > 0 ? a : -a)), armed = 0;
+            const MkwVkXr *x = xr();
+            if (x && x->turning) x->turning(1.0f);   /* (the Comfort vignette: a pulse at each snap) */
+        }
+        *rx = 0;
+        return;
+    }
+    {   /* ((Triforce VR) Smooth: how hard the stick turns, for the Turn vignette (vk_xr.cpp) */
+        const MkwVkXr *x = xr();
+        if (x && x->turning) x->turning(abs(*rx) < 1000 ? 0.0f : (float)abs(*rx) / 32767.0f);
+    }
     if (abs(*rx) < 1000) return;
     const double deg_per_second = 150.0;
     turn_w = wrap_pi(turn_w - *rx / 32767.0 * deg_per_second * M_PI / 180.0 * dt);

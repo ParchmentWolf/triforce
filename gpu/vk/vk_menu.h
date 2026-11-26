@@ -250,6 +250,9 @@ struct Options {
     int vr_event_up = 0;        // cutscenes: the eyes raised this many cm (-50 to 50)
     int vr_cutscenes = 1;       // Full Dive: cutscenes from 0 the game's camera (Classic), 1 Link's eyes
     int vr_aim_tilt = 35;       // Motion's pointed aim: the controller's ray tilted down, degrees (0 to 60)
+    int vr_turn = 0;            // first person's turning with the right stick: 0 Smooth, 1 Snap (host/vr_game.c vr_turn)
+    int vr_snap_angle = 45;     // Snap's turn, degrees (15 to 90)
+    int vr_vignette = 0;        // the Comfort vignette: moving and turning darken the view's edges: 0 Off, 1 On (shaders/xr_hud.comp)
     int vr_orbit_invert = 0;    // Immersive: 0 the right stick moves the view around Link the way it is pushed (as on a rail), 1 the game's own way (host/vr_game.c)
     int vr_swing_speed = 230;   // a sword swing's hand speed, cm a second (100 to 500)
     int vr_charge_reach = 35;   // how far out from the head a swing must leave the hand to hold the charge, cm (25 to 70)

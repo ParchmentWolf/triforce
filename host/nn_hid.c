@@ -2028,6 +2028,7 @@ static void vibration_send(uint64_t handle, uint64_t value) {
        renhdrum.dll): they keep the bands apart, which rumble_map above has flattened for the motors */
     void rh_push(int side, const float value[4]);
     rh_push(dev, v);
+    vr_rumble(dev, amp[dev][0] > amp[dev][1] ? amp[dev][0] : amp[dev][1]);   /* ((Triforce VR) the hand controllers too */
     void hos_sdl_rumble(float low, float high);   /* pad_sdl.c */
     hos_sdl_rumble(amp[0][0] > amp[1][0] ? amp[0][0] : amp[1][0], amp[0][1] > amp[1][1] ? amp[0][1] : amp[1][1]);
 }

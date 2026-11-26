@@ -67,7 +67,8 @@ namespace {
     X(xrGetVulkanDeviceExtensionsKHR) X(xrGetVulkanGraphicsDeviceKHR) X(xrGetVulkanGraphicsRequirementsKHR)          \
     X(xrLocateViews) X(xrLocateSpace) X(xrStringToPath) X(xrPathToString) X(xrCreateActionSet) X(xrCreateAction)   \
     X(xrSuggestInteractionProfileBindings) X(xrAttachSessionActionSets) X(xrSyncActions) X(xrGetActionStateBoolean)  \
-    X(xrGetActionStateFloat) X(xrGetActionStateVector2f) X(xrCreateActionSpace) X(xrGetCurrentInteractionProfile)
+    X(xrGetActionStateFloat) X(xrGetActionStateVector2f) X(xrCreateActionSpace) X(xrGetCurrentInteractionProfile)    \
+    X(xrApplyHapticFeedback) X(xrStopHapticFeedback)
 
 // Tangents of a lens's four edges (left and down negative), as OpenXR's angles are
 struct Lens {
@@ -313,6 +314,14 @@ static std::atomic<bool> g_gaze_aim{false};   // ((Triforce VR) the boomerang ou
 // ((Triforce VR) the last shot (ZR let go), and the pointer's ways just before it (vk_xr_pointer): kShotHoldNs after a shot
 // the aim is the way it was kShotBeforeNs before it
 static std::atomic<uint64_t> g_shot_at{0};
+// ((Triforce VR) the Turn vignette: Smooth turning's strength as vr_game.c last said it, and when
+static std::atomic<float> g_turning{0.0f};
+static std::atomic<uint64_t> g_turning_at{0};
+// ((Triforce VR) and how fast first person's eyes are carried through the world (a run, a roll, a knockback), 0 to 1: vk_xr_camera
+static std::atomic<float> g_moving{0.0f};
+// ((Triforce VR) nn_hid.c's rumble, each side's strength (0 to 1) and when it came: Controls::rumble
+static std::atomic<float> g_rumble[2];
+static std::atomic<uint64_t> g_rumble_at[2];
 // ((Triforce VR) the hammer's last swing (its ZR): his arms the game's own swing for kHammerSwingNs after it (vk_xr_arms_own)
 static std::atomic<uint64_t> g_hammer_swung{0};
 static constexpr uint64_t kHammerSwingNs = 900000000ull;
@@ -740,7 +749,7 @@ bool make_hud_pipeline() {
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, li.bindingCount = 4, li.pBindings = b;
     if (vkCreateDescriptorSetLayout(x.device, &li, nullptr, &x.hud_set) != VK_SUCCESS) return false;
-    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(int32_t) * 4};
+    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(int32_t) * 5};
     VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pi.setLayoutCount = 1, pi.pSetLayouts = &x.hud_set, pi.pushConstantRangeCount = 1, pi.pPushConstantRanges = &pr;
     if (vkCreatePipelineLayout(x.device, &pi, nullptr, &x.hud_layout) != VK_SUCCESS) return false;
@@ -823,7 +832,22 @@ bool make_panel(VkCommandBuffer cb, int cut, VkImageView tview = VK_NULL_HANDLE,
     }
     vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.hud_layout, 0, 4, w);
     // ((Triforce VR) 2: the layer with no full-picture fade looked for, the game paused (its menus' grey backdrop covers all)
-    const int32_t pc[4] = {(int32_t)x.hud_w, (int32_t)x.hud_h, x.layer ? (x.game_paused.load() ? 2 : 1) : 0, cut};
+    // ((Triforce VR) the Turn vignette, thousandths: Smooth turning and the eyes carried through the world (vk_xr_camera), eased
+    // in quickly as either starts, out over a third of a second)
+    int32_t vignette = 0;
+    {
+        static float v;
+        static uint64_t at;
+        const uint64_t now = plat_now_ns();
+        const float dt = at ? std::fmin(0.2f, (float)(now - at) * 1e-9f) : 0.0f;
+        at = now;
+        const uint64_t said = g_turning_at.load();
+        const float turn = said && now - said < 150000000ull ? std::fmin(1.0f, g_turning.load() * 1.5f) : 0.0f;
+        const float want = !strcmp(cfg_value("VR_VIGNETTE"), "on") ? std::fmax(turn, g_moving.load()) : 0.0f;   // (a choice: its name)
+        v += (want - v) * (1.0f - std::exp(-dt / (want > v ? 0.08f : 0.33f)));
+        vignette = (int32_t)(v * 1000.0f);
+    }
+    const int32_t pc[5] = {(int32_t)x.hud_w, (int32_t)x.hud_h, x.layer ? (x.game_paused.load() ? 2 : 1) : 0, cut, vignette};
     vkCmdPushConstants(cb, x.hud_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
     vkCmdDispatch(cb, (x.hud_w + 7) / 8, (x.hud_h + 7) / 8, 1);
     barrier(cb, x.scene8, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
@@ -1210,7 +1234,8 @@ struct Controls {
     XrActionSet set = XR_NULL_HANDLE;
     XrAction stick = XR_NULL_HANDLE, click = XR_NULL_HANDLE, trigger = XR_NULL_HANDLE, squeeze = XR_NULL_HANDLE,
              grip = XR_NULL_HANDLE, a = XR_NULL_HANDLE, b = XR_NULL_HANDLE, xb = XR_NULL_HANDLE, yb = XR_NULL_HANDLE,
-             menu = XR_NULL_HANDLE, aim = XR_NULL_HANDLE;
+             menu = XR_NULL_HANDLE, aim = XR_NULL_HANDLE, haptic = XR_NULL_HANDLE;   // (haptic: the controllers' vibration, the game's rumble)
+    bool buzzing[2] = {false, false};
     XrPath hand[2]{};
     XrSpace grip_space[2]{}, aim_space[2]{};
     bool ok = false;
@@ -1351,6 +1376,7 @@ struct Controls {
         xb = action("x", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
         yb = action("y", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
         menu = action("menu", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
+        haptic = action("haptic", XR_ACTION_TYPE_VIBRATION_OUTPUT, true);
         const struct {
             XrAction act;
             const char *at;
@@ -1364,6 +1390,7 @@ struct Controls {
             {a, "/user/hand/right/input/a/click"},               {b, "/user/hand/right/input/b/click"},
             {xb, "/user/hand/left/input/x/click"},               {yb, "/user/hand/left/input/y/click"},
             {menu, "/user/hand/left/input/menu/click"},
+            {haptic, "/user/hand/left/output/haptic"},           {haptic, "/user/hand/right/output/haptic"},
         };
         XrActionSuggestedBinding sb[sizeof binds / sizeof binds[0]];
         for (size_t i = 0; i < sizeof binds / sizeof binds[0]; i++) sb[i] = {binds[i].act, path(binds[i].at)};
@@ -1418,6 +1445,28 @@ struct Controls {
                           const float (&velocity)[2][3], const Pose &head_pose) {
         (void)bits, (void)sticks, (void)poses, (void)pose_ok, (void)velocity, (void)head_pose;
     }
+    // ((Triforce VR) the game's rumble on the hand controllers (vk_xr_rumble: each side's strength, the left Joy-Con's on the left
+    // hand, after the Controls tab's Rumble strength and Vibration curve): a short pulse renewed each frame while it lasts, stopped
+    // when it ends
+    void rumble(XrSession session, uint64_t now) {
+        Xr &x = xr();
+        if (!haptic || !x.xrApplyHapticFeedback) return;
+        for (int h = 0; h < 2; h++) {
+            const uint64_t at = g_rumble_at[h].load();
+            const float amp = at && now - at < 150000000ull ? std::fmin(1.0f, g_rumble[h].load()) : 0.0f;
+            XrHapticActionInfo hi{XR_TYPE_HAPTIC_ACTION_INFO};
+            hi.action = haptic, hi.subactionPath = hand[h];
+            if (amp > 0.02f) {
+                XrHapticVibration v{XR_TYPE_HAPTIC_VIBRATION};
+                v.duration = 60000000, v.frequency = XR_FREQUENCY_UNSPECIFIED, v.amplitude = amp;
+                x.xrApplyHapticFeedback(session, &hi, reinterpret_cast<const XrHapticBaseHeader *>(&v));
+                buzzing[h] = true;
+            } else if (buzzing[h]) {
+                x.xrStopHapticFeedback(session, &hi);
+                buzzing[h] = false;
+            }
+        }
+    }
     void read(XrSession session, XrSpace space, XrTime time, const Pose &head_pose) {
         const float *head = head_pose.p;
         if (!ok) return;
@@ -1427,6 +1476,7 @@ struct Controls {
         sy.countActiveActionSets = 1, sy.activeActionSets = &active;
         if (x.xrSyncActions(session, &sy) != XR_SUCCESS) return;   // (XR_SESSION_NOT_FOCUSED: nothing to read)
         const uint64_t now = plat_now_ns();
+        rumble(session, now);
         uint64_t bits = 0;
         const auto set_bit = [&](int bit, bool down) { bits |= down ? 1ull << bit : 0; };
         // on the PSVR2 both sticks clicked together (L3+R3) are the Menu, below: one click alone is X (jump) once it has been held
@@ -2630,6 +2680,8 @@ extern "C" void vk_xr_ocarina(int on) { xr().ocarina.store(on != 0); }
 extern "C" void vk_xr_weapon_out(int out) { xr().weapon_out.store(out != 0); }
 extern "C" void vk_xr_two_handed_sword(int on) { xr().two_handed_sword.store(on != 0); }
 extern "C" void vk_xr_game_paused(int on) { xr().game_paused.store(on != 0); }
+extern "C" void vk_xr_turning(float strength) { g_turning.store(strength), g_turning_at.store(plat_now_ns()); }
+extern "C" void vk_xr_rumble(int side, float strength) { g_rumble[side & 1].store(strength), g_rumble_at[side & 1].store(plat_now_ns()); }
 // ((Triforce VR) vr_body.c: Link's arms as the game's animation has them now, not on the controllers: the bow or the slingshot
 // drawn (its ZR), the hammer's swing
 extern "C" int vk_xr_arms_own(void) {
@@ -2773,6 +2825,22 @@ extern "C" void vk_xr_update_step(double seconds) { update_step.store(seconds, s
 
 extern "C" int vk_xr_camera(double pos[3], double at[3], float up[3], int in_place) {
     Xr &x = xr();
+    {   // ((Triforce VR) the Turn vignette's motion: the eyes' speed through the world in first person (in_place), over the last
+        // update: none below 0.3 m/s, all from 3 m/s (a run), more than that saturating; a jump of over a metre (a load, a
+        // teleport) is no motion
+        static double was[3];
+        static uint64_t was_at;
+        const uint64_t now = plat_now_ns();
+        float m = 0.0f;
+        if (in_place && was_at && now > was_at) {
+            const double dt = (now - was_at) * 1e-9;
+            const double d = std::sqrt((pos[0] - was[0]) * (pos[0] - was[0]) + (pos[1] - was[1]) * (pos[1] - was[1]) +
+                                       (pos[2] - was[2]) * (pos[2] - was[2]));
+            if (dt > 0.001 && dt < 0.5 && d < 1.0) m = (float)std::fmin(1.0, std::fmax(0.0, (d / dt - 0.3) / 2.7));
+        }
+        std::memcpy(was, pos, sizeof was), was_at = in_place ? now : 0;
+        g_moving.store(m);
+    }
     if (!x.ok || !x.head_view.load(std::memory_order_relaxed) || !x.running.load(std::memory_order_relaxed)) {
         vk_xr_untracked();
         return 0;
@@ -3287,7 +3355,7 @@ extern "C" const MkwVkXr *vk_xr_table(void) {
         vk_xr_cfg, vk_xr_head_active, vk_xr_camera, vk_xr_lens, vk_xr_holds_time, vk_xr_update_step, vk_xr_pad,
         vk_xr_ocarina, vk_xr_weapon_out, vk_xr_child,
         vk_xr_hand_item, vk_xr_in_play, vk_xr_item_bar, vk_xr_aim_freeze, vk_xr_pointer, vk_xr_aim, vk_xr_untracked, vk_xr_hands,
-        vk_xr_active, vk_xr_head_worn, vk_xr_hud_hidden, vk_xr_carrying, vk_xr_head_request, vk_xr_two_handed_sword, vk_xr_arms_own, vk_xr_game_paused};
+        vk_xr_active, vk_xr_head_worn, vk_xr_hud_hidden, vk_xr_carrying, vk_xr_head_request, vk_xr_two_handed_sword, vk_xr_arms_own, vk_xr_game_paused, vk_xr_rumble, vk_xr_turning};
     return &t;
 }
 

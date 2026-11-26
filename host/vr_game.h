@@ -39,6 +39,8 @@ int vr_game_paused(void);
 int vr_game_childhood(void);
 /* vr_game.c: his sword is one for both hands (the Biggoron's Sword), and no item is in his hand */
 int vr_game_two_handed(void);
+/* nn_hid.c vibration_send: the game's rumble on a side (0 left, 1 right), 0 to 1, to the hand controllers */
+void vr_rumble(int side, float strength);
 /* vr_game.c: the item in his hand, its model's name ("" none) */
 const char *vr_game_held(void);
 /* vr_game.c: Link shows an item (a quest item held up) */

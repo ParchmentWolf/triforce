@@ -15,6 +15,7 @@ layout(push_constant) uniform Push {
     ivec2 size;
     int layer;   // 0 no layer; 1 the layer; 2 the layer, no fade looked for (the game paused: its menus' backdrop is no fade)
     int cut;   // the panel left clear within this many pixels of its middle (the game's reticle while Link aims), 0 none
+    int vignette;   // ((Triforce VR) the Turn vignette, thousandths: the view's edges darkened while Smooth turning
 } p;
 
 vec3 encode(vec3 c) {
@@ -45,7 +46,11 @@ void main() {
         if (least > 0.02) fade = least, fade_c = encode(sum / 25.0 / least);
     }
     if (any(greaterThanEqual(at, p.size))) return;
-    const vec3 s = mix(encode(texelFetch(scene, at, 0).rgb), fade_c, fade);
+    vec3 s = mix(encode(texelFetch(scene, at, 0).rgb), fade_c, fade);
+    if (p.vignette > 0) {   // (the middle clear, black three quarters of the way out: the lenses show little of the corners)
+        const vec2 d = (vec2(at) + 0.5) / vec2(p.size) * 2.0 - 1.0;
+        s *= 1.0 - float(p.vignette) / 1000.0 * smoothstep(0.25, 0.75, length(d));
+    }
     vec4 panel;
     if (p.layer != 0) {
         const vec3 black = max(texelFetch(hud, at, 0).rgb, 0.0), white = max(texelFetch(hud, at + ivec2(p.size.x, 0), 0).rgb, 0.0);
