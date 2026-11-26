@@ -622,6 +622,7 @@ typedef struct {
     uint64_t bones, res;   /* (the part's skeleton object, [inst+0xf8], and its BFRES skeleton, [bones]) */
     int n;
     int16_t par[MA_BONES], mate[MA_BONES];
+    uint8_t leg[MA_BONES];   /* (Waist and every bone under it: his legs and skirt) */
     int16_t hand_l, hand_r;   /* (Weapon_L and Weapon_R: what he holds hangs from them; their places swapped, -1 if none) */
     Xf F[MA_BONES];   /* (B_mate^-1 S B: the rest frames' reflection, S = his model's x) */
     Xf orig[MA_BONES];   /* (each local as the animation last made it) */
@@ -766,6 +767,7 @@ static int ma_part_load(Ctx *c, uint64_t bones, MaPart *mp) {
         xf_mul(&Bi, &S, &t);
         xf_mul(&t, &B[i], &mp->F[i]);
     }
+    for (int i = 0; i < n; i++) mp->leg[i] = !strcmp(names[i], "Waist") || (mp->par[i] >= 0 && mp->leg[mp->par[i]]);
     mp->hand_l = mp->hand_r = mp->strap = mp->bangle = -1;
     for (int i = 0; i < n; i++) {
         if (!strcmp(names[i], "Ph_ArmStrap")) mp->strap = (int16_t)i;
@@ -808,6 +810,22 @@ static void ma_part_mirror(Ctx *c, int part, MaPart *mp) {
         Xf t;
         xf_mul(&S, &M[mp->mate[b]], &t);
         xf_mul(&t, &mp->F[b], &Mm[b]);
+    }
+    {   /* ((Triforce VR) moving sideways: from his waist down as the animation made it, not mirrored, so his legs go the way he goes */
+        int vr_game_sidestep(void);
+        if (vr_game_sidestep()) {
+            int waist = -1;
+            for (int b = 0; b < mp->n && waist < 0; b++)
+                if (mp->leg[b]) waist = b;
+            double d[3] = {0, 0, 0};   /* (moved so his waist stays where the mirrored body has it) */
+            if (waist >= 0)
+                for (int r = 0; r < 3; r++) d[r] = Mm[waist].m[r][3] - M[waist].m[r][3];
+            for (int b = 0; b < mp->n; b++)
+                if (mp->leg[b]) {
+                    Mm[b] = M[b];
+                    for (int r = 0; r < 3; r++) Mm[b].m[r][3] += d[r];
+                }
+        }
     }
     memcpy(mp->Mo, M, sizeof(Xf) * mp->n), memcpy(mp->Mmir, Mm, sizeof(Xf) * mp->n);
     if (mp->hand_l >= 0 && mp->hand_r >= 0) {   /* (what he holds in a hand to the other: his mirrored pose's sword hand is the right) */
@@ -1254,6 +1272,133 @@ static int mirror_attach(Ctx *c, uint64_t fn) {
 }
 int hos_oot_shield_attach(Ctx *c) { return mirror_attach(c, 0x81500960ULL); }
 int hos_oot_sword_attach(Ctx *c) { return mirror_attach(c, 0x81500720ULL); }
+
+/* (research, SWORD-TURN: the slash's trail) the bone world accessor's end (f_803a1360: instance x0, bone x2, its world as rows
+   of a 3x4 into x1): his hands asked for, counted by caller (the return address) every 5 s; and, from
+   ~/.app/pc_port/triforce-runs/sword_turn.txt (read once a second; lines "<caller hex, 0 any> <L|R|B> <x|y|z> <degrees>", in
+   order), the answer's turn turned further about its own axis, its place kept */
+static struct { uint64_t at; int64_t n[2]; } jw_callers[32];
+static int jw_n;
+static int64_t jw_told;
+static struct { uint64_t at; int hand, ax; double deg; } jw_turn[16];
+static int jw_turn_n;
+static void jw_turns_read(void) {
+    static int64_t at;
+    const int64_t now = hos_now_ns();
+    if (now - at < 1000000000LL) return;
+    at = now;
+    const char *home = getenv("HOME");
+    char path[512], line[128];
+    snprintf(path, sizeof path, "%s/.app/pc_port/triforce-runs/sword_turn.txt", home ? home : "");
+    FILE *f = fopen(path, "r");
+    int n = 0;
+    while (f && n < 16 && fgets(line, sizeof line, f)) {
+        unsigned long long a;
+        char h, ax;
+        double deg;
+        /* (A: any bone of anything that caller asks for; t: the place raised that many metres instead of a turn) */
+        if (sscanf(line, "%llx %c %c %lf", &a, &h, &ax, &deg) == 4 && (h == 'L' || h == 'R' || h == 'B' || h == 'A') &&
+            ((ax >= 'x' && ax <= 'z') || (ax >= 'X' && ax <= 'Z') || ax == 't'))   /* (X|Y|Z: that axis flipped) */
+            jw_turn[n].at = a, jw_turn[n].hand = h == 'L' ? 1 : h == 'R' ? 2 : h == 'B' ? 3 : 4,
+            jw_turn[n].ax = ax == 't' ? 3 : ax >= 'x' ? ax - 'x' : 4 + ax - 'X',
+            jw_turn[n].deg = deg, n++;
+    }
+    if (f) fclose(f);
+    static char last[256];
+    char now_s[256] = "";
+    for (int k = 0, o = 0; k < n && o < 200; k++)
+        o += snprintf(now_s + o, sizeof now_s - o, " %llx:%d:%c:%g", (unsigned long long)jw_turn[k].at, jw_turn[k].hand,
+                      jw_turn[k].ax == 3 ? 't' : jw_turn[k].ax >= 4 ? 'X' + jw_turn[k].ax - 4 : 'x' + jw_turn[k].ax, jw_turn[k].deg);
+    if (strcmp(now_s, last)) hos_log("vr: body: sword turn:%s", n ? now_s : " none"), snprintf(last, sizeof last, "%s", now_s);
+    jw_turn_n = n;
+}
+static struct { uint64_t at; int64_t n; } jw_all[128];
+static int jw_all_n;
+static int64_t jw_all_told;
+static void jw_all_note(Ctx *c) {
+    static SRWLOCK lk = SRWLOCK_INIT;
+    const uint64_t caller = c->x[30];
+    AcquireSRWLockExclusive(&lk);
+    int i = 0;
+    while (i < jw_all_n && jw_all[i].at != caller) i++;
+    if (i == jw_all_n && jw_all_n < 128) jw_all[jw_all_n++].at = caller;
+    if (i < 128) jw_all[i].n++;
+    jw_turns_read();
+    const int64_t now = hos_now_ns();
+    if (now - jw_all_told > 5000000000LL) {
+        if (jw_all_told) {
+            char line[4096];
+            int o = snprintf(line, sizeof line, "vr: body: bone reads by caller in 5 s:");
+            for (int k = 0; k < jw_all_n && o < (int)sizeof line - 40; k++)
+                if (jw_all[k].n) o += snprintf(line + o, sizeof line - o, " %llx=%lld", (unsigned long long)jw_all[k].at, (long long)jw_all[k].n);
+            hos_log("%s", line);
+        }
+        jw_all_told = now;
+        for (int k = 0; k < jw_all_n; k++) jw_all[k].n = 0;
+    }
+    ReleaseSRWLockExclusive(&lk);
+}
+static void jw_apply(Ctx *c, uint64_t out, int ax, double v) {
+    if (!plausible(out, 48)) return;
+    if (ax == 3) {
+        st_f(c, out + 16 + 12, ld_f(c, out + 16 + 12) + v);
+        return;
+    }
+    if (ax >= 4) {
+        for (int row = 0; row < 3; row++) st_f(c, out + (uint64_t)row * 16 + (uint64_t)(ax - 4) * 4, -ld_f(c, out + (uint64_t)row * 16 + (uint64_t)(ax - 4) * 4));
+        return;
+    }
+    const double r = v * 3.14159265358979 / 180.0, cs = cos(r), sn = sin(r);
+    const int a = (ax + 1) % 3, b = (ax + 2) % 3;   /* (the two columns the turn mixes) */
+    for (int row = 0; row < 3; row++) {
+        const uint64_t ra = out + (uint64_t)row * 16;
+        const double va = ld_f(c, ra + (uint64_t)a * 4), vb = ld_f(c, ra + (uint64_t)b * 4);
+        st_f(c, ra + (uint64_t)a * 4, va * cs + vb * sn), st_f(c, ra + (uint64_t)b * 4, -va * sn + vb * cs);
+    }
+}
+/* the sword's trail is built from the turn of the bone these read during a swing: mirrored, that turn sweeps the trail the
+   other way round, so their answers get the bone's z axis flipped (a reflection) while the mirror is on */
+static const uint64_t trail_readers[] = {0x82be902cULL, 0x80f95f64ULL, 0x826f8d64ULL, 0x803a1070ULL, 0x809963dcULL};
+void hos_oot_joint_world(Ctx *c) {
+    if (ma.parts && ma_wanted())
+        for (size_t k = 0; k < sizeof trail_readers / sizeof trail_readers[0]; k++)
+            if (c->x[30] == trail_readers[k]) {
+                jw_apply(c, c->x[1], 6, 0);
+                break;
+            }
+    jw_all_note(c);
+    if (jw_turn_n)
+        for (int k = 0; k < jw_turn_n; k++)
+            if (jw_turn[k].hand == 4 && jw_turn[k].at == c->x[30]) jw_apply(c, c->x[1], jw_turn[k].ax, jw_turn[k].deg);
+    if (!ma.parts || !ma_wanted()) return;
+    const MaPart *mp = &ma.part[0];
+    const int bone = (int)(int32_t)c->x[2];
+    if (bone != mp->hand_l && bone != mp->hand_r) return;
+    if (!plausible(c->x[0] + 0xf8, 8) || recomp_load64(c, c->x[0] + 0xf8) != mp->bones) return;
+    const uint64_t caller = c->x[30], out = c->x[1];
+    static SRWLOCK lock = SRWLOCK_INIT;
+    AcquireSRWLockExclusive(&lock);
+    int i = 0;
+    while (i < jw_n && jw_callers[i].at != caller) i++;
+    if (i == jw_n && jw_n < 32) jw_callers[jw_n++].at = caller;
+    if (i < 32) jw_callers[i].n[bone == mp->hand_r]++;
+    const int hand = bone == mp->hand_l ? 1 : 2;
+    for (int k = 0; k < jw_turn_n; k++) {
+        if (jw_turn[k].hand == 4 || (jw_turn[k].at && jw_turn[k].at != caller) || !(jw_turn[k].hand & hand)) continue;
+        jw_apply(c, out, jw_turn[k].ax, jw_turn[k].deg);
+    }
+    const int64_t now = hos_now_ns();
+    if (now - jw_told > 5000000000LL) {
+        if (jw_told)
+            for (int k = 0; k < jw_n; k++)
+                if (jw_callers[k].n[0] + jw_callers[k].n[1])
+                    hos_log("vr: body: hands asked for by %#llx: Weapon_L %lld, Weapon_R %lld in 5 s", (unsigned long long)jw_callers[k].at,
+                            (long long)jw_callers[k].n[0], (long long)jw_callers[k].n[1]);
+        jw_told = now;
+        for (int k = 0; k < jw_n; k++) jw_callers[k].n[0] = jw_callers[k].n[1] = 0;
+    }
+    ReleaseSRWLockExclusive(&lock);
+}
 
 /* the world pass's start (f_81501400, x0 the skeleton, x1..x2 its bones: its ranges may run on several workers): his
    locals mirrored before any of his worlds is made from them; the lock waited for, so no range reads them half done */

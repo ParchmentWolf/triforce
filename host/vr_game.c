@@ -137,6 +137,9 @@ static int oot_paused(void) {
 }
 
 int vr_game_paused(void) { return oot_paused(); }
+/* ((Triforce VR) Link moving sideways: sidehops and walking locked on (vr_body.c: his legs left as the animation makes them) */
+static volatile int g_sidestep;
+int vr_game_sidestep(void) { return g_sidestep; }
 void hos_vr_screen(Ctx *c, int open) {
     if (!xr()) return;
     const uint64_t param = oot_data_ptr(gw(), c->x[0] + 32) & ~3ULL, text = param ? oot_data_ptr(gw(), param) : 0;
@@ -797,6 +800,14 @@ void hos_vr_camera(Ctx *c) {
         if (view != was_view || event != was_event)
             hos_log("vr: event view: %s", !event ? "none (play)" : view == EV_EYES_NO_HUD ? "Link's eyes, no HUD" : view == EV_EYES ? "Link's eyes" : "the cutscene's");
         was_view = view, was_event = event;
+    }
+    {   /* (research: Link's state names as they change) */
+        static char was[48], was_up[48];
+        char st[48], up[48];
+        oot_link_state_at(st, 0x244), oot_link_state_at(up, 0x34c);
+        if (strcmp(st, was) || strcmp(up, was_up)) hos_log("vr: state: \"%s\" upper \"%s\"", st, up);
+        g_sidestep = !strcmp(st, "SideStep") || !strcmp(st, "SideStepLand") || !strcmp(st, "LockOnMove");
+        memcpy(was, st, sizeof was), memcpy(was_up, up, sizeof was_up);
     }
     const int k = scene - 1;
     if (scene == 1) head_camera = 0;
