@@ -325,6 +325,7 @@ static struct {
     uint32_t id[OB_N];
     uint64_t slot[OB_N], world[OB_N];
     uint64_t neck_world;   /* (the head's parent, Neck: its world entry, for sinking the head; 0 if none) */
+    uint64_t cap_world[7];   /* ((Triforce VR) the cap's physics bones Ph_Cap_1..7: their world entries, 0 for one not found */
     double rest[2][2];     /* (each arm's forearm and hand offsets' own lengths (side 0 left), the shortest seen) */
     int valid;
 } ob;
@@ -352,6 +353,17 @@ static void pose_cache(Ctx *c, uint64_t actor) {
     }
     memset(ob.rest, 0, sizeof ob.rest);
     ob.neck_world = 0;
+    for (int n = 0; n < 7; n++) {   /* (optional: the cap, collapsed into the hidden head in first person, cap_hide) */
+        char name[16];
+        uint32_t id;
+        snprintf(name, sizeof name, "Ph_Cap_%d", n + 1);
+        ob.cap_world[n] = 0;
+        if (!ok || !bone_id(c, model, name, &id)) continue;
+        uint64_t inst = recomp_load64(c, recomp_load64(c, model + 0x28) + (int16_t)(id & 0xffff) * 8);
+        inst = recomp_load64(c, inst);
+        const uint64_t w = recomp_load64(c, recomp_load64(c, inst + 0xf8) + 0x20) + (uint64_t)(int16_t)(id >> 16) * 64;
+        if (plausible(w, 64)) ob.cap_world[n] = w;
+    }
     for (int n = 0; ok && n < 3 && !ob.neck_world; n++) {   /* (optional: without it the head is only shrunk; Link has "Neck") */
         uint32_t nid;
         if (!bone_id(c, model, n == 0 ? "Neck" : n == 1 ? "Neck_2" : "Neck_1", &nid) || !bone_slot(c, model, nid)) continue;
@@ -386,13 +398,14 @@ static void ob_write(Ctx *c, int i, Xf *x) { bone_write(c, ob.model, ob.id[i], x
    (Mt_Angin), with Feather (Mt_Feather) on it, which swung across the view running, turning and rolling (found with a
    watch of his bones in front of the eyes: the cap's Ph_Cap_1..7 came within 6-26 cm); the shoulders' cape, collar and belts
    (Mt_Angin_Acs*, Mt_Leater_Upper, Mt_Leather_Upper_Metal) sat at the view's lower edge. Young Link: the cap Head_Band
-   (Mt_Cloth) and its knot, the collar Angin_Parts_Collar_R (Mt_Cloth_Parts), the feather, the shoulder belt) */
+   (Mt_Cloth) and its knot, the collar Angin_Parts_Collar_R (Mt_Cloth_Parts), the feather, the shoulder belt).
+   ((Triforce VR, 11-26) Only the head's own now: the adult's tunic is the cap's meshes (Hood_A Mt_Vest, Hood_B Mt_Angin), so
+   hiding those hid his whole tunic; the cap goes by its bones instead (cap_hide). Young Link's back lacing (String_Back_1,
+   Mt_Vest), collar and shoulder belt shown too, the tunic whole) */
 static const char *const head_materials[] = {
     "Mt_Hairs",        "Mt_Face",         "Mt_Face_SoftEdge", "Mt_Face_Eyelid", "Mt_Eye_Outer", "Mt_Eye_Inner",
     "Mt_Eyelashes",    "Mt_Eyelashes_01", "Mt_Eyelashes_02",  "Mt_Eyelashes_03", "Mt_Eyeshadow", "Mt_EyeShadow_test",
-    "Mt_Eyebrow",      "Mt_Teeth",        "Mt_Angin",         "Mt_Cloth",       "Mt_Cloth_Parts_AlphaMask", "Mt_Cloth_Parts",
-    "Mt_Vest",         "Mt_Leater_Upper", "Mt_Leather_Upper_Metal", "Mt_Angin_Acs", "Mt_Angin_Acs_AlphaMask", "Mt_Feather",
-    "Mt_ShoulderBelt"};
+    "Mt_Eyebrow",      "Mt_Teeth",        "Mt_Cloth",         "Mt_Cloth_Parts_AlphaMask", "Mt_Feather"};
 /* hidden (want) or shown again: every part of Link's model, each material by name the first time; kept hidden after that by
    setting the same slots (part instance, its set method, the index) again at every update of Link, one call each (the game
    may show them again; redone a part at a time, what it showed stayed seen until its turn: flashing cloth) */
@@ -479,8 +492,11 @@ static const struct { const char *prefix; int when_put_away; const char *mats[BA
        tunics bring their own hood, cape and belts, which flapped in front of the eyes as his own did (the Goron tunic's
        hood, Pg_Hood_low1 on Mt_Leather, the red strip seen jumping); hidden as his own are, the shirt and sleeves (Mt_Inner)
        kept for the arms. The Lens of Truth's glasses and young Link's masks sit on his face, at the eyes) */
-    {"Armor_Adult_Goron", 0, {"Mt_Leather", "Mt_Vest", "Mt_Beads_A", "Mt_Beads_B", "Mt_HoodAcs", "Mt_Leater_Upper", "Mt_Leather_Upper_Metal"}},
-    {"Armor_Adult_Zora", 0, {"Mt_Angin", "Mt_Angin_Acs", "Mt_Vest", "Mt_Feather", "Mt_Parts", "Mt_Leater_Upper", "Mt_Leather_Upper_Metal"}},
+    /* ((Triforce VR, 11-26) the tunic is the hood's meshes there too (romfs Model/Armor_Adult_*.bfres: Pg_Hood_low1 with the
+       Goron vest and belts, the Zora's Hood_Base with its pattern): only the Zora's feather hidden; the hood goes by its cap's
+       bones, as his own (cap_hide)) */
+    {"Armor_Adult_Goron", 0, {NULL}},
+    {"Armor_Adult_Zora", 0, {"Mt_Feather"}},
     {"Armor_Adult_GlassTruth", 0, {"Mt_GlassTruth", "Mt_Lenses", "Mt_LensesSpecular"}},
     {"Armor_Child_GlassTruth", 0, {"Mt_GlassTruth", "Mt_Lenses", "Mt_LensesSpecular"}},
     {"Armor_Child_Mask_", 0, {"Mt_Mask", "Mt_Body", "Mt_Body_AlphaMask", "Mt_Parts"}},
@@ -541,6 +557,7 @@ static int weapons_drawn(Ctx *c, uint64_t actor) {
    hidden again while they should be (the game may show them again), and shown once when they should not */
 #define WORN_MAX 16
 static volatile int weapon_drawn;   /* (the sword out, as hide_back_items last asked) */
+static void armor_caps_find(Ctx *c, const uint64_t *actors, int n);   /* (below, by cap_hide) */
 static void hide_back_items(Ctx *c, uint64_t link, int first_person) {
     static uint64_t found[WORN_MAX];
     static int n, hidden[WORN_MAX], logs, any_hidden;
@@ -566,6 +583,7 @@ static void hide_back_items(Ctx *c, uint64_t link, int first_person) {
         }
         int changed = m != n;
         for (int i = 0; !changed && i < m; i++) changed = got[i] != found[i];
+        armor_caps_find(c, got, m);
         if (changed) {
             for (int i = 0; i < m; i++) hidden[i] = -1;
             memcpy(found, got, sizeof got[0] * m), n = m;
@@ -1097,7 +1115,58 @@ static int in_his_hand(Ctx *c, uint64_t bones, uint64_t base) {
 }
 /* a thing's placing (f_81500960, f_81500720: its bones from the base matrix x1, the skeleton x0), for a thing in the table:
    its base reflected in its axis and the placing run with that; the renderer turns its faces. 1: done here */
+/* ((Triforce VR) the Goron or Zora tunic worn (an actor of its own over his model): its cap's physics bones (Ph_Cap_1..7)
+   and its model's origin, for cap_hide; looked for at each walk of what he carries (hide_back_items) */
+static struct { uint64_t world[7], origin; } armor_cap;
+static void armor_caps_find(Ctx *c, const uint64_t *actors, int n) {
+    memset(&armor_cap, 0, sizeof armor_cap);
+    char name[48];
+    for (int i = 0; i < n; i++) {
+        if (!plausible(actors[i], 0x40) || !actor_name(c, actors[i], name) || strncmp(name, "Armor_Adult_", 12) ||
+            (strncmp(name + 12, "Goron", 5) && strncmp(name + 12, "Zora", 4)))
+            continue;
+        const uint64_t model = vr_call(c, 0x80994de0ULL, actors[i], 0, 0, 0);
+        if (!plausible(model, 0x30)) continue;
+        for (int k = 0; k < 7; k++) {
+            char bone[16];
+            uint32_t id;
+            snprintf(bone, sizeof bone, "Ph_Cap_%d", k + 1);
+            if (!bone_id(c, model, bone, &id)) continue;
+            uint64_t inst = recomp_load64(c, recomp_load64(c, model + 0x28) + (int16_t)(id & 0xffff) * 8);
+            inst = recomp_load64(c, inst);
+            const uint64_t w = recomp_load64(c, recomp_load64(c, inst + 0xf8) + 0x20) + (uint64_t)(int16_t)(id >> 16) * 64;
+            if (plausible(w, 64) && plausible(inst + 0x2d0, 12)) armor_cap.world[k] = w, armor_cap.origin = inst + 0x2d0;
+        }
+        return;
+    }
+}
+/* ((Triforce VR) his cap in first person with his head hidden: its physics bones (Ph_Cap_1..7, which the head's own bone does
+   not carry) given the head's world entry, shrunk and sunk, so the cap goes with it and the tunic of the same meshes stays.
+   After his skeleton's world pass, as the things he holds are placed (mirror_attach) */
+static void cap_hide(Ctx *c) {
+    if (!ob.valid || !vr_first_person_now() || !body_arms() || !plausible(ob.world[OB_HEAD], 64)) return;
+    uint32_t head[16];
+    for (int k = 0; k < 16; k++) head[k] = recomp_load32(c, ob.world[OB_HEAD] + (uint64_t)k * 4);
+    for (int n = 0; n < 7; n++)
+        if (ob.cap_world[n] && plausible(ob.cap_world[n], 64))
+            for (int k = 0; k < 16; k++) recomp_store32_sp(c, ob.cap_world[n] + (uint64_t)k * 4, head[k]);
+    /* (the tunic's cap the same, its place moved from his model's origin to the tunic's) */
+    if (!armor_cap.origin || !plausible(armor_cap.origin, 12) || !plausible(ob.origin, 12)) return;
+    float at[3];
+    for (int k = 0; k < 3; k++) {
+        float hp;
+        memcpy(&hp, &head[12 + k], 4);
+        at[k] = (float)(hp + ld_f(c, ob.origin + (uint64_t)k * 4) - ld_f(c, armor_cap.origin + (uint64_t)k * 4));
+    }
+    for (int n = 0; n < 7; n++)
+        if (armor_cap.world[n] && plausible(armor_cap.world[n], 64)) {
+            for (int k = 0; k < 12; k++) recomp_store32_sp(c, armor_cap.world[n] + (uint64_t)k * 4, head[k]);
+            for (int k = 0; k < 3; k++) st_f(c, armor_cap.world[n] + 48 + (uint64_t)k * 4, at[k]);
+            recomp_store32_sp(c, armor_cap.world[n] + 60, head[15]);
+        }
+}
 static int mirror_attach(Ctx *c, uint64_t fn) {
+    cap_hide(c);
     if (shield_inside || !ma.parts) return 0;
     const int wanted = ma_wanted();
     if (wanted) bangle_place(c);
