@@ -200,6 +200,11 @@ const char* tx_onoff(int v) { return v ? "On" : "Off"; }
 const char* tx_vr_view(int v) { return v ? "Immersive" : "Theater"; }
 const char* tx_normal_inverted(int v) { return v ? "Inverted" : "Normal"; }
 const char* tx_vr_turn(int v) { return v ? "Snap" : "Smooth"; }
+const char* tx_tenths(int v) {   // ((Triforce VR) tenths as a decimal: 10 is "1.0"
+    static thread_local char b[16];
+    snprintf(b, sizeof b, "%d.%d", v / 10, v % 10);
+    return b;
+}
 const char* tx_vr_mode(int v) { return v >= 2 ? "Full Dive" : v ? "Immersive" : "Theater"; }
 const char* tx_view3d(int v) {
     static const char* const t[] = {"Flatscreen", "VR", "Red/cyan glasses", "Side by side (3D TV)", "Crossed eyes", "Above and below",
@@ -2441,6 +2446,13 @@ Row rows[] = {
      "How the hand controllers play. Full Gesture: Link's moves from your own: draw from behind your head, swing to slash, "
      "raise the shield, pull back the bow, point to aim. [PlaceHolder]: a scheme still to come.", nullptr, false, true, -1,
      false, "vr_scheme"},
+    MENU_HEADING(TAB_VRPAGE, "Camera"),
+    {TAB_VRPAGE, "Turn Speed", &opts.vr_turn_speed, 1, 50, 1, tx_tenths,
+     "How fast the right stick's left and right turn you: around Link in Immersive, Smooth turning in Full Dive. 1.0: as "
+     "before.", nullptr, false, true, -1, false, "vr_turn_speed"},
+    {TAB_VRPAGE, "Zoom Speed", &opts.vr_zoom_speed, 1, 50, 1, tx_tenths,
+     "Immersive: how fast the right stick's up and down bring you nearer to Link or farther from him. 1.0: as before.",
+     nullptr, false, true, -1, false, "vr_zoom_speed"},
     {TAB_VRPAGE, "Immersive Camera X", &opts.vr_orbit_invert, 0, 1, 1, tx_normal_inverted,
      "Immersive: how the right stick moves you around Link. Normal: the way you push it, as if on a rail. Inverted: the "
      "other way, as the game's camera turns on a flat screen.", nullptr, false, true, -1, false, "vr_orbit_invert"},
@@ -3411,6 +3423,8 @@ const VrKey vr_keys[] = {
     {"VR_CUTSCENES", &opts.vr_cutscenes, "classic|first"},
     {"VR_AIM_TILT", &opts.vr_aim_tilt, nullptr},
     {"VR_ORBIT_INVERT", &opts.vr_orbit_invert, nullptr},
+    {"VR_TURN_SPEED", &opts.vr_turn_speed, nullptr},
+    {"VR_ZOOM_SPEED", &opts.vr_zoom_speed, nullptr},
     {"VR_TURN", &opts.vr_turn, "smooth|snap"},
     {"VR_SNAP_ANGLE", &opts.vr_snap_angle, nullptr},
     {"VR_VIGNETTE", &opts.vr_vignette, "off|on"},

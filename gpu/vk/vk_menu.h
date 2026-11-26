@@ -253,6 +253,8 @@ struct Options {
     int vr_turn = 0;            // first person's turning with the right stick: 0 Smooth, 1 Snap (host/vr_game.c vr_turn)
     int vr_snap_angle = 45;     // Snap's turn, degrees (15 to 90)
     int vr_vignette = 0;        // the Comfort vignette: moving and turning darken the view's edges: 0 Off, 1 On (shaders/xr_hud.comp)
+    int vr_turn_speed = 10;     // the right stick's turn: Immersive's orbit around Link, Full Dive's Smooth turning; tenths (1 to 50, 10 as before)
+    int vr_zoom_speed = 10;     // Immersive: the right stick's zoom toward Link, tenths (1 to 50, 10 as before)
     int vr_orbit_invert = 0;    // Immersive: 0 the right stick moves the view around Link the way it is pushed (as on a rail), 1 the game's own way (host/vr_game.c)
     int vr_swing_speed = 230;   // a sword swing's hand speed, cm a second (100 to 500)
     int vr_charge_reach = 35;   // how far out from the head a swing must leave the hand to hold the charge, cm (25 to 70)

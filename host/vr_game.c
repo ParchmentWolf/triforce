@@ -349,6 +349,7 @@ static int link_aims(void) {
 }
 
 
+static volatile int g_ocarina;   /* (vr_tick: Link plays the ocarina) */
 static volatile int g_held_boomerang;    /* (vr_tick: the boomerang in his hand) */
 static volatile int g_held_hookshot;     /* (vr_tick: the hookshot or the longshot in his hand) */
 static volatile int32_t stick_aim[2];       /* ((Triforce VR) steer_aim: the right stick that turns the aim onto the pointer */
@@ -475,7 +476,8 @@ static void vr_tick(Ctx *c, const MkwVkXr *x) {
     (void)c;
     char state[48];
     oot_link_state_at(state, 0x244);
-    x->ocarina(!strncmp(state, "DemoOcarina", 11));   /* playing the ocarina (a lesson's too) */
+    g_ocarina = !strncmp(state, "DemoOcarina", 11);
+    x->ocarina(g_ocarina);   /* playing the ocarina (a lesson's too) */
     {   /* what he holds out, for the controllers' gestures */
         char item[96] = "";
         x->child(oot_childhood());
@@ -576,11 +578,29 @@ static void vr_turn(int32_t *rx) {
         if (x && x->turning) x->turning(abs(*rx) < 1000 ? 0.0f : (float)abs(*rx) / 32767.0f);
     }
     if (abs(*rx) < 1000) return;
-    const double deg_per_second = 150.0;
+    const double deg_per_second = 150.0 * cfg_int("VR_TURN_SPEED") / 10.0;   /* ((Triforce VR) Turn Speed, tenths */
     turn_w = wrap_pi(turn_w - *rx / 32767.0 * deg_per_second * M_PI / 180.0 * dt);
     *rx = 0;
 }
 
+/* ((Triforce VR) Immersive: the right stick's up and down are a zoom toward Link, not the game's camera swinging above and below
+   him (far above or below him in a headset, seeing what it should not): the camera's distance from what it looks at, at least
+   kZoomLeast and at most kZoomMost times the game's own (beyond the game's own nothing keeps it out of walls). Pushed up nearer,
+   down farther, kZoomRate a second times Zoom Speed */
+static volatile double zoom_d = 0, zoom_game = 0;   /* (the zoom's distance, 0 the game's own until the stick moves it; the game's own last) */
+static const double kZoomLeast = 0.8, kZoomMost = 2.0, kZoomRate = 1.2;
+static void immersive_zoom(int32_t *ry) {
+    static uint64_t at;
+    const uint64_t now = now_ns();
+    const double dt = at && now - at < 100000000ull ? (now - at) / 1e9 : 0.0;
+    at = now;
+    const double push = abs(*ry) < 3000 ? 0.0 : *ry / 32767.0;
+    *ry = 0;
+    if (push == 0.0 || !(zoom_game > 0.0)) return;
+    double d = zoom_d > 0.0 ? fmin(zoom_d, zoom_game * kZoomMost) : zoom_game;
+    d *= exp(-push * kZoomRate * (cfg_int("VR_ZOOM_SPEED") / 10.0) * dt);
+    zoom_d = fmax(kZoomLeast, d);
+}
 void vr_pad_read(Ctx *c, uint64_t *buttons, int32_t stick[4]) {
     const MkwVkXr *x = xr();
     /* (no session, VR off or no headset: nothing of VR's here, which runs on every pad read the game makes) */
@@ -591,9 +611,13 @@ void vr_pad_read(Ctx *c, uint64_t *buttons, int32_t stick[4]) {
         stick[2] = stick_aim[0], stick[3] = stick_aim[1];   /* ((Triforce VR) the pointed aim's stick: steer_aim */
     /* ((Triforce VR) Immersive: the right stick moves the view around Link the way it is pushed, as on a rail (the game's
        camera turns the other way, which on a flat screen reads right); Invert camera orbit keeps the game's */
-    if (!rx_option(1, 0) && !g_aiming && !strcmp(cfg_value("VR_VIEW"), "head") && !strcmp(cfg_value("VR_CAMERA"), "third") &&
-        !atoi(cfg_value("VR_ORBIT_INVERT")))
-        stick[2] = stick[2] == INT32_MIN ? INT32_MAX : -stick[2];
+    const int immersive = !rx_option(1, 0) && !g_aiming && !strcmp(cfg_value("VR_VIEW"), "head") && !strcmp(cfg_value("VR_CAMERA"), "third");
+    if (immersive && !atoi(cfg_value("VR_ORBIT_INVERT"))) stick[2] = stick[2] == INT32_MIN ? INT32_MAX : -stick[2];
+    if (immersive) {   /* (Turn Speed, tenths: the orbit's push scaled, the stick's range kept) */
+        const double v = stick[2] * (cfg_int("VR_TURN_SPEED") / 10.0);
+        stick[2] = (int32_t)fmax(-32767.0, fmin(32767.0, v));
+    }
+    if (immersive && !g_ocarina && !oot_paused()) immersive_zoom(&stick[3]);   /* (the notes and the menus keep the stick) */
     /* (the game reads the pad several times a frame, on its workers: what vr_tick tells VR changes at most once a frame,
        so it runs once in 4 ms, whichever reader comes first) */
     static uint64_t tick_at;
@@ -836,6 +860,17 @@ void hos_vr_camera(Ctx *c) {
     } else if (scene == 2) {   /* an event's camera, VR_EVENT_UP cm up */
         const double lift = cfg_int("VR_EVENT_UP") / 100.0;
         pos[1] += lift, at[1] += lift;
+    }
+    if (scene == 1 && !fp_eye && x->head_active() && !strcmp(cfg_value("VR_CAMERA"), "third") && !g_aiming) {
+        /* ((Triforce VR) Immersive's zoom (immersive_zoom): the camera moved toward what it looks at, never past the game's own */
+        const double v[3] = {pos[0] - at[0], pos[1] - at[1], pos[2] - at[2]};
+        const double len = sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+        if (len > 1e-3) {
+            zoom_game = len;
+            const double want = zoom_d > 0.0 ? fmin(zoom_d, len * kZoomMost) : len;
+            if (fabs(want - len) > 1e-4)
+                for (int i = 0; i < 3; i++) pos[i] = at[i] + v[i] * (want / len);
+        }
     }
     x->update_step(step_seconds < 0 ? -1 : update_seconds());
     if (!x->camera(pos, at, up, fp_eye)) return;
