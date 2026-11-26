@@ -6042,7 +6042,8 @@ void mirror_captures_over(Pool* p, uint64_t a, uint64_t b) {
 /// guest memory in the recording's uploads and entered in the page table; with captures, the captures' pages over them too
 /// (not when the caller has copies of its own to put between: mirror_make's inherited parts). False when the budget or the
 /// driver has no room: nothing of that run is made, the caller binds the import. (pools_mu held)
-bool mirror_pieces_make(Pool& p, uint64_t off, uint64_t size, bool captures, std::vector<std::pair<uint64_t, uint64_t>>* made = nullptr) {
+bool mirror_pieces_make(Pool& p, uint64_t off, uint64_t size, bool captures, std::vector<std::pair<uint64_t, uint64_t>>* made = nullptr,
+                        bool over_budget = false) {
     if (!p.mpieces || !size) return true;
     if (pieces_direct(&p, off, size)) return false;   // (a piece left in guest memory for good: the whole binding reads the import)
     const uint64_t n = p.hi - p.lo, piece = 1ull << p.piece_shift;
@@ -6057,7 +6058,9 @@ bool mirror_pieces_make(Pool& p, uint64_t off, uint64_t size, bool captures, std
     if (runs.empty()) return true;
     uint64_t want = 0;
     for (const auto& [a, b] : runs) want += std::min(b, p.mirror_size) - a;
-    if (mirror_bytes + want > mirror_budget() || mirror_small_full(p, want)) {
+    // (a GPU write past the budget too: written to the import while a piece of it is in the mirror, its readers read the
+    // mirror's stale bytes (Accurate's foliage: the culling lists landed in guest memory, the draws' counts read 0 there))
+    if (!over_budget && (mirror_bytes + want > mirror_budget() || mirror_small_full(p, want))) {
         if (mirror_heat_on()) p.piece_refused += want;   // ((Triforce, RX_VK_MIRROR_HEAT) for mirrors_by_heat's look)
         return false;
     }
@@ -6920,7 +6923,7 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     // import, as a pool out of the mirrors does
     if (p->mpieces && !pieces_resident(p, off, size)) {
         const bool direct = pieces_direct(p, off, size);
-        if (direct || par || !mirror_pieces_make(*p, off, size, true)) {
+        if (direct || par || !mirror_pieces_make(*p, off, size, true, nullptr, written)) {
             if (!direct) st_piece_direct++;
             if (!direct && par && piece_wanted.size() < 4096) piece_wanted.push_back({p->lo, off, size});
             auto& e = direct_by_pool[p->lo];

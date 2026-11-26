@@ -3281,7 +3281,8 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
         if (have_picture) {   // last: the headset's copies are made
             std::lock_guard<std::mutex> lk(x.hud_mu);
             if (d.stereo && !strcmp(cfg_value("FLAT3D"), "cardboard")) window_both_eyes(cb, window, extent, rect, d);
-            else if (d.eye >= 0) window_left_eye(cb, window, extent, format, rect, d.eye);
+            else if (d.eye >= 0 && !stereo_accurate()) window_left_eye(cb, window, extent, format, rect, d.eye);
+            else x.win_left_have = false;   // (Accurate shows both eyes at once: nothing to hold between presents)
         }
     }
     x.pending = slot;
