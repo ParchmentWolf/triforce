@@ -278,6 +278,7 @@ struct Xr {
     std::atomic<bool> weapon_out{false};   // vr_game.c: Link holds his sword and shield (or another weapon) out
     std::atomic<bool> child{true};         // vr_game.c: Link is a child (his hands' model)
     std::atomic<bool> two_handed_sword{false};   // ((Triforce VR) vr_game.c: his sword is the Biggoron's
+    std::atomic<bool> game_paused{false};        // ((Triforce VR) vr_game.c: the game paused by its menus (no fade looked for)
     std::atomic<int> hud_hidden{0};        // ((Triforce VR) vr_game.c: no HUD panel now (a load zone's transition)
     std::atomic<int> head_worn{0};
     std::atomic<bool> carrying{false};     // ((Triforce VR) vr_game.c: Link has something of the world's in his hands
@@ -821,7 +822,8 @@ bool make_panel(VkCommandBuffer cb, int cut, VkImageView tview = VK_NULL_HANDLE,
         w[i].pImageInfo = &info[i];
     }
     vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.hud_layout, 0, 4, w);
-    const int32_t pc[4] = {(int32_t)x.hud_w, (int32_t)x.hud_h, x.layer ? 1 : 0, cut};
+    // ((Triforce VR) 2: the layer with no full-picture fade looked for, the game paused (its menus' grey backdrop covers all)
+    const int32_t pc[4] = {(int32_t)x.hud_w, (int32_t)x.hud_h, x.layer ? (x.game_paused.load() ? 2 : 1) : 0, cut};
     vkCmdPushConstants(cb, x.hud_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
     vkCmdDispatch(cb, (x.hud_w + 7) / 8, (x.hud_h + 7) / 8, 1);
     barrier(cb, x.scene8, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
@@ -2627,6 +2629,7 @@ extern "C" void vk_xr_ocarina(int on) { xr().ocarina.store(on != 0); }
 
 extern "C" void vk_xr_weapon_out(int out) { xr().weapon_out.store(out != 0); }
 extern "C" void vk_xr_two_handed_sword(int on) { xr().two_handed_sword.store(on != 0); }
+extern "C" void vk_xr_game_paused(int on) { xr().game_paused.store(on != 0); }
 // ((Triforce VR) vr_body.c: Link's arms as the game's animation has them now, not on the controllers: the bow or the slingshot
 // drawn (its ZR), the hammer's swing
 extern "C" int vk_xr_arms_own(void) {
@@ -3284,7 +3287,7 @@ extern "C" const MkwVkXr *vk_xr_table(void) {
         vk_xr_cfg, vk_xr_head_active, vk_xr_camera, vk_xr_lens, vk_xr_holds_time, vk_xr_update_step, vk_xr_pad,
         vk_xr_ocarina, vk_xr_weapon_out, vk_xr_child,
         vk_xr_hand_item, vk_xr_in_play, vk_xr_item_bar, vk_xr_aim_freeze, vk_xr_pointer, vk_xr_aim, vk_xr_untracked, vk_xr_hands,
-        vk_xr_active, vk_xr_head_worn, vk_xr_hud_hidden, vk_xr_carrying, vk_xr_head_request, vk_xr_two_handed_sword, vk_xr_arms_own};
+        vk_xr_active, vk_xr_head_worn, vk_xr_hud_hidden, vk_xr_carrying, vk_xr_head_request, vk_xr_two_handed_sword, vk_xr_arms_own, vk_xr_game_paused};
     return &t;
 }
 

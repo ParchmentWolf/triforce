@@ -83,7 +83,12 @@ static void set_s(Ctx *c, int r, float v) {
 }
 
 /* Link: his actor, his feet and his rotation (nine floats, a 3x3 matrix by rows) beside them */
-static uint64_t player(void) { return oot_data_player(gw()); }
+static uint64_t player(void) {
+    /* ((Triforce VR) the game's own pointer to him, else Link as vr_body.c found him: at a start from a file the pointer is
+       filled only after its first event, which began third person) */
+    const uint64_t a = oot_data_player(gw());
+    return a ? a : vr_body_link();
+}
 static int player_pos(float xyz[3]) {
     const uint64_t a = player();
     return a && rd(a + 0x31c, xyz, 12) && isfinite(xyz[0]) && isfinite(xyz[1]) && isfinite(xyz[2]);
@@ -276,13 +281,14 @@ static void hide_link(uint64_t actor) {
 
 /* First person (VR_CAMERA first): the camera at Link's eyes, from his feet, his facing and his age; the offsets VR_EYE_UP,
    _SIDE and _FORWARD (centimetres, -30..30) move it from the place found right in a Quest 3 (below). 0 while there is no Link. */
+static double base_s, base_c;   /* (below: the game's own camera's level way) */
 static int first_person_eye(double eye[3]) {
     if (strcmp(cfg_value("VR_CAMERA"), "first")) return 0;
     const uint64_t actor = player();
     float feet[3], m[9];
     if (!actor || !player_pos(feet) || !player_rot(m)) return 0;
     double fx = m[2], fz = m[8], n = sqrt(fx * fx + fz * fz);   /* his facing: the rotation's third column, level */
-    if (!(n > 1e-4)) return 0;
+    if (!(n > 1e-4)) fx = base_s, fz = base_c, n = 1;   /* ((Triforce VR) his rotation not set yet: the camera's level way */
     fx /= n, fz /= n;
     /* (the eyes on Link whatever the headset's own place (vk_xr_camera in_place): adult 1.43 m and 16 cm ahead of his feet, young
        Link 0.97 m and 12 cm, both found right in a Quest 3) */
@@ -463,7 +469,8 @@ static void vr_tick(Ctx *c, const MkwVkXr *x) {
         x->hand_item(item);
         g_item_out = item[0] != 0;
         snprintf(g_held, sizeof g_held, "%s", item);
-        if (x->two_handed_sword) x->two_handed_sword(vr_game_two_handed());   /* (the head tilt's Z-target: vk_xr.cpp) */
+        if (x->two_handed_sword) x->two_handed_sword(vr_game_two_handed());
+        if (x->game_paused) x->game_paused(oot_paused());   /* (no full-picture fade looked for in its menus: vk_xr.cpp) */   /* (the head tilt's Z-target: vk_xr.cpp) */
         g_held_boomerang = strstr(item, "Boomerang") != NULL;
         g_held_hookshot = strstr(item, "Hookshot") != NULL;
     }
@@ -738,7 +745,12 @@ void hos_vr_camera(Ctx *c) {
     }
     const int k = scene - 1;
     if (scene == 1) head_camera = 0;
-    if (scene == 2 ? !event : event) return;   /* the camera that shows: Link's in play, the events' in an event */
+    /* the camera that shows: Link's in play, the events' in an event. ((Triforce VR) An event with no camera of its own (the
+       game's start from a file, DefaultBootEvent, keeps Link's): Link's while the events' has not updated for 200 ms, from his
+       eyes as in play; it began third person until the event ended) */
+    static uint64_t event_cam_at;
+    if (scene == 2) event_cam_at = now_ns();
+    if (scene == 2 ? !event : event && now_ns() - event_cam_at < 200000000ull) return;
     if (scene == 1) play_at = now_ns();
     double pos[3], at[3];
     float up[3];
@@ -778,7 +790,14 @@ void hos_vr_camera(Ctx *c) {
         fp_eye = 1;
     }
     if (scene == 2 && view != EV_CUTSCENE && x->head_active() && first_person_eye(eye)) {
-        /* ((Triforce VR) an event seen from Link's eyes: facing as the gameplay camera last did, the head turning from there) */
+        /* ((Triforce VR) an event seen from Link's eyes: facing as the gameplay camera last did, the head turning from there.
+           A load zone's or a void out's (no HUD): the way Link faces, the new place's entrance, not the old place's way, and
+           play goes on from it) */
+        float m[9];
+        if (view == EV_EYES_NO_HUD && player_rot(m)) {
+            const double fx = m[2], fz = m[8], n = sqrt(fx * fx + fz * fz);
+            if (n > 1e-4) base_s = fx / n, base_c = fz / n, turn_on = 0;
+        }
         for (int i = 0; i < 3; i++) pos[i] = eye[i];
         at[0] = eye[0] + base_s, at[1] = eye[1], at[2] = eye[2] + base_c;
         up[0] = 0, up[1] = 1, up[2] = 0;

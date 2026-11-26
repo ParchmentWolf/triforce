@@ -1339,6 +1339,9 @@ static const Grip GRIP_HAMMER_ADULT = {{0.0503, 0.2819, 0.9581, -0.9330, -0.3290
 
 static volatile double neck_height;
 static volatile int64_t neck_at;
+/* ((Triforce VR) vr_game.c: Link as his movement update found him, 0 before (the game's own pointer to him is filled later at a
+   start from a file) */
+uint64_t vr_body_link(void) { return ob.valid ? ob.actor : 0; }
 int vr_body_neck_height(double *height) {
     if (!neck_at || hos_now_ns() - neck_at > 200000000LL) return 0;
     *height = neck_height;

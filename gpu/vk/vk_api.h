@@ -609,6 +609,7 @@ typedef struct MkwVkXr {
     int (*head_request)(void);   /* (Triforce VR) the gestures' ask for his head, taken: 0 none, 1 the mask on, 2 the Lens of Truth on, 3 off */
     void (*two_handed_sword)(int on);   /* (Triforce VR) his sword is the Biggoron's (both hands on it), no item in his hand */
     int (*arms_own)(void);   /* (Triforce VR) his arms as the game's animation has them now: a bow or slingshot drawn, a hammer swing */
+    void (*game_paused)(int on);   /* (Triforce VR) the game paused by its menus: no full-picture fade looked for in the HUD */
 } MkwVkXr;
 
 /* the DLL's one export: null when Vulkan is not usable (the executable then falls back to WebGPU) */

@@ -43,6 +43,8 @@ int vr_game_two_handed(void);
 const char *vr_game_held(void);
 /* vr_game.c: Link shows an item (a quest item held up) */
 int vr_game_showing_item(void);
+/* vr_body.c: Link as his movement update found him, 0 before */
+uint64_t vr_body_link(void);
 /* vr_body.c: 1 and his neck's height over his feet (metres) as the late bone pass last posed it, while that was a moment ago */
 int vr_body_neck_height(double *height);
 
