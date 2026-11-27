@@ -92,6 +92,7 @@ bool enabled() {   // (Triforce, 11-13: the RenoDX HDR row as it was at the star
     return renodx_chosen();
 }
 std::atomic<int> replaced_modules{0};   // (modules of the game's that RenoDX's took the place of, this run)
+std::atomic<bool> encoder_replaced{false};   // ((Triforce, 11-26) and of them its output encoder: the one that makes it HDR
 bool adapting() { return opts.rdx_tonemap == 1 && opts.rdx_midgray == 2; }   // (PsychoV35's alone: RenoDRT, 2, reads none of it)
 
 /// (Triforce) The peak a tone mapper is given, in whites, when the encoder shows the picture as a display of gamma g would
@@ -307,6 +308,8 @@ const std::vector<uint32_t>* renodx_replacement(uint32_t crc) {
     }();
     const auto it = table.find(crc);
     if (it != table.end()) replaced_modules.fetch_add(1, std::memory_order_relaxed);
+    for (const auto& s : RENODX_SHADERS)   // ((Triforce, 11-26) its output encoder: what the half-minute line below asks after)
+        if (s.crc == crc && s.kind == 0) encoder_replaced.store(true, std::memory_order_relaxed);
     return it == table.end() ? nullptr : &it->second;
 }
 
@@ -361,10 +364,12 @@ void renodx_present() {
         // named by the CRC-32 of the module this translator makes, so another translation of the same program (a later
         // change to the emitter, another card's fixes) silently leaves the game's own HDR running
         static std::atomic<uint64_t> presents{0};
-        if (enabled() && presents.fetch_add(1, std::memory_order_relaxed) == 1800 && !replaced_modules.load(std::memory_order_relaxed))
-            logf("vk: RenoDX: on, and none of its four shaders has replaced one of the game's in 1800 presents: the game's own "
-                 "picture runs. Either HDR is not Native on an HDR10 display (its shaders are the native HDR ones), or this "
-                 "build names them by other checksums (scripts/renodx_shaders.py SHADERS: match them again)");
+        // ((Triforce, 11-26) its encoder, not any one of the four: since v0.8.0 the fog alone matched on NVIDIA and hid this)
+        if (enabled() && presents.fetch_add(1, std::memory_order_relaxed) == 1800 && !encoder_replaced.load(std::memory_order_relaxed))
+            logf("vk: RenoDX: on, and its output encoder has not replaced the game's in 1800 presents (%d of its shaders did): "
+                 "the game's own HDR picture runs. Either HDR is not Native on an HDR10 display (its shaders are the native HDR "
+                 "ones), or this build names them by other checksums (scripts/renodx_shaders.py SHADERS and ALSO: match them "
+                 "again)", replaced_modules.load(std::memory_order_relaxed));
     }
     std::lock_guard lk(mu);
     if (!st.ok) return;

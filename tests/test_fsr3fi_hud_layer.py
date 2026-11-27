@@ -96,6 +96,7 @@ using std::abs;   // (GLSL's abs of a float, not the C library's of an int)
 static float clamp(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
 static vec3 clamp(vec3 v, float lo, float hi) { return {clamp(v.r, lo, hi), clamp(v.g, lo, hi), clamp(v.b, lo, hi)}; }
 static float min(float a, float b) { return a < b ? a : b; }
+static float max(float a, float b) { return a > b ? a : b; }
 static bvec3 lessThanEqual(vec3 a, vec3 b) { return {a.r <= b.r, a.g <= b.g, a.b <= b.b}; }
 static bool all(bvec3 v) { return v.r && v.g && v.b; }
 static bool any(bvec3 v) { return v.r || v.g || v.b; }
@@ -209,6 +210,24 @@ int main() {
     // The camera stops: what was learned is kept, however long
     for (int i = 0; i < 300; i++) r.frame_(scene_at(5), glow, glow_t);
     need(std::fabs(r.layer.w - glow_t) < 0.03f, "the camera still: T kept", r.layer.w, glow_t);
+
+    // A calm background after a turn (a plain cliff face, standing by a moving waterline): the scene behind the HUD changes
+    // a little every frame, far less than kMinChange. What the turn taught is kept: T stays known (the HUD did not change),
+    // and the next turn finds it right, not started again
+    Run calm;
+    for (int i = 0; i < 6; i++) calm.frame_(scene_at(i), glow, glow_t);
+    int calm_unknown = 0, calm_wrong = 0;
+    for (int i = 0; i < 300; i++) {
+        const float k = 0.004f * (i % 3);
+        calm.frame_(vec3(0.20f + k, 0.30f + k, 0.25f - k), glow, glow_t);
+        if (calm.layer.w < 0) calm_unknown++;
+        else if (std::fabs(calm.layer.w - glow_t) > 0.04f) calm_wrong++;
+    }
+    need(calm_unknown <= 4, "a calm background after a turn: T stays known", calm_unknown, 4);
+    need(calm_wrong == 0, "and stays the HUD's", calm_wrong, 0);
+    const float calm_frames = calm.fit.z;
+    calm.frame_(scene_at(7), glow, glow_t);
+    need(calm.fit.z > calm_frames && calm.layer.w >= 0, "the next turn: known at once, not started again", calm.layer.w, glow_t);
 
     // No HUD: no layer to lay (the made frame untouched: fg_hud_composite.comp returns at (0, 0, 0, 1))
     Run none;

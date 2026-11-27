@@ -27,6 +27,22 @@
 #undef min
 #undef max
 #include "vk_paths.h"
+#else
+// (Linux: the save files' pictures (JPEG, in each save's caption.sav) and the salesman's PNGs through stb_image (third_party,
+// MIT/public domain; private to this file, as vk_texture.cpp's PNG-only copy is to that one). Windows uses WIC below)
+#define STB_IMAGE_IMPLEMENTATION
+#define STB_IMAGE_STATIC
+#define STBI_NO_STDIO
+#define STBI_NO_HDR
+#define STBI_NO_LINEAR
+#define STBI_ONLY_JPEG
+#define STBI_ONLY_PNG
+#define STBI_MAX_DIMENSIONS 16384
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"   // (stb_image declares its GIF loader, left out here)
+#include "../../third_party/stb_image/stb_image.h"
+#pragma GCC diagnostic pop
+#include <vector>
 #endif
 
 namespace mkwvk {
@@ -1322,8 +1338,36 @@ bool decode_image(const std::string& bytes, int max_w, std::vector<unsigned char
 #ifdef _WIN32
     return decode(bytes, max_w, rgba, w, h);
 #else
-    (void)bytes, (void)max_w, (void)rgba, (void)w, (void)h;
-    return false;
+    // (as WIC's above: RGBA, at most max_w wide, the height in proportion; a box filter where it is shrunk)
+    rgba.clear();
+    if (bytes.empty() || bytes.size() > 0x7fffffff || max_w < 1) return false;
+    int iw = 0, ih = 0, comp = 0;
+    unsigned char* px = stbi_load_from_memory((const stbi_uc*)bytes.data(), (int)bytes.size(), &iw, &ih, &comp, 4);
+    if (!px) return false;
+    if (iw < 1 || ih < 1) {
+        stbi_image_free(px);
+        return false;
+    }
+    int tw = iw, th = ih;
+    if (tw > max_w) th = std::max(1, (int)((double)ih * max_w / iw)), tw = max_w;
+    rgba.resize((size_t)tw * th * 4);
+    if (tw == iw && th == ih) memcpy(rgba.data(), px, rgba.size());
+    else
+        for (int y = 0; y < th; y++) {
+            const int y0 = (int)((int64_t)y * ih / th), y1 = std::max(y0 + 1, (int)((int64_t)(y + 1) * ih / th));
+            for (int x = 0; x < tw; x++) {
+                const int x0 = (int)((int64_t)x * iw / tw), x1 = std::max(x0 + 1, (int)((int64_t)(x + 1) * iw / tw));
+                unsigned sum[4] = {0, 0, 0, 0};
+                for (int sy = y0; sy < y1; sy++)
+                    for (int sx = x0; sx < x1; sx++)
+                        for (int k = 0; k < 4; k++) sum[k] += px[((size_t)sy * iw + sx) * 4 + k];
+                const unsigned n = (unsigned)((y1 - y0) * (x1 - x0));
+                for (int k = 0; k < 4; k++) rgba[((size_t)y * tw + x) * 4 + k] = (unsigned char)((sum[k] + n / 2) / n);
+            }
+        }
+    stbi_image_free(px);
+    *w = tw, *h = th;
+    return true;
 #endif
 }
 

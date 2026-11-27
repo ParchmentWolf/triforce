@@ -126,6 +126,18 @@ void hos_update_check(void) {
     char have[128], builder[MAX_PATH * 3], skipped[128] = "", tag[128];
     _snwprintf(file, MAX_PATH + 64, L"%ls\\triforce_version.txt", dir);
     if (!read_value(file, "version", have, sizeof have) || !safe_tag(have)) return;
+    {   /* ((Triforce, 11-26, a player's report: "the launcher is updated to 0.8.3 but in the folder it remains 0.8.1") the
+           program's own version over the file's: a folder whose triforce_version.txt says the new release while its program
+           is still the old one was never offered the update again */
+        const char *hos_version(void);
+        char mine[128];
+        snprintf(mine, sizeof mine, "%s", hos_version());
+        mine[strcspn(mine, " +")] = 0;
+        if (safe_tag(mine) && strcmp(mine, have)) {
+            fprintf(stderr, "update: triforce_version.txt says %s but this program is %s: taken as %s\n", have, mine, mine);
+            snprintf(have, sizeof have, "%s", mine);
+        }
+    }
     _snwprintf(file, MAX_PATH + 64, L"%ls\\user\\triforce_update_skip.txt", dir);
     read_value(file, "skip", skipped, sizeof skipped);
     if (!latest_tag(tag, sizeof tag)) {

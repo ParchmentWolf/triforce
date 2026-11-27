@@ -712,8 +712,25 @@ static bool buffer_budget_on() {
     }();
     return on;
 }
+// ((Triforce, 11-26, diagnostics) RX_VK_LOG_HOST_ALLOCS=1: each host buffer of 1 MB or more made, with its caller (the map
+// file names it): who holds the allocator's blocks in system memory (1.1 GB at the owner's spot). 2000 lines at most
+// (the module's base: __ImageBase is the Windows linker's; on Linux the caller's address is logged as it is)
+#ifdef _WIN32
+extern "C" char __ImageBase;
+static const char* host_alloc_base() { return &__ImageBase; }
+#else
+static const char* host_alloc_base() { return nullptr; }
+#endif
+static void host_alloc_note(const char* kind, uint64_t size, VkBufferUsageFlags usage, const void* caller) {
+    static const bool on = getenv("RX_VK_LOG_HOST_ALLOCS") != nullptr;
+    static std::atomic<int> n{0};
+    if (on && size >= (1u << 20) && n.fetch_add(1) < 2000)
+        logf("vk: host alloc %s %.1f MB usage %#x caller triforce_vk+%llx", kind, size / 1048576.0, (unsigned)usage,
+             (unsigned long long)((const char*)caller - host_alloc_base()));
+}
 bool create_buffer(uint64_t size, VkBufferUsageFlags usage, bool host_visible, VkBuffer& buffer,
                    VmaAllocation& allocation, void** mapped, bool dedicated) {
+    if (host_visible) host_alloc_note("visible", size, usage, __builtin_return_address(0));
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = size;
     bi.usage = usage;
@@ -748,6 +765,7 @@ bool create_buffer(uint64_t size, VkBufferUsageFlags usage, bool host_visible, V
 /// threads copy pages into it, the replay reads texture pages out of it and the GPU copies the rest from it)
 bool create_buffer_cached(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buffer, VmaAllocation& allocation,
                           void** mapped, bool dedicated) {
+    host_alloc_note("cached", size, usage, __builtin_return_address(0));
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = size;
     bi.usage = usage;

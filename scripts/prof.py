@@ -132,6 +132,19 @@ def demangle(n):
     return m.group(1) if m else n
 
 
+WAIT_MODULES = ("ntdll.dll", "KERNELBASE.dll", "win32u.dll", "KERNEL32.DLL")
+WAIT_FRAMES = ("hos_cv_sleep", "spin_until_set", "hos_oot_barrier_wait", "vc_acquire", "vc_yield", "libcpp_condvar_wait",
+               "condition_variable4wait", "hos_sleep")
+
+
+def waiting(leaf_module, frames):
+    """(Triforce, 11-26) a sample in a wait: the leaf in the system's wait or sleep code, or a host wait among its first frames
+    (scripts/chain.py: working against waiting below the game)"""
+    if leaf_module in WAIT_MODULES:
+        return True
+    return any(w in f for f in frames[:4] for w in WAIT_FRAMES)
+
+
 def profile_lines(path, skip):
     """Keep the old line-based slice without holding the capture in memory."""
     with open(path, encoding="utf-8", errors="replace") as f, ExitStack() as files:

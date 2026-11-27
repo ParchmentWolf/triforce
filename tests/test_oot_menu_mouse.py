@@ -628,7 +628,7 @@ int main(void) {
 
 
 # The game's own Options screen named for the renderer (its tabs sit in it): every system's, the mouse or not. On Windows
-# the file's other half is compiled for this (HOS_OOT_MENU_NO_MOUSE), which is the half Linux gets
+# the file's other half is compiled for this (HOS_OOT_MENU_NO_MOUSE) on every system
 OPTIONS_FIXTURE = r"""
 #include "hos.h"
 #include "../gpu/vk/vk_api.h"
@@ -718,7 +718,7 @@ class OotOptionsScreenTests(unittest.TestCase):
             shutil.copy(ROOT / "host" / "oot_title_movie.h", tmp / "host" / "oot_title_movie.h")   # (oot_menu_screen_tick)
             (tmp / "host" / "t.c").write_text(OPTIONS_FIXTURE + MENU_TICK, encoding="utf-8")
             binary = tmp / "t.exe"
-            other_half = ["-DHOS_OOT_MENU_NO_MOUSE"] if sys.platform == "win32" else []
+            other_half = ["-DHOS_OOT_MENU_NO_MOUSE"]
             build = subprocess.run([compiler, "-std=gnu11", "-Wall", "-O1", "-g", str(tmp / "host" / "t.c")] +
                                    ["-c", "-o", str(tmp / "t.o")], text=True, capture_output=True)
             self.assertEqual(build.returncode, 0, build.stderr)

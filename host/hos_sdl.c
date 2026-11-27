@@ -1189,6 +1189,12 @@ static void pad_headphones_forget(void *pad) {   /* (the pad closed: its handle 
     if (hp_dev) hos_sdl_hid_close(hp_dev);
     hp_dev = NULL, hp_pad = NULL, hp_failed = 0, hp_last = -2;
 }
+/* ((Triforce, 11-26) the reader let go while nothing needs the jack (host/pad_speaker.c headphones): its second handle
+   closed. A report of 11-26 had a DualSense drop seconds after every connection since v0.8.0, with the speaker rows off */
+void hos_sdl_pad_headphones_release(void) {
+    if (hp_dev) hos_sdl_hid_close(hp_dev);
+    hp_dev = NULL, hp_pad = NULL, hp_failed = 0, hp_last = -2;
+}
 int hos_sdl_pad_headphones(void *pad) {
     vib_calls_look();
     if (!vib_calls.HidReadTimeout || !vib_calls.HidOpenPath || !vib_calls.HidClose || !pad) return -1;
@@ -1209,9 +1215,10 @@ int hos_sdl_pad_headphones(void *pad) {
     int got = 0;
     for (int i = 0; i < 256; i++) {   /* (up to a second of reports queued: the newest counts) */
         const int n = ((int (*)(void *, unsigned char *, size_t, int))vib_calls.HidReadTimeout)(hp_dev, report, sizeof report, 0);
-        if (n < 0) {
+        if (n < 0) {   /* ((Triforce, 11-26) and not opened again each second: once a pad's life, as a failed open) */
             hos_sdl_hid_close(hp_dev);
-            hp_dev = NULL;
+            hp_dev = NULL, hp_failed = 1;
+            hos_log("sdl: the DualSense's input report stopped reading beside SDL's: its headphones are not seen");
             return -1;
         }
         if (n == 0) break;

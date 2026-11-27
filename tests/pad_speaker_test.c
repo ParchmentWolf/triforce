@@ -39,6 +39,7 @@ int rx_option(int id, int otherwise) {
 }
 static int pad_headphones = -1;   /* (what the made-up pad's report says: -1 nothing) */
 int hos_sdl_pad_headphones(void *pad) { (void)pad; return pad_headphones; }
+void hos_sdl_pad_headphones_release(void) {}
 
 static int endpoints = 1, endpoint_channels = 4, alive = 1, opened, closed, open_fails;
 static void *unmatched_pad;

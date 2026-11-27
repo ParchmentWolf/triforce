@@ -49,8 +49,13 @@ static const float evil_hd_foliage_game[EVIL_HD_FOLIAGE_COUNT] = {40.0f, 60.0f, 
    and 105 m (3x) and were steady at 70 and 75 m; the low trees' shoot leaves (the Lost Woods' leaves overhead) flickered at
    120 m and were steady at 30 and 70 m. The game's own areas set them no farther than 75 m (Hyrule Castle's ornaments) and
    70 m (Zora's Domain's shoot leaves): the foliage system seems to have room for about that many of them. The other six
-   showed no flicker at 4x and keep the whole factor. 0: no bound */
-static const float evil_hd_foliage_most[EVIL_HD_FOLIAGE_COUNT] = {0.0f, 0.0f, 75.0f, 70.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+   showed no flicker at 4x and keep the whole factor. 0: no bound
+   (11-26, measured on child Kokiri Forest, KokiriForest_Child, by the Lost Woods entrance) The undergrowth too: its low,
+   uncuttable ground cover popped in and out on camera turns at 4x, 3x, 2.5x and 2.25x and was steady at 2x (80 and 120 m).
+   With one factor per distance: 80/120 m steady, 80/135 m steady, 90/120 m borderline, 90/135 m, 80/180 m, 160/120 m and
+   80/240 m popped. The two kinds seem to share one room (more of one leaves less for the other), so both are kept to the
+   steady pair, 80 and 120 m: twice the game's. */
+static const float evil_hd_foliage_most[EVIL_HD_FOLIAGE_COUNT] = {80.0f, 120.0f, 75.0f, 70.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 /* One distance at a factor: the game's times it, kept to its most */
 static inline float evil_hd_foliage_one(int i, float factor) {
     const float v = factor == 1.0f ? evil_hd_foliage_game[i] : evil_hd_foliage_game[i] * factor;
@@ -97,7 +102,7 @@ static inline void evil_hd_foliage(float factor, float out[EVIL_HD_FOLIAGE_COUNT
 /* Whether the eight floats at the defaults' place are a version of them this rule knows: the game's own, or the game's
    times a factor of 1 to EVIL_HD_DIST_MOST (what an earlier write of this left). Another game version's bytes: left alone */
 static inline int evil_hd_foliage_known(const float have[EVIL_HD_FOLIAGE_COUNT]) {
-    const float f = have[0] / evil_hd_foliage_game[0];
+    const float f = have[5] / evil_hd_foliage_game[5];   /* (the low trees' distance: no most, so it carries the factor) */
     if (!(f >= 1.0f && f <= EVIL_HD_DIST_MOST)) return 0;
     for (int i = 0; i < EVIL_HD_FOLIAGE_COUNT; i++) {
         const float want = evil_hd_foliage_one(i, f), d = have[i] - want;

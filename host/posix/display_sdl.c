@@ -41,6 +41,15 @@ int hos_mouse_take(int32_t *dx, int32_t *dy) {
 
 /* (nn_hid.c) the game's menus do not take the mouse here: its capture, and with it its buttons, stay the game's */
 int hos_mouse_in_game_menu(void) { return 0; }
+/* (host/oot_menu.c's first half, built here for the System page's Mods and Quit entries: the game's menus get no free mouse
+   on this window, so it finds none (0) and leaves the cursor and the wheel alone; host/display.c has the Windows ones) */
+void hos_mouse_game_menu(void) {}
+void hos_mouse_game_menu_gone(void) {}
+int hos_mouse_wheel_take(void) { return 0; }
+int hos_mouse_game_pointer(int *x, int *y, int *w, int *h, uint32_t *pressed, int *wheel) {
+    *x = *y = *w = *h = 0, *pressed = 0, *wheel = 0;
+    return 0;
+}
 
 /* (mouse_native.c) motion taken and not used, put back for the next taker (the player camera's) */
 void hos_mouse_give_back(int32_t dx, int32_t dy) {

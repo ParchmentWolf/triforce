@@ -37,6 +37,7 @@ import cmpflags
 import fastfp
 import dead_flags
 import walk
+import nativefp
 import discover
 import chunks
 import standalone
@@ -59,6 +60,7 @@ vecfp.install()   # ((Triforce, 11-22, LIFT-03) SSE fast paths before float form
 cmpflags.install()   # ((Triforce) a subtraction's V flag in a form the compiler folds, with A64_SUB_V=1 or ovf: nx2/cmpflags.py)
 dead_flags.install()   # ((Triforce, 11-24) the kit's dead_flags answered at once for a function that writes no flag: nx2/dead_flags.py)
 walk.install()   # ((Triforce, 11-24) the kit's walk, one shared entry per plain op's word: nx2/walk.py)
+nativefp.install()   # ((Triforce, 11-26) hot float on the host's instructions / easy cases, with A64_NATIVE_FP=1 / A64_FPX_EASY=1: nx2/nativefp.py; last, so the native names go on the hot text as it leaves every other pass)
 
 
 def module_of(img, pc):
@@ -229,6 +231,8 @@ def main():
             print("functions with code below their entry, started at it by a goto: %d" % L.stats["entry_gotos"])
         print("interrupt polls: %d loop headers in %d functions" % (poll.stats["polls"], poll.stats["functions"]))
         print("wrote %d code files to %s (%.0fs)" % (len(files), gen, time.time() - t0))
+        if nativefp.report():
+            print(nativefp.report())
     print("done (%.0fs)" % (time.time() - t0))
 
 

@@ -2224,7 +2224,15 @@ uint64_t cap_spare_max() {
         if (capped && !small_card)
             logf("vk: capture buffers: 32 MB of spares at most, a PC of %llu MB of RAM (RX_VK_CAP_SPARE_MB=0: as before)",
                  (unsigned long long)(total >> 20));
-        return capped ? 32ull << 20 : ~0ull;
+        if (capped) return 32ull << 20;
+        // ((Triforce, 11-26) and 128 MB on a bigger PC, but on AMD (above: a buffer made anew costs ~100 ms there). The retired
+        // buffers of loads (40-60 MB each) stayed spares for good: the allocator's blocks in system memory 1.1 GB at the owner's
+        // spot (63 capture buffers, 1076 MB made in a tour), steady play's own captures ~110 MB. A new one is ~2 ms on NVIDIA)
+        if (total) {
+            logf("vk: capture buffers: 128 MB of spares at most (RX_VK_CAP_SPARE_MB=0: no bound, as before)");
+            return 128ull << 20;
+        }
+        return ~0ull;
     }();
     return v;
 }
@@ -2801,6 +2809,65 @@ int64_t st_late_why[3];   // (waited for after all: ranges not known, none on th
 bool late_part_on() {
     static const bool v = !getenv("RX_VK_LATE_PART") || atoi(getenv("RX_VK_LATE_PART")) != 0;
     return v;
+}
+// ((Triforce, 11-26) RX_VK_LATE_EVENTS=1: the partial rule (late_partial) for the pages that hold GPU-signalled event words only,
+// every other late page waited for as by default. At the owner's spot every late page of every take was one page, 0x100d6c8000,
+// the game's queue-ordering events (19 words the command buffers signal and the CPU writes): the held submits' first take of a
+// frame found it written back in part by the frame before, and its queue submit waited for the GPU to finish that frame (~1.5 ms
+// a frame, which the Presentation Thread and the game's readbacks then waited for in turn). Synced in part, the CPU's words go in
+// and the GPU's signalled words in flight stay the GPU's in the mirror, nothing waits. RX_VK_LATE_INLINE (the rule for every late
+// page, with the other rules off) flickered (139 cell blinks per 100 frames): this is that rule on the event page alone.
+// The pages are noted at the replay of each event signal (memory_note_event_word))
+std::mutex event_pages_mu;
+std::unordered_set<uint32_t> event_pages;   // (event_pages_mu: guest pages holding a GPU-signalled event word)
+std::atomic<int> event_pages_n{0};
+// ((Triforce, 11-26) RX_VK_LATE_GPU=1: a take's late pages, where RX_VK_LATE_QUEUE would put their second copy off to the queue
+// (the write-back sent already, no texture storage), are copied again ON THE GPU instead: from guest memory into their mirror,
+// in the uploads of the take's own submission, after a full barrier (memory_rb_refresh: the older submissions' write-backs into
+// guest memory are done by then, the queue's order). No fix is noted, so no queue submit waits for the write-back: the held
+// submits' first take of a frame (~100 late pages of a per-frame pool and the event page at the owner's spot) held the
+// Presentation Thread and the game's readbacks behind the GPU's frame before, ~1.5 ms a frame. The CPU's replay reads none of
+// those slots there (0 replay reads of a pending slot in every run). Off: as before)
+// (and the capture's own slot, guest memory -> capture buffer, as the CPU's fix did: a later submission's mirror sync may copy
+// the page from this capture, "from earlier ones'")
+struct LateGpuPage {
+    uint32_t page;
+    VkBuffer cap;
+    uint64_t off;
+    uint8_t n = 0;                   // (RX_VK_LATE_GPU=2: the ranges still in flight, the GPU's write-backs; 0 with whole: all)
+    bool whole = true;
+    uint16_t r[8][2];
+};
+std::mutex late_gpu_mu;
+std::vector<LateGpuPage> late_gpu_pages;   // (late_gpu_mu: pages for the next readback refresh, memory_rb_refresh)
+std::atomic<int64_t> st_late_gpu{0}, st_late_gpu_takes{0};
+// ((Triforce, 11-26) ON BY DEFAULT as 2 since 11-26 (the late pages' in-flight ranges, from guest memory on the GPU), with
+// RX_VK_REC_LAST, which it needs: without it a readback's wait came back at the first part of a submission recorded in parts,
+// before the write-back, and the exposure meter ran away (white flashes). The four-area tour 86.3-86.4 -> 88.4-90.5 fps (two
+// pairs, every area but the owner's spot ~4% faster; the spot itself ~1-2% slower), 0 cell blinks at the spot.
+// RX_VK_LATE_GPU=0, or RX_VK_REC_LAST=0: the CPU's wait for the late pages, as before)
+// ((Triforce, 11-26 evening) OFF AGAIN by default: on the walking route (forward and back with the camera turning, the owner's
+// "walking/turning" hitches) it made the frames much less even than v0.8.3 and than with it off: frame time sd 1.73-2.06 vs
+// 1.06, frame-to-frame jitter 1.89-2.05 vs 0.81, 88-97 spikes over 1.5x the median vs 26, 1% low 47-57 vs 62, fps 87.7-89.5 vs
+// 92.8. The tours' +2-5% average was the wrong measure. RX_VK_LATE_GPU=2 (with RX_VK_REC_LAST=1): on)
+int late_gpu_mode() {
+    static const int v = [] {
+        if (const char* e = getenv("RX_VK_LATE_GPU")) return atoi(e);
+        return 0;
+    }();
+    return v;
+}
+bool late_gpu_on() { return late_gpu_mode() != 0; }
+bool late_gpu_ranges() { return late_gpu_mode() == 2 || late_gpu_mode() == 3; }   // (2 or 3: the in-flight ranges only)
+bool late_gpu_from_mirror() { return late_gpu_mode() == 3; }   // (3: those ranges from the mirror into the capture only)
+bool late_events_on() {
+    static const bool v = getenv("RX_VK_LATE_EVENTS") && atoi(getenv("RX_VK_LATE_EVENTS")) != 0;
+    return v;
+}
+bool is_event_page(uint32_t page) {
+    if (!event_pages_n.load(std::memory_order_relaxed)) return false;
+    std::lock_guard lk(event_pages_mu);
+    return event_pages.count(page) != 0;
 }
 int64_t st_tk_late_n;   // (the takes that waited for the GPU for their late pages)   // (a capture was ever made: the replay thread's; without it nothing owns pages)
 
@@ -4247,6 +4314,9 @@ std::atomic<uint64_t> late_fix_top{0};       // (the highest value a pending fix
 constexpr size_t kLateFixMax = 4;
 std::atomic<int64_t> st_lq_deferred{0}, st_lq_tex{0}, st_lq_unsent{0}, st_lq_full{0}, st_lq_reads{0}, st_lq_applied{0};
 void late_fix_note_read() { st_lq_reads.fetch_add(1, std::memory_order_relaxed); }
+void late_gpu_stats(int64_t* takes, int64_t* pages) {   // ((Triforce, 11-26) RX_VK_LATE_GPU's counts since the last call)
+    *takes = st_late_gpu_takes.exchange(0), *pages = st_late_gpu.exchange(0);
+}
 /// whether the capture slot (gen, slot) is a late one whose fix is pending; *value: the write-back to wait for
 bool late_fix_slot_pending(WriteGen gen, uint32_t slot, uint64_t* value) {
     if (!late_fix_top.load(std::memory_order_acquire)) return false;
@@ -4277,8 +4347,44 @@ void memory_late_fix_apply(uint64_t done) {
     }
     late_fix_top.store(late_fixes.empty() ? 0 : late_fixes.back().value, std::memory_order_release);
 }
+// ((Triforce, 11-26, diagnostics) RX_VK_LOG_LATE_RANGE=<lo hex>-<hi hex>: a guest range traced: its late pages at a take, every
+// capture of its pages, its readback refreshes (and vk_replay.cpp: its readbacks after their wait); 1500 lines in all
+
+// ((Triforce, 11-26) RX_VK_LOG_LATE_RANGE read once: it was asked of getenv at every written binding, write-back run and take)
+bool trace_on() {
+    static const bool v = getenv("RX_VK_LOG_LATE_RANGE") != nullptr;
+    return v;
+}
+int64_t trace_now_ns() {   // (steady ns, the trace lines' clock)
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+bool trace_range(uint64_t g) {
+    static const std::pair<uint64_t, uint64_t> lr = [] {
+        std::pair<uint64_t, uint64_t> r{0, 0};
+        if (const char* e = getenv("RX_VK_LOG_LATE_RANGE")) {
+            char* end = nullptr;
+            r.first = strtoull(e, &end, 16);
+            if (end && *end == '-') r.second = strtoull(end + 1, nullptr, 16);
+        }
+        return r;
+    }();
+    static std::atomic<int> n{0};
+    static const uint64_t from = getenv("RX_VK_LOG_TRACE_FROM") ? strtoull(getenv("RX_VK_LOG_TRACE_FROM"), nullptr, 10) : 0;
+    return lr.second && g >= lr.first && g < lr.second && vk_timeline_completed() >= from &&
+           n.fetch_add(1, std::memory_order_relaxed) < 1500;
+}
 bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed) {
     const auto tk0 = std::chrono::steady_clock::now();
+    if (trace_on() && c->map)
+        for (size_t i = 0; i < c->pages.size(); i++) {
+            const uint64_t g = (uint64_t)c->pages[i] << kPageShift;
+            if (!trace_range(g)) continue;
+            cap_ready(*c, (uint32_t)i);
+            const uint32_t* cw = (const uint32_t*)((const uint8_t*)c->map + i * 4096);
+            const uint32_t* gw = (const uint32_t*)((const uint8_t*)host->guest_base() + g);
+            logf("vk: trace capture %#llx: take %llu, done %llu, late value %llu | capture %08x | guest %08x", (unsigned long long)g,
+                 (unsigned long long)value, (unsigned long long)vk_timeline_completed(), (unsigned long long)c->late_value, cw[0], gw[0]);
+        }
     // (RX_VK_LATE_QUEUE: this take's late pages' second copy left to the queue: lq; the value and the slots, noted with its buffer)
     bool lq = false;
     uint64_t lq_value = 0;
@@ -4317,9 +4423,16 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
         // ((Triforce, 11-22, the performance audit's MEM-80, after Source B's) RX_VK_LATE_INLINE=1 or the knob lateinline: the
         // partial rule alone, the other three off (late_inline.h); unset, the rules are RX_VK_LATE_NEW's as before
         static const char* late_inline_env = getenv("RX_VK_LATE_INLINE");
-        const late_inline::Rules rules = late_inline::rules(late_new_env || lab_ab::on("latenew"),   // (lab: the knob turns the rules on for its phases)
-                                                            late_inline::on(late_inline_env, lab_ab::on("lateinline")), late_same_on(),
-                                                            late_part_on(), late_defer_on());
+        late_inline::Rules rules = late_inline::rules(late_new_env || lab_ab::on("latenew"),   // (lab: the knob turns the rules on for its phases)
+                                                      late_inline::on(late_inline_env, lab_ab::on("lateinline")), late_same_on(),
+                                                      late_part_on(), late_defer_on());
+        // ((Triforce, 11-26) RX_VK_LATE_EVENTS: with no other rule, the partial rule for the event pages alone (late_events_on))
+        bool events_only = false;
+        if (!rules.any && late_events_on() && event_pages_n.load(std::memory_order_relaxed)) {
+            for (uint32_t i : c->late)
+                if (is_event_page(c->pages[i])) { events_only = true; break; }
+            if (events_only) rules.any = true, rules.part = true;
+        }
         const bool late_all = !rules.any;
         uint64_t v = c->late_value;
         if (!late_all) {
@@ -4361,7 +4474,9 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
                             continue;
                         }
                     }
-                    if (rules.part && std::binary_search(c->slots.begin(), c->slots.end(), i)) late_part_cand.push_back(i);
+                    if (rules.part && (!events_only || is_event_page(c->pages[i])) &&
+                        std::binary_search(c->slots.begin(), c->slots.end(), i))
+                        late_part_cand.push_back(i);
                     else need.push_back(i);
                 }
             }
@@ -4503,7 +4618,9 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
             else if (pending >= kLateFixMax) st_lq_full.fetch_add(1, std::memory_order_relaxed);
             else lq = true, lq_value = v;
         }
-        if (const uint64_t done0 = vk_timeline_completed(); !lq && v > done0 && !lab_ab::on("nolatewait")) {
+        bool lg = false;   // (RX_VK_LATE_GPU: the second copy made by the GPU in this submission's uploads, no fix)
+        if (lq && late_gpu_on()) lg = true, lq = false, st_late_gpu_takes.fetch_add(1, std::memory_order_relaxed);
+        if (const uint64_t done0 = vk_timeline_completed(); !lq && !lg && v > done0 && !lab_ab::on("nolatewait")) {
             const auto tw = std::chrono::steady_clock::now();
             vk_timeline_wait(v);
             const double waited = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw).count();
@@ -4541,6 +4658,49 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
             if (diff_now) diff_logged++;
             for (uint32_t i : c->late) {
                 cap_ready(*c, i);   // ((Triforce) copied ahead, as every late page: its second copy is not overwritten by its first)
+                {   // ((Triforce, 11-26, diagnostics) RX_VK_LOG_LATE_RANGE=<lo hex>-<hi hex>: each late page in that guest range, its
+                    // take's value, the GPU's done value, the late value and the first words of the capture and guest memory; 400 lines
+                    static const std::pair<uint64_t, uint64_t> lr = [] {
+                        std::pair<uint64_t, uint64_t> r{0, 0};
+                        if (const char* e = getenv("RX_VK_LOG_LATE_RANGE")) {
+                            char* end = nullptr;
+                            r.first = strtoull(e, &end, 16);
+                            if (end && *end == '-') r.second = strtoull(end + 1, nullptr, 16);
+                        }
+                        return r;
+                    }();
+                    static std::atomic<int> lr_n{0};
+                    const uint64_t g = (uint64_t)c->pages[i] << kPageShift;
+                    if (lr.second && g >= lr.first && g < lr.second && lr_n.fetch_add(1) < 400) {
+                        const uint32_t* cw = (const uint32_t*)((const uint8_t*)c->map + (uint64_t)i * 4096);
+                        const uint32_t* gw = (const uint32_t*)((const uint8_t*)host->guest_base() + g);
+                        logf("vk: late page %#llx: take %llu, done %llu, late value %llu, %s | capture %08x %08x %08x %08x | guest %08x %08x %08x %08x",
+                             (unsigned long long)g, (unsigned long long)value, (unsigned long long)vk_timeline_completed(),
+                             (unsigned long long)v, lg ? "gpu" : lq ? "queue" : "waited", cw[0], cw[1], cw[2], cw[3], gw[0], gw[1], gw[2], gw[3]);
+                    }
+                }
+                if (lg) {   // (RX_VK_LATE_GPU: its second copy by the GPU, guest memory -> mirror, in this submission's uploads)
+                    LateGpuPage l{c->pages[i], c->buffer, (uint64_t)i * 4096};
+                    // (RX_VK_LATE_GPU=2: only the ranges the write-backs still in flight write: the CPU's bytes stay the capture's,
+                    // as submitted, and nothing the CPU stored in the page since reaches the GPU. Not known: the whole page)
+                    if (late_gpu_ranges()) {
+                        std::pair<uint16_t, uint16_t> g[8];
+                        int gn = 0;
+                        bool known;
+                        {
+                            std::lock_guard wk(wb_pages_mu);
+                            known = wb_inflight_in(c->pages[i], c->late_done, g, 8, &gn);
+                        }
+                        if (known) {
+                            l.whole = false, l.n = (uint8_t)gn;
+                            for (int k = 0; k < gn; k++) l.r[k][0] = g[k].first, l.r[k][1] = g[k].second;
+                        }
+                    }
+                    std::lock_guard gk(late_gpu_mu);
+                    late_gpu_pages.push_back(l);
+                    st_late_gpu.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
                 if (lq) {   // (RX_VK_LATE_QUEUE: its second copy left to the queue, once the write-back is done: the fix)
                     lq_slots.push_back({i, c->pages[i]});
                     continue;
@@ -5692,6 +5852,7 @@ struct WriteBack {
     Pool* pool;
     uint64_t lo, hi;   // offsets in the pool
     bool event = false;   // (an NVN event's word, written by a command buffer's signal: memory_bind_event_write)
+    uint64_t early_seg = 0;   // ((Triforce, 11-26) RX_VK_EARLY_WB: a parallel replay segment's small write of pages the CPU reads back)
 };
 std::vector<WriteBack> writebacks;
 // (hookshot, 11-07) The counter reports the replay writes into guest memory on the CPU (vk_replay.cpp NOP_REPORT_COUNTER), by
@@ -6386,7 +6547,7 @@ void memory_bind_event_write(bool on) {
 // none. RX_VK_RB_REFRESH_EACH=1: in every recording, as before
 namespace {
 std::unordered_map<uint32_t, uint64_t> rb_pages;   // (guest page -> mirror_epoch it was last read at)
-std::atomic<int64_t> st_rb_refresh{0}, st_rb_held{0};
+std::atomic<int64_t> st_rb_refresh{0}, st_rb_held{0}, st_rb_skipped{0};
 // (the open submission the recording this thread is making joined; 0: none: it opens one, or comes after one's end)
 thread_local uint64_t rb_joined = 0;
 // (the GPU write hazards of submission rb_hazards_epoch, by guest address, with their recording's place in the queue
@@ -6404,6 +6565,20 @@ void rb_hazard_locked(uint64_t lo, uint64_t hi) {   // (pools_mu held)
     if (rb_hazards_epoch != mirror_epoch) rb_hazards.clear(), rb_hazards_epoch = mirror_epoch;
     rb_hazards.push_back({lo, hi, texture_segment()});
 }
+}
+void memory_note_event_word(uint64_t gpu) {
+    if (!late_events_on()) return;
+    static thread_local uint64_t last = 0;
+    if ((gpu >> 12) == last) return;
+    last = gpu >> 12;
+    uint64_t guest = gpu;
+    if (gpu >= (1ull << 40)) {   // (as memory_note_gpu_write)
+        uint64_t avail = 0;
+        if (!host->gpu_ptr(gpu, &avail) || avail < 4) return;
+        guest = host->gpu_guest(gpu);
+    }
+    std::lock_guard lk(event_pages_mu);
+    if (event_pages.insert((uint32_t)(guest >> kPageShift)).second) event_pages_n.fetch_add(1, std::memory_order_relaxed);
 }
 void memory_note_readback(uint64_t guest, uint64_t size) {
     static const bool off = getenv("RX_VK_NO_RB_REFRESH") != nullptr;
@@ -6437,6 +6612,103 @@ void memory_rb_segments_begin(uint64_t base, uint64_t n) {
     std::lock_guard lk(pools_mu);
     rb_segs = {mirror_epoch, base, n, 0};
 }
+// ((Triforce, 11-26) RX_VK_EARLY_WB=1 (off by default): the early write-back. A parallel replay segment's small writes (up to
+// 16 KB) of pages the CPU reads back (rb_pages: the exposure meter, the camera blocks, counters) are copied back to guest
+// memory at that segment's own end, not at the end of the whole submission, and the readback of them waits for that segment's
+// number on the recordings' timeline (every segment signals one while the occlusion queries run). Measured at the owner's
+// spot: the meter's writer sits in a segment ~7 recordings before the submission's end, which is what the game's readback
+// waited for (~1.2-1.4 ms a frame). Such a range leaves the submission's own write-back: a copy at its end would put the GPU's
+// sum back over the 0 the CPU stored after its early read (the exposure blow-out)
+bool early_wb_on() {
+    static const bool v = getenv("RX_VK_EARLY_WB") && atoi(getenv("RX_VK_EARLY_WB")) != 0;
+    return v;
+}
+uint64_t early_wb_segment(uint64_t lo, uint64_t hi, bool event) {   // (pools_mu held) the segment to write it back at, or 0
+    if (!early_wb_on() || event || hi <= lo || hi - lo > 0x4000) return 0;
+    const uint64_t seg = texture_segment();
+    if (rb_segs.epoch != mirror_epoch || seg < rb_segs.base || seg - rb_segs.base >= rb_segs.n) return 0;
+    for (uint64_t pg = lo >> kPageShift; pg <= (hi - 1) >> kPageShift; pg++)
+        if (rb_pages.count((uint32_t)pg)) return seg;
+    return 0;
+}
+struct EarlyWb {
+    uint64_t hi, value, seq;
+};
+std::mutex early_mu;   // (after pools_mu)
+std::map<uint64_t, EarlyWb> early_wbs;   // (guest lo -> the submission's value and the segment's number: early_mu)
+std::map<uint64_t, std::vector<std::pair<uint64_t, uint64_t>>> early_made;   // (segment -> guest ranges copied back at its end: pools_mu)
+std::atomic<int64_t> st_early_ranges{0}, st_early_waits{0}, st_early_dropped{0};
+/// (a segment's job, its thread, before its command buffer ends) its early write-backs, with the barriers around them
+void memory_segment_early_wb(VkCommandBuffer cmd, uint64_t seg, bool allowed) {
+    if (!early_wb_on() || !allowed || !seg) return;
+    std::lock_guard lk(pools_mu);
+    bool any = false;
+    for (size_t i = 0; i < writebacks.size();) {
+        WriteBack& w = writebacks[i];
+        if (w.early_seg != seg || !w.pool || w.pool->mstate != Pool::MIRROR_ON || !w.pool->mirror) {
+            i++;
+            continue;
+        }
+        if (!any) full_barrier(cmd, "barrier (early write-back)"), any = true;
+        Pool& p = *w.pool;
+        lazy_settle(p.lo + w.lo, p.lo + w.hi, wb_lazy::BY_GPU);
+        const VkBufferCopy r{w.lo, w.lo, w.hi - w.lo};
+        vkCmdCopyBuffer(cmd, p.mirror, p.buffer, 1, &r);
+        shadow_forget(p, w.lo, w.hi - w.lo);
+        early_made[seg].push_back({p.lo + w.lo, p.lo + w.hi});
+        st_early_ranges.fetch_add(1, std::memory_order_relaxed);
+        writebacks[i] = writebacks.back();
+        writebacks.pop_back();
+    }
+    if (any) full_barrier(cmd, "barrier (early write-back)");
+}
+/// (the replay thread, the segment submitted with that number on the recordings' timeline, 0: not) its ranges noted
+void memory_segment_early_submitted(uint64_t seg, uint64_t seq) {
+    if (!early_wb_on()) return;
+    std::lock_guard lk(pools_mu);
+    auto it = early_made.find(seg);
+    if (it == early_made.end()) return;
+    for (const auto& [lo, hi] : it->second) {
+        wb_pages_note(lo, hi, mem_rec_value);
+        std::lock_guard ek(early_mu);
+        if (seq) early_wbs[lo] = {hi, mem_rec_value, seq};
+        else early_wbs.erase(lo);
+    }
+    early_made.erase(it);
+    if (early_made.size() > 4096) early_made.clear();
+}
+/// (a later write-back of the same submission over an early range: the early one no longer says when its bytes are there)
+void early_wb_overlap(uint64_t lo, uint64_t hi, uint64_t value) {
+    if (!early_wb_on()) return;
+    std::lock_guard ek(early_mu);
+    if (early_wbs.empty()) return;
+    auto it = early_wbs.upper_bound(lo);
+    if (it != early_wbs.begin()) --it;
+    while (it != early_wbs.end() && it->first < hi) {
+        if (it->second.hi > lo && it->second.value == value) {
+            it = early_wbs.erase(it);
+            st_early_dropped.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            ++it;
+        }
+    }
+}
+/// (invalidate) the range written back early by the submission of value v alone: the recordings' number to wait for
+bool memory_early_wb_seq(uint64_t guest, uint64_t size, uint64_t v, uint64_t* seq) {
+    if (!early_wb_on() || !size) return false;
+    std::lock_guard ek(early_mu);
+    auto it = early_wbs.upper_bound(guest);
+    if (it == early_wbs.begin()) return false;
+    --it;
+    if (it->first > guest || it->second.hi < guest + size || it->second.value != v) return false;
+    *seq = it->second.seq;
+    const int64_t n = st_early_waits.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n % 3000 == 0)
+        logf("vk: early write-backs (RX_VK_EARLY_WB): %lld ranges copied back at their segment's end, %lld readbacks waited for "
+             "their segment alone, %lld dropped (written again later in the submission)", (long long)st_early_ranges.load(),
+             (long long)n, (long long)st_early_dropped.load());
+    return true;
+}
 /// Records the refresh copies into the submission's upload command buffer; true when it recorded any
 bool memory_rb_refresh(VkCommandBuffer up) {
     std::lock_guard lk(pools_mu);
@@ -6451,18 +6723,79 @@ bool memory_rb_refresh(VkCommandBuffer up) {
         ahead_made = ahead_made && k < 64 && (rb_segs.made & below) == below;
         if (k < 64) rb_segs.made |= 1ull << k;
     }
-    if (rb_pages.empty() || !up) return false;
+    if (!up) return false;
+    if (rb_pages.empty()) {
+        std::lock_guard gk(late_gpu_mu);
+        if (late_gpu_pages.empty()) return false;
+    }
     auto written_ahead = [&](uint64_t lo, uint64_t hi) {   // (may be, by a recording ahead of this one in its submission)
         if (rb_hazards_epoch != mirror_epoch) return false;
         for (const RbHazard& h : rb_hazards)
             if (h.seg < seg && h.lo < hi && lo < h.hi) return true;
         return false;
     };
+    // ((Triforce, 11-26) RX_VK_RB_REFRESH_WRITTEN (on; =0 off): only the pages this recording may write itself (its GPU write hazards): the
+    // refresh is for the GPU adding into what the CPU stored since the submit (the exposure meter's sums), and a recording that
+    // writes nothing there needs nothing newer than its capture. Every page every recording, ~1,250 copies and 6.4 MB a frame at the
+    // owner's spot (0.42 ms of GPU), most of them for recordings that never touch the meter)
+    // (on by default since 11-26: his spot 90.0-90.2 -> 91.9 fps, a four-area tour 90.8 -> 92.3, the same brightness steps and
+    // fewer cell blinks; =0: every page, as before)
+    static const bool written_only = !(getenv("RX_VK_RB_REFRESH_WRITTEN") && atoi(getenv("RX_VK_RB_REFRESH_WRITTEN")) == 0);
+    auto written_here = [&](uint64_t lo, uint64_t hi) {
+        if (rb_hazards_epoch != mirror_epoch) return false;
+        for (const RbHazard& h : rb_hazards)
+            if (h.seg == seg && h.lo < hi && lo < h.hi) return true;
+        return false;
+    };
     std::map<Pool*, std::vector<VkBufferCopy>> by_pool;
+    {   // ((Triforce, 11-26) RX_VK_LATE_GPU: this submission's take's late pages, from guest memory after the write-backs before)
+        std::vector<LateGpuPage> lp;
+        {
+            std::lock_guard gk(late_gpu_mu);
+            lp.swap(late_gpu_pages);
+        }
+        bool barrier_made = false;
+        for (const LateGpuPage& l : lp) {
+            const uint64_t g = (uint64_t)l.page << kPageShift;
+            auto pit = imported.upper_bound(g);
+            if (pit == imported.begin()) continue;
+            --pit;
+            Pool& p = pit->second;
+            if (g < p.lo || g >= p.hi || !p.buffer) continue;
+            const uint64_t a = g - p.lo, n = std::min(g + 4096, p.hi) - g;
+            VkBufferCopy rs[8];
+            uint32_t nr = 0;
+            if (l.whole) rs[nr++] = {a, l.off, n};
+            else
+                for (int k = 0; k < l.n; k++)
+                    if (l.r[k][0] < n) rs[nr++] = {a + l.r[k][0], l.off + l.r[k][0], std::min<uint64_t>(l.r[k][1], n) - l.r[k][0]};
+            if (!nr) continue;
+            if (late_gpu_from_mirror()) {   // (=3: the mirror's words for the ranges in flight, what lands in guest memory)
+                if (!l.cap || p.mstate != Pool::MIRROR_ON || !p.mirror || l.whole) continue;
+                if (!barrier_made) full_barrier(up), barrier_made = true;
+                vkCmdCopyBuffer(up, p.mirror, l.cap, nr, rs);
+                continue;
+            }
+            if (l.cap) {   // (the capture's slot: guest memory as it is after the write-backs before, as the CPU's fix copied it)
+                if (!barrier_made) full_barrier(up), barrier_made = true;
+                lazy_settle(g, g + n, wb_lazy::BY_GPU);
+                vkCmdCopyBuffer(up, p.buffer, l.cap, nr, rs);
+            }
+            if (p.mstate == Pool::MIRROR_ON && p.mirror)
+                for (uint32_t k = 0; k < nr; k++) by_pool[&p].push_back({rs[k].srcOffset, rs[k].srcOffset, rs[k].size});
+        }
+    }
     for (auto it = rb_pages.begin(); it != rb_pages.end();) {
         if (it->second + 600 < mirror_epoch) { it = rb_pages.erase(it); continue; }   // (not read for a while)
         const uint64_t g = (uint64_t)it->first << kPageShift;
         ++it;
+        if (written_only && !written_here(g, g + 4096)) {
+            st_rb_skipped++;
+            continue;
+        }
+        if (trace_range(g))
+            logf("vk: trace refresh %#llx: recording %llu, done %llu | guest %08x", (unsigned long long)g, (unsigned long long)mem_rec_value,
+                 (unsigned long long)vk_timeline_completed(), *(const uint32_t*)((const uint8_t*)host->guest_base() + g));
         auto pit = imported.upper_bound(g);
         if (pit == imported.begin()) continue;
         --pit;
@@ -6499,8 +6832,8 @@ bool memory_rb_refresh(VkCommandBuffer up) {
     }
     static std::atomic<int64_t> n{0};
     if (++n % 3000 == 1)
-        logf("vk: readback pages refreshed from guest memory: %lld pages so far (%lld held: may be written ahead in their submission)",
-             (long long)st_rb_refresh.load(), (long long)st_rb_held.load());
+        logf("vk: readback pages refreshed from guest memory: %lld pages so far (%lld held: may be written ahead in their submission; %lld not written by their recording, left: RX_VK_RB_REFRESH_WRITTEN)",
+             (long long)st_rb_refresh.load(), (long long)st_rb_held.load(), (long long)st_rb_skipped.load());
     return true;
 }
 
@@ -6786,6 +7119,10 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
         guest = host->gpu_guest(gpu);
     }
     if (deferred_late_n.load(std::memory_order_relaxed)) late_deferred_bound(guest, size);   // (Triforce: a page put off, bound now)
+    if (written && trace_on() && trace_range(guest & ~4095ull))   // ((Triforce, 11-26, diagnostics) the writer's binding
+        logf("vk: trace write bind %#llx +%#llx: recording %llu, segment %llu, recordings submitted %llu, at %.3f ms", (unsigned long long)guest,
+             (unsigned long long)size, (unsigned long long)mem_rec_value, (unsigned long long)texture_segment(),
+             (unsigned long long)vk_rec_seq_now(), (trace_now_ns() % 1000000000000ll) / 1e6);
     // (the same read, while that stamp still stands: the buffer and the offset are the ones found before. a miss
     // runs the lookup below, including a mirror sync, and remembers what it returned. a write is not remembered)
     auto remember = [&](BufferRef ref) {
@@ -6975,7 +7312,7 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
                          "%lld KB; RX_VK_WB_EXCL_CLIP=0: copied)", (unsigned long long)(p->lo + off), (unsigned long long)(wb_end - off),
                          (unsigned long long)dropped, (long long)(k + 1), (long long)(st_clipped_bytes.load(std::memory_order_relaxed) >> 10));
             } else {
-                writebacks.push_back({p, off, wb_end, tl_event_write});
+                writebacks.push_back({p, off, wb_end, tl_event_write, early_wb_segment(p->lo + off, p->lo + wb_end, tl_event_write)});
             }
         }
         rb_hazard_locked(p->lo + off, p->lo + std::min(off + size, p->hi - p->lo));   // (memory_rb_refresh)
@@ -9107,6 +9444,11 @@ void memory_end_submission(VkCommandBuffer cmd) {
                 for (const auto& e : event_runs)
                     if (r.dstOffset >= e.first && r.dstOffset + r.size <= e.second) { event_only = true; break; }
                 if (event_only) { st_wb_event_runs++; continue; }
+                early_wb_overlap(p->lo + r.dstOffset, p->lo + r.dstOffset + r.size, mem_rec_value);
+                if (trace_on() && trace_range(p->lo + r.dstOffset))
+                    logf("vk: trace wb %#llx +%#llx: recording %llu, recordings submitted %llu, at %.3f ms", (unsigned long long)(p->lo + r.dstOffset),
+                         (unsigned long long)r.size, (unsigned long long)mem_rec_value, (unsigned long long)vk_rec_seq_now(),
+                         (trace_now_ns() % 1000000000000ll) / 1e6);
                 wb_pages_note(p->lo + r.dstOffset, p->lo + r.dstOffset + r.size, mem_rec_value);
             }
             {   // (hookshot) RX_VK_LOG_WRITEBACK=1: the pools written back the most, every 600 write-back submissions

@@ -1307,6 +1307,17 @@ NV(nvnSyncWait) {
                             (unsigned long long)s->fence, (unsigned long long)U64(1), (unsigned long long)c->x[30],
                             (unsigned long long)rx_nvn_fence(), (unsigned long long)rx_nvn_replayed());
     if (!s->fenced) { RET(NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED); return; }
+    {   /* ((Triforce, 11-26, LAB ONLY) HOS_SYNC_SKIP_LR=<hex lr>: a blocking wait from that return address answers "signalled" at
+           once: what the game's own per-frame GPU wait costs, its readbacks left to their own write-back waits. NOT correct for
+           anything the game reads without a readback; never on by default) */
+        static uint64_t skip_lr = ~0ull;
+        if (skip_lr == ~0ull) skip_lr = getenv("HOS_SYNC_SKIP_LR") ? strtoull(getenv("HOS_SYNC_SKIP_LR"), NULL, 16) : 0;
+        if (skip_lr && c->x[30] == skip_lr && U64(1)) {
+            if (s->fenced == 1 && s->fence > rx_nvn_fence()) held_flush();
+            RET(NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED);
+            return;
+        }
+    }
     if (s->fenced == 1 && s->fence > rx_nvn_fence()) held_flush();   /* (a wait flushes what it waits for) */
     if (rx_nvn_wait(s->fence, 0)) { RET(NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED); return; }
     static int block = -1;   /* HOS_NVN_SYNC_BLOCK=1 (experiment): a poll waits for the GPU */

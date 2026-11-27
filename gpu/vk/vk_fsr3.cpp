@@ -538,6 +538,12 @@ bool supported() {
         vkGetPhysicalDeviceProperties2(dev.physical, &p2);
         const VkSubgroupFeatureFlags want = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_QUAD_BIT;
         g.wave = (sg.supportedOperations & want) == want && (sg.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT);
+        // ((Triforce, 11-26, a GTX 1080 Ti's report: big blue and yellow blocks and a yellow drift with FSR 3.1, driver
+        // 531.79) RX_VK_FSR3_WAVE=0: the pyramids' passes without subgroup operations, for an A/B on such a card
+        if (const char* w = getenv("RX_VK_FSR3_WAVE"); w && atoi(w) == 0 && g.wave) {
+            g.wave = false;
+            logf("vk: fsr3: the passes without subgroup operations (RX_VK_FSR3_WAVE=0)");
+        }
         logf("vk: fsr3: AMD FSR 3.1 can run on this GPU");
         return true;
     }();

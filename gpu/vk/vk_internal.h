@@ -437,6 +437,12 @@ bool memory_gpu_writes_any();
 bool uniform_snapshot_on();
 /// (vk_replay.cpp) The GPU's progress on the recordings' timeline, and a wait for it to reach v
 uint64_t vk_timeline_completed();
+// ((Triforce, 11-26) RX_VK_EARLY_WB (vk_memory.cpp): a segment's early write-backs, their submit, and a readback's wait for them
+void memory_segment_early_wb(VkCommandBuffer cmd, uint64_t seg, bool allowed);
+void memory_segment_early_submitted(uint64_t seg, uint64_t seq);
+bool memory_early_wb_seq(uint64_t guest, uint64_t size, uint64_t v, uint64_t* seq);
+uint64_t vk_rec_seq_now();    // ((Triforce, 11-26, diagnostics) vk_replay.cpp: recordings submitted so far
+uint64_t vk_rec_done_now();   // (and done on the GPU)
 /// (vk_replay.cpp) The value the timeline reaches only after every recording made so far is done on the GPU (0: never)
 uint64_t vk_retirement_value();
 bool memory_direct_wb();   // ((Triforce) vk_memory.cpp: RX_VK_DIRECT_WB=1, off unless set)
@@ -456,6 +462,7 @@ void late_fix_flush_locked();
 void vk_late_queue_stats(int64_t* waits, int64_t* wait_ns, int64_t* timeouts);
 uint64_t memory_late_fix_pending();
 void memory_late_fix_apply(uint64_t done);
+void memory_note_event_word(uint64_t gpu);   // ((Triforce, 11-26) RX_VK_LATE_EVENTS: a GPU-signalled event word's page (vk_memory.cpp)
 /// ((Triforce, wp20) of this thread's last vk_timeline_wait, the part after the writer's recording was done (ns): wb_rec_wait.h)
 int64_t vk_timeline_wait_held_last();
 WriteGen memory_generation();
