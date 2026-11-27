@@ -539,6 +539,15 @@ int aa_mode() {
         const int choice = choice_now();
         // ((Triforce, FSR3-06, FSR4-5) with an upscaler after the bloom, none: aa_rows.h effective)
         const int want = ar::effective(choice, upscaler_now(), temporal_before_bloom(), env_choice() >= 0);
+        // ((Triforce, 11-26, a player's report: "Upscale Before Bloom gets rid of Evil HD's ambient occlusion") the AO and the
+        // light shafts are drawn in the stand-in for the game's SMAA composition (ao_after), which an upscaler before the bloom
+        // leaves to the game (GAME): said once. Drawing them there too is to come (the render-size depth, before the bloom)
+        if (want == ar::GAME && evil_hd_now() && temporal_before_bloom() && ar::upscaler_own(upscaler_now())) {
+            static bool told;
+            if (!told)
+                told = true, logf("vk: Evil HD's ambient occlusion and light shafts: not drawn while the upscaler works before the "
+                                  "bloom (the Upscale before bloom row)");
+        }
         frame_begun(s, frame, want);
         mode_now.store(want, std::memory_order_release);
         frame_read.store(frame, std::memory_order_release);

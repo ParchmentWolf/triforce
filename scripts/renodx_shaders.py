@@ -65,10 +65,15 @@ SHADERS = [
 # 41 of the encoder's 1,327 words): of the 24,350 modules a Setup build of v0.3.6 made, exactly one has each of the four's
 # signature. C749AC23 and D2EDEE38 are also the patch's; its other two (0D00542E, 9E0C0C3A: v0.3.3's translator) are made by
 # neither build any more. A change to the emitter changes all eight: match again the same way
+# (Triforce, 11-26) And on a GPU whose driver reports no fp32 denormal modes (NVIDIA's: adfbf8745, in v0.8.0, claims them
+# only when the device has them): the same modules less the DenormFlushToZero 32 execution mode and its capability. Since
+# v0.8.0 every NVIDIA player's RenoDX replaced the fog alone (which has neither), the game's own native HDR encoder and tone
+# mapping drew the picture: washed out, and the UI brightness and peak rows did nothing (three reports of 11-26; an AMD log
+# of v0.8.3 replaced all three). The new checksums are the old modules' with that mode and capability taken out
 ALSO = {
-    0x4AE77AB6: (0xC749AC23,),
-    0x66644A1B: (0xD2EDEE38,),
-    0xD08E7AD8: (0xCC713D29,),
+    0x4AE77AB6: (0xC749AC23, 0xC7B42A6F, 0xAF846BBF),
+    0x66644A1B: (0xD2EDEE38, 0x3435D82B, 0x09A9DA07),
+    0xD08E7AD8: (0xCC713D29, 0xF7D0C7A5, 0xAA6209A9),
     0xCCB24C45: (0x93C92C19,),
 }
 FLAGS = ["-stage", "fragment", "-O3", "-g0", "-entry", "main", "-Wno-30056", "-Wno-15205", "-Wno-30081", "-Wno-41035",

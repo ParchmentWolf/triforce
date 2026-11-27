@@ -106,11 +106,31 @@ function startBuffer(m, t) {
   src.start();
   m.src = src; m.g = g; m.v = v; m.loading = false;
 }
+/* An <audio> element's source, as a blob: URL of the file read with fetch. (WebKitGTK's media player can't read the
+   launcher's own app:// scheme, MediaError 4, though fetch can; the direct URL stays the fallback.) One per file and
+   media version. */
+const blobs = new Map();
+let blobsFor;
+function audioSrc(name) {
+  if (HOST !== 'linux') return Promise.resolve('audio/' + name + '.wav');   // (Windows' WebView2 plays the scheme's files as before)
+  if (blobsFor !== S.media.v) { blobs.forEach(p => p.then(u => { if (u.startsWith('blob:')) URL.revokeObjectURL(u); })); blobs.clear(); blobsFor = S.media.v; }
+  let p = blobs.get(name);
+  if (!p) {
+    const url = 'audio/' + name + '.wav';
+    p = fetch(url).then(r => { if (!r.ok) throw new Error(name + ': ' + r.status); return r.blob(); })
+      .then(b => URL.createObjectURL(b.type ? b : new Blob([b], { type: 'audio/wav' })), () => url);
+    blobs.set(name, p);
+  }
+  return p;
+}
 function startElement(m) {
-  const el = new Audio('audio/' + m.name + '.wav'); el.loop = m.loop; el.volume = level(m);
-  m.el = el; m.loading = false;
-  el.play().catch(() => { m.blocked = true; });
-  if (!m.loop) el.onended = () => oneShotEnded(m);
+  audioSrc(m.name).then(src => {
+    if (m.dead) return;
+    const el = new Audio(src); el.loop = m.loop; el.volume = level(m);
+    m.el = el; m.loading = false;
+    el.play().catch(() => { m.blocked = true; });
+    if (!m.loop) el.onended = () => oneShotEnded(m);
+  });
 }
 function level(m) { return Math.max(0, Math.min(1, m.k * m.k * (S.sound.muted ? 0 : S.sound.music))); }
 function oneShotEnded(m) { m.target = 0; m.k = 0; if (curTrack === m.name) { curTrack = null; afterOneShot(m.name); } nowPlaying(); }
@@ -158,16 +178,36 @@ function audioTick(t) {
 }
 const SFX_IDS = ['cursor', 'tab_l', 'tab_r', 'decide', 'decide_l', 'cancel', 'open', 'close', 'success', 'error'];
 let sfxPool = null, lastCursor = 0;
+/* The sounds play through Web Audio, decoded once, so a sound starts with the hover or press that made it (an <audio>
+   element is slow to start in WebKitGTK, and the cursor sound came noticeably late); <audio> elements are the fallback,
+   for a page without Web Audio or a file it cannot decode. */
+function sfxElements(p, n) {
+  p.a = [0, 1, 2].map(() => { const a = new Audio(); a.preload = 'auto'; return a; });
+  audioSrc(n).then(src => p.a.forEach(a => { a.src = src; }));
+}
 function loadSfx() {
   if (sfxPool || !S.media.sfx) return;
   sfxPool = {};
-  SFX_IDS.forEach(n => { sfxPool[n] = { i: 0, a: [0, 1, 2].map(() => { const a = new Audio('audio/' + n + '.wav'); a.preload = 'auto'; return a; }) }; });
+  SFX_IDS.forEach(n => {
+    const p = sfxPool[n] = { i: 0, a: [], buf: null };
+    if (HOST !== 'linux' || !audioCtx()) return sfxElements(p, n);   // (Web Audio for the sounds on Linux alone: Windows as before)
+    fetch('audio/' + n + '.wav').then(r => { if (!r.ok) throw new Error(n + ': ' + r.status); return r.arrayBuffer(); })
+      .then(ab => new Promise((ok, no) => { const q = actx.decodeAudioData(ab, ok, no); if (q && q.then) q.then(ok, no); }))
+      .then(b => { p.buf = b; }, () => sfxElements(p, n));
+  });
 }
 function sfx(n) {
   if (!sfxPool || S.sound.muted || !S.sound.sfx) return;
   if (n === 'cursor') { const t = performance.now(); if (t - lastCursor < 55) return; lastCursor = t; }
   const p = sfxPool[n]; if (!p) return;
-  const a = p.a[p.i++ % 3]; a.currentTime = 0; a.volume = S.sound.sfx * (n === 'cursor' ? .8 : 1); a.play().catch(() => {});
+  const vol = S.sound.sfx * (n === 'cursor' ? .8 : 1);
+  if (p.buf) {
+    const src = actx.createBufferSource(), g = actx.createGain();
+    src.buffer = p.buf; g.gain.value = vol; src.connect(g); g.connect(actx.destination);
+    src.onended = () => g.disconnect(); src.start();
+    return;
+  }
+  const a = p.a[p.i++ % 3]; if (!a || !a.src) return; a.currentTime = 0; a.volume = vol; a.play().catch(() => {});
 }
 function nowPlaying() {
   $('#nowT').textContent = curTrack ? TRACKS[curTrack] : S.media.music ? 'Nothing playing' : 'Music comes from your game once it is added';

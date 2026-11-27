@@ -31,7 +31,7 @@
 void rx_option_set(int id, int value);   /* rx_backend.c */
 /* ((Triforce, 11-22) Both halves': the guest reads, a screen's list of entries and its buttons' boxes, and benchmark mode's
    presses through the start's screens (bench_menu). Without them the Linux half pressed nothing, and the benchmark stood
-   on the title screen (#bug-tracker, 11-21). The mouse, Quit and Mods stay the Windows half's */
+   on the title screen (#bug-tracker, 11-21). The mouse, Quit and Mods are the first half's (Windows and Linux) */
 #include <stdlib.h>
 #include <string.h>
 #include "hos_bench.h"   /* ((Triforce, 11-19) benchmark mode) */
@@ -123,7 +123,10 @@ static void autoload_menu(uint64_t screen, uint64_t vt) {
     if (hos_oot_autoload_menu(vt, l.index)) hos_hid_tap("0:A/120");
 }
 
-#if defined(_WIN32) && !defined(HOS_OOT_MENU_NO_MOUSE)   /* (the macro: tests/test_oot_menu_mouse.py builds the other half on Windows) */
+#if !defined(HOS_OOT_MENU_NO_MOUSE)   /* (the macro: tests/test_oot_menu_mouse.py builds the other half. Linux runs this half too: the
+   System page's Mods and Quit entries (Quit Game / Restart Game: gpu/vk/vk_menu.cpp end_game, whose WM_CLOSE and WM_APP + 9
+   host/posix/display_sdl.c hos_posix_post_message takes as the Insert menu's). Its mouse bridges are inert there: no free
+   mouse in the game's menus, keyboard and pads only) */
 #include <windows.h>
 #include <ctype.h>
 #include <stdio.h>
@@ -1238,7 +1241,7 @@ void hos_oot_menu_tick(Ctx *c, uint64_t screen) {
     if (screen == pause_screen_now()) InterlockedIncrement(&ticks);
 }
 #else
-/* Not Windows: the mouse in the game's menus is the Windows window's (display.c), not here. The game's own Options
+/* HOS_OOT_MENU_NO_MOUSE (the tests' build): no mouse, Quit or Mods entry here. The game's own Options
    screen is named all the same, each frame it runs, so the options' tabs sit in it as on Windows: they are the only way
    to our options since the keys that opened them over the game went (gpu/vk/vk_menu.cpp overlay_allowed), and with this
    left out a Linux build had none at all (2026-11-14). The screen is the one whose update the lifted game is running

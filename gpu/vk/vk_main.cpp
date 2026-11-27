@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -133,7 +134,48 @@ bool has_extension(const std::vector<VkExtensionProperties>& all, const char* na
     return false;
 }
 
+/// (vk_draw.cpp nv_own_folder_mark_path's file: beside the game)
+std::string nv_own_folder_mark_path() {
+    char exe[MAX_PATH];
+    const DWORD n = game_module_path(exe, MAX_PATH);
+    const std::string dir(exe, n);
+    return dir.substr(0, dir.find_last_of("\\/") + 1) + "triforce_nvidia_cache.own";
+}
+/// ((Triforce, 11-26) a PC whose NVIDIA shader cache did not keep the game's (vk_draw.cpp nv_own_folder_mark_path has the lab
+/// numbers and the player's report): the driver's cache in a folder of the game's own, triforce_nvidia_cache beside it, with
+/// 10 GB of room, so other games' shaders do not push the game's out. Before the first Vulkan call, when the driver loads and
+/// reads them; a path or size the player set wins. Windows' driver honours both (a probe at 100 MB stayed there); Linux's
+/// main sets the size for every player already (host/hos_main.c driver_cache_room)
+static void nv_own_folder() {
+    FILE* m = fopen(nv_own_folder_mark_path().c_str(), "rb");
+    if (!m) return;
+    fclose(m);
+    const std::string mark = nv_own_folder_mark_path();
+    const std::string dir = mark.substr(0, mark.find_last_of("\\/") + 1) + "triforce_nvidia_cache";
+    if (getenv("__GL_SHADER_DISK_CACHE_PATH")) {
+        logf("vk: NVIDIA's shader cache: __GL_SHADER_DISK_CACHE_PATH is set already, kept (%s)", getenv("__GL_SHADER_DISK_CACHE_PATH"));
+        return;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+#ifdef _WIN32
+    // (the CRT's copy and the process's: the driver may read either)
+    _putenv_s("__GL_SHADER_DISK_CACHE_PATH", dir.c_str());
+    SetEnvironmentVariableA("__GL_SHADER_DISK_CACHE_PATH", dir.c_str());
+    if (!getenv("__GL_SHADER_DISK_CACHE_SIZE")) {
+        _putenv_s("__GL_SHADER_DISK_CACHE_SIZE", "10737418240");
+        SetEnvironmentVariableA("__GL_SHADER_DISK_CACHE_SIZE", "10737418240");
+    }
+#else
+    setenv("__GL_SHADER_DISK_CACHE_PATH", dir.c_str(), 0);
+    setenv("__GL_SHADER_DISK_CACHE_SIZE", "10737418240", 0);
+#endif
+    logf("vk: NVIDIA's shader cache: a folder of the game's own, %s, %s bytes (this PC's driver did not keep the game's in its "
+         "own folder: %s; remove that file to use the driver's folder again)", dir.c_str(), getenv("__GL_SHADER_DISK_CACHE_SIZE"),
+         mark.c_str());
+}
 bool create_instance() {
+    nv_own_folder();
     uint32_t version = VK_API_VERSION_1_0;
     if (vkEnumerateInstanceVersion) vkEnumerateInstanceVersion(&version);
     if (version < VK_API_VERSION_1_3) {
@@ -1993,7 +2035,22 @@ void new_refused() {
     const bool known = new_commit_left(&avail);
     if (!new_wait::waits(known, avail, new_wait::t_waited_ms, max_ms, new_wait::t_no_wait)) throw std::bad_alloc();
     static std::atomic<int> told{0};
-    if (told.fetch_add(1) < 8)
+    const int n = told.fetch_add(1);
+    if (n == 0) {   // ((Triforce, 11-26) as host/mkw_glue.c hos_commit_limit_mark: the next start says so, once)
+        // (no allocation here: this is the new handler, at the commit limit)
+        char path[MAX_PATH + 32];
+        const DWORD len = game_module_path(path, MAX_PATH);
+        char* slash = len ? strrchr(path, '\\') : nullptr;
+        if (!slash && len) slash = strrchr(path, '/');
+        if (slash) {
+            snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "triforce_commit_limit.txt");
+            if (FILE* f = fopen(path, "w")) {
+                fputs("Windows' commit limit (RAM and page file) was reached in the last session: the next start says so\n", f);
+                fclose(f);
+            }
+        }
+    }
+    if (n < 8)
         logf("vk: an allocation refused with %llu MB of the system's commit left: tried again for up to %d ms (HOS_COMMIT_WAIT_MS)",
              (unsigned long long)(avail >> 20), max_ms);
     Sleep(new_wait::kStepMs);

@@ -432,6 +432,14 @@ void hos_pad_speaker_forget(void *pad) {
 /* Headphones in the jack: what the pad says (-1: it does not say), or the switch over it, each second */
 static void headphones(void *pad) {
     int plugged = env_int("HOS_PAD_SPEAKER_HEADPHONES", -1, 0, 1);
+    /* ((Triforce, 11-26) the pad's jack read only while a row uses it: the Headphones row on, or a class of sounds sent to the
+       pad. Read every second with them all off (the default), a second handle on the DualSense drained its reports, and a
+       player's pad dropped seconds after each connection since v0.8.0 (unproven as the cause; the only new code on it) */
+    const int needed = atomic_read(&hp_mode) != HOS_PAD_HEADPHONES_OFF || atomic_read(&any_class);
+    if (plugged < 0 && !needed) {
+        hos_sdl_pad_headphones_release();
+        plugged = 0;
+    }
     if (plugged < 0) plugged = pad ? hos_sdl_pad_headphones(pad) : 0;
     if (plugged < 0) plugged = 0;
     if (plugged != atomic_read(&hp_plugged)) hos_log("pad speaker: headphones %s the pad's jack", plugged ? "in" : "out of");

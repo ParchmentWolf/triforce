@@ -32,8 +32,26 @@ int hos_commit_wait_ms(void) {
     if (ms < 0) ms = host_alloc_wait_ms(getenv("HOS_COMMIT_WAIT_MS"));
     return ms;
 }
+/* ((Triforce, 11-26) A session that reached Windows' commit limit leaves triforce_commit_limit.txt beside the game, once: the
+   next start's notice (hos_main.c memory_notice) says why before play. Three reports of 11-26 (an RX 7900 XTX after the Deku
+   Tree, another on pausing after 3 hours, a third loading a save) ended there with a page file of a fixed 0.6 to 8 GB, the
+   game holding 28 to 38 GB: their message box at the moment, over a full-screen game, was not seen) */
+void hos_commit_limit_mark(void) {
+    static volatile LONG done;
+    if (InterlockedExchange(&done, 1)) return;
+    char path[MAX_PATH];
+    const DWORD len = hos_game_path_a(path, MAX_PATH);
+    char *slash = len ? strrchr(path, '\\') : NULL;
+    if (!slash) return;
+    snprintf(slash + 1, (size_t)(path + MAX_PATH - slash - 1), "triforce_commit_limit.txt");
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fputs("Windows' commit limit (RAM and page file) was reached in the last session: the next start says so\n", f);
+    fclose(f);
+}
 static int commit_wait(void *p, SIZE_T size) {
     static volatile LONG made, given_up;
+    hos_commit_limit_mark();
     const int tries = host_alloc_tries(hos_commit_wait_ms());   /* ((Triforce, OS-04) 100 for the 5 s; 0: the refusal stands at once) */
     for (int i = 0; i < tries; i++) {
         Sleep(50);
@@ -940,6 +958,7 @@ static DWORD WINAPI sample_all_thread(void *p) {
         const long ms = (long)((hos_now_ns() - t0) / 1000000);
         for (int i = 0; i < nt; i++) {
             if (SuspendThread(th[i]) == (DWORD)-1) continue;
+            const int64_t at = hos_now_ns();   /* ((Triforce, 11-26) the sample's own time: scripts/chain.py puts it on HOS_CHAIN's clock */
             CONTEXT ctx = {0};
             ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
             const BOOL got = GetThreadContext(th[i], &ctx);
@@ -965,7 +984,7 @@ static DWORD WINAPI sample_all_thread(void *p) {
                 if (!unwind_step(&ctx, stack)) break;
             }
             ResumeThread(th[i]);
-            fprintf(out, "%s\n", line);
+            fprintf(out, "# at %lld\n%s\n", (long long)at, line);
         }
     }
     return 0;
@@ -1243,11 +1262,66 @@ static void census_figures(GcCensus *c) {
 #endif
 }
 
+/* ((Triforce, 11-26, diagnostics) HOS_HEAP_WALK=<seconds>: once, that long after the start, every heap of the process walked
+   (HeapLock, HeapWalk): its busy bytes and blocks by size, its committed regions, its biggest blocks. Which owner holds the
+   "heaps and other private memory" of the memory line (7 GB at the owner's spot). Never by default */
+#ifdef _WIN32
+#include <malloc.h>
+static void heap_walk_report(void) {
+    HANDLE heaps[256];
+    const DWORD n = GetProcessHeaps(256, heaps);
+    const HANDLE proc = GetProcessHeap();
+    const HANDLE crt = (HANDLE)_get_heap_handle();
+    hos_log("mem: heap walk: %lu heaps (the process heap %p, the C runtime's %p)", (unsigned long)n, (void *)proc, (void *)crt);
+    for (DWORD i = 0; i < n && i < 256; i++) {
+        uint64_t busy = 0, committed = 0, uncommitted = 0, blocks = 0, by[6] = {0}, by_bytes[6] = {0}, top[6] = {0};
+        PROCESS_HEAP_ENTRY e;
+        memset(&e, 0, sizeof e);
+        if (!HeapLock(heaps[i])) continue;
+        const int64_t t0 = hos_now_ns();
+        while (HeapWalk(heaps[i], &e)) {
+            if (e.wFlags & PROCESS_HEAP_REGION) {
+                committed += e.Region.dwCommittedSize, uncommitted += e.Region.dwUnCommittedSize;
+            } else if (e.wFlags & PROCESS_HEAP_ENTRY_BUSY) {
+                const uint64_t sz = e.cbData;
+                busy += sz, blocks++;
+                const int k = sz < 256 ? 0 : sz < 4096 ? 1 : sz < 65536 ? 2 : sz < (1u << 20) ? 3 : sz < (16u << 20) ? 4 : 5;
+                by[k]++, by_bytes[k] += sz;
+                for (int t = 0; t < 6; t++)
+                    if (sz > top[t]) {
+                        for (int u = 5; u > t; u--) top[u] = top[u - 1];
+                        top[t] = sz;
+                        break;
+                    }
+            }
+        }
+        HeapUnlock(heaps[i]);
+        if (busy < (16ull << 20)) continue;   /* (the small ones: not the question) */
+        hos_log("mem: heap %p%s: %.0f MB busy in %llu blocks (regions committed %.0f MB, uncommitted %.0f MB; walked in %.0f ms); "
+                "by size: <256 B %llu (%.0f MB), <4 KB %llu (%.0f MB), <64 KB %llu (%.0f MB), <1 MB %llu (%.0f MB), <16 MB %llu (%.0f MB), "
+                "16 MB+ %llu (%.0f MB); biggest %.1f, %.1f, %.1f, %.1f, %.1f, %.1f MB",
+                (void *)heaps[i], heaps[i] == proc ? " (the process heap)" : heaps[i] == crt ? " (the C runtime's)" : "",
+                busy / 1048576.0, (unsigned long long)blocks, committed / 1048576.0, uncommitted / 1048576.0, (hos_now_ns() - t0) / 1e6,
+                (unsigned long long)by[0], by_bytes[0] / 1048576.0, (unsigned long long)by[1], by_bytes[1] / 1048576.0,
+                (unsigned long long)by[2], by_bytes[2] / 1048576.0, (unsigned long long)by[3], by_bytes[3] / 1048576.0,
+                (unsigned long long)by[4], by_bytes[4] / 1048576.0, (unsigned long long)by[5], by_bytes[5] / 1048576.0,
+                top[0] / 1048576.0, top[1] / 1048576.0, top[2] / 1048576.0, top[3] / 1048576.0, top[4] / 1048576.0, top[5] / 1048576.0);
+    }
+}
+#else
+static void heap_walk_report(void) {}
+#endif
+
 static DWORD WINAPI census_main(void *unused) {
     (void)unused;
     hos_host_thread_register_self("hos memory census");
+    const char *hw = getenv("HOS_HEAP_WALK");
+    const int heap_walk_at = hw ? atoi(hw) : 0;
+    int elapsed = 0, heap_walked = 0;
     for (;;) {
         Sleep((DWORD)census_every * 1000);
+        elapsed += census_every;
+        if (heap_walk_at > 0 && !heap_walked && elapsed >= heap_walk_at) heap_walked = 1, heap_walk_report();
         GcCensus c;
         memset(&c, 0, sizeof c);
         census_figures(&c);

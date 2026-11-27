@@ -1937,7 +1937,7 @@ Row rows[] = {
     // (Triforce, 11-13: vk_temporal.cpp pre_wanted. Shown with DLSS or FSR: row_shown)
     {TAB_GRAPHICS, "Upscale before bloom", &opts.upscale_pre, 0, 1, 1, tx_onoff,
      "On: the upscaler works on the scene before the game's glow and tone mapping, which are then made at full size. "
-     "Applies after a restart.", nullptr, true, true},
+     "Evil HD's ambient occlusion and light shafts are not drawn with this on. Applies after a restart.", nullptr, true, true},
     {TAB_GRAPHICS, "Sharpness", &opts.sharpness, 0, 100, 10, tx_percent,
      "With DLSS, DLAA or AMD FSR as the Upscaler, the 3D before the HUD (FSR's own sharpening; AMD's RCAS for DLSS); with "
      "the game's own upscaler, the picture at the window. 0 is off. Too much shows halos around edges.", hn_sharpness},
@@ -6536,7 +6536,9 @@ void files_pictures_load() {
         for (int slot = 0; slot < 12; slot++) {   // (the game looks for slot_00 to slot_11)
             if (known >= 0 && slot != known) continue;
             char path[save_file_rows::kPath + 32];
-            snprintf(path, sizeof path, "%s%02d\\caption.sav", save_files.pictures[i], slot);
+            // (the folder's own separator: host/save_files.c writes the start of the path with '/' on Linux, where fopen
+            // takes no '\')
+            snprintf(path, sizeof path, "%s%02d%ccaption.sav", save_files.pictures[i], slot, strchr(save_files.pictures[i], '\\') ? '\\' : '/');
             FILE* f = fopen(path, "rb");
             if (!f) continue;
             std::string bytes(size_t(1) << 20, '\0');   // (a save's caption is some tens of kilobytes)

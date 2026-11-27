@@ -5,8 +5,8 @@ using Photino.NET;
 namespace Triforce.Launcher.Host;
 
 /// <summary>Linux: Photino (WebKitGTK) in a window the desktop frames (on a Steam Deck in Game Mode, gamescope shows it full
-/// screen). Photino will not open a page on its own scheme as the first page, so the page is handed over as a string with
-/// a base address on app://localhost/ui/, and everything it loads after that comes through the app:// scheme.
+/// screen). The page opens at app://localhost/ui/index.html, so it and everything it loads come through the app:// scheme
+/// on one origin.
 /// Dropped files: WebKitGTK puts file:// links in the drop's text/uri-list, so the page sends them in the JSON.</summary>
 public sealed class LinuxHost : IHost
 {
@@ -56,9 +56,9 @@ public sealed class LinuxHost : IHost
 
     public void Run()
     {
-        var page = content.Get("ui/index.html")!.Value.data;
-        var html = Encoding.UTF8.GetString(page).Replace("<head>", "<head><base href=\"" + Origin + "ui/\">");
-        win.LoadRawString(html);
+        // From the app scheme itself, as on Windows: a raw string would be about:blank with a null origin, so every fetch of
+        // the page's own files (the music, read for Web Audio) would be cross-origin and fail in WebKitGTK.
+        win.Load(new Uri(Origin + "ui/index.html" + Environment.GetEnvironmentVariable("TRIFORCE_START")));
         win.WaitForClose();
     }
 

@@ -23,6 +23,7 @@ layout(push_constant) uniform P { ivec2 offset; ivec2 size; int prev; } pc;
 const float kKeep = 0.9;          // (of the fit, each frame with something to learn from: the newer frames count more)
 const float kMinChange = 0.02;    // (sum dS.dS: enough change behind the pixel that the picture's rounding is not T)
 const float kMinFrames = 2.0;
+const float kLearnChange = 0.1 * kMinChange;   // (dS.dS a frame, once T is known: less is not learned from)
 
 float see_through(vec4 f) { return clamp(f.x / f.y, 0.0, 1.0); }
 bool known(vec4 f) { return f.z >= kMinFrames && f.y >= kMinChange; }
@@ -53,7 +54,14 @@ vec4 hud_fit(vec3 s1, vec3 d1, vec3 s0, vec3 d0, bool prev, vec4 f, out vec4 lay
     if (known(f) && !explains(s1, d1, s0, d0, see_through(f))) return vec4(0.0);
     const vec3 ds = s1 - s0, dd = d1 - d0;
     const float change = dot(ds, ds);
-    if (change > 1e-8) f = vec4(kKeep * f.x + dot(ds, dd), kKeep * f.y + change, min(f.z + 1.0, 255.0), 0.0);
+    // (once known, what was learned is kept through a calm background behind the HUD (a plain wall, the camera nearly still):
+    // forgetting by kKeep there made T unknown again, the presented pixel, a halo, while the HUD had not changed, and a change
+    // that small is mostly the picture's rounding, so it is checked (explains() above) but not learned from. Nor is the fit
+    // ever forgotten below kMinChange. A changed HUD fails explains() and starts again)
+    if (change > (known(f) ? kLearnChange : 1e-8)) {
+        const float keep = known(f) ? max(kKeep, min(1.0, kMinChange / f.y)) : kKeep;
+        f = vec4(keep * f.x + dot(ds, dd), keep * f.y + change, min(f.z + 1.0, 255.0), 0.0);
+    }
     if (!known(f)) return f;
     const float t = see_through(f);
     // (the frame is the picture clamped at 1, sRGB-encoded: a scene or HUD brighter than that behind the pixel would make

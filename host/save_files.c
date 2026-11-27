@@ -148,7 +148,9 @@ static int last_saved(int file, char *when, size_t when_cap, char *picture, size
         /* ((Triforce) 11-18, his picture of the game's own load list beside the card: "the screenshot doesn't match the last
            autosave either nor does the time". The slot written last cannot be told from the disk: the game writes them all
            again whenever it saves one. Where the slots are, then, and the menu reads each one's own time out of it) */
-        if (saved && snprintf(picture, picture_cap, "%s\\save\\%s\\slot_", dir, fd.cFileName) >= (int)picture_cap) picture[0] = 0;
+        /* (the menu opens these with its own fopen, not through the Find shim: the folder's own separator, '/' on Linux) */
+        const char sep = strchr(dir, '\\') ? '\\' : '/';
+        if (saved && snprintf(picture, picture_cap, "%s%csave%c%s%cslot_", dir, sep, sep, fd.cFileName, sep) >= (int)picture_cap) picture[0] = 0;
         /* ((Triforce) 11-18, his picture: File 2, a new game started and not yet saved, said "Saved game" with no picture. The
            game makes account.sav as it starts on a file: a file has a save once it has a slot) */
         if (!saved) when[0] = 0;

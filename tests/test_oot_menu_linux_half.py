@@ -1,7 +1,8 @@
 """host/oot_menu.c's two halves: what other host files call is defined in both, and benchmark mode presses through the start
 in both.
 
-The file is one half on Windows (#if defined(_WIN32)) and another elsewhere (#else). A function the Windows half added for the
+The file is one half for the game (#if !defined(HOS_OOT_MENU_NO_MOUSE): Windows, and Linux since the System page's Quit entry)
+and another for the tests (#else). A function the first half added for the
 rest of the host (v0.5.0's hos_oot_mods_down, nn_hid.c) and not the other half stopped every Linux build at the link (11-18).
 This test lists the non-static functions each half defines and the ones host/*.c outside it call, and checks that every one
 called from outside is in the non-Windows half too.
@@ -29,7 +30,7 @@ DEF = re.compile(r"^(?!static\b)[A-Za-z_][\w \t\*]*?\b(hos_\w+)\s*\([^;]*\)\s*\{
 
 
 def halves(text):
-    start = text.index("#if defined(_WIN32)")
+    start = text.index("#if !defined(HOS_OOT_MENU_NO_MOUSE)")
     other = text.index("\n#else", start)
     end = text.index("\n#endif", other)
     return text[start:other], text[other:end]
@@ -196,7 +197,7 @@ class OotMenuBenchOtherHalfTest(unittest.TestCase):
             shutil.copy(ROOT / "host" / "guest_bounds.h", tmp / "host" / "guest_bounds.h")
             (tmp / "host" / "t.c").write_text(FIXTURE, encoding="utf-8")
             binary = tmp / "t.exe"
-            other_half = ["-DHOS_OOT_MENU_NO_MOUSE"] if sys.platform == "win32" else []
+            other_half = ["-DHOS_OOT_MENU_NO_MOUSE"]   # (the game's builds, Linux's too, have the first half)
             build = subprocess.run([compiler, "-std=gnu11", "-Wall", "-Werror", "-O1", "-g"] + other_half +
                                    [str(tmp / "host" / "t.c"), str(tmp / "host" / "oot_menu.c"), "-o", str(binary)],
                                    text=True, capture_output=True)

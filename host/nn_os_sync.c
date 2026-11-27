@@ -930,7 +930,64 @@ static int event_wait_atomic(Obj *e, int64_t timeout_ns, int try_only) {   /* (H
     if (got && wake_lat_on()) wake_lat_note(slept ? 2 : 1, slept ? hos_now_ns() - signaled_at : 0);
     return got;
 }
+/* (Triforce, 11-26) Which stage limits the frame. OoT's frame is two stages that overlap: the game's update (main thread and
+   its job threads) and the drawing (the Presentation Thread's submits, where the replay runs, and its present). They meet
+   twice a frame: the Presentation Thread waits for the main thread's hand-over of the next frame (a message queue receive,
+   lr 0x834a3084), and the main thread waits for the Presentation Thread's present (an event, lr 0x81207a6c). Whichever
+   side waits is the faster one. Every 5 s: "stages: ..." with both waits a frame and which stage limits. A test of a change to
+   one stage at a spot the other limits reads no gain (the drawing thread waited 2.7 ms a frame at the owner's spot, 11-26:
+   the game's update limited it). HOS_STAGE_LOG=0: off */
+static int stage_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("HOS_STAGE_LOG"); on = !(e && e[0] == '0'); }
+    return on;
+}
+static volatile LONG64 stage_ns[2], stage_t0, stage_p0;
+static int stage_of(void) {
+    if (!stage_on()) return -1;
+    const Ctx *c = hos_ctx();
+    if (!c) return -1;
+    const int k = c->x[30] == 0x834a3084ULL ? 0 : c->x[30] == 0x81207a6cULL ? 1 : -1;
+    if (k < 0) return -1;
+    /* (the queue receive at 0x834a3084 is the game's own, its job threads wait there too: only the presenting thread's wait
+       and the main thread's count; the thread's kind looked up once) */
+    static _Thread_local int who = -1;   /* (0 the Presentation Thread, 1 the main thread, 2 another) */
+    if (who < 0) {
+        HosThread *self = hos_self();
+        const char *n = self ? hos_thread_name(self) : NULL;
+        who = n && !strcmp(n, "Presentation Thread") ? 0 : n && !strcmp(n, "sead::MainThread") ? 1 : 2;
+    }
+    return who == k ? k : -1;
+}
+static void stage_note(int k, int64_t ns) {
+    extern volatile LONG64 hos_present_count;   /* display.c */
+    InterlockedAdd64(&stage_ns[k], ns);
+    const int64_t now = hos_now_ns(), t0 = stage_t0;
+    if (!t0) { InterlockedCompareExchange64(&stage_t0, now, 0); stage_p0 = hos_present_count; return; }
+    if (now - t0 < 5000000000LL || InterlockedCompareExchange64(&stage_t0, now, t0) != t0) return;
+    const int64_t p = hos_present_count, frames = p - stage_p0;
+    stage_p0 = p;
+    const double draw_w = InterlockedExchange64(&stage_ns[0], 0) / 1e6, game_w = InterlockedExchange64(&stage_ns[1], 0) / 1e6;
+    if (frames <= 0) return;
+    const double dw = draw_w / (double)frames, gw = game_w / (double)frames, fms = (now - t0) / 1e6 / (double)frames;
+    const char *lim = dw >= 0.5 && dw > gw ? "the game's update (its threads; the drawing thread waits for it)"
+                    : gw >= 0.5 && gw > dw ? "the drawing (the replay and the present; the game waits for it)"
+                    : "neither by more than 0.5 ms (close)";
+    hos_log("stages (%lld frames, %.2f ms each): the drawing thread waited %.2f ms a frame for the game's hand-over, the game "
+            "waited %.2f ms a frame for the present: the frame is limited by %s (HOS_STAGE_LOG=0: off)", (long long)frames,
+            fms, dw, gw, lim);
+}
+
+static int event_wait_body(Obj *e, int64_t timeout_ns, int try_only);
 static int event_wait(Obj *e, int64_t timeout_ns, int try_only) {
+    const int k = try_only ? -1 : stage_of();
+    if (k < 0) return event_wait_body(e, timeout_ns, try_only);
+    const int64_t t0 = hos_now_ns();
+    const int got = event_wait_body(e, timeout_ns, try_only);
+    stage_note(k, hos_now_ns() - t0);
+    return got;
+}
+static int event_wait_body(Obj *e, int64_t timeout_ns, int try_only) {
     if (event_atomic()) return event_wait_atomic(e, timeout_ns, try_only);
     int64_t deadline = timeout_ns > 0 ? hos_now_ns() + timeout_ns : 0;
     const int was_set = e->signaled > 0;
@@ -1257,7 +1314,16 @@ static int queue_put(Obj *q, uint64_t v, int jam, int try_only) {
     return 1;
 }
 /* take: remove it; timeout_ns: < 0 forever, 0 try, > 0 timed. Returns 1 if a value was read. */
-static int queue_get(Obj *q, uint64_t *out, int take, int64_t timeout_ns) {
+static int queue_get_body(Obj *q, uint64_t *out, int take, int64_t timeout_ns);
+static int queue_get(Obj *q, uint64_t *out, int take, int64_t timeout_ns) {   /* ((Triforce) the stage note: stage_of) */
+    const int k = timeout_ns != 0 ? stage_of() : -1;
+    if (k < 0) return queue_get_body(q, out, take, timeout_ns);
+    const int64_t t0 = hos_now_ns();
+    const int got = queue_get_body(q, out, take, timeout_ns);
+    stage_note(k, hos_now_ns() - t0);
+    return got;
+}
+static int queue_get_body(Obj *q, uint64_t *out, int take, int64_t timeout_ns) {
     int64_t deadline = timeout_ns > 0 ? hos_now_ns() + timeout_ns : 0;
     const int was_set = q->qlen > 0;
     const int chain = timeout_ns != 0 && !was_set && hos_chain_on;   /* ((Triforce) HOS_CHAIN) */

@@ -1211,6 +1211,68 @@ bool pcache_from_file = false;
 // (a temporary in the call's full expression), and pcache_let_go destroys it once the PC's RAM runs short and nobody is
 // inside (pcache_gate.h has why). Closed, pcache_use() gives no cache: the creation goes without one)
 pcache_gate::Gate pcache_door;
+// ((Triforce, 11-26) NVIDIA's driver: pipelines come from its own disk cache (pcache_init, precompile_keeps_all)
+bool nv_own_cache_serves() { return dev.props.vendorID == 0x10DE; }
+// ((Triforce, 11-26) RX_VK_PCACHE_NV=1 (OFF by default): on NVIDIA the file is not read (pcache_init). Measured after it shipped
+// to the owner as the default: the working set -3 GB, but a pipeline made in play took 4.4-5.3 ms from the driver's own cache
+// against ~1 ms from ours, 100-150 of them in an area's first seconds: 80 -> 50 fps dips walking into new places)
+// ((Triforce, 11-26) RX_VK_PCACHE_COMPACT=1: on NVIDIA the main cache has a file of its own, mkw_vk_pipelines_nv.bin, which holds
+// only what this PC's sessions made: it starts empty, every pipeline a session makes goes into it (no play cache: its
+// creations asked the main cache with FAIL_ON_PIPELINE_COMPILE_REQUIRED, which the driver's own disk cache answered at 4.4 ms
+// each, so nothing ever reached the play cache), and the usual saves write it as it grows. A preparation that builds into it
+// writes nothing this session (it would hold every pipeline again). The 2.8 GB file (+3.3 GB of RAM held by the driver) is
+// neither read nor written while it is on)
+// ON BY DEFAULT on NVIDIA since 11-26 (RX_VK_PCACHE_COMPACT=0: the big file, as before). Four-area tour, the owner's PC: a new
+// compact cache's first session (seeded with the order's pipelines and their stage libraries, 4.2 s at that start) 0.43 ms a
+// pipeline made in play, 19 stalls, 3 late frames, 88.6 fps, working set 13.7 GB, private 22.0 GB; the big file's 1.05 ms, 19,
+// 8, 90.2, 17.0 GB, 25.6 GB; its second session 0.92-1.32 ms, 15 stalls. The file was 263-378 MB against 2.75 GB)
+std::string pipe_order_path();
+// ((Triforce, 11-26) On NVIDIA both pipeline files hold what the driver answers from its own shader disk cache, not the
+// compiled code: on a PC whose driver cache does not keep the game's (the control panel's Shader Cache Size too small for
+// it beside the other games', or cleared) every pipeline of a session compiled in play. Lab, the walk with NVIDIA's cache
+// emptied (__GL_SHADER_DISK_CACHE_PATH): the compact file 1% low 12.5 fps, 30 frames over 100 ms, 130 ms a pipeline, a 10 s
+// stall; the big file 13.3 fps, 23, 126 ms once its start left the libraries to the draws (and 32.5 when it made them
+// again). A player's RTX 5080 log (v0.8.3) found the libraries cold at every start, and the game "rebuilt shaders after
+// every restart". Such a start's library check (lib_check_cold) makes them again before the game (44.1 fps, 1 frame over
+// 100 ms in the same walk) and leaves this file beside the game: from the next start the driver keeps the game's shaders in a
+// folder of its own beside the game (triforce_nvidia_cache) with 10 GB of room (vk_main.cpp create_instance sets
+// __GL_SHADER_DISK_CACHE_PATH and _SIZE before the driver loads, which Windows' driver honours: a probe at 100 MB stayed
+// there), where other games' shaders do not push them out. Removing the file uses the driver's own folder again
+std::string nv_own_folder_mark_path() {
+    const std::string o = pipe_order_path();
+    return o.substr(0, o.find_last_of("\\/") + 1) + "triforce_nvidia_cache.own";
+}
+bool nv_compact_on() {
+    static const bool v = [] {
+        if ((getenv("RX_VK_PCACHE_COMPACT") && atoi(getenv("RX_VK_PCACHE_COMPACT")) == 0) || getenv("RX_VK_PCACHE_LOAD") ||
+            !nv_own_cache_serves())
+            return false;
+        if (getenv("RX_VK_PCACHE_COMPACT")) return true;   // (=1: on whatever the order says)
+        // ((Triforce, 11-26) and only once this PC's order (triforce_pipeline_order.bin) names enough pipelines to seed it: a new
+        // player, or one whose order is short, keeps the big file the preparation built, and its pipelines at ~1 ms from the
+        // start. A compact cache seeded with little made each pipeline of a session's new places at 4.4-6 ms from the driver's
+        // own cache: the 80 -> 50 fps dips)
+        uint64_t keys = 0;
+        if (FILE* f = fopen(pipe_order_path().c_str(), "rb")) {
+            _fseeki64(f, 0, SEEK_END);
+            const int64_t sz = _ftelli64(f);
+            fclose(f);
+            keys = sz > 24 ? (uint64_t)(sz - 24) / 8 : 0;
+        }
+        if (keys < 1024) {
+            logf("vk: pipeline cache: the big file, not the compact one: this PC's order names %llu pipelines (under 1024 to seed it; "
+                 "RX_VK_PCACHE_COMPACT=1: compact all the same)", (unsigned long long)keys);
+            return false;
+        }
+        return true;
+    }();
+    return v;
+}
+bool nv_pcache_skip() {
+    static const bool v = getenv("RX_VK_PCACHE_NV") && atoi(getenv("RX_VK_PCACHE_NV")) != 0 && !getenv("RX_VK_PCACHE_LOAD") &&
+                          nv_own_cache_serves();
+    return v;
+}
 using PcacheUse = pcache_gate::Use<VkPipelineCache>;
 PcacheUse pcache_use() { return PcacheUse(pcache_door, pcache); }
 void pcache_play_open(bool same);
@@ -1224,9 +1286,20 @@ std::atomic<size_t> pcache_play_saved{0};
 std::atomic<int> pcache_preparing{0};
 std::atomic<int64_t> pcache_main_built{0}, st_play_made{0};
 std::atomic<bool> pcache_fold{false};
+bool nv_compact_on();
+static bool pcache_no_save = false;   // ((Triforce) RX_VK_PCACHE_LOAD=0 and the rules that set it: not read, not saved)
 struct PcachePreparing {   // (prepare_run, for its length)
+    int64_t built0 = pcache_main_built.load();
     PcachePreparing() { pcache_preparing++; }
-    ~PcachePreparing() { pcache_preparing--; }
+    ~PcachePreparing() {
+        pcache_preparing--;
+        // ((Triforce, 11-26) RX_VK_PCACHE_COMPACT: a preparation that built into the compact cache: nothing written this session)
+        if (nv_compact_on() && pcache_main_built.load() > built0 && !pcache_no_save) {
+            pcache_no_save = true;
+            logf("vk: pipeline cache: the preparation built into the compact cache: it is not saved this session (it would hold "
+                 "every pipeline)");
+        }
+    }
 };
 // ((Triforce, 11-22, the performance audit's PIPE-23, after Source A's; precompile_save.h) RX_VK_PRECOMPILE_SAVE_S: the
 // seconds of building from which a keep-all precompile's end saves the cache before the title (30; 0: never, and the
@@ -1495,7 +1568,6 @@ static uint64_t linux_ram_bytes() {
 // (Triforce) RX_VK_PCACHE_LOAD=0: mkw_vk_pipelines.bin is neither read nor saved (pcache_init, pipeline_cache_save). An A/B of
 // what the file costs in memory (read whole and held by the driver all session): the cache starts empty and the driver's own
 // shader cache is all there is. Not set: as before
-static bool pcache_no_save = false;
 void pcache_init() {
     if (pcache) return;
     uint64_t ws0 = 0, priv0 = 0;   // ((Triforce) what the cache costs the RAM once the driver has it: the line below)
@@ -1505,6 +1577,22 @@ void pcache_init() {
     std::string dir(exe, n);
     dir = dir.substr(0, dir.find_last_of("\\/") + 1);
     pcache_path = dir + "mkw_vk_pipelines.bin";
+    if (nv_compact_on()) {
+        pcache_path = dir + "mkw_vk_pipelines_nv.bin";
+        logf("vk: pipeline cache: the compact one of what this PC's sessions made, %s (RX_VK_PCACHE_COMPACT=0: the big file)", pcache_path.c_str());
+        // (grown past RX_VK_PCACHE_COMPACT_MAX_MB (1024) over the sessions: made again from the last sessions' order at this start)
+        static const int64_t max_mb = getenv("RX_VK_PCACHE_COMPACT_MAX_MB") ? atoll(getenv("RX_VK_PCACHE_COMPACT_MAX_MB")) : 1024;
+        if (FILE* f = fopen(pcache_path.c_str(), "rb")) {
+            _fseeki64(f, 0, SEEK_END);
+            const int64_t sz = _ftelli64(f);
+            fclose(f);
+            if (max_mb > 0 && sz > (max_mb << 20)) {
+                remove(pcache_path.c_str());
+                logf("vk: pipeline cache: the compact one has grown to %lld MB (over %lld): made again from the last sessions' order",
+                     (long long)(sz >> 20), (long long)max_mb);
+            }
+        }
+    }
     // (Triforce, 11-14) The file is kept for one set of translated shaders: the ones named beside it (<file>.for, the programs'
     // stamp). The driver's data only ever grows: every update that changes the translator (and a Setup build after a lab one:
     // another C++ library, other SPIR-V) added its ~650 MB of pipelines to the pipelines of shaders that no longer exist, and
@@ -1563,6 +1651,17 @@ void pcache_init() {
     if (pcache_no_save)
         logf("vk: RX_VK_PCACHE_LOAD=0: pipeline cache %s not read, and not saved this run (the driver's own cache serves)",
              pcache_path.c_str());
+    // ((Triforce, 11-26) NVIDIA's driver, RX_VK_PCACHE_LOAD unset: the file is not read either. The driver serves most pipelines
+    // from its own disk cache all the same (it reports ~460 of ~12,900 precompiled ones as found in ours), and it holds what it
+    // is handed for the whole session: the owner's 2.8 GB file put +3.3 GB into the working set at every start, and letting the
+    // cache go later gave none of it back (11-16). Four-area tour on his PC with the precompile not keeping its pipelines
+    // either (precompile_keeps_all): working set 17.0 -> 14.0 GB, private 25.6 -> 22.8 GB, 90.2 / 89.7 fps, no draw left out
+    // and no wait for a pipeline, fewer late frames (8 -> 2). RX_VK_PCACHE_LOAD=1: read, as before)
+    if (!pcache_no_save && nv_pcache_skip()) {
+        pcache_no_save = true;
+        logf("vk: pipeline cache %s not read, and not saved this run: NVIDIA's driver serves the pipelines from its own cache "
+             "(RX_VK_PCACHE_LOAD=1: read)", pcache_path.c_str());
+    }
     if (FILE* f = pcache_no_save ? nullptr : fopen(pcache_path.c_str(), "rb")) {
         _fseeki64(f, 0, SEEK_END);
         const int64_t sz = _ftelli64(f);
@@ -1680,6 +1779,10 @@ void pcache_init() {
 void pcache_play_open(bool same) {
     pcache_play_path = pcache_path.substr(0, pcache_path.size() - 4) + "_play.bin";
     static const bool on = !(getenv("RX_VK_PCACHE_PLAY_FILE") && atoi(getenv("RX_VK_PCACHE_PLAY_FILE")) == 0);
+    if (nv_compact_on()) {   // ((Triforce, 11-26) RX_VK_PCACHE_COMPACT: everything into the compact cache)
+        logf("vk: pipeline cache: no play file (the compact cache takes what a run makes)");
+        return;
+    }
     if (!on || !pcache || !dev.vk13.pipelineCreationCacheControl || pcache_libs_only) {   // ((Triforce, 11-22, PIPE-78) lean: none)
         logf("vk: pipeline cache: no play file (%s): what a run compiles goes into the cache above",
              !on ? "RX_VK_PCACHE_PLAY_FILE=0" : pcache_libs_only ? "libraries only, RX_VK_PCACHE_LIBS_ONLY"
@@ -13675,6 +13778,24 @@ bool lib_check_cold(const std::string& prepared, uint64_t warmed) {
              "or its draws are left out (RX_VK_LIB_CHECK=0: not looked at)", t.cold, t.got, t.answered, t.first_median,
              t.again_median, ms, pcache_path.c_str());
     }
+    // ((Triforce, 11-26) found cold on NVIDIA: the driver's shader cache did not keep the game's (nv_own_folder_mark_path).
+    // This start makes the libraries again before the game whatever the record says (left to the draws, every pipeline of
+    // the session compiled in play: the lab's 10 s stall), and the next start gives the driver a folder of its own for them
+    if (nv_own_cache_serves() && v != lib_check::Verdict::Warm && v != lib_check::Verdict::Unknown) {
+        FILE* m = fopen(nv_own_folder_mark_path().c_str(), "rb");
+        const bool had = m != nullptr;
+        if (m) fclose(m);
+        if (!had)
+            if (FILE* f = fopen(nv_own_folder_mark_path().c_str(), "wb")) {
+                fputs("NVIDIA's shader cache did not keep the game's: from the next start it has a folder of its own beside the "
+                      "game (triforce_nvidia_cache). Remove this file to use the driver's own folder again\n", f);
+                fclose(f);
+            }
+        logf("vk: NVIDIA's shader cache did not keep the game's libraries: made again now, before the game%s (%s)",
+             had ? "" : "; from the next start the driver keeps them in a folder of their own beside the game, with 10 GB of room",
+             nv_own_folder_mark_path().c_str());
+        return true;
+    }
     return d == lib_check::Do::Again;
 }
 /// prepare_run's, the part made again after lib_check_cold (made) or left out by warm_begin (not made): recorded, so that a start
@@ -14165,6 +14286,13 @@ uint64_t built_computes_key() {
 bool precompile_keeps_all() {
     const char* e = getenv("RX_VK_PRECOMPILE_KEEP");
     if (e && strcmp(e, "auto")) return atoi(e) != 0;
+    // ((Triforce, 11-26) NVIDIA's driver serving from its own cache (pcache_init): nothing kept, the driver holds each kept one's
+    // binary for the session (15,877 kept: +5 GB of working set when the cache was not read)
+    if (!e && nv_own_cache_serves()) {
+        logf("vk: precompile: the pipelines it builds go to the caches and are not kept on NVIDIA's driver: they come from the "
+             "caches at their first draw (RX_VK_PRECOMPILE_KEEP=1: kept)");
+        return false;
+    }
     {
         uint64_t used = 0, allowed = 0;
         if (vram_usage(&used, &allowed) && allowed < (6656ull << 20)) {
@@ -14702,6 +14830,7 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
         return dev.foliage_rate && n.n == 0 && depth_aspect((VkFormat)n.depth_format) ? mix(n.key, kRateLibrary) : n.key;
     };
     bool rebuilt = false;   // ((Triforce, 11-22, PIPE-21) the record not trusted this start: built_check_cold)
+    std::unordered_set<uint64_t> seed;   // ((Triforce, 11-26) RX_VK_PCACHE_COMPACT: a new compact cache's seed, below)
     if (light) {
         built = built_read(built_stamp);
         computes_built = built.count(computes_key) != 0;
@@ -14709,7 +14838,28 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
         // (built_check.h). Cold, nothing is left out below: everything noted and listed is built again, and recorded anew)
         if (!built.empty() && built_check_cold(notes, built, built_key, computes_built, computes_listed, built_stamp))
             built.clear(), computes_built = false, rebuilt = true;
-        std::erase_if(notes,[&](const std::unique_ptr<PipeNote>& n) { return built.count(built_key(*n)) != 0; });
+        // ((Triforce, 11-26) RX_VK_PCACHE_COMPACT with no compact file read: the pipelines the last sessions' draws first needed
+        // (triforce_pipeline_order.bin) are built into it now, not kept, though the record says the caches have them: the driver's
+        // own cache answers at 4.4-6 ms a pipeline, ours at ~1.3, and a session on an empty compact cache dipped at each new place)
+        if (nv_compact_on() && !pcache_from_file) {
+            std::lock_guard ok(pipe_order_file_mu);
+            const std::vector<uint64_t>& order = order_before_locked();
+            // (the newest sessions' first, as the file keeps them: RX_VK_PCACHE_COMPACT_SEED=<n>; unset: all of them, what this PC plays)
+            static const size_t most = getenv("RX_VK_PCACHE_COMPACT_SEED") ? (size_t)std::max(0, atoi(getenv("RX_VK_PCACHE_COMPACT_SEED"))) : pipe_order::kKeysMax;
+            seed.insert(order.begin(), order.begin() + std::min(order.size(), most));
+        }
+        size_t seeded = 0;
+        std::erase_if(notes, [&](const std::unique_ptr<PipeNote>& n) {
+            if (!built.count(built_key(*n))) return false;
+            if (seed.count(n->key)) return seeded++, false;
+            return true;
+        });
+        if (!seed.empty())
+            logf("vk: precompile: the compact cache is new: %zu pipelines the last sessions drew are built into it now (%zu in their "
+                 "order)%s", seeded, seed.size(), computes_built ? ", and the compute programs play dispatched" : "");
+        // (and the compute programs play dispatched: made at their first dispatch from the driver's own cache, 3.1 ms each against
+        // 0.4 from the big file, 89 of them in an area's arrival frames)
+        if (!seed.empty()) computes_built = false;
         logf("vk: precompile: RAM spared (RX_VK_PRECOMPILE_KEEP=1: as before): %zu of %zu noted pipelines were built by "
              "an earlier start and are left to their first draw%s", noted_n - notes.size(), noted_n,
              computes_built ? ", the compute programs' too" : "");
@@ -14773,11 +14923,13 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
         std::atomic<bool> graphics_begun{false};
         bool abandoned = false;
         bool light = false;   // ((Triforce) the graphics pipelines built for the caches and let go: precompile_keeps_all)
+        std::unordered_set<uint64_t> seed;   // ((Triforce, 11-26) RX_VK_PCACHE_COMPACT's seed: their stage libraries built too
         PrepTimes times;   // ((Triforce) the timing line: 0 the compute pipelines, 1 the mesh fallbacks, 2 the graphics pipelines)
     };
     const size_t graphics_n = notes.size(), computes_n = computes.size(), fallbacks_n = fallbacks.size();
     Pre* pre = new Pre;
     pre->light = light;
+    pre->seed = std::move(seed);
     pre->notes = std::move(notes), pre->computes = std::move(computes), pre->fallbacks = std::move(fallbacks);
     auto& next = pre->next;
     auto& done = pre->done;
@@ -14842,6 +14994,13 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
                     pre->times.add(2, built_from);
                     pre->graphics_begun = true;
                     if (first.owns_lock()) first.unlock();
+                    // ((Triforce, 11-26) a compact cache's seed: the pipeline's stage libraries too, which play's fast links are made from
+                    // (without them the new cache's first session made each from the driver's own cache: 0.5-0.75 s of pipelines at
+                    // an area's arrival, against 25 ms with the big file)
+                    if (pre->light && gpl_wanted() && pre->seed.count(n.key))
+                        for (int part = p->mesh ? 1 : 0; part < 4; part++)
+                            if (const VkPipeline lib = build_graphics(*p, n.s, note_targets(n), (VkPrimitiveTopology)n.topo, part))
+                                vkDestroyPipeline(dev.device, lib, nullptr);
                     if (pre->light) {   // ((Triforce) in the caches now: its first draw builds it from there)
                         if (made) vkDestroyPipeline(dev.device, made, nullptr);
                     } else {
@@ -16374,7 +16533,9 @@ void pipeline_cache_save(bool force) {
                 // 4 GB at its worst), a commit spike and seconds of disk load in the middle of play, for a few hundred KB new.
                 // What play builds is in the driver's own cache at once, and the save at the game's close takes all of it
                 static const size_t play_grow = (size_t)(getenv("RX_VK_PCACHE_PLAY_MB") ? std::max(0ll, atoll(getenv("RX_VK_PCACHE_PLAY_MB"))) : 64) << 20;
-                if (!force && pcache_saved_size > (1u << 20) && n < pcache_saved_size + play_grow) return;
+                // ((Triforce, 11-26) the compact cache (RX_VK_PCACHE_COMPACT): written at 32 MB of growth, a file of some hundred MB)
+                const size_t grow = nv_compact_on() ? std::min<size_t>(play_grow, 32u << 20) : play_grow;
+                if (!force && pcache_saved_size > (1u << 20) && n < pcache_saved_size + grow) return;
                 // ((Triforce) In play, not while a copy of it would not fit in the RAM available with 2 GB to spare
                 // (mem_parts.h copy_fits): the data is fetched whole into memory, 2 to 3 GB with the stage libraries, and with
                 // the RAM short that is what Windows pages out under the game. It waits for the next check, or the game's close)

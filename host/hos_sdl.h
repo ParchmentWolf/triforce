@@ -134,3 +134,4 @@ void hos_sdl_hid_close(void *hid);
    when it cannot say) */
 int hos_sdl_pad_audio_endpoint(void *pad);
 int hos_sdl_pad_headphones(void *pad);
+void hos_sdl_pad_headphones_release(void);   /* ((Triforce, 11-26) its second handle closed: nothing needs the jack */
