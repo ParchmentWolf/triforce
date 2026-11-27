@@ -1518,6 +1518,46 @@ void hos_oot_joint_world(Ctx *c) {
     ReleaseSRWLockExclusive(&lock);
 }
 
+/* ((Scout, 11-26) right-handed: the charged spin turned the same way as the left-handed game's. The game picks between its two
+   charged spins (states ChargeAttack and ChargeAttackReverse: the spin and the same spin the other way round) from his pose as
+   he charges, and that pose is the mirrored one, so it picked the reverse spin, which the mirror turned round again: the
+   left-handed game's way. Measured: the game picks ChargeAttack mirror off, ChargeAttackReverse mirror on; with the mirror
+   held off only while he charges (state ChargeWait) it picks ChargeAttack again. Its list of the spins' names (pointers in
+   its data: "ChargeAttackReverse", "ChargeAttack", "RotationCut_ChargeNoMP", "RotationCut_Charge", "RotationCut_ChargeFull";
+   found once by those values) has its first two swapped while the mirror is on: the game's pick, made from the mirrored pose,
+   asks for the other spin, and the mirror makes that the right-handed one. Swapped back when the mirror goes off */
+static void spin_names_place(Ctx *c, int mirrored) {
+    static SRWLOCK lk = SRWLOCK_INIT;
+    static int looked, swapped;
+    static uint64_t table;
+    if (!TryAcquireSRWLockExclusive(&lk)) return;
+    if (!looked && mirrored) {   /* (looked for once, the first time the mirror is on: no cost left-handed) */
+        looked = 1;
+        static const char rev[] = "ChargeAttackReverse", norm[] = "ChargeAttack";
+        uint64_t s_rev = 0, s_norm[4] = {0};
+        int nn = 0;
+        for (uint64_t a = hos_image_base + 1; a + sizeof rev <= hos_image_end; a++) {   /* (the strings, NUL before and after) */
+            if (recomp_load8(c, a) != 'C' || recomp_load8(c, a - 1) != 0) continue;
+            int k = 0;
+            while (k < (int)sizeof rev && recomp_load8(c, a + (uint64_t)k) == (uint8_t)rev[k]) k++;
+            if (k == (int)sizeof rev && !s_rev) s_rev = a;
+            if (k == (int)sizeof norm - 1 && recomp_load8(c, a + sizeof norm - 1) == 0 && nn < 4) s_norm[nn++] = a;
+        }
+        for (uint64_t a = (hos_image_base + 7) & ~7ULL; s_rev && !table && a + 16 <= hos_image_end; a += 8)
+            if (recomp_load64(c, a) == s_rev)
+                for (int k = 0; k < nn; k++)
+                    if (recomp_load64(c, a + 8) == s_norm[k]) table = a;
+        hos_log("vr: body: mirrored animation: the charged spins' names %s%#llx", table ? "at " : "not found ", (unsigned long long)table);
+    }
+    if (table && mirrored != swapped) {
+        const uint64_t a = recomp_load64(c, table), b = recomp_load64(c, table + 8);
+        recomp_store64(c, table, b), recomp_store64(c, table + 8, a);
+        swapped = mirrored;
+        static int told;
+        if (told < 4) told++, hos_log("vr: body: mirrored animation: the charged spins' names %s", mirrored ? "swapped (right-handed)" : "as the game has them");
+    }
+    ReleaseSRWLockExclusive(&lk);
+}
 /* the world pass's start (f_81501400, x0 the skeleton, x1..x2 its bones: its ranges may run on several workers): his
    locals mirrored before any of his worlds is made from them; the lock waited for, so no range reads them half done */
 void hos_oot_world_pass(Ctx *c) {
@@ -1525,6 +1565,7 @@ void hos_oot_world_pass(Ctx *c) {
     const uint64_t bones = c->x[0];
     int i = 0;
     while (i < ma.parts && ma.part[i].bones != bones) i++;
+    if (i == 0) spin_names_place(c, ma_wanted());
     if (i == ma.parts || !ma_wanted()) return;
     {   /* ((Triforce VR) aiming: the game turns his upper body to the aim after the arms' hook, which the mirror would turn the
            other way; the arms put on the controllers again here, just before the mirror (the hook leaves at once if nothing
