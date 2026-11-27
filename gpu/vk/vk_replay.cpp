@@ -5814,6 +5814,7 @@ bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, 
         for (int k = 0; k < n; k++)
             if (handles[k]) replay(c2, again, reinterpret_cast<const uint8_t*>(handles[k]));
         second_eye = false, xr_eye.on = false;
+        if (xr_probe_on()) xr_probe_walk_end();
         end_pass(rec_cur->cmd);
         vk_xr_second_eye(rec_cur->cmd, 0);
         full_barrier(rec_cur->cmd, "barrier (the other eye's walk done)");

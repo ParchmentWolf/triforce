@@ -283,6 +283,8 @@ struct Xr {
     std::atomic<int> hud_hidden{0};        // ((Triforce VR) vr_game.c: no HUD panel now (a load zone's transition)
     std::atomic<int> head_worn{0};
     std::atomic<bool> carrying{false};     // ((Triforce VR) vr_game.c: Link has something of the world's in his hands
+    std::atomic<bool> airborne{false};     // ((Triforce VR) vr_game.c: Link in the air (jumping, falling)
+    std::atomic<int> combo_want{-1};       // ((Triforce VR) the gesture-chosen slash's combo counter (vr_game.c takes it): -1 none
     std::atomic<int> head_request{0};      // ((Triforce VR) the gestures' ask for his head (vr_game.c takes it): 1 mask on, 2 Lens on, 3 off         // ((Triforce VR) vr_game.c: 0 nothing on his head, 1 a mask, 2 the Lens of Truth)
     std::atomic<bool> in_play{false};      // vr_game.c: play (not a menu, a pause, an event): the grips' and swing's play roles
     // the last picture drawn from the head whose world scene8 and eye8 still hold (the present's thread alone): a paused
@@ -327,7 +329,7 @@ static std::atomic<uint64_t> g_hammer_swung{0};
 static constexpr uint64_t kHammerSwingNs = 900000000ull;
 static constexpr uint64_t kShotHoldNs = 350000000ull, kShotBeforeNs = 150000000ull;
 static int item_mirrored_right(const char *it) {
-    static const char *const as_made[] = {"Shield", "DekuNut", "ScrubBusinessSeed", "Slingshot", "SlingShot", "Pachinko", "Bow", "Bomb", "Hammer"};
+    static const char *const as_made[] = {"Shield", "ScrubBusinessSeed", "Slingshot", "SlingShot", "Pachinko", "Bow", "Bomb", "Hammer"};
     for (const char *n : as_made)
         if (strstr(it, n)) return 0;
     return 1;
@@ -438,6 +440,7 @@ bool running_runtime(std::string &manifest, std::string &who) {
     return true;
 }
 }   // namespace
+bool make_flat_pipelines();   // ((Triforce VR) below, for VR's desktop 3D too
 #endif
 
 namespace {
@@ -766,6 +769,110 @@ bool make_hud_pipeline() {
 }
 
 // ((Triforce VR) the sword's hand: the last two-grip draw's, else the Handedness row's)
+// ((Triforce VR) research: while triforce-runs/gestures_in_immersive.txt exists, Immersive uses the gesture rules too (to see them
+// from outside), a second's check
+static bool gestures_in_immersive() {
+    static bool on;
+    static uint64_t looked;
+    const uint64_t now = plat_now_ns();
+    if (now - looked > 1000000000ull) {
+        looked = now;
+        const char *home = getenv("HOME");
+        char path[512];
+        snprintf(path, sizeof path, "%s/.app/pc_port/triforce-runs/gestures_in_immersive.txt", home ? home : "");
+        FILE *f = fopen(path, "r");
+        const bool v = f != nullptr;
+        if (f) fclose(f);
+        if (v != on) rt_log("vr: gestures in Immersive %s", v ? "on (research)" : "off");
+        on = v;
+    }
+    return on;
+}
+// ((Triforce VR) the sword's gesture-chosen slashes: what a swing is, from its path in the head's frame (X toward the sword hand's
+// side, U up, F ahead, metres) and what came before it (a pause, a raise). Codes: 0 none (ignored), 1-5 the combo's steps, 6 its
+// finisher, 10/11 the steep slash from the sword hand's side / across the face, 12 the steep finisher, 20 the jump slash, 21 the
+// stab, 31/32/33/36 the Biggoron's Sword's steps 1, 2, 3 and its finisher, 40 a slash in the air (the game's jump attack)
+struct SlashIn {
+    float X, U, F, pk, fwd0;    // (the swing so far; fwd0: how far ahead it went in its first 80 ms)
+    float start_side, start_ahead, s0;   // (where it began: across the head (right +), ahead; s0 toward the sword hand's side)
+    uint64_t quiet, last_fast, soft;     // (before it: the longest run under 0.3 m/s in 0.5 s, the time since over 1 m/s, under 0.5 in 1 s)
+    bool raised, big, early;             // (a raise in the second before; the Biggoron's Sword; the live choice at 30 cm)
+    bool zt = false, air = false;        // (Z held (the shield's raise, the head's tilt); Link in the air)
+    float start_up = 0;                  // (how high it began, from the eyes)
+};
+int slash_classify(const SlashIn &in, const char **why) {
+    const float X = in.X, U = in.U, F = in.F;
+    const float flat = std::sqrt(X * X + F * F), st_deg = std::atan2(std::fabs(U), flat) * 57.2958f;
+    const float side_up = std::sqrt(X * X + U * U);
+    const bool strict = in.quiet >= 150000000ull || in.last_fast >= 300000000ull;
+    const bool hesitant = in.early ? strict : in.soft >= 150000000ull || in.quiet >= 150000000ull || in.last_fast >= 350000000ull;
+    const float fin = in.early ? 4.5f : 10.0f;   // (the finishers' speed)
+    const bool deep = in.quiet >= 250000000ull || in.last_fast >= 350000000ull;
+    const bool finisher = hesitant && in.pk > fin;
+    const auto r = [&](int code, const char *w) { if (why) *why = w; return code; };
+    // (in the air: any downward slash is the game's jump attack, nothing else looked for)
+    if (in.air) return U < 0 && in.fwd0 > 0.0f ? r(40, "slash in the air (jump attack)") : r(0, "ignored (in the air, not downward)");
+    if (in.fwd0 <= 0.0f) return r(0, "ignored (no forward start)");
+    if (U > 0 && st_deg > 55.0f) return r(0, "ignored (wind-up: steep upward)");
+    // (a stab: mostly forward, its forward part at least 0.8 of the rest)
+    const bool thrust = F > 0.15f && F >= 0.8f * side_up;
+    // ((Triforce VR) the Biggoron's Sword, both hands busy, needs no Z for its Z attacks (Z held for that press): its jump slash
+    // first (begun at the middle, high or just after a raise, coming down)
+    if (in.big && (in.raised || in.start_up > 0.0f) && std::fabs(in.start_side) < 0.10f && U < -0.10f) return r(20, "jump slash (Biggoron)");
+    if (in.zt) {   // (the stab and the jump slash only with Z held: a swing begun high or just after a raise the jump slash, coming
+                   // down or forward; a forward one begun lower without a raise the stab)
+        if ((in.raised || in.start_up > 0.0f) && std::fabs(in.start_side) < 0.15f && (U < -0.10f || F > 0.15f)) return r(20, "jump slash");
+        if (thrust) return r(21, "stab");
+    }
+    // (Z's finishers by the way the swing goes: away and down combo 1's (its third), else combo 2's)
+    const auto z_finish = [&]() { return X < 0 && U < 0 ? r(13, "Z finisher 1 (away+down)") : r(12, "Z finisher 2 (toward+up)"); };
+    // (the Biggoron's Sword: a forward thrust is its stab without Z too (Z held for that press), its hands on the hilt)
+    // (without Z a truly straight jab: its forward part at least 1.5 times the rest, the Biggoron's swings carrying much forward)
+    if (in.big && !in.zt && F > 0.15f && F >= 1.5f * side_up) return r(21, "stab (Biggoron)");
+    // (a slash: at least 12 cm across or up and down; less is no slash)
+    if (side_up < 0.12f) return r(0, "ignored (too small for a slash)");
+    if (in.zt) {   // (Z held: Z's two slashes by the side of the face it starts on, its finishers; the Biggoron's the same)
+        if (finisher) return z_finish();
+        return in.s0 > 0 ? r(10, "Z slash: sword side (variant 1)") : r(11, "Z slash: far side (variant 2)");
+    }
+    if (in.big) {
+        // (steep: up and down against side to side, its forward part left out (the Biggoron's swings carry much of it); strict on
+        // the sword hand's side, lenient across the face)
+        const float vert_deg = std::atan2(std::fabs(U), std::fabs(X)) * 57.2958f;
+        if (U < 0 && vert_deg > (in.s0 > 0 ? 65.0f : 55.0f)) {
+            if (deep && in.pk > 8.0f) return z_finish();
+            return in.s0 > 0 ? r(10, "steep: sword side (Z variant 1)") : r(11, "steep: far side (Z variant 2)");
+        }
+        if (st_deg < 28.0f) return X < 0 ? r(31, "Biggoron 1 (horizontal away)") : r(32, "Biggoron 2 (horizontal toward)");
+        if (X < 0 && U < 0) return finisher ? r(33, "Biggoron 3 (finisher, away+down)") : r(31, "Biggoron 1 (diagonal, no finisher)");
+        if (X > 0 && U > 0) return finisher ? r(36, "Biggoron 6 (finisher, toward+up)") : r(32, "Biggoron 2 (diagonal, no finisher)");
+        return r(0, "ignored (Biggoron backhand)");
+    }
+    // (the one-handed combos: four diagonals, 1 away and down (its finisher 3), 2 toward and up, 4 toward and down, 5 away and up;
+    // combo 2's finisher F a level swing toward the sword hand's side)
+    if (X > 0 && st_deg < 25.0f && finisher) return r(6, "finisher F (level, toward)");
+    if (X < 0 && U < 0) return finisher ? r(3, "step 3 (finisher, away+down)") : r(1, "step 1 (away+down)");
+    if (X < 0 && U >= 0) return r(5, "step 5 (away+up)");
+    if (X >= 0 && U >= 0) return r(2, "step 2 (toward+up)");
+    return r(4, "step 4 (toward+down)");
+}
+// (the combo counter that plays a code's step next (Link's component 107 +0x177c: n-1 plays CutSn, 5 its finisher); -1 none)
+int slash_counter(int code) {
+    switch (code) {
+    case 1: case 2: case 3: case 4: case 5: return code - 1;
+    case 6: return 5;
+    case 31: return 0;
+    case 32: return 1;
+    case 33: return 2;
+    case 36: return 5;
+    case 10: return 0;
+    case 11: return 1;
+    case 12: return 5;
+    case 13: return 2;
+    default: return -1;
+    }
+}
+
 int sword_hand_now() {
     const int live = g_live_sword.load();
     return live >= 0 ? live : strcmp(cfg_value("VR_HANDEDNESS"), "right") == 0 ? 1 : 0;
@@ -1086,6 +1193,78 @@ void keep_eye(VkCommandBuffer cb, Drawn &d) {
 VkImage eye_image(const Drawn &d, int e) { return d.eye >= 0 ? xr().acc8[e] : xr().eye8[e]; }
 
 VkImage eye_image(const Drawn &d, int e);
+// ((Triforce VR) VR + a flat screen's 3D (red/cyan, side by side, crossed eyes, above and below, Cardboard): the desktop shows the
+// headset's two eyes made into that picture by Flatscreen 3D's shader, the HUD at the screen; the window back in TRANSFER_SRC
+// after. False when it could not (the caller then does as before)
+bool window_vr_3d(VkCommandBuffer cb, VkImage window, VkExtent2D extent, const int rect[4], const Drawn &d) {
+    Xr &x = xr();
+    if (!x.hud_w || !x.hud_h || !x.panel8_view) return false;
+    if (!x.flat_tried) {
+        x.flat_tried = true;
+        if (!make_flat_pipelines()) {
+            rt_log("flat3d: the shaders could not be made: VR's desktop 3D off");
+            x.flat_pipe = VK_NULL_HANDLE;
+        } else rt_log("flat3d: VR's desktop 3D on");
+    }
+    if (!x.flat_pipe) return false;
+    if (!x.screen) {
+        if (!make_buffer(16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, x.screen)) {
+            x.screen = VK_NULL_HANDLE;
+            return false;
+        }
+        vkCmdFillBuffer(cb, x.screen, 0, 16, 0);
+        memory_barrier(cb);
+    }
+    if (!x.flat8 || x.flat_w != x.hud_w || x.flat_h != x.hud_h) {
+        if (!make_image(x.hud_w, x.hud_h, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                        x.flat8, x.flat8_view)) {
+            x.flat8 = VK_NULL_HANDLE;
+            return false;
+        }
+        x.flat_w = x.hud_w, x.flat_h = x.hud_h;
+    }
+    const VkImageView ev[2] = {d.eye >= 0 ? x.acc8_view[0] : x.eye8_view[0], d.eye >= 0 ? x.acc8_view[1] : x.eye8_view[1]};
+    if (!ev[0] || !ev[1]) return false;
+    const char *m = cfg_value("FLAT3D");
+    const int32_t mode = !strcmp(m, "sbs") ? 1 : !strcmp(m, "crosseye") ? 2 : !strcmp(m, "tab") ? 3 : !strcmp(m, "cardboard") ? 4 : 0;
+    barrier(cb, x.flat8, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.flat_pipe);
+    const VkDescriptorImageInfo info[4] = {{x.linear, ev[0], VK_IMAGE_LAYOUT_GENERAL},
+                                           {x.linear, ev[1], VK_IMAGE_LAYOUT_GENERAL},
+                                           {x.linear, x.panel8_view, VK_IMAGE_LAYOUT_GENERAL},
+                                           {VK_NULL_HANDLE, x.flat8_view, VK_IMAGE_LAYOUT_GENERAL}};
+    const VkDescriptorBufferInfo scr{x.screen, 0, 16};
+    VkWriteDescriptorSet w[5]{};
+    for (uint32_t i = 0; i < 5; i++) {
+        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, w[i].dstBinding = i, w[i].descriptorCount = 1;
+        w[i].descriptorType = i == 4 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                              : i == 3 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        if (i == 4) w[i].pBufferInfo = &scr;
+        else w[i].pImageInfo = &info[i];
+    }
+    vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.flat_layout, 0, 5, w);
+    struct {
+        int32_t w, h, mode, hud_on;
+        float shift_l, shift_r;
+    } fp{(int32_t)x.hud_w, (int32_t)x.hud_h, mode, 1, 0.0f, 0.0f};   // (the headset's eyes already apart: none moved)
+    vkCmdPushConstants(cb, x.flat_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof fp, &fp);
+    vkCmdDispatch(cb, (x.hud_w + 7) / 8, (x.hud_h + 7) / 8, 1);
+    barrier(cb, x.flat8, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+    int to[4];
+    gfx_fit_rect(rect[2], rect[3], (int)extent.width, (int)extent.height, to);
+    if (to[2] <= 1 || to[3] <= 1) return false;
+    barrier(cb, window, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    const VkClearColorValue black{};
+    const VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdClearColorImage(cb, window, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
+    VkImageBlit b{};
+    b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    b.srcOffsets[1] = {(int32_t)x.flat_w, (int32_t)x.flat_h, 1};
+    b.dstOffsets[0] = {to[0], to[1], 0}, b.dstOffsets[1] = {to[0] + to[2], to[1] + to[3], 1};
+    vkCmdBlitImage(cb, x.flat8, VK_IMAGE_LAYOUT_GENERAL, window, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+    barrier(cb, window, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    return true;
+}
 // (vk_xr_capture, last, hud_mu held) with Flatscreen 3D's Cardboard choice while VR runs in stereo: the desktop shows both of
 // the headset's eyes, each its whole picture at half its size in its own half (the left eye's on the left), for a phone in a
 // viewer or a stream in 3D; the window back in TRANSFER_SRC after
@@ -1326,8 +1505,8 @@ struct Controls {
     uint64_t ocarina_off_since = 0;
     bool ocarina_left = false;
     // ((Triforce VR) the head's nods: up then down puts the Lens of Truth on, down then up takes it off; within nod_ns, at least
-    // nod_speed metres a second each way, then not again for nod_refractory_ns)
-    static constexpr float nod_speed = 0.35f;
+    // nod_speed metres a second each way, then not again for nod_refractory_ns; none within 0.6 s of a swing (the body's lean)
+    static constexpr float nod_speed = 0.55f;
     static constexpr uint64_t nod_ns = 450000000ull, nod_refractory_ns = 1000000000ull;
     float head_y[4]{};
     uint64_t head_t[4]{}, nod_up_at = 0, nod_down_at = 0, nod_at = 0;
@@ -1336,6 +1515,7 @@ struct Controls {
     static constexpr float shield_on = 0.79f, shield_off = 1.05f, shield_reach = 0.70f;   // radians, radians, metres
     bool shielding = false;
     uint64_t draw_at = 0, draw_until = 0;
+    uint64_t weapon_seen_at = 0;   // ((Triforce VR) the last moment a weapon was out)
     int draw_bit = -1;
 
     XrPath path(const char *s) {
@@ -1512,7 +1692,10 @@ struct Controls {
             set_bit(A, on(session, a, XR_NULL_PATH) || on(session, xb, XR_NULL_PATH));
             set_bit(B, on(session, b, XR_NULL_PATH) || on(session, yb, XR_NULL_PATH));
             set_bit(X, click_x);
-            set_bit(L, trigger_on[0]), set_bit(R, trigger_on[1]);   // the triggers L and R: the game's item bars
+            // the triggers L and R: the game's item bars; ((Triforce VR) the Biggoron's Sword out: not the other hand's, which the
+            // sword hand's controller presses by accident on the close two-handed grip)
+            const int no_trig = x.weapon_out.load() && x.two_handed_sword.load() ? 1 - sword_hand_now() : -1;
+            set_bit(L, trigger_on[0] && no_trig != 0), set_bit(R, trigger_on[1] && no_trig != 1);
         }
         // the Menu: a tap is Plus for a moment at its release, a second's hold Minus for a moment then
         if (combo_latch || on(session, menu, XR_NULL_PATH)) {
@@ -1609,7 +1792,7 @@ struct Controls {
             if (head_n >= 4) {
                 const int o = head_n & 3;
                 const float dt = (float)(head_t[i] - head_t[o]) * 1e-9f, vy = dt > 0 ? (head_y[i] - head_y[o]) / dt : 0.0f;
-                if (now - nod_at >= nod_refractory_ns) {
+                if (now - nod_at >= nod_refractory_ns && now - swing_at >= 600000000ull) {
                     if (vy > nod_speed) {
                         if (nod_down_at && now - nod_down_at < nod_ns) {
                             nod_at = now, nod_down_at = 0, rt_log("vr: head: down then up: the Lens of Truth off");
@@ -1660,29 +1843,31 @@ struct Controls {
         if (pose_ok[0] && pose_ok[1]) {
             float d2 = 0;
             for (int c = 0; c < 3; c++) d2 += (poses[0].p[c] - poses[1].p[c]) * (poses[0].p[c] - poses[1].p[c]);
-            // ((Triforce VR) both within 22 cm of the mouth (14 cm ahead of the eyes, 17 below them): held at the mouth, not
-            // up at the eyes)
+            // ((Triforce VR) both within 15 cm of the mouth (14 cm ahead of the eyes, 17 below them): held at the mouth, not
+            // up at the eyes, nor the Biggoron's Sword held up before the face)
             at_face = d2 < 0.16f * 0.16f;
             for (int h = 0; h < 2 && at_face; h++) {
                 const float a = fwd[h] - 0.14f, u = up[h] + 0.17f;
-                at_face = a * a + u * u + side[h] * side[h] < 0.22f * 0.22f;
+                at_face = a * a + u * u + side[h] * side[h] < 0.15f * 0.15f;
             }
             beside = side[0] < -0.10f && side[0] > -0.35f && side[1] > 0.10f && side[1] < 0.35f && std::fabs(up[0]) < 0.15f &&
                      std::fabs(up[1]) < 0.15f && std::fabs(fwd[0]) < 0.15f && std::fabs(fwd[1]) < 0.15f;
         }
         {   // ((Triforce VR) the ocarina: both pointer rays sideways, the same way: left mirrored, right as made)
             float lat[2] = {0, 0};
+            bool level = x.aim_ok[0] && x.aim_ok[1];   // ((Triforce VR) neither pointing up (past about 27 degrees))
             static const float ray[3] = {0, 0, -1};
             for (int h = 0; h < 2; h++)
                 if (x.aim_ok[h]) {
                     float d[3];
                     rotate(x.aim_pose[h].q, ray, d);
+                    if (d[1] > 0.45f) level = false;
                     // (its level part alone: how far it tips up or down, and its roll, do not count)
                     const float l = d[0] * rx + d[2] * rz, f = d[0] * fx + d[2] * fz, n = std::sqrt(l * l + f * f);
                     lat[h] = n > 0.2f ? l / n : 0.0f;
                 }
             const bool sideways = x.aim_ok[0] && x.aim_ok[1] && std::fabs(lat[0]) > 0.6f && std::fabs(lat[1]) > 0.6f && lat[0] * lat[1] > 0;
-            if (at_face && !sideways) at_face = false;
+            if (at_face && (!sideways || !level)) at_face = false;
             if (at_face) ocarina_left = lat[0] < 0;
             // (both hands within 30 cm of the mouth, about 12 cm ahead of the eyes and 8 below them)
             bool near_mouth = pose_ok[0] && pose_ok[1];
@@ -1705,7 +1890,10 @@ struct Controls {
         else if (in_play && !x.ocarina.load() && now - dpad_gesture_at >= dpad_refractory_ns) {
             int bit = -1;
             (void)wave;   // ((Triforce VR) the mask: the grips on and before the head now, below)
-            if (both_up) bit = DOWN;
+            // ((Triforce VR) the hands apart (30 cm or more): a two-handed grip's raise, such as the Biggoron's jump slash, is not it)
+            float apart2 = 0;
+            for (int c = 0; c < 3; c++) apart2 += (poses[0].p[c] - poses[1].p[c]) * (poses[0].p[c] - poses[1].p[c]);
+            if (both_up && pose_ok[0] && pose_ok[1] && apart2 > 0.30f * 0.30f) bit = DOWN;
             else if (pose_since[0] && now - pose_since[0] >= dwell_ns) bit = LEFT, g_live_mirror.store(ocarina_left ? 1 : 0);
             else if (pose_since[1] && now - pose_since[1] >= dwell_ns) bit = RIGHT;
             if (bit >= 0) {
@@ -1726,11 +1914,25 @@ struct Controls {
             const bool sq[2] = {squeeze_on[0], squeeze_on[1]};
             const bool fresh[2] = {sq[0] && !squeezed_before[0], sq[1] && !squeezed_before[1]};
             const bool weapon = x.weapon_out.load();
+            {   // ((Triforce VR) the last moment a weapon was out: the hands are chosen only when one is pulled out)
+                static bool was_weapon;
+                if (weapon) weapon_seen_at = now;
+                if (weapon != was_weapon) rt_log("vr: weapon out: %s", weapon ? "yes" : "no"), was_weapon = weapon;
+            }
             // both: the sword and shield
             if (!draw_arm && pose_ok[0] && pose_ok[1] && sq[0] && sq[1] && (fresh[0] || fresh[1]) && back_any[0] > behind_on &&
                 back_any[1] > behind_on && std::fabs(poses[0].p[1] - poses[1].p[1]) > draw_gap) {
                 draw_arm = true, draw_sword = poses[1].p[1] > poses[0].p[1] ? 1 : 0, item_arm = -1;
                 rt_log("vr: grips: sword and shield armed, the sword in the %s hand", draw_sword ? "right" : "left");
+            }
+            // ((Triforce VR) the Biggoron's Sword equipped: both grips held, the sword hand alone behind the shoulder (Link draws it
+            // with one hand and takes it in both on the way); the other hand anywhere)
+            if (!draw_arm && x.two_handed_sword.load() && pose_ok[0] && pose_ok[1] && sq[0] && sq[1] && (fresh[0] || fresh[1]) &&
+                (back_any[0] > behind_on || back_any[1] > behind_on)) {
+                const bool both_back = back_any[0] > behind_on && back_any[1] > behind_on;
+                draw_arm = true, item_arm = -1;
+                draw_sword = both_back ? (poses[1].p[1] > poses[0].p[1] ? 1 : 0) : back_any[1] > behind_on ? 1 : 0;
+                rt_log("vr: grips: the Biggoron's Sword armed, in the %s hand", draw_sword ? "right" : "left");
             }
             if (draw_arm && (!sq[0] || !sq[1])) draw_arm = false;
             if (draw_arm && pose_ok[draw_sword] && back_any[draw_sword] < -ahead_on) {
@@ -1803,10 +2005,8 @@ struct Controls {
                 g_live_mirror.store(item_mirrored_right(held_item) ? pull_hand : 1 - pull_hand);
                 rt_log("vr: grips: %s in the %s hand: %s", held_item, pull_hand ? "right" : "left", g_live_mirror.load() ? "mirrored" : "as made");
             }
-            if (gone && item_seen[0]) {   // (an item put away for good: back to the sword's hand; not each frame, the ocarina's own kept)
-                item_seen[0] = 0;
-                if (g_live_sword.load() >= 0 && !x.carrying.load()) g_live_mirror.store(g_live_sword.load());
-            }
+            // ((Triforce VR) an item put away for good: the hand it was in is kept (the next draw or pull chooses again))
+            if (gone && item_seen[0]) item_seen[0] = 0;
             for (int h = 0; h < 2; h++) {   // masks: a grip on top of the head puts it on; squeezed before the face and drawn up, off
                 if (!pose_ok[h] || !sq[h]) {
                     mask_pull[h] = false;
@@ -1818,6 +2018,10 @@ struct Controls {
                     const int hw = x.head_worn.load();
                     if (((hw & 3) == 1 || ((hw & 3) == 2 && (hw & 8))) && !((hw & 3) == 1 && head_on))
                         x.head_request.store(1), head_on = true, rt_log("vr: grips: mask on");
+                    else rt_log("vr: grips: a grip on the head: no mask to put on (the head's item %d%s)", hw & 3,
+                                head_on ? ", one on already" : "");
+                } else if (fresh[h] && up[h] > 0.0f && std::fabs(side[h]) < 0.25f && std::fabs(fwd[h]) < 0.25f) {
+                    rt_log("vr: grips: a grip near the head's top, not on it (up %.2f, side %.2f, ahead %.2f m)", up[h], side[h], fwd[h]);
                 } else if (fresh[h] && fwd[h] > 0.04f && fwd[h] < 0.25f && up[h] > -0.20f && up[h] < 0.05f && std::fabs(side[h]) < 0.12f) {
                     mask_pull[h] = true, std::memcpy(mask_from[h], poses[h].p, sizeof mask_from[h]);
                 } else if (mask_pull[h]) {
@@ -1849,9 +2053,9 @@ struct Controls {
                     if (d2 < reach * reach) bow_arm = true, sling_took = std::sqrt(d2);
                     else rt_log("vr: grips: a draw out of reach (%.0f cm of %.0f)", std::sqrt(d2) * 100.0f, reach * 100.0f);
                 }
-                const float far = sling_took + (sling ? sling_pull : bow_pull), near = sling_took + 0.04f;
-                if (bow_arm && !bow_drawn && d2 > far * far) bow_drawn = true, rt_log("vr: grips: drawn");
-                if (bow_drawn && d2 < near * near) bow_drawn = bow_arm = false, rt_log("vr: grips: brought back: the shot");
+                const float pulled = sling_took + (sling ? sling_pull : bow_pull), returned = sling_took + 0.04f;
+                if (bow_arm && !bow_drawn && d2 > pulled * pulled) bow_drawn = true, rt_log("vr: grips: drawn");
+                if (bow_drawn && d2 < returned * returned) bow_drawn = bow_arm = false, rt_log("vr: grips: brought back: the shot");
                 drawing = bow_drawn;
                 if (drawing) {
                     const float n = std::sqrt(d2);
@@ -1912,6 +2116,7 @@ struct Controls {
         {
             // the shield's raise for one hand: its face (drawn on the back of the hand, out of the grip's -x on the left hand, +x
             // on the right) within shield_on of ahead (shield_off to stay), before its own side's eye (12 cm, 19 to stay), in reach
+            bool biggoron_guard = false;
             const auto raised = [&](int hd, bool staying) {
                 if (!pose_ok[hd] || !x.aim_ok[hd]) return false;
                 // ((Triforce VR) held as for the bottle and the ocarina: its pointer's level part pointing inward across the body
@@ -1921,20 +2126,40 @@ struct Controls {
                 rotate(x.aim_pose[hd].q, ray, d);
                 const float l = d[0] * rx + d[2] * rz, fw = d[0] * fx + d[2] * fz, n = std::sqrt(l * l + fw * fw);
                 const float ahead = n > 0.2f ? (hd ? -l : l) / n : 0.0f;   // (1 straight across, inward)
-                const float off_eye = std::fabs((hd ? side[hd] : -side[hd]) - 0.032f);   // (about 3 cm out from the head's middle)
+                const float outward = hd ? side[hd] : -side[hd];   // (toward its own side, from the head's middle)
+                float off_eye = std::fabs(outward - 0.032f);   // (about 3 cm out from the head's middle)
+                // ((Triforce VR) the Biggoron's Sword's guard, raised by the sword hand: from the body's middle over to the other
+                // side, where the other hand on the hilt can follow it)
+                if (biggoron_guard) off_eye = outward > 0.06f ? outward - 0.06f : outward < -0.30f ? -0.30f - outward : 0.0f;
                 const float dx = poses[hd].p[0] - head[0], dz = poses[hd].p[2] - head[2];
                 const bool in_reach = dx * dx + dz * dz < shield_reach * shield_reach;   // (not "near": windows.h defines it)
-                return staying ? ahead > std::cos(shield_off) && off_eye < 0.19f && in_reach
-                               : ahead > std::cos(shield_on) && off_eye < 0.12f && in_reach && !at_face;
+                // ((Triforce VR) away from the face: ahead of the eyes or below them (a mask's grab at the face is no shield)
+                const bool off_face = staying ? fwd[hd] > 0.20f || up[hd] < -0.15f : fwd[hd] > 0.25f || up[hd] < -0.20f;
+                return staying ? ahead > std::cos(shield_off) && off_eye < 0.19f && in_reach && off_face
+                               : ahead > std::cos(shield_on) && off_eye < 0.12f && in_reach && !at_face && off_face;
             };
-            int shield = 1 - sword_hand_now();
+            // ((Triforce VR) the Biggoron's Sword out: both hands hold it, its guard raised by the sword hand)
+            // (not the shield raised alone: with the Biggoron's Sword put away, its shield out is no Biggoron guard)
+            const bool biggoron_out = !held_item[0] && x.weapon_out.load() && x.two_handed_sword.load() && !shield_alone;
+            int shield = biggoron_out ? sword_hand_now() : 1 - sword_hand_now();
+            biggoron_guard = biggoron_out;
             bool keep = false;
-            if (x.weapon_out.load()) keep = raised(shield, shielding);   // (the sword out: its other hand's shield)
+            // (the sword out: its other hand's shield; ((Triforce VR) the shield raised alone stays only while its grip is held)
+            if (x.weapon_out.load()) keep = raised(shield, shielding) && (!shield_alone || squeeze_on[shield]);
+            if (biggoron_guard && keep && !shielding) {   // ((Triforce VR) the guard begins only from a hand held fairly still, not
+                                                          // within 0.4 s of a swing: a swing passes through the guard's pose)
+                const float gs = std::sqrt(hv[shield][0] * hv[shield][0] + hv[shield][1] * hv[shield][1] + hv[shield][2] * hv[shield][2]);
+                if (gs > 1.0f || now - swing_at < 400000000ull || swinging) keep = false;
+            }
             else {
                 // ((Triforce VR) no sword out: either hand's raise with its grip held is Link's lock with the shield alone, the shield
                 // in that hand: the left mirrors him (the sword then the right's), the right does not; the last one kept while held)
                 if (shielding && squeeze_on[shield] && raised(shield, true)) keep = true;
-                for (int hd = 0; hd < 2 && !keep; hd++)
+                // ((Triforce VR) not while the sword is being drawn, nor until 1.5 s after a weapon was last out: the hands of
+                // a sword and shield already out never swap)
+                const bool settled = !draw_arm && !drawn_by_grips && !sword_release_at && now - weapon_seen_at > 1500000000ULL &&
+                                     now - draw_at > 1500000000ULL;
+                for (int hd = 0; hd < 2 && !keep && settled; hd++)
                     // ((Triforce VR) not a hand that holds an item or owns its trigger: a boomerang aimed up before the face is
                     // no shield)
                     if (squeeze_on[hd] && raised(hd, false) && hd != pull_hand && hd != hook_hand) {
@@ -2002,22 +2227,23 @@ struct Controls {
                 // ((Triforce VR) the Deku Stick and the hammer: downward swings only; a bottle: inward only (the right hand's
                 // right to left, the left's left to right); the sword any way)
                 bool way = true;
-                if (strstr(held_item, "Hammer")) way = v[1] < -0.6f * speed;
-                else if (strstr(held_item, "DekuStick")) {
-                    // ((Triforce VR) the Deku Stick in both hands: the other hand at the holding controller's bottom (past its
-                    // handle's end along the controller's own down, within 18 cm, however it is tilted), both swinging down)
-                    const int oh = 1 - sword;
-                    bool under = false;
-                    if (pose_ok[oh]) {
-                        const float d[3] = {poses[oh].p[0] - poses[sword].p[0], poses[oh].p[1] - poses[sword].p[1], poses[oh].p[2] - poses[sword].p[2]};
-                        const float inv[4] = {-poses[sword].q[0], -poses[sword].q[1], -poses[sword].q[2], poses[sword].q[3]};
-                        float l[3];
-                        rotate(inv, d, l);   // (in the holding controller's grip frame: its handle along z, -z out of the fist's top)
-                        under = l[2] > 0.03f && l[0] * l[0] + l[1] * l[1] + l[2] * l[2] < 0.18f * 0.18f;
-                    }
-                    const float os = std::sqrt(hv[oh][0] * hv[oh][0] + hv[oh][1] * hv[oh][1] + hv[oh][2] * hv[oh][2]);
-                    way = v[1] < -0.6f * speed && under && os > 0.5f * speed && hv[oh][1] < -0.6f * os;
+                // ((Triforce VR) a thing held in both hands: the other hand at the holding controller's bottom (past its handle's
+                // end along the controller's own down, within 18 cm, however it is tilted), and swinging with it)
+                const int oh = 1 - sword;
+                bool under = false;
+                if (pose_ok[oh]) {
+                    const float d[3] = {poses[oh].p[0] - poses[sword].p[0], poses[oh].p[1] - poses[sword].p[1], poses[oh].p[2] - poses[sword].p[2]};
+                    const float inv[4] = {-poses[sword].q[0], -poses[sword].q[1], -poses[sword].q[2], poses[sword].q[3]};
+                    float l[3];
+                    rotate(inv, d, l);   // (in the holding controller's grip frame: its handle along z, -z out of the fist's top)
+                    under = l[2] > 0.03f && l[0] * l[0] + l[1] * l[1] + l[2] * l[2] < 0.18f * 0.18f;
                 }
+                const float os = std::sqrt(hv[oh][0] * hv[oh][0] + hv[oh][1] * hv[oh][1] + hv[oh][2] * hv[oh][2]);
+                if (strstr(held_item, "Hammer")) way = v[1] < -0.6f * speed;
+                else if (strstr(held_item, "DekuStick"))   // (the Deku Stick: both swinging down)
+                    way = v[1] < -0.6f * speed && under && os > 0.5f * speed && hv[oh][1] < -0.6f * os;
+                else if (!held_item[0] && x.two_handed_sword.load())   // (the Biggoron's Sword: both swinging, any way)
+                    way = under && os > 0.5f * speed;
                 else if (!strcmp(held_item, "Item_Bottle")) {
                     const float lat = v[0] * rx + v[2] * rz;
                     way = sword ? lat < -0.5f * speed : lat > 0.5f * speed;
@@ -2033,6 +2259,8 @@ struct Controls {
                     }
                     way = way && (sword ? aim_lat < -0.6f : aim_lat > 0.6f);
                 }
+                // ((Triforce VR) Immersive (third person): any solid swing, whichever way, for every item (no direction or two-hand rule)
+                if (!strcmp(cfg_value("VR_VIEW"), "head") && !strcmp(cfg_value("VR_CAMERA"), "third") && !gestures_in_immersive()) way = true;
                 if (!swinging && speed > swing_on && now - swing_at >= refractory_ns && !back && way) {
                     swinging = swung = true;
                     swing_at = now;
@@ -2043,6 +2271,196 @@ struct Controls {
                 }
             }
         } else swing_n = 0, swinging = false;
+        // ((Triforce VR) the sword's gesture-chosen slash: a sword swing waits for its choice (at 30 cm from its start, 250 ms at most)
+        static bool slash_wait = false, slash_ready = false;
+        static int slash_code = -1;
+        static uint64_t slash_wait_at = 0, slash_extra_until = 0;
+        static bool slash_zl = false, slash_fwd = false;   // (the press's Z held, the left stick forward with it)
+        {   // ((Triforce VR) research, SWING-LOG: each swing's path in the head's frame (side to the right, up, ahead), its peak
+            // speed and the half second before it (a pause, a slow start), logged when it ends, for the gesture-chosen slashes)
+            struct Pt { uint64_t t; float s, u, f, v; };
+            static Pt path[192];
+            static int path_n, start_at = -1;
+            static bool was_swinging;
+            if (pose_ok[sword]) {
+                const float dx = poses[sword].p[0] - head[0], dz = poses[sword].p[2] - head[2];
+                Pt q{now, dx * rx + dz * rz, poses[sword].p[1] - head[1], dx * fx + dz * fz, 0};
+                if (path_n) {
+                    const Pt &o = path[(path_n - 1) % 192];
+                    const float dt = (float)(now - o.t) * 1e-9f;
+                    const float a = q.s - o.s, b = q.u - o.u, c = q.f - o.f;
+                    q.v = dt > 0 ? std::sqrt(a * a + b * b + c * c) / dt : o.v;
+                }
+                path[path_n++ % 192] = q;
+            }
+            const auto at = [&](int i) -> const Pt & { return path[((i % 192) + 192) % 192]; };
+            if (swung) start_at = path_n - 1;
+            {   // ((Triforce VR) the live choice
+                static int live_st = -1;
+                static uint64_t l_quiet, l_fast, l_soft;
+                static bool l_raised;
+                // ((Triforce VR) not in Immersive (third person): there any solid swing is the sword's plain swing, as before)
+                const bool immersive_view = !strcmp(cfg_value("VR_VIEW"), "head") && !strcmp(cfg_value("VR_CAMERA"), "third") &&
+                                            !gestures_in_immersive();
+                if (swung && in_play && !carry && !held_item[0] && x.weapon_out.load() && start_at >= 0 && !immersive_view) {
+                    int st = start_at;
+                    while (st > path_n - 190 && st > 0 && at(st - 1).v >= swing_off && now - at(st - 1).t < 1500000000ull) st--;
+                    live_st = st, slash_wait = true, slash_ready = false, slash_wait_at = now;
+                    const Pt &a0 = at(st);
+                    uint64_t run = 0, soft_run = 0, prev_t = a0.t;
+                    bool fast_seen = false;
+                    float u_min = a0.u;
+                    l_quiet = l_soft = 0, l_fast = 600000000ull;
+                    for (int i = st - 1; i > st - 190 && i >= 0; i--) {
+                        const Pt &p = at(i);
+                        const uint64_t ago = a0.t - p.t;
+                        if (ago > 1000000000ull) break;
+                        u_min = std::fmin(u_min, p.u);
+                        if (p.v < 0.5f) soft_run += prev_t - p.t, l_soft = std::max(l_soft, soft_run);
+                        else soft_run = 0;
+                        if (ago <= 500000000ull) {
+                            if (p.v < 0.3f) run += prev_t - p.t, l_quiet = std::max(l_quiet, run);
+                            else run = 0;
+                            if (!fast_seen && p.v > 1.0f) l_fast = ago, fast_seen = true;
+                        }
+                        prev_t = p.t;
+                    }
+                    l_raised = a0.u - u_min > 0.35f;
+                }
+                if (slash_wait && !slash_ready && live_st >= 0 && path_n - live_st < 180) {
+                    const Pt &a0 = at(live_st), &q = at(path_n - 1);
+                    const float dx1 = q.s - a0.s, du1 = q.u - a0.u, df1 = q.f - a0.f;
+                    if (dx1 * dx1 + du1 * du1 + df1 * df1 >= 0.30f * 0.30f || now - slash_wait_at >= 250000000ull || !swinging) {
+                        float pk = 0, fwd0 = 0;
+                        for (int i = live_st; i < path_n; i++) {
+                            pk = std::fmax(pk, at(i).v);
+                            if (at(i).t - a0.t <= 80000000ull) fwd0 = at(i).f - a0.f;
+                        }
+                        const float os = sword ? 1.0f : -1.0f;
+                        SlashIn in{dx1 * os, du1, df1, pk, fwd0, a0.s, a0.f, a0.s * os, l_quiet, l_fast, l_soft, l_raised,
+                                   x.two_handed_sword.load(), true};
+                        in.zt = (bits & 1ull << ZL) != 0, in.air = x.airborne.load(), in.start_up = a0.u;
+                        const char *why = "";
+                        slash_code = slash_classify(in, &why), slash_ready = true;
+                        rt_log("vr: slash: %s (counter %d, %.0f ms in)", why, slash_counter(slash_code), (double)(now - slash_wait_at) * 1e-6);
+                    }
+                }
+            }
+            if (was_swinging && !swinging && start_at >= 0 && path_n - start_at < 180) {
+                // its start: back from the trigger to where the hand was last under swing_off (0.3 s at most)
+                int st = start_at;
+                while (st > path_n - 190 && st > 0 && at(st - 1).v >= swing_off && now - at(st - 1).t < 1500000000ull) st--;
+                // its end: the point farthest from its start (a hand brought back after it is not part of it)
+                int fe = st;
+                float far2 = 0;
+                for (int i = st; i < path_n; i++) {
+                    const float a1 = at(i).s - at(st).s, b1 = at(i).u - at(st).u, c1 = at(i).f - at(st).f, d2 = a1 * a1 + b1 * b1 + c1 * c1;
+                    if (d2 > far2) far2 = d2, fe = i;
+                }
+                const Pt &a = at(st), &b = at(fe);
+                float peak = 0;
+                for (int i = st; i <= fe; i++) peak = std::fmax(peak, at(i).v);
+                // before it: the slowest and the fastest of the 0.6 s before, how long it was still (under 0.15 m/s) right
+                // before, and its mean speed over the 0.25 s before
+                float pre_min = 1e9f, pre_max = 0, mean25 = 0;
+                int n25 = 0;
+                uint64_t still_ns = 0;
+                bool still_run = true;
+                for (int i = st - 1; i > st - 180 && i >= 0 && a.t - at(i).t < 600000000ull; i--) {
+                    const Pt &p = at(i);
+                    pre_min = std::fmin(pre_min, p.v), pre_max = std::fmax(pre_max, p.v);
+                    if (a.t - p.t < 250000000ull) mean25 += p.v, n25++;
+                    if (still_run && p.v < 0.15f) still_ns = a.t - p.t;
+                    else still_run = false;
+                }
+                // the speed over the 0.5 s before it, 50 ms a step (oldest first), and how far it went forward in its first 80 ms
+                char prof[160];
+                int po = 0;
+                for (int k = 9; k >= 0; k--) {
+                    float sum = 0;
+                    int cnt = 0;
+                    for (int i = st - 1; i > st - 180 && i >= 0; i--) {
+                        const uint64_t ago = a.t - at(i).t;
+                        if (ago >= (uint64_t)k * 50000000ull && ago < (uint64_t)(k + 1) * 50000000ull) sum += at(i).v, cnt++;
+                        if (ago > 600000000ull) break;
+                    }
+                    po += snprintf(prof + po, sizeof prof - po, "%s%.2f", k == 9 ? "" : " ", cnt ? sum / (float)cnt : 0.0f);
+                }
+                float first_fwd = 0;
+                for (int i = st; i <= fe; i++)
+                    if (at(i).t - a.t <= 80000000ull) first_fwd = at(i).f - a.f;
+                const float ds = b.s - a.s, du = b.u - a.u, df = b.f - a.f, flat = std::sqrt(ds * ds + df * df);
+                const float steep = std::atan2(std::fabs(du), flat) * 57.2958f;
+                const float out_s = sword ? 1.0f : -1.0f;   // (+ toward the sword hand's side)
+                rt_log("vr: swing: %s hand, %.0f ms, peak %.2f m/s; from side %+.2f up %+.2f ahead %+.2f to side %+.2f up %+.2f ahead %+.2f "
+                       "(toward sword side %+.2f, up %+.2f, ahead %+.2f; steep %.0f deg); before: still %.0f ms, slowest %.2f, fastest %.2f, "
+                       "mean of 0.25 s %.2f; profile [%s]; first 80 ms ahead %+.3f; item \"%s\" biggoron %d weapon %d shield %d",
+                       sword ? "right" : "left", (double)(b.t - a.t) * 1e-6, peak, a.s, a.u, a.f, b.s, b.u, b.f, ds * out_s, du, df, steep,
+                       (double)still_ns * 1e-6, pre_min < 1e8f ? pre_min : 0.0f, pre_max, n25 ? mean25 / (float)n25 : 0.0f, prof, first_fwd, held_item,
+                       (int)x.two_handed_sword.load(), (int)x.weapon_out.load(), (int)shielding);
+                {   // ((Triforce VR) research, SWING-CLASS: the slash these rules would choose (log only), from the whole swing and
+                    // from its first 100 ms (what a live choice would have)
+                    // before it: the longest run under 0.3 m/s in the 0.5 s before, the time since the hand last moved over 1 m/s, and
+                    // how far it rose in the second before (a jump slash's raise)
+                    uint64_t quiet = 0, run = 0, soft = 0, soft_run = 0, last_fast = 600000000ull, prev_t = a.t;
+                    bool fast_seen = false;
+                    float u_min = a.u;
+                    for (int i = st - 1; i > st - 190 && i >= 0; i--) {
+                        const Pt &p = at(i);
+                        const uint64_t ago = a.t - p.t;
+                        if (ago > 1000000000ull) break;
+                        u_min = std::fmin(u_min, p.u);
+                        // (a softer pause for the finishers: under 0.5 m/s, anywhere in the second before)
+                        if (p.v < 0.5f) soft_run += prev_t - p.t, soft = std::max(soft, soft_run);
+                        else soft_run = 0;
+                        if (ago <= 500000000ull) {
+                            if (p.v < 0.3f) run += prev_t - p.t, quiet = std::max(quiet, run);
+                            else run = 0;
+                            if (!fast_seen && p.v > 1.0f) last_fast = ago, fast_seen = true;
+                        }
+                        prev_t = p.t;
+                    }
+                    const bool raised = a.u - u_min > 0.35f;
+                    const float s0 = a.s * out_s;   // (its start toward the sword hand's side)
+                    const bool big = !held_item[0] && x.two_handed_sword.load();
+                    // (early: the live choice at 30 cm: a strict hesitation and the speed reached by then (4.5 m/s) mark a finisher)
+                    const auto classify = [&](float X, float U, float F, float pk, float fwd0, bool early_rule = false) -> const char * {
+                        const SlashIn in{X, U, F, pk, fwd0, a.s, a.f, s0, quiet, last_fast, soft, raised, big, early_rule};
+                        const char *why = "";
+                        slash_classify(in, &why);
+                        return why;
+                    };
+                    int e = st;   // (100 ms in)
+                    float pk_e = 0;
+                    for (int i = st; i <= fe && at(i).t - a.t <= 100000000ull; i++) e = i, pk_e = std::fmax(pk_e, at(i).v);
+                    const Pt &m = at(e);
+                    const char *full = (b.t - a.t < 120000000ull || peak > 30.0f) ? "ignored (tracking glitch)"
+                                     : classify(ds * out_s, du, df, peak, first_fwd);
+                    const char *early = classify((m.s - a.s) * out_s, m.u - a.u, m.f - a.f, pk_e, first_fwd);
+                    // (and once it has gone 20 cm and 30 cm from its start: the verdict and when)
+                    char at_d[2][96];
+                    for (int k = 0; k < 2; k++) {
+                        const float dd = k ? 0.30f : 0.20f;
+                        snprintf(at_d[k], sizeof at_d[k], "never");
+                        float pk_d = 0;
+                        for (int i = st; i <= fe; i++) {
+                            const Pt &q = at(i);
+                            pk_d = std::fmax(pk_d, q.v);
+                            const float a1 = q.s - a.s, b1 = q.u - a.u, c1 = q.f - a.f;
+                            if (a1 * a1 + b1 * b1 + c1 * c1 >= dd * dd) {
+                                snprintf(at_d[k], sizeof at_d[k], "%s at %.0f ms, %.2f m/s", classify(a1 * out_s, b1, c1, pk_d, first_fwd, true),
+                                         (double)(q.t - a.t) * 1e-6, pk_d);
+                                break;
+                            }
+                        }
+                    }
+                    rt_log("vr: swing class: %s | early (100 ms): %s | 20 cm: %s | 30 cm: %s | quiet %.0f ms, last fast %.0f ms ago, raised %d, soft pause %.0f ms",
+                           full, early, at_d[0], at_d[1], (double)quiet * 1e-6, (double)last_fast * 1e-6, (int)raised, (double)soft * 1e-6);
+                }
+                start_at = -1;
+            }
+            was_swinging = swinging;
+        }
         if (carry) {   // (both hands together, neither back toward the body nor down, as it is put down; one alone throws nothing)
             swung = outward = charging = false;
             const float least = carry_share * swing_on;
@@ -2053,7 +2471,19 @@ struct Controls {
                 vm[0] * fx + vm[2] * fz > -0.5f * m && vm[1] > -0.7f * m && now - swing_at >= refractory_ns)
                 swung = true, swing_at = now, rt_log("vr: carry: thrown by both hands");
         }
-        if (swung) queued = true;
+        if (swung && !slash_wait) queued = true;
+        if (slash_wait && slash_ready) {   // ((Triforce VR) the gesture-chosen slash: its step set, then the swing's press; none ignored
+            slash_wait = false;
+            if (slash_code != 0) {
+                const int cv = slash_counter(slash_code);
+                if (cv >= 0) x.combo_want.store(cv);
+                // (the Biggoron's steep slashes: Z for that press; the stab: Z (held already) and forward; the jump slash: forward and A)
+                slash_zl = x.two_handed_sword.load() && ((slash_code >= 10 && slash_code <= 13) || slash_code == 20 || slash_code == 21);
+                slash_fwd = slash_code == 20 || slash_code == 21;
+                slash_extra_until = now + 250000000ull;
+                queued = true;
+            }
+        }
         if (charging) {
             queued = false;   // (the hand brought back in fast is the release, not a swing)
             if (out < out_off || !pose_ok[sword]) charging = false, y_down = 0, y_up = now;
@@ -2071,11 +2501,18 @@ struct Controls {
                                  strstr(held_item, "Item_Bomb");
             // (something of the world's carried: the throw, Y, whatever item was out before)
             tap_bit = !in_play ? -1 : carry ? Y : swinger ? ZR : !held_item[0] && x.weapon_out.load() ? Y : -1;   // (no swing in menus)
+            if (tap_bit == Y && slash_code == 20 && now < slash_extra_until) tap_bit = A;   // ((Triforce VR) the jump slash: A)
             queued = false;
-            if (tap_bit >= 0) y_down = now, outward = outward && swinging && tap_bit == Y && !carry;   // (the charge: the sword's)
+            // (the charge: the sword's; ((Triforce VR) a gesture-chosen slash's press comes once it is chosen, often after the swing has
+            // ended: its outward kept)
+            if (tap_bit >= 0) y_down = now, outward = outward && (swinging || now < slash_extra_until) && tap_bit == Y && !carry;
             if (tap_bit == ZR && strstr(held_item, "Hammer")) g_hammer_swung.store(now);   // ((Triforce VR) his arms the swing's: vk_xr_arms_own
         }
         if (tap_bit >= 0) set_bit(tap_bit, y_down != 0);
+        if (now < slash_extra_until && (y_down || queued)) {   // ((Triforce VR) the gesture-chosen slash's Z and stick
+            if (slash_zl) set_bit(ZL, true);
+            if (slash_fwd) sticks[0][0] = 0.0f, sticks[0][1] = 1.0f;
+        }
         if (bits & 1ull << Y || (now < draw_until && draw_bit == Y)) shield_alone = false;
         {   // ((Triforce VR) (an item a gamepad took out: in the hand the mirror puts it)
             const bool hammer = strstr(held_item, "Hammer"), stick = strstr(held_item, "DekuStick");
@@ -3280,7 +3717,8 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
         x.box_drawn[slot] = d;
         if (have_picture) {   // last: the headset's copies are made
             std::lock_guard<std::mutex> lk(x.hud_mu);
-            if (d.stereo && !strcmp(cfg_value("FLAT3D"), "cardboard")) window_both_eyes(cb, window, extent, rect, d);
+            if (d.stereo && strcmp(cfg_value("FLAT3D"), "off") && window_vr_3d(cb, window, extent, rect, d)) {}
+            else if (d.stereo && !strcmp(cfg_value("FLAT3D"), "cardboard")) window_both_eyes(cb, window, extent, rect, d);
             else if (d.eye >= 0 && !stereo_accurate()) window_left_eye(cb, window, extent, format, rect, d.eye);
             else x.win_left_have = false;   // (Accurate shows both eyes at once: nothing to hold between presents)
         }
@@ -3349,6 +3787,8 @@ extern "C" int vk_xr_active(void) { return xr().ok && xr().timeline; }
 extern "C" void vk_xr_head_worn(int what) { xr().head_worn.store(what); }
 extern "C" void vk_xr_carrying(int on) { xr().carrying.store(on != 0); }
 extern "C" int vk_xr_head_request(void) { return xr().head_request.exchange(0); }
+extern "C" int vk_xr_combo_want(void) { return xr().combo_want.exchange(-1); }
+extern "C" void vk_xr_airborne(int on) { xr().airborne.store(on != 0); }
 extern "C" void vk_xr_hud_hidden(int hidden) { xr().hud_hidden.store(hidden != 0); }
 
 extern "C" const MkwVkXr *vk_xr_table(void) {
@@ -3356,7 +3796,7 @@ extern "C" const MkwVkXr *vk_xr_table(void) {
         vk_xr_cfg, vk_xr_head_active, vk_xr_camera, vk_xr_lens, vk_xr_holds_time, vk_xr_update_step, vk_xr_pad,
         vk_xr_ocarina, vk_xr_weapon_out, vk_xr_child,
         vk_xr_hand_item, vk_xr_in_play, vk_xr_item_bar, vk_xr_aim_freeze, vk_xr_pointer, vk_xr_aim, vk_xr_untracked, vk_xr_hands,
-        vk_xr_active, vk_xr_head_worn, vk_xr_hud_hidden, vk_xr_carrying, vk_xr_head_request, vk_xr_two_handed_sword, vk_xr_arms_own, vk_xr_game_paused, vk_xr_rumble, vk_xr_turning};
+        vk_xr_active, vk_xr_head_worn, vk_xr_hud_hidden, vk_xr_carrying, vk_xr_head_request, vk_xr_two_handed_sword, vk_xr_arms_own, vk_xr_game_paused, vk_xr_rumble, vk_xr_turning, vk_xr_combo_want, vk_xr_airborne};
     return &t;
 }
 

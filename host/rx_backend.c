@@ -552,6 +552,16 @@ void hos_vk_mirror_publish(const float *turns, int n) {
     if (looked != vk_module) looked = vk_module, publish = (void (*)(const float *, int))(void *)GetProcAddress(vk_module, "hos_vk_mirror_publish");
     if (publish) publish(turns, n);
 }
+/* ((Scout, 11-26) right-handed: his mirrored center bones' frames and the reflections of the game's own (host/vr_body.c
+   mirror_frames_publish) to the back end, which draws an effect laid out in one of them in the reflection (gpu/vk/vk_draw.cpp
+   xr_effect_frame_fix); an older back end without the export: nothing */
+void hos_vk_mirror_frames_publish(const float *pairs, int n) {
+    static void (*publish)(const float *, int);
+    static HMODULE looked;
+    if (!vk_module) return;
+    if (looked != vk_module) looked = vk_module, publish = (void (*)(const float *, int))(void *)GetProcAddress(vk_module, "hos_vk_mirror_frames_publish");
+    if (publish) publish(pairs, n);
+}
 void rx_resize(int width, int height) { vk ? vk->resize(width, height) : wgr_resize(width, height); }
 const char *rx_describe(void) { return vk ? vk->describe() : wgr_describe(); }
 void rx_stats(int64_t *draws, int64_t *skipped, int64_t *pipelines) {

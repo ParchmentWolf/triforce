@@ -42,7 +42,8 @@ static int vr_sword_right(void) {
 
 /* ---- the game's memory, and calls into its code ---- */
 static int plausible(uint64_t a, uint64_t n) {
-    return (a >= HOS_HEAP_BASE && a + n > a && a + n <= (uint64_t)HOS_SPACE_END) || (a >= hos_image_base && a + n <= hos_image_end);
+    /* ((Triforce VR) no wrap-around in either: a pointer of -1 (a thing half made, as at an age switch) passed the image's test) */
+    return (a >= HOS_HEAP_BASE && a + n > a && a + n <= (uint64_t)HOS_SPACE_END) || (a >= hos_image_base && a + n > a && a + n <= hos_image_end);
 }
 static float ld_f(Ctx *c, uint64_t a) {
     const uint32_t b = recomp_load32(c, a);
@@ -939,7 +940,16 @@ static const char mir_items_builtin[] =
     "Item_ZeldaLetter - P\n"
     "Item_WeirdEgg - P\n"
     "Item_ScrubBusinessSeed - P\n"
-    "Item_MagicBean - P\n";
+    "Item_MagicBean - P\n"
+    "Item_PocketCucco - P\n"
+    "Item_OddMushroom - P\n"
+    "Item_OddPowder - P\n"
+    "Item_PoacherSaw - P\n"
+    "Item_EyeballFrog - P\n"
+    "Item_EyeDrop - P\n"
+    "Item_ClaimCheck - P\n"
+    "Item_Prescription - P\n"
+    "Item_RutoLetter - P\n";
 static void mir_items_read(void) {
     static int64_t at;
     const int64_t now = hos_now_ns();
@@ -1183,6 +1193,56 @@ static void cap_hide(Ctx *c) {
             recomp_store32_sp(c, armor_cap.world[n] + 60, head[15]);
         }
 }
+/* ((Scout, 11-26) right-handed Link: an effect laid out in the frame of one of his center bones (no left/right mate: the spine,
+   neck, head...; the sword's slash trail, Wpn_Sword_Slash_00's SwordBlur drawn by the game's WeaponBlurRenderer, is laid out
+   in Spine_2's frame) followed the mirror's turn of that bone (S M F, F = B^-1 S B: kept a turn by the axis along his x turned
+   round), so the trail's sideways axis pointed the other way and the slash arced over and behind him. Measured against the
+   game's own swing: x and y the reflection's, z dot -1. Each such bone's world as the GPU will see it (his origin added) and
+   that frame times F, the exact reflection of the game's own (F is its own inverse), to the renderer, which draws an effect
+   whose emitter frame is the first in the second (gpu/vk/vk_draw.cpp xr_effect_frame_fix). After his world pass, as the
+   things he holds are placed (mirror_attach), once a pass */
+static void mirror_frames_publish(Ctx *c) {
+    static SRWLOCK lk = SRWLOCK_INIT;
+    static float pairs[MA_BONES][24], last[MA_BONES][12];
+    static int last_n;
+    const MaPart *mp = &ma.part[0];
+    const int part = ma_part_index(c, mp->bones);
+    if (!mp->written || part < 0 || !TryAcquireSRWLockExclusive(&lk)) return;
+    const uint64_t link_inst = recomp_load64(c, recomp_load64(c, recomp_load64(c, ma.model + 0x28) + (uint64_t)part * 8));
+    const uint64_t worlds = recomp_load64(c, mp->bones + 0x20);
+    int n = 0;
+    if (plausible(link_inst + 0x2d0, 12) && plausible(worlds, (uint64_t)mp->n * 64)) {
+        double org[3];
+        for (int r = 0; r < 3; r++) org[r] = ld_f(c, link_inst + 0x2d0 + (uint64_t)r * 4);
+        for (int b = 0; b < mp->n; b++) {
+            if (mp->mate[b] != b) continue;
+            Xf W, T;
+            xf_load(c, worlds + (uint64_t)b * 64, &W);
+            for (int r = 0; r < 3; r++) W.m[r][3] += org[r];
+            xf_mul(&W, &mp->F[b], &T);
+            for (int k = 0; k < 4; k++)
+                for (int r = 0; r < 3; r++) pairs[n][k * 3 + r] = (float)W.m[r][k], pairs[n][12 + k * 3 + r] = (float)T.m[r][k];
+            n++;
+        }
+    }
+    int same = n == last_n;   /* (this pass's already sent: the same frames as last time) */
+    for (int i = 0; i < n && same; i++) same = !memcmp(pairs[i], last[i], sizeof last[i]);
+    if (n && !same) {
+        void hos_vk_mirror_frames_publish(const float *pairs, int n);
+        hos_vk_mirror_frames_publish(&pairs[0][0], n);
+        for (int i = 0; i < n; i++) memcpy(last[i], pairs[i], sizeof last[i]);
+        last_n = n;
+    }
+    ReleaseSRWLockExclusive(&lk);
+}
+/* ((Triforce VR) the trade item last placed in his hand, and when (vr_body_held_quest) */
+static char quest_name[48];
+static int64_t quest_at;
+int vr_body_held_quest(char out[48]) {
+    if (hos_now_ns() - __atomic_load_n(&quest_at, __ATOMIC_ACQUIRE) > 400000000LL) return 0;
+    snprintf(out, 48, "%s", quest_name);
+    return out[0] != 0;
+}
 static int mirror_attach(Ctx *c, uint64_t fn) {
     /* ((Triforce VR) never on the game's thread that makes and deletes things (BaseProcCreateAndDeleteThread): it places a
        thing as it is made, its skeleton and his not all there yet at a load or an age switch, and putting ours in there
@@ -1197,10 +1257,14 @@ static int mirror_attach(Ctx *c, uint64_t fn) {
     cap_hide(c);
     if (shield_inside || !ma.parts) return 0;
     const int wanted = ma_wanted();
-    if (wanted) bangle_place(c);
+    if (wanted) bangle_place(c), mirror_frames_publish(c);
     const int it = mirrored_item(c, c->x[0]);
     const uint64_t base = c->x[1];
     if (it < 0 || !plausible(base, 64)) return 0;
+    if (mi_back[it] == -2) {   /* ((Triforce VR) a thing only ever in his hand (a trade item): which, for the hands (vr_game.c) */
+        snprintf(quest_name, sizeof quest_name, "%s", mir_items[mi_item[it]].prefix);
+        __atomic_store_n(&quest_at, hos_now_ns(), __ATOMIC_RELEASE);
+    }
     const int hand = mi_back[it] == -2 ? 0 : in_his_hand(c, c->x[0], base);
     if (!wanted && (hand || !mi_always[it] || mi_back[it] != -1)) return 0;   /* (the mirror off: only the always-fixed, put away) */
     const int axes = hand ? mi_hand[it] : mi_back[it];
@@ -1356,16 +1420,37 @@ static void jw_apply(Ctx *c, uint64_t out, int ax, double v) {
         st_f(c, ra + (uint64_t)a * 4, va * cs + vb * sn), st_f(c, ra + (uint64_t)b * 4, -va * sn + vb * cs);
     }
 }
-/* the sword's trail is built from the turn of the bone these read during a swing: mirrored, that turn sweeps the trail the
-   other way round, so their answers get the bone's z axis flipped (a reflection) while the mirror is on */
-static const uint64_t trail_readers[] = {0x82be902cULL, 0x80f95f64ULL, 0x826f8d64ULL, 0x803a1070ULL, 0x809963dcULL};
+/* (research, SPINE-FLIP: while triforce-runs/spine_flip.txt exists and the mirror is on, a center bone (one that is its own
+   left/right partner: the spine, neck, head, waist) read by the game comes back with its sideways (z) axis turned round: the
+   reflection of the game's own frame, as the trail's renderer fix draws it, for what the game itself works out from those bones
+   (a spin's way round, a sidestep's) */
+static int spine_flip_on(void) {
+    static int on = -1;
+    static int64_t looked;
+    const int64_t now = hos_now_ns();
+    if (now - looked > 1000000000LL) {
+        looked = now;
+        char path[512];
+        const char *home = getenv("HOME");
+        snprintf(path, sizeof path, "%s/.app/pc_port/triforce-runs/spine_flip.txt", home ? home : "");
+        FILE *f = fopen(path, "r");
+        const int v = f != NULL;
+        if (f) fclose(f);
+        if (v != on) hos_log("vr: body: center bones' reads %s", v ? "reflected (spine_flip.txt)" : "as the mirror leaves them");
+        on = v;
+    }
+    return on;
+}
 void hos_oot_joint_world(Ctx *c) {
-    if (ma.parts && ma_wanted())
-        for (size_t k = 0; k < sizeof trail_readers / sizeof trail_readers[0]; k++)
-            if (c->x[30] == trail_readers[k]) {
-                jw_apply(c, c->x[1], 6, 0);
+    if (spine_flip_on() && ma.parts && ma_wanted() && plausible(c->x[0] + 0xf8, 8)) {
+        const uint64_t bones = recomp_load64(c, c->x[0] + 0xf8);
+        const int bone = (int)(int32_t)c->x[2];
+        for (int i = 0; i < ma.parts; i++)
+            if (ma.part[i].bones == bones) {
+                if (bone >= 0 && bone < ma.part[i].n && ma.part[i].mate[bone] == bone) jw_apply(c, c->x[1], 6, 0);
                 break;
             }
+    }
     jw_all_note(c);
     if (jw_turn_n)
         for (int k = 0; k < jw_turn_n; k++)

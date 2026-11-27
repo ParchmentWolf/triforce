@@ -206,10 +206,11 @@ const char* tx_tenths(int v) {   // ((Triforce VR) tenths as a decimal: 10 is "1
     return b;
 }
 const char* tx_vr_mode(int v) { return v >= 2 ? "Full Dive" : v ? "Immersive" : "Theater"; }
-const char* tx_view3d(int v) {
-    static const char* const t[] = {"Flatscreen", "VR", "Red/cyan glasses", "Side by side (3D TV)", "Crossed eyes", "Above and below",
-                                    "Side by side (Cardboard)"};
-    return t[v >= 0 && v < 7 ? v : 0];
+const char* tx_view3d(int v) {   // ((Triforce VR) each flat screen 3D style followed by VR with it on the desktop: Mode = style * 2 + VR
+    static const char* const t[] = {"Flatscreen", "VR", "Red/cyan glasses", "VR + Red/cyan glasses", "Side by side (3D TV)",
+                                    "VR + Side by side (3D TV)", "Crossed eyes", "VR + Crossed eyes", "Above and below",
+                                    "VR + Above and below", "Side by side (Cardboard)", "VR + Side by side (Cardboard)"};
+    return t[v >= 0 && v < 12 ? v : 0];
 }
 const char* tx_vr_camera(int v) { return v ? "Third person" : "First person"; }
 const char* tx_vr_cutscenes(int v) { return v ? "First person" : "Classic"; }
@@ -1851,13 +1852,15 @@ Row rows[] = {
     {TAB_DISPLAY, "GPU device", &opts.gpu_device, 0, 8, 1, tx_gpu,
      "Which graphics card the game runs on. Applies after a restart.", hn_gpu, true, true},
     MENU_HEADING(TAB_DISPLAY, "3D Style"),
-    {TAB_DISPLAY, "Mode", &merged.view3d, 0, 6, 1, tx_view3d,
+    {TAB_DISPLAY, "Mode", &merged.view3d, 0, 11, 1, tx_view3d,
      "How the game is shown. Flatscreen: on the screen as usual. VR: in a VR headset through OpenXR (for example WiVRn on "
      "Linux, SteamVR or Meta's runtime on Windows), with the headset connected before the game starts; turning VR on or off "
      "applies after a restart. The rest are 3D on a flat screen without a headset. Red/cyan: glasses with a red and a cyan "
      "lens. Side by side (3D TV): each eye squeezed into its half, for a 3D TV's side by side mode. Crossed eyes: the right "
      "eye's picture on the left, for viewing with crossed eyes. Above and below: each eye in its half, one over the other. "
-     "Side by side (Cardboard): each eye's whole picture in its own half, for a phone in a viewer such as Google Cardboard.",
+     "Side by side (Cardboard): each eye's whole picture in its own half, for a phone in a viewer such as Google Cardboard. "
+     "VR + one of these: the headset as VR, and the desktop window showing the headset's two eyes in that 3D style (for a "
+     "stream or someone watching with glasses).",
      nullptr, true, true},
     {TAB_DISPLAY, "3D Settings", nullptr, 0, 0, 0, nullptr,   // ((Triforce VR) opens the 3D Settings page, the TAB_3DPAGE rows)
      "Flat screen 3D: how strong the 3D is, and where the screen sits in it."},
@@ -2453,9 +2456,6 @@ Row rows[] = {
     {TAB_VRPAGE, "Zoom Speed", &opts.vr_zoom_speed, 1, 50, 1, tx_tenths,
      "Immersive: how fast the right stick's up and down bring you nearer to Link or farther from him. 1.0: as before.",
      nullptr, false, true, -1, false, "vr_zoom_speed"},
-    {TAB_VRPAGE, "Immersive Camera X", &opts.vr_orbit_invert, 0, 1, 1, tx_normal_inverted,
-     "Immersive: how the right stick moves you around Link. Normal: the way you push it, as if on a rail. Inverted: the "
-     "other way, as the game's camera turns on a flat screen.", nullptr, false, true, -1, false, "vr_orbit_invert"},
     MENU_HEADING(TAB_VRPAGE, "Comfort"),
     {TAB_VRPAGE, "Vignette", &opts.vr_vignette, 0, 1, 1, tx_onoff,
      "Full Dive: the edges of the view darken while you move or turn, more the faster (a run, a roll, a knockback), with "
@@ -3215,7 +3215,7 @@ void merged_sync() {
     merged.pacing = mr7::pacing_row(opts.pace, opts.steady_fps);
     merged.latency = mr7::latency_row(latency_vendor(), opts.reflex, opts.antilag);
     merged.vr_mode = !opts.vr_view ? 0 : opts.vr_camera ? 1 : 2;   // (Theater; Immersive: third person; Full Dive: first)
-    merged.view3d = opts.vr ? 1 : opts.flat3d > 0 ? opts.flat3d + 1 : 0;
+    merged.view3d = opts.flat3d * 2 + (opts.vr ? 1 : 0);
 }
 /// ...and a merged row's new value into the saved ones it stands for
 void merged_store(const int* v) {
@@ -3224,7 +3224,7 @@ void merged_store(const int* v) {
     if (v == &merged.pacing) mr7::pacing_set(merged.pacing, opts.pace, opts.steady_fps);
     if (v == &merged.latency) mr7::latency_set(merged.latency, latency_vendor(), opts.reflex, opts.antilag);
     if (v == &merged.vr_mode) opts.vr_view = merged.vr_mode > 0, opts.vr_camera = merged.vr_mode == 1;
-    if (v == &merged.view3d) opts.vr = merged.view3d == 1, opts.flat3d = merged.view3d >= 2 ? merged.view3d - 1 : 0;
+    if (v == &merged.view3d) opts.vr = merged.view3d & 1, opts.flat3d = merged.view3d >> 1;
 }
 /// A merged row's next value from v (dir): its choices here
 int merged_step(const int* value, int v, int dir) {
@@ -3232,8 +3232,8 @@ int merged_step(const int* value, int v, int dir) {
         if (!framegen_count) framegen_row_sync();
         return mr7::step_in(framegen_list, framegen_count, v, dir);
     }
-    int list[8], n = 0;
-    const int hi = value == &merged.vr_mode ? 2 : value == &merged.view3d ? 6 : value == &merged.hdr ? (renodx_built() ? 3 : 2)
+    int list[16], n = 0;
+    const int hi = value == &merged.vr_mode ? 2 : value == &merged.view3d ? 11 : value == &merged.hdr ? (renodx_built() ? 3 : 2)
                  : value == &merged.pacing ? 3 : mr7::latency_hi(latency_vendor());
     for (int k = 0; k <= hi; k++) list[n++] = k;
     return mr7::step_in(list, n, v, dir);
@@ -3422,7 +3422,6 @@ const VrKey vr_keys[] = {
     {"VR_EVENT_UP", &opts.vr_event_up, nullptr},
     {"VR_CUTSCENES", &opts.vr_cutscenes, "classic|first"},
     {"VR_AIM_TILT", &opts.vr_aim_tilt, nullptr},
-    {"VR_ORBIT_INVERT", &opts.vr_orbit_invert, nullptr},
     {"VR_TURN_SPEED", &opts.vr_turn_speed, nullptr},
     {"VR_ZOOM_SPEED", &opts.vr_zoom_speed, nullptr},
     {"VR_TURN", &opts.vr_turn, "smooth|snap"},

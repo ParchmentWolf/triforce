@@ -123,9 +123,21 @@ struct XrEyeCam { bool on = false; float d = 0; uint32_t w = 0, h = 0; int hits 
 void xr_swaps_reset();
 extern int xr_n_swaps;
 int xr_swap_copies(float* p, uint64_t n);
+/// (Scout probe, RX_VK_XR_PROBE=1) the other eye's walk, what it moved: each uniform buffer a program binds (moved: the camera's
+/// own block or a copy of its matrices swapped), the words of one not moved that are close to a scene camera's (not bit for bit,
+/// or transposed) or hold its place; each draw's program and target; once a walk ends, the programs it moved nothing of
+bool xr_probe_on();
+void xr_probe_ubo(uint64_t prog, int stage, uint32_t index, uint64_t addr, uint64_t n, bool moved);
+void xr_probe_draw(uint64_t prog, uint32_t w, uint32_t h);
+void xr_probe_walk_end();
 extern XrEyeCam xr_eye;
 bool xr_draw_mirrored(const NvnState& s);
 bool xr_is_camera(uint64_t addr);
+/// ((Scout, 11-26) right-handed Link) his mirrored center bones' frames as published by the game side (host/vr_body.c
+/// mirror_frames_publish): live while it publishes; an effect's emitter frame (head: the first 48 words of its vertex c14,
+/// three copies of a 4x4 by rows) that is one of them gets the reflection of the game's own frame in to (16 words)
+bool xr_effect_frames_live();
+bool xr_effect_frame_fix(const float* head, float* to);
 struct Texture;
 void xr_eye_shift(float* camera);
 void xr_span_probe(uint32_t op, const uint8_t* a, uint32_t avail, const uint8_t* cb_start, uint64_t rec, NvnState& s);

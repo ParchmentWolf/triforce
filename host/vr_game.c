@@ -410,11 +410,33 @@ static int hand_item(char out[96]) {
         {"SlingShot", "Weapon_Range_SlingShot"}, {"Bow", "Weapon_Range_Bow"}, {"Hookshot", "Item_Hookshot.Item_Hookshot_Body"},
         {"Longshot", "Item_Hookshot.Item_Hookshot_Body"}, {"Boomerang", "Item_Boomerang"}, {"Hammer", "Item_Hammer"},
         {"DekuStick", "Item_DekuStick"}, {"BottleA", "A"}, {"BottleB", "B"}, {"BottleC", "C"}, {"BottleD", "D"},
-        {"BottleE", "E"}, {"Bomb", "Item_Bomb"}, {"Bombchu", "Item_Bombchu"}};
+        {"BottleE", "E"}, {"Bomb", "Item_Bomb"}, {"Bombchu", "Item_Bombchu"},
+        /* ((Triforce VR) the trade items, for the hand that pulled them and the mirror (names as the game's own models)) */
+        {"PocketCucco", "Item_PocketCucco"}, {"Cojiro", "Item_CojiroCucco"}, {"OddMushroom", "Item_OddMushroom"},
+        {"OddPowder", "Item_OddPowder"}, {"OddPotion", "Item_OddPowder"}, {"PoacherSaw", "Item_PoacherSaw"},
+        {"Prescription", "Item_Prescription"}, {"EyeballFrog", "Item_EyeballFrog"}, {"EyeDrop", "Item_EyeDrop"},
+        {"EyeDrops", "Item_EyeDrop"}, {"ClaimCheck", "Item_ClaimCheck"}, {"WeirdEgg", "Item_WeirdEgg"},
+        {"Chicken", "Item_AlarmCucco"}, {"ZeldaLetter", "Item_ZeldaLetter"}, {"MagicBean", "Item_MagicBean"},
+        {"DekuNut", "Item_DekuNut"}};
     const char *now_item = NULL;
     for (size_t i = 0; i < sizeof items / sizeof *items && !now_item; i++)
         if (item == oot_data_hash(items[i].value)) now_item = items[i].model;
+    {   /* ((Triforce VR) research: an item set to the button whose name is not known here, once each) */
+        static uint32_t told[16];
+        static int n_told;
+        int seen = !item || now_item;
+        for (int i = 0; i < n_told && !seen; i++) seen = told[i] == item;
+        if (!seen && n_told < 16) told[n_told++] = item, hos_log("vr: an item not known to the hands: %#x", item);
+    }
     static const char *held;   /* what the last button put in his hand (NULL the sword) */
+    int quest_now = 0;
+    {   /* ((Triforce VR) a trade item (not on the item slot this reads: it shows Empty) seen in his hand: that one held, until gone */
+        int vr_body_held_quest(char out[48]);
+        static char quest[48];
+        char now_q[48];
+        if (vr_body_held_quest(now_q)) snprintf(quest, sizeof quest, "%s", now_q), held = quest, quest_now = 1;
+        else if (held == quest) held = NULL;
+    }
     static uint64_t seen_zr, seen_y;
     if (zr_at != seen_zr) {
         seen_zr = zr_at;
@@ -437,6 +459,10 @@ static int hand_item(char out[96]) {
         if (actor != was) was = actor, held = NULL;
     }
     if (strstr(names, "Hammer") && now_item && !strcmp(now_item, "Item_Hammer")) held = now_item;
+    /* ((Triforce VR) a sword's attack: the sword is in his hand, so nothing else is (an item kept from a press the game took no
+       further, such as the bow at a trigger pressed by accident); not the hammer's, the Deku Stick's or a bottle's swing) */
+    if (held && held[1] && strstr(names, " Cut") && !strstr(names, "Hammer") && !strstr(held, "Hammer") && !strstr(held, "DekuStick"))
+        held = NULL;
     const int aiming = (strstr(names, " BowReLoadUpper ") || strstr(names, " BowChargeUpper ") ||
                         strstr(names, " BowShootUpper ") || strstr(names, " HoldItem") || strstr(names, " Hookshot") ||
                         strstr(names, " FaceBattleBoomerang ")) && now_item;
@@ -445,7 +471,7 @@ static int hand_item(char out[96]) {
     static uint64_t out_at;
     const uint64_t t = now_ns();
     if (aiming || strstr(names, " CommonUpper ") || strstr(names, " WeaponEquipOnUpper ") || strstr(names, "Bottle") ||
-        strstr(names, "Drink") || strstr(names, " Cut") || strstr(names, " DemoShield") || strstr(names, "Hammer"))
+        strstr(names, "Drink") || strstr(names, " Cut") || strstr(names, " DemoShield") || strstr(names, "Hammer") || quest_now)
         out_at = t;
     /* put away: when he puts it away; otherwise what was brought out last stays his (no timer: an item held still shows
        none of those names, and a swing taken as the sword's would swap it for the sword) */
@@ -489,6 +515,7 @@ static void vr_tick(Ctx *c, const MkwVkXr *x) {
         g_item_out = item[0] != 0;
         snprintf(g_held, sizeof g_held, "%s", item);
         if (x->two_handed_sword) x->two_handed_sword(vr_game_two_handed());
+        if (x->airborne) x->airborne((!strncmp(state, "Jump", 4) || !strncmp(state, "Fall", 4)) && !strstr(state, "Land"));
         if (x->game_paused) x->game_paused(oot_paused());   /* (no full-picture fade looked for in its menus: vk_xr.cpp) */   /* (the head tilt's Z-target: vk_xr.cpp) */
         g_held_boomerang = strstr(item, "Boomerang") != NULL;
         g_held_hookshot = strstr(item, "Hookshot") != NULL;
@@ -609,13 +636,46 @@ void vr_pad_read(Ctx *c, uint64_t *buttons, int32_t stick[4]) {
     /* (no session, VR off or no headset: nothing of VR's here, which runs on every pad read the game makes) */
     if (!x || !x->active || !x->active()) return;
     if (!rx_option(1, 0)) x->pad(buttons, stick, stick + 2);   /* the hand controllers, as the pad (the Insert menu's own while it is open) */
+    if (x->combo_want) {   /* ((Triforce VR) the gesture-chosen slash: Link's combo counter (component 107 +0x177c: n-1 plays CutSn next,
+                              5 its finisher) set at each read for up to 200 ms, until that slash begins (the game puts it back to the
+                              start as it takes a press after the combo's time ran out) */
+        static int want = -1;
+        static uint64_t want_until;
+        const int v = x->combo_want();
+        const uint64_t t = now_ns();
+        if (v >= 0) want = v, want_until = t + 200000000ull;
+        if (want >= 0 && t < want_until) {
+            char st[48], target[16];
+            oot_link_state_at(st, 0x244);
+            if (want == 5) snprintf(target, sizeof target, "CutSF");
+            else snprintf(target, sizeof target, "CutS%d", want + 1);
+            if (!strcmp(st, target)) want = -1;
+            else {
+                const uint64_t actor = player(), comps = actor ? rd_ptr(actor + 0x270) : 0;
+                const uint64_t c107 = comps ? rd_ptr(comps + 107 * 8) : 0;
+                if (c107) poke(c107 + 0x177c, &want, 4);
+            }
+        } else want = -1;
+    }
     if (!rx_option(1, 0)) vr_pad(buttons, &stick[0], &stick[1]), vr_turn(&stick[2]);   /* (not while the Insert menu is open) */
-    if (!rx_option(1, 0) && now_ns() - __atomic_load_n(&stick_aim_at, __ATOMIC_ACQUIRE) < 150000000ull)
+    if (!rx_option(1, 0) && now_ns() - __atomic_load_n(&stick_aim_at, __ATOMIC_ACQUIRE) < 150000000ull) {
         stick[2] = stick_aim[0], stick[3] = stick_aim[1];   /* ((Triforce VR) the pointed aim's stick: steer_aim */
+        /* (the game's own camera inversions turned back: the steering pushes the way the pointer is) */
+        int rev_x = 0, rev_y = 0;
+        oot_data_flag(gw(), "OptionData.IsCameraRightLeftReverse", &rev_x), oot_data_flag(gw(), "OptionData.IsCameraUpDownReverse", &rev_y);
+        if (rev_x) stick[2] = stick[2] == INT32_MIN ? INT32_MAX : -stick[2];
+        if (rev_y) stick[3] = stick[3] == INT32_MIN ? INT32_MAX : -stick[3];
+    }
     /* ((Triforce VR) Immersive: the right stick moves the view around Link the way it is pushed, as on a rail (the game's
-       camera turns the other way, which on a flat screen reads right); Invert camera orbit keeps the game's */
+       camera turns the other way, which on a flat screen reads right); the game's own camera inversion setting turns it back */
     const int immersive = !rx_option(1, 0) && !g_aiming && !strcmp(cfg_value("VR_VIEW"), "head") && !strcmp(cfg_value("VR_CAMERA"), "third");
-    if (immersive && !atoi(cfg_value("VR_ORBIT_INVERT"))) stick[2] = stick[2] == INT32_MIN ? INT32_MAX : -stick[2];
+    if (immersive) stick[2] = stick[2] == INT32_MIN ? INT32_MAX : -stick[2];   /* (the game's own Invert camera turns it back) */
+    {   /* ((Triforce VR) Immersive, aiming: the game's own horizontal camera inversion turned back, so the aim goes the way it is pushed */
+        const int imm_aim = !rx_option(1, 0) && g_aiming && !strcmp(cfg_value("VR_VIEW"), "head") && !strcmp(cfg_value("VR_CAMERA"), "third");
+        int reversed = 0;
+        if (imm_aim) oot_data_flag(gw(), "OptionData.IsCameraRightLeftReverse", &reversed);
+        if (imm_aim && reversed) stick[2] = stick[2] == INT32_MIN ? INT32_MAX : -stick[2];
+    }
     if (immersive) {   /* (Turn Speed, tenths: the orbit's push scaled, the stick's range kept) */
         const double v = stick[2] * (cfg_int("VR_TURN_SPEED") / 10.0);
         stick[2] = (int32_t)fmax(-32767.0, fmin(32767.0, v));
@@ -649,6 +709,11 @@ static void turn_link(const double ahead[3]) {
     const double n = sqrt(ahead[0] * ahead[0] + ahead[2] * ahead[2]);
     if (!(n > 1e-4)) return;
     head_s = ahead[0] / n, head_c = ahead[2] / n;
+    {   /* ((Triforce VR) not while he attacks: the game ends a combo when he is turned, and the head's every small turn did) */
+        char st[48];
+        oot_link_state_at(st, 0x244);
+        if (!strncmp(st, "Cut", 3) || !strcmp(st, "ChargeWait") || !strncmp(st, "ChargeAttack", 12)) return;
+    }
     const int straight = now_ns() - run_at < 100000000ull;   /* running straight ahead: that way */
     const float s = (float)(straight ? run_s : head_s), co = (float)(straight ? run_c : head_c);
     if (!face_link(actor, s, co)) return;
@@ -660,6 +725,7 @@ static double wrap_pi(double a) {
     while (a < -M_PI) a += 2 * M_PI;
     return a;
 }
+
 
 /* ((Triforce VR) the aim set where the pointer is, in the gameplay camera's state (x19) while Link aims: the angles it turns
    toward (+0xa384, and again at +0xa38c) and its own (+0x1178), in degrees, the way's height's asin held to the game's -85
@@ -674,7 +740,9 @@ static int set_aim(uint64_t state, const double t[3]) {
     return 1;
 }
 static void steer_aim(const MkwVkXr *x, const double d[3], uint64_t state, const double pos[3]) {
-    const int pointed = d && g_aiming && !strcmp(cfg_value("VR_PLAY"), "motion") && x->head_active();
+    /* ((Triforce VR) not in Immersive (third person): there the right stick aims, as on a gamepad) */
+    const int immersive_view = !strcmp(cfg_value("VR_VIEW"), "head") && !strcmp(cfg_value("VR_CAMERA"), "third");
+    const int pointed = d && g_aiming && !strcmp(cfg_value("VR_PLAY"), "motion") && x->head_active() && !immersive_view;
     x->aim_freeze(pointed);
     double t[3];
     const int pointer = pointed && x->pointer(t);

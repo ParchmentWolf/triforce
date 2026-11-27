@@ -143,6 +143,7 @@ namespace Shader::Optimization {   // ((Triforce) collect_shader_info_pass.cpp: 
 extern std::atomic<uint32_t> g_table_check_unchecked;
 }
 namespace mkwvk {
+std::string memory_buffer_kind(uint64_t vkbuf);
 // (EvilOOT, RX_VK_DRAW_STATS: the pointer table's regions, vk_bank.cpp)
 struct PointerEntry { uint64_t addr, size; };
 const PointerEntry* pointer_table(const NvnState& s, int stage);
@@ -527,10 +528,29 @@ void stats_dump_stage(uint64_t prog, const NvnState& s, int stage) {
     for (int i = 0; i < 16; i++) dump("ubo", i, s.ubo[stage][i]);
     for (int i = 0; i < 16; i++) dump("ssbo", i, s.ssbo[stage][i]);
 }
+// ((Triforce VR, research) the draw statistics' two switches from files beside the run logs when not set: a set RX_VK_ switch
+// is part of the shader caches' key, so setting it started every shader over (~/.app/pc_port/triforce-runs/draw_stats_dir.txt:
+// RX_VK_DRAW_STATS's folder; draw_stats_progs.txt: RX_VK_DRAW_STATS_PROGS's keys; their first line, read once at the start)
+static const char* stats_switch(const char* env, const char* file) {
+    if (const char* e = getenv(env)) return e;
+    const char* home = getenv("HOME");
+    char path[512];
+    snprintf(path, sizeof path, "%s/.app/pc_port/triforce-runs/%s", home ? home : "", file);
+    FILE* f = fopen(path, "r");
+    if (!f) return nullptr;
+    static char lines[2][1024];
+    char* l = lines[strcmp(file, "draw_stats_dir.txt") ? 1 : 0];
+    if (!fgets(l, 1024, f)) l[0] = 0;
+    fclose(f);
+    l[strcspn(l, "\r\n")] = 0;
+    return l[0] ? l : nullptr;
+}
+static const char* stats_dir_switch() { static const char* v = stats_switch("RX_VK_DRAW_STATS", "draw_stats_dir.txt"); return v; }
+static const char* stats_progs_switch() { static const char* v = stats_switch("RX_VK_DRAW_STATS_PROGS", "draw_stats_progs.txt"); return v; }
 bool stats_prog_wanted(uint64_t key) {
     static const std::vector<uint64_t> want = [] {
         std::vector<uint64_t> v;
-        for (const char* q = getenv("RX_VK_DRAW_STATS_PROGS"); q && *q;) {
+        for (const char* q = stats_progs_switch(); q && *q;) {
             char* end;
             const uint64_t k = strtoull(q, &end, 16);
             if (end == q) break;
@@ -5822,6 +5842,7 @@ bool ub_snapshot_wanted() {
 // is changed (the same buffer slot has other numbers in other stages). The field grass, the large simulated turf, is the
 // Simulated turf page's (sim_turf_settings.h), served by the turf lists above. Game's (the default) changes nothing. RX_VK_GRASS_DISTANCE=<n> (1 to 8) over the row for a run
 thread_local uint64_t ub_prog_key = 0;   // (the program whose descriptors build_descriptors is making)
+thread_local uint64_t xr_fix_slot = 0;   // ((Scout, RX_VK_XR_FIX) the program, stage and slot uniform_range copies for the other eye)
 float grass_reach() {
     static const char* const env = getenv("RX_VK_GRASS_DISTANCE");
     static const float forced = env && *env ? std::clamp((float)atof(env), 1.0f, 8.0f) : 0.0f;
@@ -5915,6 +5936,27 @@ VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_
         const uint64_t want = used ? std::max<uint64_t>(used, 16) : std::max<uint64_t>(u.size, 16);
         const uint64_t n = std::min<uint64_t>(std::min<uint64_t>(want, u.size ? std::max<uint64_t>(u.size, 16) : want),
                                               dev.props.limits.maxUniformBufferRange);
+        {   // ((Scout, 11-26) right-handed Link: an effect drawn in the frame of one of his mirrored center bones (the sword's slash
+            // trail, WeaponBlurRenderer, lays its ribbon out in Spine_2's) has the frame of the game's own pose reflected, not the
+            // turn the mirror keeps the bone as (host/vr_body.c mirror_frames_publish; xr_effect_frame_fix). VFX3 puts an
+            // emitter's frame at the vertex stage's c14 (uniform slot 11): a 4x4 by rows (axes, then place) twice, then made
+            // apart a third time (the same to a few units in the last place); all three the reflection here. Either eye)
+            if (index == 3 + 11 && st.nvn_stage == 0 && n >= 0xc0 && n <= 0x10000 && xr_effect_frames_live()) {
+                float head[48], to[16];
+                if (ub_read(u.addr, head, sizeof head) && xr_effect_frame_fix(head, to) && stream_reserve(n, align)) {
+                    static thread_local std::vector<float> ef;
+                    const uint64_t words = n / 4;
+                    ef.resize((size_t)words);
+                    const uint64_t base = ub_read(u.addr, ef.data(), words * 4) ? stream_alloc(n, align) : UINT64_MAX;
+                    if (base != UINT64_MAX) {
+                        for (int copy = 0; copy < 3; copy++) std::memcpy(ef.data() + copy * 16, to, sizeof to);
+                        std::memcpy(cur->mapped + base, ef.data(), words * 4);
+                        if (n > words * 4) std::memset(cur->mapped + base + words * 4, 0, n - words * 4);
+                        return {cur->stream, base, n};
+                    }
+                }
+            }
+        }
         // ((Triforce VR) the other eye's walk: a range holding a scene camera one copy (the overlay's when the stream's updates
         // touch it, else as submitted) with that camera moved to the eye (xr_eye_shift)
         if (xr_eye.on && xr_is_camera(u.addr) && stream_reserve(n, align)) {
@@ -5926,25 +5968,33 @@ VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_
                 xr_eye_shift(cam);
                 std::memcpy(cur->mapped + base, cam, std::min<uint64_t>(n, sizeof cam));
                 xr_eye.hits++;
+                if (xr_probe_on()) xr_probe_ubo(ub_prog_key, st.nvn_stage, index, u.addr, n, true);
                 return {cur->stream, base, n};
             }
         }
         // ((Triforce VR) and any other range holding a copy of a scene camera's matrices (an effect's, a billboard's): a copy with
         // them moved too, when it has one)
         if (xr_eye.on && xr_n_swaps && n <= 0x10000 && stream_reserve(n, align)) {
+            xr_fix_slot = ub_prog_key * 0x9E3779B97F4A7C15ull ^ ((uint64_t)st.nvn_stage << 8) ^ (uint64_t)index;
             static thread_local std::vector<float> scan;
-            scan.resize((size_t)(n / 4));
-            if (memory_read_as_submitted(u.addr, scan.data(), (n / 4) * 4) && xr_swap_copies(scan.data(), (n / 4) * 4)) {
-                uint64_t base = ub_overlay(u.addr, n, cur->mapped, stream_alloc, align);
-                if (base == UINT64_MAX && (base = stream_alloc(n, align)) != UINT64_MAX)
-                    memory_read_as_submitted(u.addr, cur->mapped + base, n);
+            const uint64_t words = n / 4;
+            scan.resize((size_t)words);
+            // ((Scout) the copy made and moved here in the CPU's memory, as the stream sees the range (ub_read: the capture with the
+            // stream's updates over it), and written to the stream once. Moving it in the stream's mapping read that memory back,
+            // which is the GPU's and slow to read (a thousand such copies a walk took the game to 1 frame a second); and a copy
+            // ub_overlay keeps for the recording may be one the first eye's draws read too)
+            if (ub_read(u.addr, scan.data(), words * 4) && xr_swap_copies(scan.data(), words * 4)) {
+                const uint64_t base = stream_alloc(n, align);
                 if (base != UINT64_MAX) {
-                    xr_swap_copies(reinterpret_cast<float*>(cur->mapped + base), (n / 4) * 4);
+                    std::memcpy(cur->mapped + base, scan.data(), words * 4);
+                    if (n > words * 4) std::memset(cur->mapped + base + words * 4, 0, n - words * 4);
                     xr_eye.copies++;
+                    if (xr_probe_on()) xr_probe_ubo(ub_prog_key, st.nvn_stage, index, u.addr, n, true);
                     return {cur->stream, base, n};
                 }
             }
         }
+        if (xr_eye.on && xr_probe_on()) xr_probe_ubo(ub_prog_key, st.nvn_stage, index, u.addr, n, false);
         {   // ((Triforce) the Grass distance row: grass_reach. A copy in the stream, which the per-binding reuse never keeps)
             uint16_t words[2];
             int power[2];
@@ -6390,6 +6440,7 @@ int desc_keep_mode() {
                                                "RX_VK_LOG_MIRROR_USE", "RX_VK_SSBO_STRETCH", "RX_VK_SSBO_WIDE"};
         for (const char* n : off_with)
             if (m && getenv(n)) m = 0, why = n;
+        if (m && stats_dir_switch()) m = 0, why = "draw_stats_dir.txt";   // ((Triforce VR) the draw statistics from its file too
         if (const char* v = getenv("RX_VK_SAMPLER_CACHE"); m && v && atoi(v) == 0) m = 0, why = "RX_VK_SAMPLER_CACHE=0";
         if (const char* v = getenv("RX_VK_LATE_DEFER"); m && v && atoi(v) != 0) m = 0, why = "RX_VK_LATE_DEFER";
         logf("vk: per-binding descriptor reuse %s%s%s", m == 2 ? "on, each kept result checked (RX_VK_DESC_KEEP=check)" : m ? "on" : "off",
@@ -6728,7 +6779,7 @@ void build_descriptors(const NvnState& s, const Program& p, bool keep = false, b
                 {   // (EvilOOT) the wanted programs' storage descriptors in order, once: descriptor n = the IR's "#n"
                     static std::mutex lm;
                     static std::unordered_set<uint64_t> told;
-                    static const bool stats_env = getenv("RX_VK_DRAW_STATS") != nullptr;
+                    static const bool stats_env = stats_dir_switch() != nullptr;
                     if (stats_env && stats_prog_wanted(p.key)) {
                         const size_t n_desc = (size_t)(&d - info.storage_buffers_descriptors.data());
                         std::lock_guard lk(lm);
@@ -9753,6 +9804,7 @@ struct StatsMeta {
     uint8_t dispatch;                 // (a compute dispatch: its grid, or its indirect arguments as above)
     uint32_t grid[3];
     uint64_t args_vkbuf, args_vkoff;  // (the Vulkan buffer and offset the arguments were read from)
+    uint8_t walk2;                    // (Accurate: recorded in the second eye's walk)
 };
 VkQueryPool stats_pool = VK_NULL_HANDLE;
 // (indirect draws: after the draw, the first 16 bytes of its arguments and its count word as the GPU holds them, 32 bytes a
@@ -9844,7 +9896,7 @@ std::atomic<int64_t> stats_frame{-1};   // (the frame measured; -1 none)
 std::atomic<bool> stats_written{false};
 std::mutex stats_mu;
 const char* stats_dir() {
-    static const char* d = getenv("RX_VK_DRAW_STATS");
+    static const char* d = stats_dir_switch();
     return d && *d ? d : nullptr;
 }
 bool stats_frame_now() {
@@ -9940,6 +9992,7 @@ void stats_tick() {
                      : VK_SUCCESS;
     struct Sum {
         uint64_t draws = 0, vs = 0, clip_in = 0, clip_out = 0, fs = 0, cs = 0, task = 0, mesh = 0;
+        uint64_t r_draws = 0, r_mesh = 0, r_fs = 0, r_cs = 0;
         bool is_mesh = false, indirect = false, is_dispatch = false;
         std::string args;   // (indirect: the GPU's argument words and count of its first draws)
     };
@@ -9950,6 +10003,7 @@ void stats_tick() {
         const uint64_t* v = &r[(size_t)i * words];
         x.draws++, x.vs += v[0], x.clip_in += v[1], x.clip_out += v[2], x.fs += v[3], x.cs += v[4];
         if (stats_mesh_bits) x.task += v[5], x.mesh += v[6];
+        if (m.walk2) x.r_draws++, x.r_fs += v[3], x.r_cs += v[4], x.r_mesh += stats_mesh_bits ? v[6] : 0;
         x.is_mesh |= m.mesh != 0, x.indirect |= m.indirect != 0, x.is_dispatch |= m.dispatch != 0;
         if (m.dispatch && x.draws == 1) x.args += " #" + std::to_string(i);   // (its place in the frame's recording)
         if (m.dispatch && !m.indirect && x.args.size() < 200) {
@@ -9987,14 +10041,14 @@ void stats_tick() {
         for (const auto& [prog, x] : rows) {
             const int k = rank(x);
             if (x.is_dispatch) {   // (compute: its dispatches, the threads they ran)
-                fprintf(f, "comp %016llx %6llu | cs threads %12llu | %s%s\n", (unsigned long long)prog, (unsigned long long)x.draws,
-                        (unsigned long long)x.cs, k == 4 ? "NO THREADS" : "", (x.indirect ? " (indirect)" + x.args : x.args).c_str());
+                fprintf(f, "comp %016llx %6llu | cs threads %12llu | [R %llu cs %llu] %s%s\n", (unsigned long long)prog, (unsigned long long)x.draws,
+                        (unsigned long long)x.cs, (unsigned long long)x.r_draws, (unsigned long long)x.r_cs, k == 4 ? "NO THREADS" : "", (x.indirect ? " (indirect)" + x.args : x.args).c_str());
                 continue;
             }
-            fprintf(f, "%s %016llx %6llu | %10llu %8llu %10llu | %10llu %10llu | %11llu | %s%s\n", x.is_mesh ? "mesh" : "draw",
+            fprintf(f, "%s %016llx %6llu | %10llu %8llu %10llu | %10llu %10llu | %11llu | [R %llu mesh %llu fs %llu] %s%s\n", x.is_mesh ? "mesh" : "draw",
                     (unsigned long long)prog, (unsigned long long)x.draws, (unsigned long long)x.vs, (unsigned long long)x.task,
                     (unsigned long long)x.mesh, (unsigned long long)x.clip_in, (unsigned long long)x.clip_out,
-                    (unsigned long long)x.fs, k == 0 ? "RAN, NO PRIMITIVES" : k == 1 ? "primitives, no fragments" : k == 2 ? "no shader work" : "",
+                    (unsigned long long)x.fs, (unsigned long long)x.r_draws, (unsigned long long)x.r_mesh, (unsigned long long)x.r_fs, k == 0 ? "RAN, NO PRIMITIVES" : k == 1 ? "primitives, no fragments" : k == 2 ? "no shader work" : "",
                     x.indirect ? (" (indirect)" + x.args).c_str() : "");
         }
         // who binds each indirect draw's argument words in this frame: written (W) or only read (r), by which programs
@@ -10004,7 +10058,7 @@ void stats_tick() {
             binds = stats_binds;
         }
         // (RX_VK_DRAW_STATS_PROGS=<key>,...: every storage buffer those programs bound in this frame)
-        if (const char* want = getenv("RX_VK_DRAW_STATS_PROGS")) {
+        if (const char* want = stats_progs_switch()) {
             for (const char* q = want; *q;) {
                 char* end;
                 const uint64_t k = strtoull(q, &end, 16);
@@ -10191,6 +10245,14 @@ void stats_tick() {
             }
             if (!ptr_who.empty()) fprintf(f, "     pointed to by:%s\n", ptr_who.c_str());
         }
+        {
+            std::map<uint64_t, int> seen;
+            for (const StatsBind& sb : binds) if (sb.vkbuf) seen[sb.vkbuf]++;
+            for (uint32_t i = 0; i < n; i++) if (stats_meta[i].args_vkbuf) seen[stats_meta[i].args_vkbuf]++;
+            fprintf(f, "\n# Vulkan buffers seen\n");
+            for (const auto& [vb, c] : seen)
+                fprintf(f, "vk %llx (%d): %s\n", (unsigned long long)vb, c, memory_buffer_kind(vb).c_str());
+        }
         fclose(f);
     }
     logf("vk: draw stats: frame %lld, %u draws of %zu programs -> %s", (long long)at, n, rows.size(), path.c_str());
@@ -10219,6 +10281,7 @@ struct StatsQuery {
         if (i >= kStatsQueries) return;
         stats_meta[i] = {prog, (uint8_t)d.mesh, (uint8_t)(d.indirect != 0), (uint8_t)d.indexed, 0, d.count, d.instances, d.max,
                          d.stride, d.count_addr, d.indirect, {}, 0, (uint8_t)dispatch, {}, 0, 0};
+        stats_meta[i].walk2 = xr_eye.on && !xr_eye.prev_only;
         if (grid) std::memcpy(stats_meta[i].grid, grid, sizeof stats_meta[i].grid);
         if (d.indirect) {
             host->gpu_read(d.indirect, stats_meta[i].guest, dispatch ? 12 : 16);
@@ -11292,6 +11355,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         ParLock lk(d.mesh);   // (graphics programs: each thread's picks, program_pick's own lock)
         cp = program_for(s, d.mesh ? ProgramKind::Mesh : ProgramKind::Graphics, types);
     }
+    if (cp && xr_eye.on && xr_probe_on()) xr_probe_draw(cp->key, at.width, at.height);
     if (use.on) use.program(cp, cp && cp->ready.load(std::memory_order_acquire)), use.count_skips(&st_pending_skips);
     {   // (hookshot, a test) RX_VK_NO_MESH=1: task / mesh draws left out, to see what they draw; =2: the others left out
         static const int no_mesh = getenv("RX_VK_NO_MESH") ? atoi(getenv("RX_VK_NO_MESH")) : 0;
@@ -16388,6 +16452,72 @@ bool xr_draw_mirrored(const NvnState& s) {
     }
     return false;
 }
+// ((Scout, 11-26) right-handed Link: his mirrored center bones' frames, each as the GPU will see it and as the reflection of
+// the game's own pose (host/vr_body.c mirror_frames_publish: 24 words a bone, column-major 3x4s), 1024 kept: the renderer
+// runs frames behind the game)
+static std::mutex xr_ef_mu;
+static float xr_ef_pairs[1024][24];
+static float xr_ef_lo[3], xr_ef_hi[3];   // (the box round every kept frame's place: an effect elsewhere is no match at once)
+static int xr_ef_at, xr_ef_n;
+static std::atomic<int64_t> xr_ef_last{0};
+static int64_t xr_ef_now() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+bool xr_effect_frames_live() {
+    const int64_t at = xr_ef_last.load(std::memory_order_relaxed);
+    return at && xr_ef_now() - at < 2000;
+}
+bool xr_effect_frame_fix(const float* h, float* to) {
+    // (an emitter's frame: the axes' w 0 and the place's 1, the second copy the first's, the third the first's to a few units
+    // in the last place: measured, it is made apart from the other two)
+    if (h[3] != 0.0f || h[7] != 0.0f || h[11] != 0.0f || h[15] != 1.0f || std::memcmp(h, h + 16, 64)) return false;
+    for (int i = 0; i < 16; i++)
+        if (fabsf(h[32 + i] - h[i]) > 1e-5f + 1e-6f * fabsf(h[i])) return false;
+    std::lock_guard<std::mutex> g(xr_ef_mu);
+    for (int r = 0; r < 3; r++)
+        if (!xr_ef_n || h[12 + r] < xr_ef_lo[r] - 0.01f || h[12 + r] > xr_ef_hi[r] + 0.01f) return false;
+    for (int i = 0; i < xr_ef_n; i++) {
+        const float* p = xr_ef_pairs[i];
+        bool same = true;
+        for (int k = 3; k >= 0 && same; k--)   // (the place first: most frames are elsewhere)
+            for (int r = 0; r < 3 && same; r++) same = fabsf(h[k * 4 + r] - p[k * 3 + r]) < (k == 3 ? 2e-3f : 1e-3f);
+        if (!same) continue;
+        for (int k = 0; k < 4; k++) {
+            for (int r = 0; r < 3; r++) to[k * 4 + r] = p[12 + k * 3 + r];
+            to[k * 4 + 3] = k == 3 ? 1.0f : 0.0f;
+        }
+        static std::atomic<int> told{0};
+        if (told.fetch_add(1) < 3)
+            logf("vk: xr mirror: an effect in a mirrored center bone's frame (at %.2f %.2f %.2f) drawn in the reflection of the game's own",
+                 h[12], h[13], h[14]);
+        return true;
+    }
+    return false;
+}
+}  // namespace mkwvk
+// ((Scout, 11-26) right-handed: the game side's mirrored center bones' frames (xr_effect_frame_fix); looked up by name
+// (host/rx_backend.c hos_vk_mirror_frames_publish)
+extern "C"
+#ifdef _WIN32
+__declspec(dllexport)
+#else
+__attribute__((visibility("default")))
+#endif
+void hos_vk_mirror_frames_publish(const float* pairs, int n) {
+    using namespace mkwvk;
+    std::lock_guard<std::mutex> g(xr_ef_mu);
+    for (int i = 0; i < n; i++) {
+        memcpy(xr_ef_pairs[xr_ef_at], pairs + i * 24, sizeof xr_ef_pairs[0]);
+        xr_ef_at = (xr_ef_at + 1) % 1024;
+        if (xr_ef_n < 1024) xr_ef_n++;
+    }
+    for (int r = 0; r < 3; r++) xr_ef_lo[r] = 1e30f, xr_ef_hi[r] = -1e30f;
+    for (int i = 0; i < xr_ef_n; i++)
+        for (int r = 0; r < 3; r++)
+            xr_ef_lo[r] = std::min(xr_ef_lo[r], xr_ef_pairs[i][9 + r]), xr_ef_hi[r] = std::max(xr_ef_hi[r], xr_ef_pairs[i][9 + r]);
+    xr_ef_last.store(xr_ef_now(), std::memory_order_relaxed);
+}
+namespace mkwvk {
 /// (Triforce VR) a scene camera block at addr: its target's size the scene's (0x120), its projection's w row (0, 0, -1, 0) at 0xa0
 bool xr_is_camera(uint64_t addr) {
     float c[0x130 / 4];
@@ -16406,7 +16536,7 @@ bool xr_is_camera(uint64_t addr) {
 struct XrSwap { float from[16], to[16]; int n; };
 XrSwap xr_swaps[12];
 int xr_n_swaps = 0;
-void xr_swaps_reset() { xr_n_swaps = 0; }
+void xr_swaps_reset() { xr_n_swaps = 0; extern uint64_t xr_fix_walks; xr_fix_walks++; }
 void xr_swap_note(const float* from, const float* to, int n) {
     for (int i = 0; i < xr_n_swaps; i++)
         if (xr_swaps[i].n == n && !std::memcmp(xr_swaps[i].from, from, n * 4)) return;
@@ -16415,6 +16545,7 @@ void xr_swap_note(const float* from, const float* to, int n) {
     std::memcpy(w.from, from, n * 4), std::memcpy(w.to, to, n * 4), w.n = n;
 }
 /// copies of a scene camera's matrices in the n bytes at p (word aligned) swapped for the other eye's: how many
+int xr_swap_projected(float* p, uint64_t words);
 int xr_swap_copies(float* p, uint64_t n) {
     int done = 0;
     const uint64_t words = n / 4;
@@ -16423,7 +16554,202 @@ int xr_swap_copies(float* p, uint64_t n) {
         for (uint64_t k = 0; k + (uint64_t)w.n <= words; k += 4)   // (matrices sit on 16-byte rows)
             if (p[k] == w.from[0] && !std::memcmp(p + k, w.from, w.n * 4)) std::memcpy(p + k, w.to, w.n * 4), done++;
     }
+    // ((Scout, RX_VK_XR_FIX=1, a test) and what is made from the camera without being a copy of its words: another projection
+    // times its view (an effect system's own view-projection: VFX3's ViewParam), and its place (an effect's eye position)
+    static const bool fix = !getenv("RX_VK_XR_FIX") || atoi(getenv("RX_VK_XR_FIX")) != 0;   // ((Triforce VR) on unless =0)
+    if (fix) done += xr_swap_projected(p, words);
     return done;
+}
+namespace {
+bool xr_close(float a, float b) { return fabsf(a - b) <= 1e-3f * std::max(1.0f, fabsf(b)); }
+bool xr_close_pos(float a, float b) { return fabsf(a - b) <= 1e-4f + 1e-5f * fabsf(b); }   // (a place: millimetres)
+// (a noted view V, 3x4 rows with (0 0 0 1) under them, and its inverse: V's rotation is orthonormal, so R^T and -R^T t)
+void xr_view_inverse(const float* v, float inv[16]) {
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 3; c++) inv[r * 4 + c] = v[c * 4 + r];
+    for (int r = 0; r < 3; r++) inv[r * 4 + 3] = -(inv[r * 4] * v[3] + inv[r * 4 + 1] * v[7] + inv[r * 4 + 2] * v[11]);
+    inv[12] = inv[13] = inv[14] = 0, inv[15] = 1;
+}
+// M (4x4 rows at m) = Q V with Q a perspective projection: Q's bottom row (0 0 -1 0), no x or y shear or offset; Q out
+bool xr_projected_by(const float* m, const float* v, float q[16]) {
+    for (int c = 0; c < 4; c++)   // (M's bottom row is -V's third: the quick test first)
+        if (!xr_close(m[12 + c], -v[8 + c])) return false;
+    float inv[16];
+    xr_view_inverse(v, inv);
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) {
+            float s = 0;
+            for (int k = 0; k < 4; k++) s += m[r * 4 + k] * inv[k * 4 + c];
+            q[r * 4 + c] = s;
+        }
+    const float sx = std::max(fabsf(q[0]), 1e-3f), sy = std::max(fabsf(q[5]), 1e-3f);
+    return fabsf(q[1]) < 1e-3f * sx && fabsf(q[3]) < 1e-3f * sx && fabsf(q[4]) < 1e-3f * sy && fabsf(q[7]) < 1e-3f * sy &&
+           fabsf(q[8]) < 1e-3f && fabsf(q[9]) < 1e-3f && fabsf(q[12]) < 1e-3f && fabsf(q[13]) < 1e-3f &&
+           xr_close(q[14], -1.0f) && fabsf(q[15]) < 1e-3f && fabsf(q[0]) > 1e-2f && fabsf(q[5]) > 1e-2f;
+}
+}  // namespace
+int xr_fix_row(float* p, uint64_t words, uint64_t k, bool patch);
+namespace {
+struct XrFixSlot { std::vector<uint32_t> rows; uint64_t scanned_walk = 0; bool any = false; };
+std::mutex xr_fix_mu;
+std::unordered_map<uint64_t, XrFixSlot> xr_fix_slots;   // (by xr_fix_slot: a program, a stage, a uniform buffer slot)
+}  // namespace
+uint64_t xr_fix_walks = 0;   // (xr_swaps_reset: a walk begins)
+int xr_swap_projected(float* p, uint64_t words) {
+    // (each program's slot scanned once for the rows that hold camera-made data (again every 600 walks while it has none),
+    // then only those rows: a full scan of every range at every binding took the game to 1 frame a second)
+    XrFixSlot* sl;
+    {
+        std::lock_guard<std::mutex> g(xr_fix_mu);
+        sl = &xr_fix_slots[xr_fix_slot];
+        if (!sl->any && (!sl->scanned_walk || xr_fix_walks >= sl->scanned_walk + 600)) {
+            sl->scanned_walk = xr_fix_walks + 1;
+            sl->rows.clear();
+            for (uint64_t k = 0; k + 3 <= words; k += 4)
+                if (xr_fix_row(p, words, k, false)) sl->rows.push_back((uint32_t)k);
+            sl->any = !sl->rows.empty();
+            if (sl->any) {
+                static int told;
+                if (told++ < 60) logf("vk: xr fix: program %016llx slot %llx: %zu rows of camera-made data, first at +%#x",
+                                      (unsigned long long)ub_prog_key, (unsigned long long)xr_fix_slot, sl->rows.size(), sl->rows[0] * 4);
+            }
+        }
+    }
+    int done = 0;
+    for (const uint32_t k : sl->rows)
+        if (k + 3 <= words) done += xr_fix_row(p, words, k, true);
+    return done;
+}
+// (one row k of a range: another projection times a noted view, a transposed copy of a noted matrix, or a noted inverse view's
+// place; patched for the other eye when patch is set. 1 when it is one)
+int xr_fix_row(float* p, uint64_t words, uint64_t k, bool patch) {
+    for (int i = 0; i < xr_n_swaps; i++) {
+        const XrSwap& w = xr_swaps[i];
+        if (w.n == 12 && k + 16 <= words) {
+            float q[16];
+            if (xr_projected_by(p + k, w.from, q)) {
+                if (patch) {
+                    const float* t = w.to;   // (Q times the moved view)
+                    float out[16];
+                    for (int r = 0; r < 4; r++)
+                        for (int c = 0; c < 4; c++)
+                            out[r * 4 + c] = q[r * 4] * t[c] + q[r * 4 + 1] * t[4 + c] + q[r * 4 + 2] * t[8 + c] + (c == 3 ? q[r * 4 + 3] : 0.0f);
+                    std::memcpy(p + k, out, sizeof out);
+                }
+                return 1;
+            }
+        }
+        const int rows = w.n / 4;
+        if (k + 16 <= words) {   // (stored by columns: column c holds row c's words of the noted rows)
+            bool tr = true;
+            for (int r = 0; r < rows && tr; r++)
+                for (int c = 0; c < 4 && tr; c++) tr = xr_close(p[k + c * 4 + r], w.from[r * 4 + c]);
+            if (tr) {
+                if (patch)
+                    for (int r = 0; r < rows; r++)
+                        for (int c = 0; c < 4; c++) p[k + c * 4 + r] = w.to[r * 4 + c];
+                return 1;
+            }
+        }
+        if (w.n == 12 && fabsf(w.from[3]) + fabsf(w.from[7]) + fabsf(w.from[11]) >= 0.5f && xr_close_pos(p[k], w.from[3]) &&
+            xr_close_pos(p[k + 1], w.from[7]) && xr_close_pos(p[k + 2], w.from[11])) {
+            if (patch) p[k] = w.to[3], p[k + 1] = w.to[7], p[k + 2] = w.to[11];
+            return 1;
+        }
+    }
+    return 0;
+}
+// ---- (Scout probe, RX_VK_XR_PROBE=1) what the other eye's walk moves and what it leaves: for the floating glows ----
+namespace {
+struct XrProbeProg { uint32_t draws = 0, ubos = 0, moved = 0, w = 0, h = 0; };
+std::mutex xr_probe_mu;
+std::unordered_map<uint64_t, XrProbeProg> xr_probe_walk;   // (this walk's programs)
+std::set<std::pair<uint64_t, uint64_t>> xr_probe_told;     // (program, stage | slot | offset | kind) already logged
+uint64_t xr_probe_walks = 0;
+bool xr_probe_near(float a, float b) { return fabsf(a - b) <= 1e-3f * std::max(1.0f, fabsf(b)); }
+}  // namespace
+bool xr_probe_on() {
+    static const bool v = getenv("RX_VK_XR_PROBE") && atoi(getenv("RX_VK_XR_PROBE")) != 0;
+    return v;
+}
+void xr_probe_draw(uint64_t prog, uint32_t w, uint32_t h) {
+    std::lock_guard<std::mutex> g(xr_probe_mu);
+    XrProbeProg& p = xr_probe_walk[prog];
+    p.draws++, p.w = w, p.h = h;
+}
+void xr_probe_ubo(uint64_t prog, int stage, uint32_t index, uint64_t addr, uint64_t n, bool moved) {
+    std::lock_guard<std::mutex> g(xr_probe_mu);
+    XrProbeProg& p = xr_probe_walk[prog];
+    p.ubos++;
+    if (moved) { p.moved++; return; }
+    if (xr_probe_told.size() >= 800 || !xr_n_swaps) return;
+    {   // (each program's slot scanned once every 600 walks: the scan is a few tens of thousands of compares)
+        static std::unordered_map<uint64_t, uint64_t> scanned;
+        const uint64_t slot = prog * 0x9E3779B97F4A7C15ull ^ ((uint64_t)stage << 8) ^ (uint64_t)index;
+        auto it = scanned.find(slot);
+        if (it != scanned.end() && xr_probe_walks < it->second + 600) return;
+        scanned[slot] = xr_probe_walks;
+    }
+    static std::vector<float> w;
+    const uint64_t words = std::min<uint64_t>(n, 0x4000) / 4;
+    w.resize((size_t)words);
+    if (!words || !memory_read_as_submitted(addr, w.data(), words * 4)) return;
+    static const char* const kinds[] = {"an exact copy (not swapped)", "a near copy", "a transposed copy", "the camera's place",
+                                        "another projection times the view"};
+    auto tell = [&](uint64_t k, int kind, int swap) {
+        const uint64_t tag = ((uint64_t)(stage & 0xff) << 56) | ((uint64_t)(index & 0xff) << 48) | (k * 4 << 8) | (uint64_t)kind;
+        if (!xr_probe_told.insert({prog, tag}).second) return;
+        logf("vk: xr probe: program %016llx stage %d c%u (%llu bytes) at +%#llx: %s of scene camera matrix %d (%d words: %s), "
+             "not moved for the other eye; words there %g %g %g %g", (unsigned long long)prog, stage, index, (unsigned long long)n,
+             (unsigned long long)(k * 4), kinds[kind], swap, xr_swaps[swap].n,
+             xr_swaps[swap].n == 16 ? "a view-projection" : "a view or its inverse", (double)w[k], (double)w[k + 1],
+             (double)w[k + 2], (double)w[k + 3]);
+    };
+    for (int i = 0; i < xr_n_swaps; i++) {
+        const XrSwap& s = xr_swaps[i];
+        const int rows = s.n / 4;
+        for (uint64_t k = 0; k + 4 <= words; k += 4) {
+            if (k + (uint64_t)s.n <= words) {
+                bool nearby = true, exact = true;
+                for (int q = 0; q < s.n && nearby; q++) exact = exact && w[k + q] == s.from[q], nearby = xr_probe_near(w[k + q], s.from[q]);
+                if (nearby) { tell(k, exact ? 0 : 1, i); continue; }
+            }
+            if (k + 16 <= words) {   // (stored by columns: column c holds row c's words of the noted rows)
+                bool tr = true;
+                for (int r = 0; r < rows && tr; r++)
+                    for (int c = 0; c < 4 && tr; c++) tr = xr_probe_near(w[k + c * 4 + r], s.from[r * 4 + c]);
+                if (tr) { tell(k, 2, i); continue; }
+            }
+            if (s.n == 12 && k + 3 <= words && xr_probe_near(w[k], s.from[3]) && xr_probe_near(w[k + 1], s.from[7]) &&
+                xr_probe_near(w[k + 2], s.from[11]) && fabsf(s.from[3]) + fabsf(s.from[7]) + fabsf(s.from[11]) > 0.5f)
+                tell(k, 3, i);
+            float q[16];
+            if (s.n == 12 && k + 16 <= words && xr_projected_by(w.data() + k, s.from, q)) tell(k, 4, i);
+        }
+    }
+}
+void xr_probe_walk_end() {
+    std::lock_guard<std::mutex> g(xr_probe_mu);
+    const uint64_t walk = ++xr_probe_walks;
+    if (walk == 120 || walk == 600 || walk % 1800 == 0) {
+        std::vector<std::pair<uint64_t, XrProbeProg>> v(xr_probe_walk.begin(), xr_probe_walk.end());
+        std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.draws > b.second.draws; });
+        int moved = 0, still = 0, comp = 0;
+        for (const auto& [k, p] : v) (p.moved ? moved : p.draws ? still : comp)++;
+        logf("vk: xr probe: walk %llu (frame %llu): %zu programs; %d moved something, %d drew with nothing moved, %d dispatched "
+             "with nothing moved", (unsigned long long)walk, (unsigned long long)texture_frame_no(), v.size(), moved, still, comp);
+        int lines = 0;
+        for (const auto& [k, p] : v)
+            if (!p.moved && p.draws && lines++ < 80)
+                logf("vk: xr probe: walk %llu: program %016llx drew %u times into %ux%u, %u uniform buffers, none moved",
+                     (unsigned long long)walk, (unsigned long long)k, p.draws, p.w, p.h, p.ubos);
+        lines = 0;
+        for (const auto& [k, p] : v)
+            if (p.moved && p.draws && lines++ < 80)
+                logf("vk: xr probe: walk %llu: program %016llx drew %u times into %ux%u, %u of %u uniform buffers moved",
+                     (unsigned long long)walk, (unsigned long long)k, p.draws, p.w, p.h, p.moved, p.ubos);
+    }
+    xr_probe_walk.clear();
 }
 void xr_eye_shift(float* c) {
     float before[0x230 / 4];

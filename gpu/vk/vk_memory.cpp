@@ -9624,3 +9624,23 @@ int mkwvk_memory_holders(char* out, size_t n) {
         return 0;
     }
 }
+
+namespace mkwvk {
+// (draw stats) what a Vulkan buffer is: a pool's import or mirror, live or retired
+std::string memory_buffer_kind(uint64_t vkbuf) {
+    std::lock_guard lk(pools_mu);
+    char b[200];
+    auto one = [&](const Pool& p, const char* life) -> bool {
+        const char* k = (uint64_t)(uintptr_t)p.buffer == vkbuf ? "import" : (uint64_t)(uintptr_t)p.mirror == vkbuf ? "mirror" : nullptr;
+        if (!k) return false;
+        snprintf(b, sizeof b, "%s of %s pool %#llx-%#llx mstate %d synced %llu/%llu pieces %d", k, life, (unsigned long long)p.lo,
+                 (unsigned long long)p.hi, (int)p.mstate, (unsigned long long)p.synced_epoch, (unsigned long long)mirror_epoch, p.mpieces ? 1 : 0);
+        return true;
+    };
+    for (auto& [lo, p] : imported)
+        if (one(p, "live")) return b;
+    for (auto& n : retired_pools)
+        if (one(n.mapped(), "retired")) return b;
+    return "unknown";
+}
+}  // namespace mkwvk
