@@ -235,6 +235,29 @@ def patch_sword(source):
     return source, 1
 
 
+STRAFE_HOOKS = (("void f_80819d40(Ctx *__restrict A64_NOESC c) {\n", "hos_oot_strafe_yes"),   # (the strafe test)
+                ("void f_80818f30(Ctx *__restrict A64_NOESC c) {\n", "hos_oot_move_test"),   # (the move test; host/vr_game.c)
+                ("void f_8081b860(Ctx *__restrict A64_NOESC c) {\n", "hos_oot_jump_test_a"),   # (the lock-on jumps)
+                ("void f_8081bbb0(Ctx *__restrict A64_NOESC c) {\n", "hos_oot_jump_test_b"))
+
+
+def patch_strafe(source):
+    """(source, the hooks in it: made here or before)"""
+    sites = 0
+    for head, fn in STRAFE_HOOKS:
+        call = "    if (%s(c)) return;\n" % fn
+        if head + call in source:
+            sites += 1
+            continue
+        if source.count(head) != 1:
+            continue
+        source = source.replace(head, head + call, 1)
+        if "extern int %s(Ctx *c);" % fn not in source:
+            source = source.replace('#include "a64.h"\n', '#include "a64.h"\nextern int %s(Ctx *c);\n' % fn, 1)
+        sites += 1
+    return source, sites
+
+
 def patch_after_anim(source):
     """(source, the sites with the hook: made here or before)"""
     sites = 0
@@ -2200,6 +2223,7 @@ def apply(gen, *, protect_hearts=False, required=False):
     shadow_step_sites = 0   # ((Triforce, 11-21, GAME-05) patch_shadow_step: the one read of a shadow map's side)
     sword_sites = 0   # ((Triforce VR) patch_sword: f_81500720
     shield_sites = 0   # ((Triforce VR) patch_shield: f_81500960
+    strafe_sites = 0   # ((Triforce VR) patch_strafe: f_80819d40, f_80818f30
     world_sites = 0   # ((Triforce VR) patch_world_pass: the mirrored animation's hook, in f_81501400
     anim_sites = 0   # ((Triforce VR) patch_after_anim: the late bone pass's calls with the arms' hook, 5 in the supported build)
     shadow_res_sites = shadow_fit_sites = 0   # ((Triforce) 11-24: patch_shadow_res, patch_shadow_fit: the sun's cascades)
@@ -2319,6 +2343,10 @@ def apply(gen, *, protect_hearts=False, required=False):
             if n:
                 shield_sites += n
                 print("oot_patches: the mirrored shield's hook in %s" % os.path.basename(path))
+            out, n = patch_strafe(out)
+            if n:
+                strafe_sites += n
+                print("oot_patches: %d of the first-person strafe's hooks in %s" % (n, os.path.basename(path)))
             out, n = patch_world_pass(out)
             if n:
                 world_sites += n
@@ -2542,6 +2570,8 @@ def apply(gen, *, protect_hearts=False, required=False):
         print("oot_patches: WARNING: the sword placing's hook was found in %d places, not 1" % sword_sites)
     if protect_hearts and shield_sites != 1:
         print("oot_patches: WARNING: the shield's hook was found in %d places, not 1" % shield_sites)
+    if protect_hearts and strafe_sites != len(STRAFE_HOOKS):
+        print("oot_patches: WARNING: the strafe's hooks were found in %d places, not %d" % (strafe_sites, len(STRAFE_HOOKS)))
     if protect_hearts and world_sites != 1:   # ((Triforce VR) without it right-handed play shows his animations unmirrored)
         print("oot_patches: WARNING: the world pass's hook was found in %d places, not 1" % world_sites)
     if protect_hearts and anim_sites != len(ANIM_ANCHORS):   # ((Triforce VR) without them the arms do not follow the hands)

@@ -285,6 +285,8 @@ static void hide_link(uint64_t actor) {
 /* First person (VR_CAMERA first): the camera at Link's eyes, from his feet, his facing and his age; the offsets VR_EYE_UP,
    _SIDE and _FORWARD (centimetres, -30..30) move it from the place found right in a Quest 3 (below). 0 while there is no Link. */
 static double base_s, base_c;   /* (below: the game's own camera's level way) */
+static double head_s, head_c;   /* (below: the head's view's level way, set by turn_link at head_at) */
+static volatile uint64_t head_at;
 static int first_person_eye(double eye[3]) {
     if (strcmp(cfg_value("VR_CAMERA"), "first")) return 0;
     const uint64_t actor = player();
@@ -292,6 +294,10 @@ static int first_person_eye(double eye[3]) {
     if (!actor || !player_pos(feet) || !player_rot(m)) return 0;
     double fx = m[2], fz = m[8], n = sqrt(fx * fx + fz * fz);   /* his facing: the rotation's third column, level */
     if (!(n > 1e-4)) fx = base_s, fz = base_c, n = 1;   /* ((Triforce VR) his rotation not set yet: the camera's level way */
+    /* ((Triforce VR) the eyes put ahead of him the way the view looks (the head and the right stick's turn), not the way he
+       faces: turned past him (the stick's half turn before he follows, or the game holding his facing) the view pivots over
+       his body instead of looking back into it from in front of his face */
+    if (now_ns() - head_at < 200000000ull) fx = head_s, fz = head_c, n = 1;
     fx /= n, fz /= n;
     /* (the eyes on Link whatever the headset's own place (vk_xr_camera in_place): adult 1.43 m and 16 cm ahead of his feet, young
        Link 0.97 m and 12 cm, both found right in a Quest 3) */
@@ -576,12 +582,13 @@ static void vr_tick(Ctx *c, const MkwVkXr *x) {
     x->in_play(play && !oot_paused());
 }
 
-/* First person play: the left stick runs Link the way it points (forward, back or sideways) from the head's view, with no ZL.
-   turn_link faces him that way. */
+// first person: the left stick outside RUN_CONE strafes through the game's own strafe test (hos_oot_strafe_yes)
+#define RUN_CONE (45.0 * M_PI / 180.0)   // each side of the head's forward
 static double head_s, head_c = 1;   /* the head's view's level direction (sin, cos of its yaw), from the last camera update */
 static double base_s, base_c = 1;   /* the game's own camera's, before the head turned it */
 static double run_s, run_c = 1;     /* the way a run straight ahead takes */
 static uint64_t run_at;             /* when the stick last ran him straight ahead */
+static volatile uint64_t strafe_at; /* when the stick last pointed outside RUN_CONE */
 
 static void vr_pad(uint64_t *buttons, int32_t *lx, int32_t *ly) {
     {   /* the item button's and the sword's presses, for the item in hand (hand_item) */
@@ -594,6 +601,10 @@ static void vr_pad(uint64_t *buttons, int32_t *lx, int32_t *ly) {
     if (now_ns() - fp_at > 200000000ull) return;
     const int64_t m2 = (int64_t)*lx * *lx + (int64_t)*ly * *ly;
     if (m2 < (int64_t)8000 * 8000) return;
+    if (!g_aiming && atan2(fabs((double)*lx), (double)*ly) > RUN_CONE) {
+        strafe_at = now_ns();
+        return;
+    }
     /* the stick's way from the head's forward (head_s, head_c) and right (-head_c, head_s) */
     const double wx = head_s * *ly - head_c * *lx, wz = head_c * *ly + head_s * *lx;
     const double n = sqrt(wx * wx + wz * wz);
@@ -714,6 +725,35 @@ void vr_pad_read(Ctx *c, uint64_t *buttons, int32_t stick[4]) {
         vr_tick(c, x);
 }
 
+// main+0x7f9d40 (nx2/oot_patches.py patch_strafe): the strafe test, x0 the actor, answers 1 to move as a strafe
+int hos_oot_strafe_yes(Ctx *c) {
+    if (now_ns() - strafe_at > 100000000ull || !c->x[0] || c->x[0] != player()) return 0;
+    c->x[0] = 1;
+    return 1;
+}
+
+// while strafing, the game test at fn sees ZL (bit 2 of [comp107+0x50]) held for its own call
+static int test_with_zl(Ctx *c, uint64_t fn) {
+    static __thread int inside;
+    if (inside || now_ns() - strafe_at > 100000000ull || !c->x[0] || c->x[0] != player()) return 0;
+    const uint64_t comps = rd_ptr(c->x[0] + 0x270), state = comps ? rd_ptr(comps + 107 * 8) : 0;
+    const uint64_t flag = state ? rd_ptr(state + 0x50) : 0;
+    const A64Fn test = a64_lookup(fn);
+    uint8_t b = 0;
+    if (!flag || !test || !rd(flag, &b, 1) || b & 4) return 0;
+    const uint8_t held = b | 4;
+    if (!poke(flag, &held, 1)) return 0;
+    inside = 1;
+    test(c);
+    inside = 0;
+    if (rd(flag, &b, 1) && b & 4) b &= ~4, poke(flag, &b, 1);
+    return 1;
+}
+// patch_strafe: main+0x7f8f30 the move test; main+0x7fb860 and main+0x7fbbb0 the lock-on jumps (the side hop)
+int hos_oot_move_test(Ctx *c) { return test_with_zl(c, 0x80818f30ULL); }
+int hos_oot_jump_test_a(Ctx *c) { return test_with_zl(c, 0x8081b860ULL); }
+int hos_oot_jump_test_b(Ctx *c) { return test_with_zl(c, 0x8081bbb0ULL); }
+
 /* his facing as the game keeps it, from which his rotation, his physics and the rest are made each frame: the object
    component 0 points at (+0x60), its 3x4 matrix by rows at +0x1f8 (the position in each row's fourth float); s, co the
    sine and cosine of the way he faces. 0 when he is not upright now */
@@ -732,7 +772,11 @@ static void turn_link(const double ahead[3]) {
     if (!actor || strcmp(cfg_value("VR_CAMERA"), "first")) return;
     const double n = sqrt(ahead[0] * ahead[0] + ahead[2] * ahead[2]);
     if (!(n > 1e-4)) return;
-    head_s = ahead[0] / n, head_c = ahead[2] / n;
+    head_s = ahead[0] / n, head_c = ahead[2] / n, head_at = now_ns();
+    if (now_ns() - strafe_at < 100000000ull) {   /* strafing: the game holds his facing */
+        fp_at = now_ns();
+        return;
+    }
     {   /* ((Triforce VR) not while he attacks: the game ends a combo when he is turned, and the head's every small turn did) */
         char st[48];
         oot_link_state_at(st, 0x244);
