@@ -31,6 +31,8 @@
 #include <cstring>
 #include <mutex>
 #include <cctype>
+#include <filesystem>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -51,6 +53,8 @@
 #include "shaders/xr_desat_comp_spv.h"
 #include "shaders/xr_flat3d_conv_comp_spv.h"
 #include "shaders/xr_hud_comp_spv.h"
+#include "shaders/xr_room_frag_spv.h"
+#include "shaders/xr_room_vert_spv.h"
 #include "vk_work.h"
 
 // the picture's place in a window of dw x dh, as the present puts a cw x ch picture there (vk_replay.cpp present_rect)
@@ -71,7 +75,7 @@ namespace {
     X(xrLocateViews) X(xrLocateSpace) X(xrStringToPath) X(xrPathToString) X(xrCreateActionSet) X(xrCreateAction)   \
     X(xrSuggestInteractionProfileBindings) X(xrAttachSessionActionSets) X(xrSyncActions) X(xrGetActionStateBoolean)  \
     X(xrGetActionStateFloat) X(xrGetActionStateVector2f) X(xrCreateActionSpace) X(xrGetCurrentInteractionProfile)    \
-    X(xrApplyHapticFeedback) X(xrStopHapticFeedback)
+    X(xrApplyHapticFeedback) X(xrStopHapticFeedback) X(xrEnumerateViewConfigurationViews)
 
 // Tangents of a lens's four edges (left and down negative), as OpenXR's angles are
 struct Lens {
@@ -2856,6 +2860,475 @@ struct Controls {
     }
 };
 
+// vr-room-surround.bin (notes/vr-room/scripts/room_build.py): Link's house around the flat screen, drawn on the session's thread
+namespace {
+struct Surround {
+    struct Tex {
+        uint32_t w = 0, h = 0;
+        bool bc7 = false;            // ((local) BC7 blocks, 16 bytes a 4x4 block: the file's width with its top bit set)
+        std::vector<uint8_t> rgba;   // (RGBA8, or the BC7 blocks)
+    };
+    struct Part {
+        uint32_t tex = 0, first = 0, count = 0;
+    };
+    std::atomic<int> state{0};   // 1 reading, 2 read, 3 no file
+    std::vector<Tex> texs;
+    std::vector<Part> parts;
+    std::vector<float> verts;   // 8 floats a vertex: metres from the floor's middle (the screen toward -z), normal, uv
+    // the screen's place in the room, from the file's end ("VRA1", then its middle x y z, the way it faces as an angle
+    // round y from +z, its width; metres in the vertices' frame: notes/vr-room/scripts/room_anchor.py): the room is
+    // turned and scaled round the screen so that place is always behind it, whatever the screen's size
+    bool anchored = false;
+    float anchor[3] = {0, 0, 0}, anchor_turn = 0, anchor_w = 1;
+    bool up = false, failed = false;
+    VkBuffer vb = VK_NULL_HANDLE;
+    std::vector<VkImageView> views;
+    VkSampler sampler = VK_NULL_HANDLE;
+    VkDescriptorSetLayout set = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    std::vector<std::pair<VkBuffer, VkDeviceMemory>> staging;
+} sur;
+enum { SUR_VF = 8 };
+
+void surround_read() {
+    FILE *f = std::fopen("vr-room-surround.bin", "rb");
+    if (!f) {
+        sur.state = 3;
+        return;
+    }
+    char magic[4];
+    uint32_t nt = 0, np = 0;
+    bool ok = std::fread(magic, 1, 4, f) == 4 && !std::memcmp(magic, "VRC1", 4) && std::fread(&nt, 4, 1, f) == 1 &&
+              std::fread(&np, 4, 1, f) == 1 && nt < 4096 && np < 65536;
+    for (uint32_t i = 0; ok && i < nt; i++) {
+        Surround::Tex t;
+        ok = std::fread(&t.w, 4, 1, f) == 1 && std::fread(&t.h, 4, 1, f) == 1;
+        // ((local) a width with its top bit set: BC7 blocks follow, a quarter of RGBA8's size (notes/vr-room/scripts/room_bc7.py))
+        t.bc7 = ok && (t.w & 0x80000000u) != 0;
+        t.w &= 0x7fffffffu;
+        ok = ok && t.w && t.h && t.w <= 8192 && t.h <= 8192;
+        if (!ok) break;
+        t.rgba.resize(t.bc7 ? (size_t)((t.w + 3) / 4) * ((t.h + 3) / 4) * 16 : (size_t)t.w * t.h * 4);
+        ok = std::fread(t.rgba.data(), 1, t.rgba.size(), f) == t.rgba.size();
+        sur.texs.push_back(std::move(t));
+    }
+    for (uint32_t i = 0; ok && i < np; i++) {
+        Surround::Part p;
+        ok = std::fread(&p.tex, 4, 1, f) == 1 && std::fread(&p.count, 4, 1, f) == 1 && p.tex < nt && p.count < (1u << 24);
+        if (!ok) break;
+        p.first = (uint32_t)(sur.verts.size() / SUR_VF);
+        const size_t n = (size_t)p.count * 3 * SUR_VF;
+        sur.verts.resize(sur.verts.size() + n);
+        ok = std::fread(sur.verts.data() + sur.verts.size() - n, sizeof(float), n, f) == n;
+        p.count *= 3;
+        sur.parts.push_back(p);
+    }
+    if (ok) {
+        char am[4];
+        float a[5];
+        if (std::fread(am, 1, 4, f) == 4 && !std::memcmp(am, "VRA1", 4) && std::fread(a, sizeof(float), 5, f) == 5 &&
+            std::isfinite(a[0]) && std::isfinite(a[1]) && std::isfinite(a[2]) && std::isfinite(a[3]) && a[4] > 0.05f && a[4] < 50.0f) {
+            sur.anchored = true;
+            sur.anchor[0] = a[0], sur.anchor[1] = a[1], sur.anchor[2] = a[2], sur.anchor_turn = a[3], sur.anchor_w = a[4];
+            rt_log("vr: room: the screen's place in it %.2f %.2f %.2f, facing %.0f degrees, %.2f m wide", a[0], a[1], a[2],
+                   a[3] * 57.29578f, a[4]);
+        }
+    }
+    std::fclose(f);
+    rt_log("vr: room: vr-room-surround.bin %s: %u textures, %u parts, %zu triangles", ok ? "read" : "NOT read", nt, np,
+           sur.verts.size() / SUR_VF / 3);
+    sur.state = ok && !sur.parts.empty() ? 2 : 3;
+}
+
+bool sur_staged(VkDeviceSize n, const void *data, VkBuffer &buf) {
+    Xr &x = xr();
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = n, bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    if (vkCreateBuffer(x.device, &bi, nullptr, &buf) != VK_SUCCESS) return false;
+    VkMemoryRequirements mr;
+    vkGetBufferMemoryRequirements(x.device, buf, &mr);
+    VkPhysicalDeviceMemoryProperties mem;
+    vkGetPhysicalDeviceMemoryProperties(x.phys, &mem);
+    const VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    uint32_t type = UINT32_MAX;
+    for (uint32_t i = 0; i < mem.memoryTypeCount && type == UINT32_MAX; i++)
+        if ((mr.memoryTypeBits & (1u << i)) && (mem.memoryTypes[i].propertyFlags & host) == host) type = i;
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = mr.size, ai.memoryTypeIndex = type;
+    VkDeviceMemory dm = VK_NULL_HANDLE;
+    void *map = nullptr;
+    if (type == UINT32_MAX || vkAllocateMemory(x.device, &ai, nullptr, &dm) != VK_SUCCESS ||
+        vkBindBufferMemory(x.device, buf, dm, 0) != VK_SUCCESS || vkMapMemory(x.device, dm, 0, n, 0, &map) != VK_SUCCESS)
+        return false;
+    std::memcpy(map, data, (size_t)n);
+    sur.staging.push_back({buf, dm});
+    return true;
+}
+
+bool sur_image(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect,
+               VkSampleCountFlagBits samples, VkImage &image, VkImageView &view) {
+    Xr &x = xr();
+    VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ci.imageType = VK_IMAGE_TYPE_2D, ci.format = format, ci.extent = {w, h, 1};
+    ci.mipLevels = ci.arrayLayers = 1, ci.samples = samples, ci.tiling = VK_IMAGE_TILING_OPTIMAL, ci.usage = usage;
+    if (vkCreateImage(x.device, &ci, nullptr, &image) != VK_SUCCESS) return false;
+    VkMemoryRequirements mr;
+    vkGetImageMemoryRequirements(x.device, image, &mr);
+    VkPhysicalDeviceMemoryProperties mem;
+    vkGetPhysicalDeviceMemoryProperties(x.phys, &mem);
+    uint32_t type = UINT32_MAX;
+    for (uint32_t i = 0; i < mem.memoryTypeCount && type == UINT32_MAX; i++)
+        if ((mr.memoryTypeBits & (1u << i)) && (mem.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) type = i;
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = mr.size, ai.memoryTypeIndex = type;
+    VkDeviceMemory dm = VK_NULL_HANDLE;
+    if (type == UINT32_MAX || vkAllocateMemory(x.device, &ai, nullptr, &dm) != VK_SUCCESS ||
+        vkBindImageMemory(x.device, image, dm, 0) != VK_SUCCESS)
+        return false;
+    VkImageViewCreateInfo vc{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vc.image = image, vc.viewType = VK_IMAGE_VIEW_TYPE_2D, vc.format = format, vc.subresourceRange = {aspect, 0, 1, 0, 1};
+    return vkCreateImageView(x.device, &vc, nullptr, &view) == VK_SUCCESS;
+}
+
+bool sur_pipeline(VkFormat color) {
+    Xr &x = xr();
+    if (!x.push_set) x.push_set = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(x.device, "vkCmdPushDescriptorSetKHR");
+    if (!x.push_set) return false;
+    VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    si.magFilter = si.minFilter = VK_FILTER_LINEAR, si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if (vkCreateSampler(x.device, &si, nullptr, &sur.sampler) != VK_SUCCESS) return false;
+    const VkDescriptorSetLayoutBinding b{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, li.bindingCount = 1, li.pBindings = &b;
+    if (vkCreateDescriptorSetLayout(x.device, &li, nullptr, &sur.set) != VK_SUCCESS) return false;
+    const VkPushConstantRange pr{VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(float) * 16};
+    VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pi.setLayoutCount = 1, pi.pSetLayouts = &sur.set, pi.pushConstantRangeCount = 1, pi.pPushConstantRanges = &pr;
+    if (vkCreatePipelineLayout(x.device, &pi, nullptr, &sur.layout) != VK_SUCCESS) return false;
+    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
+    mi.codeSize = sizeof XR_ROOM_VERT_SPV, mi.pCode = XR_ROOM_VERT_SPV;
+    if (vkCreateShaderModule(x.device, &mi, nullptr, &vs) != VK_SUCCESS) return false;
+    mi.codeSize = sizeof XR_ROOM_FRAG_SPV, mi.pCode = XR_ROOM_FRAG_SPV;
+    if (vkCreateShaderModule(x.device, &mi, nullptr, &fs) != VK_SUCCESS) return false;
+    VkPipelineShaderStageCreateInfo st[2]{};
+    st[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vs, "main", nullptr};
+    st[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fs, "main", nullptr};
+    const VkVertexInputBindingDescription vb{0, sizeof(float) * SUR_VF, VK_VERTEX_INPUT_RATE_VERTEX};
+    const VkVertexInputAttributeDescription va[2] = {{0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0}, {1, 0, VK_FORMAT_R32G32_SFLOAT, 24}};
+    VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    vi.vertexBindingDescriptionCount = 1, vi.pVertexBindingDescriptions = &vb;
+    vi.vertexAttributeDescriptionCount = 2, vi.pVertexAttributeDescriptions = va;
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL, rs.cullMode = VK_CULL_MODE_NONE, rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_4_BIT;
+    VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    ds.depthTestEnable = ds.depthWriteEnable = VK_TRUE, ds.depthCompareOp = VK_COMPARE_OP_GREATER;   // reversed
+    VkPipelineColorBlendAttachmentState cba{};
+    cba.colorWriteMask = 0xf;
+    VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cbs.attachmentCount = 1, cbs.pAttachments = &cba;
+    const VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dy.dynamicStateCount = 2, dy.pDynamicStates = dyn;
+    VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    ri.colorAttachmentCount = 1, ri.pColorAttachmentFormats = &color, ri.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
+    VkGraphicsPipelineCreateInfo gi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gi.pNext = &ri, gi.stageCount = 2, gi.pStages = st, gi.pVertexInputState = &vi, gi.pInputAssemblyState = &ia;
+    gi.pViewportState = &vp, gi.pRasterizationState = &rs, gi.pMultisampleState = &ms, gi.pDepthStencilState = &ds;
+    gi.pColorBlendState = &cbs, gi.pDynamicState = &dy, gi.layout = sur.layout;
+    const VkResult res = vkCreateGraphicsPipelines(x.device, VK_NULL_HANDLE, 1, &gi, nullptr, &sur.pipe);
+    vkDestroyShaderModule(x.device, vs, nullptr), vkDestroyShaderModule(x.device, fs, nullptr);
+    return res == VK_SUCCESS;
+}
+
+// (the session's command buffer, begun) the vertices and textures onto the card; the staging freed after the submit
+bool sur_upload(VkCommandBuffer cb, VkFormat color) {
+    Xr &x = xr();
+    if (!sur_pipeline(color)) return rt_log("vr: room: the pipeline could not be made"), false;
+    const VkDeviceSize vn = sizeof(float) * sur.verts.size();
+    VkBuffer src = VK_NULL_HANDLE;
+    if (!sur_staged(vn, sur.verts.data(), src) ||
+        !make_buffer(vn, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, sur.vb))
+        return rt_log("vr: room: the vertex buffer could not be made"), false;
+    const VkBufferCopy bc{0, 0, vn};
+    (vkCmdCopyBuffer)(cb, src, sur.vb, 1, &bc);
+    for (const Surround::Tex &t : sur.texs) {
+        VkImage img = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;
+        if (!sur_staged(t.rgba.size(), t.rgba.data(), src) ||
+            !sur_image(t.w, t.h, t.bc7 ? VK_FORMAT_BC7_SRGB_BLOCK : VK_FORMAT_R8G8B8A8_SRGB,
+                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                       VK_IMAGE_ASPECT_COLOR_BIT, VK_SAMPLE_COUNT_1_BIT, img, view))
+            return rt_log("vr: room: a texture %ux%u could not be made", t.w, t.h), false;
+        barrier_direct(cb, img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkBufferImageCopy c{};
+        c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        c.imageExtent = {t.w, t.h, 1};
+        (vkCmdCopyBufferToImage)(cb, src, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+        barrier_direct(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        sur.views.push_back(view);
+    }
+    (void)x;
+    return true;
+}
+
+void sur_free_staging() {
+    Xr &x = xr();
+    for (auto &s : sur.staging) vkDestroyBuffer(x.device, s.first, nullptr), vkFreeMemory(x.device, s.second, nullptr);
+    sur.staging.clear();
+    sur.verts.clear(), sur.verts.shrink_to_fit();
+    for (Surround::Tex &t : sur.texs) t.rgba.clear(), t.rgba.shrink_to_fit();
+}
+
+// column-major 4x4: a * b
+void mat_mul(const float a[16], const float b[16], float out[16]) {
+    for (int c = 0; c < 4; c++)
+        for (int r = 0; r < 4; r++) {
+            float s = 0;
+            for (int k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k];
+            out[c * 4 + r] = s;
+        }
+}
+
+// both eyes side by side (2w x h): msaa resolved into target; model: the room's vertices to LOCAL
+void sur_draw(VkCommandBuffer cb, VkImageView msaa, VkImageView target, VkImageView depth, uint32_t w, uint32_t h,
+              const XrView views[2], const float model[16]) {
+    Xr &x = xr();
+    VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    ca.imageView = msaa, ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    ca.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT, ca.resolveImageView = target;
+    ca.resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    ca.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, ca.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    ca.clearValue.color = {{0.004f, 0.003f, 0.002f, 1.0f}};
+    VkRenderingAttachmentInfo da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    da.imageView = depth, da.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, da.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    da.clearValue.depthStencil = {0.0f, 0};
+    VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    ri.renderArea = {{0, 0}, {2 * w, h}}, ri.layerCount = 1;
+    ri.colorAttachmentCount = 1, ri.pColorAttachments = &ca, ri.pDepthAttachment = &da;
+    (vkCmdBeginRendering)(cb, &ri);
+    (vkCmdBindPipeline)(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, sur.pipe);
+    const VkDeviceSize zero = 0;
+    vkCmdBindVertexBuffers(cb, 0, 1, &sur.vb, &zero);
+    for (int e = 0; e < 2; e++) {
+        const VkViewport vp{(float)(e * w), 0, (float)w, (float)h, 0, 1};
+        const VkRect2D sc{{(int32_t)(e * w), 0}, {w, h}};
+        (vkCmdSetViewport)(cb, 0, 1, &vp), (vkCmdSetScissor)(cb, 0, 1, &sc);
+        const float tl = std::tan(views[e].fov.angleLeft), tr = std::tan(views[e].fov.angleRight);
+        const float tu = std::tan(views[e].fov.angleUp), td = std::tan(views[e].fov.angleDown), near_z = 0.02f;
+        float proj[16] = {};
+        proj[0] = 2.0f / (tr - tl), proj[8] = (tr + tl) / (tr - tl);
+        proj[5] = -2.0f / (tu - td), proj[9] = -(tu + td) / (tu - td);
+        proj[11] = -1.0f, proj[14] = near_z;
+        const float q[4] = {views[e].pose.orientation.x, views[e].pose.orientation.y, views[e].pose.orientation.z,
+                            views[e].pose.orientation.w};
+        const float p[3] = {views[e].pose.position.x, views[e].pose.position.y, views[e].pose.position.z};
+        static const float axis[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+        float rc[3][3];
+        for (int i = 0; i < 3; i++) rotate(q, axis[i], rc[i]);   // the eye's axes in LOCAL
+        float view[16] = {};
+        for (int i = 0; i < 3; i++) {
+            for (int c = 0; c < 3; c++) view[c * 4 + i] = rc[i][c];
+            view[12 + i] = -(rc[i][0] * p[0] + rc[i][1] * p[1] + rc[i][2] * p[2]);
+        }
+        view[15] = 1;
+        float vm[16], clip[16];
+        mat_mul(view, model, vm), mat_mul(proj, vm, clip);
+        (vkCmdPushConstants)(cb, sur.layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof clip, clip);
+        for (const Surround::Part &pt : sur.parts) {
+            const VkDescriptorImageInfo ii{sur.sampler, sur.views[pt.tex], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            VkWriteDescriptorSet wr{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            wr.dstBinding = 0, wr.descriptorCount = 1, wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            wr.pImageInfo = &ii;
+            x.push_set(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, sur.layout, 0, 1, &wr);
+            (vkCmdDraw)(cb, pt.count, 1, pt.first, 0);
+        }
+    }
+    (vkCmdEndRendering)(cb);
+}
+
+// room-snap.go in the game's folder: the room drawn even when the runtime says not to draw (no one wearing the headset)
+bool sur_snap_wanted() {
+    static unsigned polled;
+    static bool wanted;
+    if (++polled % 90 == 0) {
+        FILE *t = std::fopen("room-snap.go", "rb");
+        wanted = t != nullptr;
+        if (t) std::fclose(t);
+    }
+    return wanted;
+}
+
+// (the session's thread) the room into its own swapchain for this frame: false when there is none to show
+bool sur_frame(XrSession session, XrSpace space, XrSpace stage, XrTime at, VkFormat format, VkCommandPool pool, VkCommandBuffer cb,
+               VkFence fence, const XrView views[2], XrSwapchain &chain, std::vector<XrSwapchainImageVulkanKHR> &images,
+               std::vector<VkImageView> &targets, VkImage &msaa, VkImageView &msaa_view, VkImage &depth, VkImageView &depth_view,
+               uint32_t &w, uint32_t &h, XrCompositionLayerProjectionView pv[2], XrCompositionLayerProjection &layer) {
+    Xr &x = xr();
+    if (sur.state.load() != 2 || sur.failed) return false;
+    const auto submit = [&]() {
+        (vkEndCommandBuffer)(cb);
+        VkCommandBufferSubmitInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+        cbi.commandBuffer = cb;
+        VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+        si.commandBufferInfoCount = 1, si.pCommandBufferInfos = &cbi;
+        (vkQueueSubmit2)(x.queue, 1, &si, fence);
+        (vkWaitForFences)(x.device, 1, &fence, VK_TRUE, UINT64_MAX);
+        (vkResetFences)(x.device, 1, &fence);
+    };
+    const auto begin = [&]() {
+        (vkResetCommandPool)(x.device, pool, 0);
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        (vkBeginCommandBuffer)(cb, &bi);
+    };
+    if (!sur.up) {
+        sur.failed = true;
+        XrViewConfigurationView vcv[2] = {{XR_TYPE_VIEW_CONFIGURATION_VIEW}, {XR_TYPE_VIEW_CONFIGURATION_VIEW}};
+        uint32_t vn = 0;
+        if (XR_FAILED(x.xrEnumerateViewConfigurationViews(x.instance, x.system, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 2, &vn,
+                                                          vcv)) || vn != 2)
+            return rt_log("vr: room: the eyes' sizes are not known"), false;
+        w = std::min(vcv[0].recommendedImageRectWidth, 2048u), h = std::min(vcv[0].recommendedImageRectHeight, 2048u);
+        XrSwapchainCreateInfo sw{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+        sw.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+        sw.format = format, sw.sampleCount = 1, sw.width = 2 * w, sw.height = h;
+        sw.faceCount = sw.arraySize = sw.mipCount = 1;
+        uint32_t n = 0;
+        if (XR_FAILED(x.xrCreateSwapchain(session, &sw, &chain)) || XR_FAILED(x.xrEnumerateSwapchainImages(chain, 0, &n, nullptr)))
+            return rt_log("vr: room: no swapchain for it"), false;
+        images.assign(n, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+        x.xrEnumerateSwapchainImages(chain, n, &n, (XrSwapchainImageBaseHeader *)images.data());
+        bool ok = sur_image(2 * w, h, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT,
+                            VK_SAMPLE_COUNT_4_BIT, depth, depth_view) &&
+                  sur_image(2 * w, h, format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_IMAGE_ASPECT_COLOR_BIT, VK_SAMPLE_COUNT_4_BIT,
+                            msaa, msaa_view);
+        for (auto &img : images) {
+            VkImageViewCreateInfo vc{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vc.image = img.image, vc.viewType = VK_IMAGE_VIEW_TYPE_2D, vc.format = format;
+            vc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            VkImageView v = VK_NULL_HANDLE;
+            ok = ok && vkCreateImageView(x.device, &vc, nullptr, &v) == VK_SUCCESS;
+            targets.push_back(v);
+        }
+        if (!ok) return rt_log("vr: room: its images could not be made"), false;
+        begin();
+        ok = sur_upload(cb, format);
+        submit();
+        sur_free_staging();
+        rt_log("vr: room: %s, %ux%u for each eye", ok ? "on the card" : "could not be put on the card", w, h);
+        if (!ok) return false;
+        sur.up = true, sur.failed = false;
+    }
+    uint32_t index = 0;
+    XrSwapchainImageAcquireInfo acq{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wait.timeout = XR_INFINITE_DURATION;
+    if (XR_FAILED(x.xrAcquireSwapchainImage(chain, &acq, &index)) || XR_FAILED(x.xrWaitSwapchainImage(chain, &wait))) return false;
+    float floor_y = -1.6f;
+    XrSpaceLocation fl{XR_TYPE_SPACE_LOCATION};
+    if (stage && XR_SUCCEEDED(x.xrLocateSpace(stage, space, at, &fl)) && (fl.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT))
+        floor_y = fl.pose.position.y;
+    begin();
+    barrier_direct(cb, msaa, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    {
+        const VkImageMemoryBarrier2 b = layout_change(depth, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                                                      VK_IMAGE_ASPECT_DEPTH_BIT);
+        VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        d.imageMemoryBarrierCount = 1, d.pImageMemoryBarriers = &b;
+        (vkCmdPipelineBarrier2)(cb, &d);
+    }
+    // (the room's vertices to LOCAL: on the floor; anchored, turned and scaled so its screen place is the screen's)
+    float model[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, floor_y, 0, 1};
+    if (sur.anchored) {
+        const float wide = 3.14159265f / 180.0f * (float)cfg_int("VR_SCREEN_SIZE");
+        const bool curved = x.cylinder && cfg_bool("VR_SCREEN_CURVE");
+        const float screen_w = curved ? wide * x.screen_distance : 2.0f * x.screen_distance * std::tan(0.5f * std::fmin(wide, 2.6f));
+        const float k = screen_w / sur.anchor_w;
+        const float c = std::cos(-sur.anchor_turn), s = std::sin(-sur.anchor_turn);   // (its facing turned to +z, at the eyes)
+        // p' = S + k R (p - A), R = [c 0 s; 0 1 0; -s 0 c], S = the screen's middle (0, 0, -distance)
+        const float R[3][3] = {{c, 0, s}, {0, 1, 0}, {-s, 0, c}};
+        const float S[3] = {0, 0, -x.screen_distance};
+        for (int r = 0; r < 3; r++) {
+            float t = S[r];
+            for (int col = 0; col < 3; col++) model[col * 4 + r] = k * R[r][col], t -= k * R[r][col] * sur.anchor[col];
+            model[12 + r] = t;
+        }
+        model[3] = model[7] = model[11] = 0, model[15] = 1;
+    }
+    sur_draw(cb, msaa_view, targets[index], depth_view, w, h, views, model);
+    // room-snap.go in the game's folder: this picture of both eyes to room-snap.bin ("RSN1", width, height, VkFormat, pixels)
+    static unsigned polled;
+    static VkBuffer snap = VK_NULL_HANDLE;
+    static void *snap_map = nullptr;
+    bool snapping = false;
+    if (++polled % 90 == 0) {
+        if (FILE *t = std::fopen("room-snap.go", "rb")) {
+            std::fclose(t);
+            std::remove("room-snap.go");
+            if (!snap) {
+                const VkDeviceSize n = (VkDeviceSize)2 * w * h * 4;
+                VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+                bi.size = n, bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                VkMemoryRequirements mr;
+                VkPhysicalDeviceMemoryProperties mem;
+                vkGetPhysicalDeviceMemoryProperties(x.phys, &mem);
+                const VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+                uint32_t type = UINT32_MAX;
+                VkDeviceMemory dm = VK_NULL_HANDLE;
+                if (vkCreateBuffer(x.device, &bi, nullptr, &snap) == VK_SUCCESS) {
+                    vkGetBufferMemoryRequirements(x.device, snap, &mr);
+                    for (uint32_t i = 0; i < mem.memoryTypeCount && type == UINT32_MAX; i++)
+                        if ((mr.memoryTypeBits & (1u << i)) && (mem.memoryTypes[i].propertyFlags & host) == host) type = i;
+                    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                    ai.allocationSize = mr.size, ai.memoryTypeIndex = type;
+                    if (type == UINT32_MAX || vkAllocateMemory(x.device, &ai, nullptr, &dm) != VK_SUCCESS ||
+                        vkBindBufferMemory(x.device, snap, dm, 0) != VK_SUCCESS || vkMapMemory(x.device, dm, 0, n, 0, &snap_map) != VK_SUCCESS)
+                        snap_map = nullptr;
+                }
+            }
+            if (snap_map) {
+                const VkImage img = images[index].image;
+                barrier_direct(cb, img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                VkBufferImageCopy c{};
+                c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                c.imageExtent = {2 * w, h, 1};
+                (vkCmdCopyImageToBuffer)(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, snap, 1, &c);
+                barrier_direct(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+                snapping = true;
+            }
+        }
+    }
+    submit();
+    if (snapping) {
+        if (FILE *f = std::fopen("room-snap.bin", "wb")) {
+            const uint32_t head[4] = {0x314e5352u, 2 * w, h, (uint32_t)format};
+            std::fwrite(head, 4, 4, f), std::fwrite(snap_map, 4, (size_t)2 * w * h, f);
+            std::fclose(f);
+        }
+        rt_log("vr: room: snap written (%ux%u, floor %.2f m below the start)", 2 * w, h, -floor_y);
+    }
+    XrSwapchainImageReleaseInfo rel{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    x.xrReleaseSwapchainImage(chain, &rel);
+    for (int e = 0; e < 2; e++) {
+        pv[e].pose = views[e].pose, pv[e].fov = views[e].fov;
+        pv[e].subImage.swapchain = chain;
+        pv[e].subImage.imageRect = {{e ? (int32_t)w : 0, 0}, {(int32_t)w, (int32_t)h}};
+    }
+    layer.space = space, layer.viewCount = 2, layer.views = pv;
+    return true;
+}
+}   // namespace
+
 // The session's thread: its events, the headset's frames, and each newer box into the swapchain
 void run(void *) {
     Xr &x = xr();
@@ -2881,6 +3354,19 @@ void run(void *) {
     x.xrCreateReferenceSpace(session, &rs, &space);
     rs.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
     x.xrCreateReferenceSpace(session, &rs, &view_space);
+    XrSpace stage = XR_NULL_HANDLE;
+    rs.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
+    if (XR_FAILED(x.xrCreateReferenceSpace(session, &rs, &stage))) stage = XR_NULL_HANDLE;
+    if (sur.state.load() == 0) {
+        sur.state = 1;
+        std::thread(surround_read).detach();
+    }
+    XrSwapchain room_chain = XR_NULL_HANDLE;
+    std::vector<XrSwapchainImageVulkanKHR> room_images;
+    std::vector<VkImageView> room_targets;
+    VkImage room_msaa = VK_NULL_HANDLE, room_depth = VK_NULL_HANDLE;
+    VkImageView room_msaa_view = VK_NULL_HANDLE, room_depth_view = VK_NULL_HANDLE;
+    uint32_t room_w = 0, room_h = 0;
 
     uint32_t n = 0;
     x.xrEnumerateSwapchainFormats(session, 0, &n, nullptr);
@@ -3000,6 +3486,8 @@ void run(void *) {
         x.xrBeginFrame(session, &bfi);
         frames++;
 
+        XrView eye_views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+        bool eye_ok = false;
         {   // the head and the eyes' lenses at this frame's predicted time: what the game draws its next frame with
             XrViewLocateInfo li{XR_TYPE_VIEW_LOCATE_INFO};
             li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -3010,6 +3498,8 @@ void run(void *) {
             uint32_t count = 0;
             XrSpaceLocation head{XR_TYPE_SPACE_LOCATION};
             const bool views_ok = XR_SUCCEEDED(x.xrLocateViews(session, &li, &vs, 2, &count, views)) && count == 2;
+            eye_ok = views_ok && (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT);
+            if (eye_ok) eye_views[0] = views[0], eye_views[1] = views[1];
             const bool head_ok = XR_SUCCEEDED(x.xrLocateSpace(view_space, space, fs.predictedDisplayTime, &head)) &&
                                  (head.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT);
             if (views_ok && head_ok) {
@@ -3195,8 +3685,25 @@ void run(void *) {
         const bool show_hud = shown_drawn.tracked && shown_drawn.hud && hud_has && hud_swapchain && !x.hud_hidden.load();
         const XrCompositionLayerBaseHeader *screen = curved ? (const XrCompositionLayerBaseHeader *)&curve
                                                             : (const XrCompositionLayerBaseHeader *)&quad;
-        const XrCompositionLayerBaseHeader *layers[14] = {shown_drawn.tracked ? (const XrCompositionLayerBaseHeader *)&proj : screen};
+        XrCompositionLayerProjectionView room_pv[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
+                                                       {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
+        XrCompositionLayerProjection room_proj{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+        {
+            static int was = -1;
+            const int why = !have_image ? 1 : !fs.shouldRender && !sur_snap_wanted() ? 2 : shown_drawn.tracked ? 3 : !eye_ok ? 4 : sur.state.load() != 2 ? 5 : 0;
+            if (why != was)
+                rt_log("vr: room: %s", why == 0 ? "shown" : why == 1 ? "not shown (no picture yet)" : why == 2 ? "not shown (the runtime says not to draw)"
+                                   : why == 3 ? "not shown (the head's view)" : why == 4 ? "not shown (no eye poses)" : "not shown (no room read)");
+            was = why;
+        }
+        const bool room_shown = have_image && (fs.shouldRender || sur_snap_wanted()) && !shown_drawn.tracked && eye_ok &&
+                                sur_frame(session, space, stage, fs.predictedDisplayTime, (VkFormat)format, pool, cb, fence, eye_views,
+                                          room_chain, room_images, room_targets, room_msaa, room_msaa_view, room_depth,
+                                          room_depth_view, room_w, room_h, room_pv, room_proj);
+        const XrCompositionLayerBaseHeader *layers[14] = {shown_drawn.tracked ? (const XrCompositionLayerBaseHeader *)&proj
+                                                          : room_shown ? (const XrCompositionLayerBaseHeader *)&room_proj : screen};
         uint32_t layer_n = 1;
+        if (room_shown) layers[layer_n++] = screen;
         if (show_hud || show_menu) layers[layer_n++] = (const XrCompositionLayerBaseHeader *)&hud;
         if (shown_drawn.tracked) tracked_frames++;
         XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
@@ -3331,8 +3838,10 @@ extern "C" void vk_xr_device_ready(VkInstance instance, VkPhysicalDevice phys, V
 
 extern "C" int vk_xr_head_wanted(void) { return xr().ok && strcmp(cfg_value("VR_VIEW"), "head") == 0; }
 
+bool room_active();
+
 extern "C" int vk_xr_depth_wanted(void) {   // (Balanced keeps the depth too: the hands and the reticle are hidden by it)
-    return flat_on() || (vk_xr_head_wanted() && (cfg_int("VR_DEPTH") > 0 || stereo_turns() || stereo_accurate()));
+    return flat_on() || (vk_xr_head_wanted() && (cfg_int("VR_DEPTH") > 0 || stereo_turns() || stereo_accurate() || room_active()));
 }
 
 extern "C" void vk_xr_keep_depth(VkCommandBuffer cb, VkImageView depth, uint32_t w, uint32_t h) {
@@ -3789,6 +4298,14 @@ extern "C" int vk_xr_camera(double pos[3], double at[3], float up[3], int in_pla
         double place[3];
         world(head.p, place);
         for (int c = 0; c < 3; c++) pos[c] -= place[c];
+        static double stand;
+        static uint64_t stand_at;
+        const uint64_t now = plat_now_ns();
+        const double dt = stand_at && now > stand_at ? (now - stand_at) * 1e-9 : 0;
+        if (!stand_at || head.p[1] > stand) stand = head.p[1];
+        else if (dt < 0.5) stand += (head.p[1] - stand) * (1.0 - std::exp(-dt / 30.0));   // 30 s to settle after sitting down
+        stand_at = now;
+        pos[1] -= std::fmin(stand - head.p[1], 0.75);   // m, the eyes stay over the feet for young Link
     }
     // Stereo Balanced: this picture from one eye, the other the next (eyes in turn): the head moved half the eyes'
     // distance (VR_DEPTH percent of it, as depth stereo's) to that eye's side, the game's camera with it
@@ -4030,6 +4547,157 @@ extern "C" int vk_xr_wants_capture(int hdr) {
 
 void desat_right(VkCommandBuffer cb);
 
+// room-shot-NNN.bin: Room::Head, then RGBA8 w x h, then R32F depth dw x dh (half the scene's and the depth's sizes)
+namespace {
+float room_proj[16], room_view[12];   // the scene's last projection and view, by rows (vk_xr_note_projection, _view)
+std::mutex room_proj_mu;
+struct Room {
+    struct Head {
+        char magic[4] = {'V', 'R', 'S', '1'};
+        int32_t shot = 0;
+        uint32_t w = 0, h = 0, dw = 0, dh = 0;
+        float planes[2]{}, proj[16]{}, view[12]{};
+        double cam[9]{}, link[3]{};
+    };
+    std::mutex mu;
+    int want = -1;
+    uint64_t want_at = 0;
+    double cam[9]{}, link[3]{};
+    std::atomic<uint64_t> at{0};   // the host's last call (plat_now_ns)
+    std::atomic<int> stage{0};   // 1: copied to the buffer `frames` presents ago, 2: read by the writer's thread
+    int frames = 0;
+    Head head;
+    uint32_t sw = 0, sh = 0, sdw = 0, sdh = 0;
+    VkBuffer buf = VK_NULL_HANDLE;
+    void *map = nullptr;
+    VkDeviceSize have = 0;
+} room;
+
+bool room_buffer(VkDeviceSize n) {
+    Xr &x = xr();
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = n, bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    VkBuffer buf = VK_NULL_HANDLE;
+    if (vkCreateBuffer(x.device, &bi, nullptr, &buf) != VK_SUCCESS) return false;
+    VkMemoryRequirements mr;
+    vkGetBufferMemoryRequirements(x.device, buf, &mr);
+    VkPhysicalDeviceMemoryProperties mem;
+    vkGetPhysicalDeviceMemoryProperties(x.phys, &mem);
+    const VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    uint32_t type = UINT32_MAX;
+    for (int pass = 0; pass < 2; pass++)   // cached first: reading uncached memory runs at a few MB a second
+        for (uint32_t i = 0; i < mem.memoryTypeCount && type == UINT32_MAX; i++) {
+            const VkMemoryPropertyFlags want = pass ? host : host | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+            if ((mr.memoryTypeBits & (1u << i)) && (mem.memoryTypes[i].propertyFlags & want) == want) type = i;
+        }
+    if (type != UINT32_MAX)
+        rt_log("vr: room capture: buffer memory %s", mem.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT ? "cached" : "NOT cached");
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = mr.size, ai.memoryTypeIndex = type;
+    VkDeviceMemory dm = VK_NULL_HANDLE;
+    void *map = nullptr;
+    if (type == UINT32_MAX || vkAllocateMemory(x.device, &ai, nullptr, &dm) != VK_SUCCESS ||
+        vkBindBufferMemory(x.device, buf, dm, 0) != VK_SUCCESS || vkMapMemory(x.device, dm, 0, n, 0, &map) != VK_SUCCESS)
+        return false;
+    room.buf = buf, room.map = map, room.have = n;
+    return true;
+}
+
+void room_write() {
+    Room::Head hd = room.head;
+    hd.w = room.sw / 2, hd.h = room.sh / 2, hd.dw = room.sdw / 2, hd.dh = room.sdh / 2;
+    auto out = std::make_shared<std::vector<uint8_t>>(sizeof hd + (size_t)hd.w * hd.h * 4 + (size_t)hd.dw * hd.dh * 4);
+    std::memcpy(out->data(), &hd, sizeof hd);
+    const uint8_t *rgba = (const uint8_t *)room.map;
+    uint8_t *c = out->data() + sizeof hd;
+    for (uint32_t y = 0; y < hd.h; y++)
+        for (uint32_t xx = 0; xx < hd.w; xx++)
+            for (int k = 0; k < 4; k++) {
+                const size_t a = ((size_t)(2 * y) * room.sw + 2 * xx) * 4 + k, b = a + (size_t)room.sw * 4;
+                *c++ = (uint8_t)((rgba[a] + rgba[a + 4] + rgba[b] + rgba[b + 4] + 2) / 4);
+            }
+    const float *depth = (const float *)(rgba + (size_t)room.sw * room.sh * 4);
+    float *d = (float *)c;
+    for (uint32_t y = 0; y < hd.dh; y++)
+        for (uint32_t xx = 0; xx < hd.dw; xx++) *d++ = depth[(size_t)(2 * y) * room.sdw + 2 * xx];
+    room.stage = 0;
+    // ((local, VR room) into room-shots\ beside the game, not its folder's root: notes/vr-room/scripts/shotpack.py packs
+    // them there into a file a group)
+    std::error_code made;
+    std::filesystem::create_directory("room-shots", made);
+    char name[64];
+    std::snprintf(name, sizeof name, "room-shots/room-shot-%03d.bin", hd.shot);
+    FILE *f = std::fopen(name, "wb");
+    const bool ok = f && std::fwrite(out->data(), 1, out->size(), f) == out->size();
+    if (f) std::fclose(f);
+    rt_log("vr: room capture: shot %d %s", hd.shot, ok ? "written" : "NOT written");
+}
+
+// (hud_mu held, scene8 just made) the shot the host asked for, copied out of scene8 and the kept depth
+void room_copy(VkCommandBuffer cb) {
+    Xr &x = xr();
+    if (room.stage == 1) {
+        if (++room.frames < 4) return;
+        room.stage = 2;
+        std::thread(room_write).detach();
+        return;
+    }
+    if (room.stage != 0) return;
+    int shot;
+    {
+        std::lock_guard<std::mutex> lk(room.mu);
+        shot = room.want, room.want = -1;
+        if (shot < 0) return;
+        if (plat_now_ns() - room.want_at > 150000000ull) {
+            rt_log("vr: room capture: shot %d dropped (asked too long ago)", shot);
+            return;
+        }
+        std::memcpy(room.head.cam, room.cam, sizeof room.cam), std::memcpy(room.head.link, room.link, sizeof room.link);
+    }
+    float planes[2];
+    if (!x.scene8 || !x.depth || !x.depth_kept || !vk_xr_planes(planes)) {
+        rt_log("vr: room capture: shot %d dropped (no scene depth)", shot);
+        return;
+    }
+    const VkDeviceSize need = (VkDeviceSize)x.hud_w * x.hud_h * 4 + (VkDeviceSize)x.depth_w * x.depth_h * 4;
+    if (need > room.have && !room_buffer(need)) {
+        rt_log("vr: room capture: no memory for a %llu MiB buffer", (unsigned long long)(need >> 20));
+        return;
+    }
+    room.head.shot = shot, room.head.planes[0] = planes[0], room.head.planes[1] = planes[1];
+    {
+        std::lock_guard<std::mutex> lk(room_proj_mu);
+        std::memcpy(room.head.proj, room_proj, sizeof room_proj), std::memcpy(room.head.view, room_view, sizeof room_view);
+    }
+    room.sw = x.hud_w, room.sh = x.hud_h, room.sdw = x.depth_w, room.sdh = x.depth_h;
+    memory_barrier(cb);
+    VkBufferImageCopy c{};
+    c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    c.imageExtent = {room.sw, room.sh, 1};
+    vkCmdCopyImageToBuffer(cb, x.scene8, VK_IMAGE_LAYOUT_GENERAL, room.buf, 1, &c);
+    c.bufferOffset = (VkDeviceSize)room.sw * room.sh * 4, c.imageExtent = {room.sdw, room.sdh, 1};
+    vkCmdCopyImageToBuffer(cb, x.depth, VK_IMAGE_LAYOUT_GENERAL, room.buf, 1, &c);
+    VkMemoryBarrier2 m{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    m.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    m.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT, m.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+    VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dep.memoryBarrierCount = 1, dep.pMemoryBarriers = &m;
+    vkCmdPipelineBarrier2(cb, &dep);
+    memory_barrier(cb);
+    room.stage = 1, room.frames = 0;
+}
+}   // namespace
+
+bool room_active() { return plat_now_ns() - room.at.load(std::memory_order_relaxed) < 1000000000ull; }
+
+extern "C" void vk_xr_room_shot(int shot, const double cam[9], const double link[3]) {
+    room.at.store(plat_now_ns(), std::memory_order_relaxed);
+    if (shot < 0) return;
+    std::lock_guard<std::mutex> lk(room.mu);
+    room.want = shot, room.want_at = plat_now_ns();
+    std::memcpy(room.cam, cam, sizeof room.cam), std::memcpy(room.link, link, sizeof room.link);
+}
+
 extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D extent, VkFormat format, VkImage picture,
                               VkImageLayout picture_layout, const int rect[4], VkSemaphoreSubmitInfo *signal) {
     Xr &x = xr();
@@ -4145,6 +4813,7 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
         const int cut = game_reticle() ? 0 : aim_cut(d);
         made = make_panel(cb, cut, pair ? x.target_l_view : VK_NULL_HANDLE);
         hw = x.hud_w, hh = x.hud_h;
+        if (made) room_copy(cb);
         if (made) make_aim(cb, d);
         if (made) make_phys(cb, d);
         if (made && depth && d.eye < 0) d.stereo = make_eyes(cb, d);
@@ -4263,6 +4932,10 @@ extern "C" void vk_xr_note_projection(const float P[16], int minus_w) {
     std::memcpy(&bits, planes, 8);
     planes_bits.store(bits, std::memory_order_relaxed);
     lens_p00.store(P[0], std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lk(room_proj_mu);
+        std::memcpy(room_proj, P, sizeof room_proj);
+    }
     planes_at.store(plat_now_ns(), std::memory_order_relaxed);
     static int lines;
     static float logged[2];
@@ -4272,6 +4945,11 @@ extern "C" void vk_xr_note_projection(const float P[16], int minus_w) {
         rt_log("vr: the scene's projection: near %.6g, far %.6g, depth %s, clip depth %s", n, f,
                inverted ? "inverted (1 near)" : "0 near, 1 far", minus_w ? "-w..w" : "0..w");
     }
+}
+
+extern "C" void vk_xr_note_view(const float view[12]) {
+    std::lock_guard<std::mutex> lk(room_proj_mu);
+    std::memcpy(room_view, view, sizeof room_view);
 }
 
 extern "C" int vk_xr_planes(float planes[2]) {
@@ -4313,7 +4991,7 @@ extern "C" const MkwVkXr *vk_xr_table(void) {
         vk_xr_active, vk_xr_head_worn, vk_xr_hud_hidden, vk_xr_carrying, vk_xr_head_request, vk_xr_item_menu,
         vk_xr_item_pick, vk_xr_grips, vk_xr_grab_hands, vk_xr_two_handed_sword, vk_xr_arms_own, vk_xr_game_paused,
         vk_xr_rumble, vk_xr_turning, vk_xr_combo_want, vk_xr_airborne, vk_xr_item_shape, vk_xr_hand_bones,
-        vk_xr_phys_shapes};
+        vk_xr_phys_shapes, vk_xr_room_shot};
     return &t;
 }
 

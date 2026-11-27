@@ -578,7 +578,7 @@ static float model_scale(Ctx *c, uint64_t model) {
 }
 static volatile int weapon_drawn;   /* (the sword out, as hide_back_items last asked) */
 static void armor_caps_find(Ctx *c, const uint64_t *actors, int n);   /* (below, by cap_hide) */
-static void hide_back_items(Ctx *c, uint64_t link, int first_person) {
+static void hide_back_items(Ctx *c, uint64_t link, int first_person, int all) {
     static uint64_t found[WORN_MAX];
     static int n, hidden[WORN_MAX], logs, any_hidden;
     static int64_t walked_at;
@@ -629,7 +629,9 @@ static void hide_back_items(Ctx *c, uint64_t link, int first_person) {
             if (s > 0 && fabsf(s - told) > 0.02f && logs < 40) logs++, told = s, hos_log("vr: body: %s drawn at %.3f of its mesh's size", name, s);
             sword_scale = s;
         }
-        const int hide = first_person && (!back_items[kind].when_put_away || drawn == 0);
+        // young Link never holds the Hylian Shield: it stays on his back
+        const int back_only = vr_game_childhood() && strstr(name, "Shield_Hylian") != NULL;
+        const int hide = first_person && (all || !back_items[kind].when_put_away || drawn == 0 || back_only);
         any_hidden |= hide;
         if (!hide && hidden[i] == 0) continue;   /* (shown already: nothing to do) */
         if (!model) model = vr_call(c, 0x80994de0ULL, found[i], 0, 0, 0);
@@ -1626,6 +1628,134 @@ void hos_oot_world_pass(Ctx *c) {
     ReleaseSRWLockExclusive(&ma_lock);
 }
 
+/* hidden while the room capture runs (vr_game.c): Navi (romfs Model/Npc_Navi.Npc_Navi.bfres) and the ocarina
+   (Item_Ocarina_Fairy, _Time), by their materials; vr_game.c fades and moves them too (vr_body_room_actor). Her glow ball
+   is not in her model's materials */
+static const struct { const char *prefix; const char *mats[6]; } room_hides[] = {
+    {"Npc_Navi", {"Mt_Body", "Mt_Body_AlphaMask", "Mt_Body_Npc_Navi2_Alb", "Mt_Wings"}},
+    {"Item_Ocarina_Fairy", {"Mt_Item_Ocarina_Fairy", "Mt_Item_Ocarina_Fairy_AO", "Mt_Item_Ocarina_Fairy_Nrm", "Mt_Item_Ocarina_Fairy_Rgh"}},
+    {"Item_Ocarina_Time", {"Mt_Item_Ocarina_Time", "Mt_Item_Ocarina_Time_AO", "Mt_Item_Ocarina_Time_Alb", "Mt_Item_Ocarina_Time_Mtl",
+                           "Mt_Item_Ocarina_Time_Nrm", "Mt_Item_Ocarina_Time_Rgh"}},
+    {"Item_OcarinaHolder_", {NULL}},
+};
+#define ROOM_HIDE_MAX 8
+#define ROOM_LIST_MAX 4096   /* (entries of the actor list walked for Navi: she was not in the first 1024 once) */
+static volatile int navi_hidden_want;
+static volatile uint64_t room_actor[ROOM_HIDE_MAX];   /* (Navi first when found, then the ocarina's actors; 0 none) */
+void vr_body_hide_navi(int on) { navi_hidden_want = on != 0; }
+uint64_t vr_body_room_actor(int i) { return i >= 0 && i < ROOM_HIDE_MAX && navi_hidden_want ? room_actor[i] : 0; }
+/* Navi is not always in Link's list (+0x1b0): every actor starts with the vtable 0x84b45e18, its name at +0x20, so the heap's
+   committed pages are scanned for one named Npc_Navi (Windows: VirtualQuery passes over what the game never touched, which
+   a read would commit). Once a capture; 0 none found */
+static uint64_t navi_scan(Ctx *c) {
+    uint64_t hit = 0;
+#ifdef _WIN32
+    const int64_t t0 = hos_now_ns();
+    const uint64_t end = HOS_HEAP_BASE + hos_heap_size;
+    uint64_t a = HOS_HEAP_BASE, looked = 0, actors = 0;
+    char name[48];
+    while (a < end && !hit) {
+        MEMORY_BASIC_INFORMATION mi;
+        if (!VirtualQuery(GP(a), &mi, sizeof mi)) break;
+        uint64_t next = a + (uint64_t)((uint8_t *)mi.BaseAddress + mi.RegionSize - (uint8_t *)GP(a));
+        if (next > end || next <= a) next = end;
+        if (mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+            const uint64_t *p = (const uint64_t *)GP(a), n = (next - a) / 8;
+            looked += next - a;
+            for (uint64_t i = 0; i < n; i++) {
+                if (p[i] != 0x84b45e18ULL) continue;
+                actors++;
+                if (actor_name(c, a + i * 8, name) && !strcmp(name, "Npc_Navi")) {
+                    hit = a + i * 8;
+                    break;
+                }
+            }
+        }
+        a = next;
+    }
+    hos_log("vr: body: room capture: the heap scanned for Navi: %s (%llu MB looked at, %llu with the actors' vtable, %.0f ms)",
+            hit ? "found" : "NOT found", (unsigned long long)(looked >> 20), (unsigned long long)actors, (hos_now_ns() - t0) / 1e6);
+#else
+    (void)c;
+#endif
+    return hit;
+}
+static int room_hide_kind(const char *name) {
+    for (unsigned k = 0; k < sizeof room_hides / sizeof *room_hides; k++)
+        if (!strncmp(name, room_hides[k].prefix, strlen(room_hides[k].prefix))) return (int)k;
+    return -1;
+}
+static void navi_hide(Ctx *c, uint64_t link) {
+    static uint64_t found[ROOM_HIDE_MAX];
+    static int n, hidden, logs;
+    static int64_t walked_at;
+    static SRWLOCK lock = SRWLOCK_INIT;
+    const int want = navi_hidden_want;
+    if (!want && !hidden) return;
+    if (!TryAcquireSRWLockExclusive(&lock)) return;
+    char name[48];
+    const int64_t now = hos_now_ns();
+    if (want && (!n || now - walked_at > 1000000000LL)) {
+        walked_at = now;
+        uint64_t got[ROOM_HIDE_MAX] = {0};
+        int m = 1;   /* (got[0]: Navi) */
+        const uint64_t list = plausible(link + 0x1b0, 8) ? recomp_load64(c, link + 0x1b0) : 0;
+        static int navi_logs;
+        int named = 0, past = 0;   /* (past: named beyond the first 1024 entries) */
+        for (int i = 0; list && i < ROOM_LIST_MAX; i++) {
+            const uint64_t at = list + (uint64_t)i * 0x60 + 0x40;
+            if (!plausible(at, 8)) break;
+            const uint64_t w = recomp_load64(c, at);
+            if (!w || !plausible(w, 0x40) || !actor_name(c, w, name)) continue;
+            named++, past += i >= 1024;
+            const int kind = room_hide_kind(name);
+            if (kind == 0 && !got[0]) got[0] = w;   /* (Navi: whatever her vtable) */
+            if (recomp_load64(c, w) != 0x84b45e18ULL) continue;
+            if (kind > 0 && m < ROOM_HIDE_MAX) got[m++] = w;
+        }
+        {   /* (not in his list: the heap's scan, once a capture, and its find while it is still her) */
+            static uint64_t scanned;
+            static int scan_done;
+            if (!n) scan_done = 0, scanned = 0;   /* (a new capture) */
+            if (!got[0] && scanned && plausible(scanned, 0x40) && recomp_load64(c, scanned) == 0x84b45e18ULL && actor_name(c, scanned, name) &&
+                !strcmp(name, "Npc_Navi"))
+                got[0] = scanned;
+            if (!got[0] && !scan_done) scan_done = 1, scanned = navi_scan(c), got[0] = scanned;
+        }
+        if (!got[0] && navi_logs < 3) {   /* (not found: what in the list is named like her) */
+            navi_logs++;
+            hos_log("vr: body: room capture: Navi not in the list of %d named actors, %d of them past entry 1024 (list %llx)", named, past,
+                    (unsigned long long)list);
+            for (int i = 0; list && i < ROOM_LIST_MAX; i++) {
+                const uint64_t at = list + (uint64_t)i * 0x60 + 0x40;
+                if (!plausible(at, 8)) break;
+                const uint64_t w = recomp_load64(c, at);
+                if (w && plausible(w, 0x40) && actor_name(c, w, name) && (strstr(name, "Navi") || strstr(name, "Fairy") || strstr(name, "Elf")))
+                    hos_log("vr: body: room capture: actor %d \"%s\" vtable %llx", i, name, (unsigned long long)recomp_load64(c, w));
+            }
+        }
+        if (logs < 10 && (m != n || got[0] != found[0])) {
+            logs++, hos_log("vr: body: room capture: Navi %s, %d of the ocarina's actors", got[0] ? "found" : "NOT found", m - 1);
+            for (int i = 1; i < m; i++)
+                if (actor_name(c, got[i], name)) hos_log("vr: body: room capture: %s", name);
+        }
+        memcpy(found, got, sizeof got), n = m;
+        for (int i = 0; i < ROOM_HIDE_MAX; i++) room_actor[i] = got[i];
+    }
+    for (int i = 0; i < n; i++) {
+        if (!found[i] || !plausible(found[i], 0x40) || recomp_load64(c, found[i]) != 0x84b45e18ULL || !actor_name(c, found[i], name)) continue;
+        const int kind = room_hide_kind(name);
+        if (kind < 0) continue;
+        const uint64_t model = vr_call(c, 0x80994de0ULL, found[i], 0, 0, 0);
+        int done = 0;
+        for (unsigned k = 0; k < 6 && room_hides[kind].mats[k]; k++) done += model_material_vis(c, model, room_hides[kind].mats[k], !want);
+        if (want != hidden && logs < 20) logs++, hos_log("vr: body: room capture: %s %s (%d materials)", name, want ? "hidden" : "shown", done);
+    }
+    if (!want) n = 0, memset((void *)room_actor, 0, sizeof room_actor);
+    hidden = want;
+    ReleaseSRWLockExclusive(&lock);
+}
+
 static struct { float m[24]; int ok; int64_t at; } bones_pub[2];
 static int bones_pub_i;
 static void hand_bones_publish(Ctx *c, const MkwVkXr *x) {
@@ -1666,13 +1796,14 @@ int vr_body_hand_bones(float m[24]) {
 
 void vr_body_lift(Ctx *c, uint64_t actor) {
     ma_seen(c, actor);
+    navi_hide(c, actor);
     const MkwVkXr *x = rx_xr();
     if (!x || !x->hands || !x->active) return;
     const int on = x->active();   /* (no session: no bones looked for; what was hidden is shown again) */
     if (on) pose_cache(c, actor);
     const int fp = on && vr_first_person_now() && !vr_game_paused();   /* ((Triforce VR) the menus show him whole) */
     head_materials_set(c, fp && body_arms());
-    hide_back_items(c, actor, fp);
+    hide_back_items(c, actor, fp || navi_hidden_want, navi_hidden_want);   /* (the room capture: all his gear, drawn or not) */
     if (on && x->hand_bones) hand_bones_publish(c, x);
 }
 

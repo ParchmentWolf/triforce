@@ -1100,6 +1100,144 @@ static int event_view(uint64_t event) {
     return strcmp(cfg_value("VR_CUTSCENES"), "first") ? EV_CUTSCENE : EV_EYES;
 }
 
+/* room-capture.go in the game's folder starts it; the renderer saves each shot (vk_xr_room_shot). The file's words: "all"
+   the whole set (room-shot-000..233.bin), else the check alone (room-shot-1NNN.bin: the centre at 1.5 m six ways, and
+   down from 1.0 m), to see that Link, his gear, the ocarina and Navi are gone before the whole set is taken; "nomove"
+   leaves Navi where she is; "poses": the cameras in room-poses.txt (room-shot-2NNN.bin; lines "x y z  ax ay az  fov": the
+   eye, a point it looks at, in the world, and its vertical view in degrees: the room kit's outside_spots.py puts cameras
+   out of the house, above it and just past the door and the window, for the room's outside). The shots go to room-shots\
+   beside the game; the kit's shotpack.py packs them there into a file a group */
+enum { ROOM_SPOTS = 39, ROOM_SHOTS = ROOM_SPOTS * 6, ROOM_HOLD = 14, ROOM_ASK = 10, ROOM_CHECK_ID = 1000, ROOM_POSE_ID = 2000,
+       ROOM_POSES_MAX = 512 };
+static const double room_centre[3] = {-44.68, 118.46, 15.64};   /* his house's floor: notes/vr-room/FINDINGS.md */
+static const float room_fov_all = 1.7453f;   /* 100 degrees, vertical */
+static float room_fov = 1.7453f;   /* (the shot's own: a pose's may be narrower) */
+static const int room_check[] = {78, 79, 80, 81, 82, 83, 5};   /* (spot 13 six ways, spot 0 down) */
+static int room_shot = -1, room_held, room_step, room_steps, room_all, room_move, room_posed;
+static double room_poses[ROOM_POSES_MAX][7];   /* (eye, the point it looks at, the vertical view in degrees) */
+
+/* the game's fade (hide_link) on every fade component of an actor, not only the two slots Link's are in */
+static void fade_actor(uint64_t actor) {
+    static const float hidden = -1.0f;
+    const uint64_t components = rd_ptr(actor + 0x270);
+    const unsigned size = game_rw(components, 0x400) ? 0x400 : game_rw(components, 0x280) ? 0x280 : 0;
+    for (unsigned slot = 0; slot < size; slot += 8) {
+        const uint64_t object = rd_ptr(components + slot);
+        if (!game_rw(object, 0x138)) continue;
+        const uint64_t vt = rd_ptr(object);
+        if (vt == OOT_DATA_MAIN + 0x4b4a5a0) poke(object + 0x118, &hidden, sizeof hidden);
+        else if (vt == OOT_DATA_MAIN + 0x4b4b4a8) poke(object + 0x130, &hidden, sizeof hidden);
+    }
+}
+/* Navi 30 m under his feet for the capture: her glow ball is an effect at her place, not her model. Her place guessed at
+   Link's offsets (+0x31c; component 0's matrix, +0x1f8): each written only while it is near him or already moved */
+static void navi_away(uint64_t navi, int log) {
+    float feet[3], p[3], t[12];
+    if (!player_pos(feet)) return;
+    const uint64_t components = rd_ptr(navi + 0x270), c0 = components ? rd_ptr(components) : 0, m = c0 ? rd_ptr(c0 + 0x60) : 0;
+    const int have_p = rd(navi + 0x31c, p, sizeof p) && isfinite(p[0]) && isfinite(p[1]) && isfinite(p[2]);
+    const int have_t = game_rw(m, 0x1f8 + sizeof t) && rd(m + 0x1f8, t, sizeof t) && isfinite(t[3]) && isfinite(t[7]) && isfinite(t[11]);
+    if (log)
+        hos_log("vr: room capture: Link %.2f %.2f %.2f; Navi +0x31c %s %.2f %.2f %.2f, matrix %s %.2f %.2f %.2f", feet[0], feet[1], feet[2],
+                have_p ? "" : "(none)", have_p ? p[0] : 0, have_p ? p[1] : 0, have_p ? p[2] : 0, have_t ? "" : "(none)",
+                have_t ? t[3] : 0, have_t ? t[7] : 0, have_t ? t[11] : 0);
+    const float under = feet[1] - 30.0f;
+    /* (she flies up to the canopy, 4.2 m over his feet seen: the house's size) */
+    #define NEAR(x, y, z) ((hypotf((x) - feet[0], (z) - feet[2]) < 6.0f && fabsf((y) - feet[1]) < 8.0f) || fabsf((y) - under) < 1.0f)
+    if (have_p && NEAR(p[0], p[1], p[2])) {
+        const float q[3] = {feet[0], under, feet[2]};
+        poke(navi + 0x31c, q, sizeof q);
+    }
+    if (have_t && NEAR(t[3], t[7], t[11])) t[3] = feet[0], t[7] = under, t[11] = feet[2], poke(m + 0x1f8, t, sizeof t);
+    #undef NEAR
+}
+
+static void room_pose(int shot, double pos[3], double at[3], float up[3]) {
+    static const double heights[3] = {1.0, 1.5, 2.0};
+    const int spot = shot / 6, way = shot % 6, k = spot % 13;
+    const double ring = k == 0 ? 0.0 : k <= 6 ? 0.75 : 1.6;
+    const double angle = k <= 6 ? (k - 1) * M_PI / 3 : M_PI / 6 + (k - 7) * M_PI / 3;
+    pos[0] = room_centre[0] + ring * cos(angle);
+    pos[1] = room_centre[1] + heights[spot / 13];
+    pos[2] = room_centre[2] + ring * sin(angle);
+    static const double ways[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}, {0, 1, 0}, {0, -1, 0}};
+    static const float ups[6][3] = {{0, 1, 0}, {0, 1, 0}, {0, 1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1}};
+    for (int i = 0; i < 3; i++) at[i] = pos[i] + ways[way][i], up[i] = ups[way][i];
+}
+
+static int room_capture(const MkwVkXr *x, double pos[3], double at[3], float up[3]) {
+    if (room_shot < 0) {
+        static unsigned polled;
+        if (++polled % 30) return 0;
+        FILE *f = fopen("room-capture.go", "rb");
+        if (!f) return 0;
+        char words[128] = "";
+        words[fread(words, 1, sizeof words - 1, f)] = 0;
+        fclose(f);
+        remove("room-capture.go");
+        float feet[3];
+        const double away = player_pos(feet) ? hypot(feet[0] - room_centre[0], feet[2] - room_centre[2]) : 1e9;
+        if (!x->room_shot || away > 6.0) {
+            hos_log("vr: room capture not started: %s", x->room_shot ? "Link is not in his house" : "the renderer has no room capture");
+            return 0;
+        }
+        room_all = strstr(words, "all") != NULL, room_move = !strstr(words, "nomove");
+        room_steps = room_all ? ROOM_SHOTS : (int)(sizeof room_check / sizeof *room_check);
+        room_posed = strstr(words, "poses") != NULL;
+        if (room_posed) {
+            FILE *pf = fopen("room-poses.txt", "r");
+            int n = 0;
+            while (pf && n < ROOM_POSES_MAX) {
+                double *q = room_poses[n];
+                const int got = fscanf(pf, "%lf %lf %lf %lf %lf %lf %lf", &q[0], &q[1], &q[2], &q[3], &q[4], &q[5], &q[6]);
+                if (got != 7) break;
+                if (q[6] > 1.0 && q[6] < 170.0) n++;
+            }
+            if (pf) fclose(pf);
+            if (!n) {
+                hos_log("vr: room capture not started: room-poses.txt has no poses");
+                return 0;
+            }
+            room_steps = n, room_all = 0;
+        }
+        hos_log("vr: room capture: %s, %d shots, Navi %s, Link's feet %.2f %.2f %.2f", room_posed ? "poses" : room_all ? "all" : "check", room_steps,
+                room_move ? "moved away" : "not moved", feet[0], feet[1], feet[2]);
+        room_step = 0, room_held = -60;
+        vr_body_hide_navi(1);
+    }
+    room_shot = room_posed ? room_step : room_all ? room_step : room_check[room_step];
+    if (room_posed) {
+        const double *q = room_poses[room_step];
+        for (int i = 0; i < 3; i++) pos[i] = q[i], at[i] = q[3 + i], up[i] = i == 1;
+        room_fov = (float)(q[6] * M_PI / 180.0);
+    } else {
+        room_pose(room_shot, pos, at, up);
+        room_fov = room_fov_all;
+    }
+    const uint64_t actor = player();
+    if (actor) hide_link(actor);
+    for (int i = 0; i < 8; i++) {
+        const uint64_t a = vr_body_room_actor(i);
+        if (!a) continue;
+        fade_actor(a);
+        if (i == 0 && room_move) navi_away(a, room_held == ROOM_ASK && (room_step == 0 || room_step == room_steps - 1));
+    }
+    double cam[9], link[3] = {0, 0, 0};
+    float feet[3];
+    if (player_pos(feet)) link[0] = feet[0], link[1] = feet[1], link[2] = feet[2];
+    for (int i = 0; i < 3; i++) cam[i] = pos[i], cam[3 + i] = at[i], cam[6 + i] = up[i];
+    x->room_shot(room_held == ROOM_ASK ? room_shot + (room_posed ? ROOM_POSE_ID : room_all ? 0 : ROOM_CHECK_ID) : -1, cam, link);
+    if (++room_held >= ROOM_HOLD) {
+        room_held = 0;
+        if (++room_step >= room_steps) {
+            room_shot = -1;
+            vr_body_hide_navi(0);
+            hos_log("vr: room capture done (%s)", room_posed ? "poses" : room_all ? "all" : "check");
+        }
+    }
+    return 1;
+}
+
 void hos_vr_physics(Ctx *c);   /* (vr_physics.c) */
 void hos_vr_camera(Ctx *c) {
     hos_vr_physics(c);
@@ -1217,9 +1355,11 @@ void hos_vr_camera(Ctx *c) {
     }
     x->update_step(step_seconds < 0 ? -1 : update_seconds());
     if (!x->camera(pos, at, up, fp_eye)) return;
+    const int room = scene == 1 && room_capture(x, pos, at, up);
     for (int i = 0; i < 3; i++) set_d(c, i, pos[i]), set_d(c, 3 + i, at[i]), set_s(c, up_reg[i], up[i]);
     memcpy(out_pos[k], pos, sizeof pos), memcpy(out_at[k], at, sizeof at), have_out[k] = 1;
     head_camera = c->x[19];
+    if (room) return;
     if (fp_eye) fp_eye_at = now_ns();   /* (vr_body.c: his head hidden; his arms on the controllers in play alone: the anchor) */
     if (scene != 1) return;   /* Link turns in play alone */
     {   /* (vr_body.c: where Link stood for this view, the hands' anchor; and first person's eyes on him) */
@@ -1238,7 +1378,8 @@ void hos_vr_camera(Ctx *c) {
 void hos_vr_lens(Ctx *c) {
     const MkwVkXr *x = xr();
     float headset;
-    if (x && head_camera && c->x[19] == head_camera && x->lens(&headset) && isfinite(headset) && headset > 0.05f &&
-        headset < 3.0f)
+    if (x && head_camera && c->x[19] == head_camera && room_shot >= 0) set_s(c, 0, room_fov);
+    else if (x && head_camera && c->x[19] == head_camera && x->lens(&headset) && isfinite(headset) && headset > 0.05f &&
+             headset < 3.0f)
         set_s(c, 0, headset);
 }

@@ -47,6 +47,9 @@ const char *vr_game_held(void);
 int vr_game_showing_item(void);
 /* vr_body.c: Link as his movement update found him, 0 before */
 uint64_t vr_body_link(void);
+void vr_body_hide_navi(int on);
+/* vr_body.c: while the room capture hides them, its actors: 0 Navi, 1.. the ocarina's; 0 none */
+uint64_t vr_body_room_actor(int i);
 /* vr_body.c: 1 and his neck's height over his feet (metres) as the late bone pass last posed it, while that was a moment ago */
 int vr_body_neck_height(double *height);
 /* vr_body.c: each controller's arm (0 left, 1 right) as last posed, in the game's world: shoulder, elbow, wrist; ok[] the
