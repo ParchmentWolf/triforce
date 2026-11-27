@@ -1436,6 +1436,14 @@ static uint32_t oot_capacity(Ctx *c, uint64_t mgr, const char *what, int *value)
     return entry ? hash : 0;
 }
 
+/* (Triforce VR) for host/vr_game.c's item panel: an item's count by the game's own query, a bag's size (0 none) */
+int hos_oot_pouch_count(Ctx *c, const char *name) { return oot_pouch_count(c, name); }
+int hos_oot_capacity(Ctx *c, const char *what) {
+    const uint64_t mgr = oot_singleton(c, OOT_GAMEDATA_SLOT);
+    int value = 0;
+    return mgr && oot_capacity(c, mgr, what, &value) ? value : 0;
+}
+
 /* a count of the Pouch set (and the item marked as got once), 1 when the Pouch has the item */
 static int oot_pouch_set(Ctx *c, uint64_t mgr, const char *name, int count) {
     const uint32_t stock = oot_item_stock_hash(c, mgr, name);

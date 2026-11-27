@@ -49,5 +49,7 @@ int vr_game_showing_item(void);
 uint64_t vr_body_link(void);
 /* vr_body.c: 1 and his neck's height over his feet (metres) as the late bone pass last posed it, while that was a moment ago */
 int vr_body_neck_height(double *height);
+/* vr_game.c: a VR session playing Simplified: the sprint is Left stick click, Toggle (oot_sprint.c), whatever its rows say */
+int vr_simplified_sprint(void);
 
 #endif

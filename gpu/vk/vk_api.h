@@ -21,8 +21,10 @@ extern "C" {
    bridge functions, frame_info to setting_set; MkwVkHost's prompts_live, reset_binding, rebind_control and binding_is_default
    at its end (the live button prompts, the Controls page's per-control reset and confirmed rebinds); MkwVkRenderer's
    jitter_sample, the camera jitter's one whole sample; MkwVkRenderer's nvn_program_created at its end, the load of a
-   program at its create call (RX_VK_LOAD=create). 25: all of them together */
-#define MKWVK_API_VERSION 25
+   program at its create call (RX_VK_LOAD=create). 25: all of them together. 26: (Triforce VR) the Simplified item
+   panel's calls (item_menu, item_pick) in MkwVkXr, and aim's and weapon_out's 2 (aiming, its aim not on the pointer yet;
+   the sword seen in his hand) */
+#define MKWVK_API_VERSION 26
 enum { HOS_OPT_CHEAT_HEARTS = 32, HOS_OPT_CHEAT_FLIGHT, HOS_OPT_CHEAT_ACTION, HOS_OPT_CHEAT_CAMERA };
 /* (hookshot) the Motion page's rows (host/pad_sdl.c reads them, vk_replay.cpp's option answers them): Motion controls on
    or off, the horizontal's and the vertical's sensitivity in percent, each turned around, and the deadzone (0 to 2) */
@@ -581,6 +583,20 @@ typedef struct MkwVkRenderer {
     void (*nvn_program_created)(const nvn_prog *p);
 } MkwVkRenderer;
 
+/* (Triforce VR) the Simplified item panel's list, by the game's side at its open: each item's actor (its picture and name), its count
+   (-1 none shown) and whether that count is the bag's most; pick the item on the button, or -1 */
+#define MKWVK_ITEM_MENU_MAX 40
+typedef struct MkwVkItem {
+    char item_actor[48];
+    int item_count, item_full;
+} MkwVkItem;
+typedef struct MkwVkItemMenu {
+    int item_n, item_pick;
+    char item_mals[8];
+    char item_sword[48];   /* Link's sword's actor (Weapon_Sword_Kokiri), "" none known */
+    MkwVkItem item_list[MKWVK_ITEM_MENU_MAX];
+} MkwVkItemMenu;
+
 /* (Triforce VR) what the game's side asks of VR (gpu/vk/vk_xr.h has what each does). Every function answers "no" (0) while
    VR has no session */
 typedef struct MkwVkXr {
@@ -599,7 +615,7 @@ typedef struct MkwVkXr {
     void (*item_bar)(int open);
     void (*aim_freeze)(int on);
     int (*pointer)(double dir[3]);
-    void (*aim)(int on, const double origin[3], const double dir[3]);
+    void (*aim)(int on, const double origin[3], const double dir[3]);   /* on: 0 none, 1 aiming, 2 aiming, its aim not on the pointer yet */
     void (*untracked)(void);
     int (*hands)(double pos[6], double point[6], double palm[6]);   /* (Triforce VR) the controllers in the game's world */
     int (*active)(void);   /* (Triforce VR) a session runs: without one the game's side does nothing (vk_xr_active) */
@@ -607,6 +623,8 @@ typedef struct MkwVkXr {
     void (*hud_hidden)(int hidden);   /* (Triforce VR) 1: no HUD panel now (a load zone's transition) */
     void (*carrying)(int on);   /* (Triforce VR) Link lifts, carries, throws or puts down something of the world's (a pot, a rock, a bomb flower) */
     int (*head_request)(void);   /* (Triforce VR) the gestures' ask for his head, taken: 0 none, 1 the mask on, 2 the Lens of Truth on, 3 off */
+    void (*item_menu)(const MkwVkItemMenu *menu);   /* (Triforce VR) the item panel's list, at its open */
+    int (*item_pick)(void);   /* (Triforce VR) the item panel's pick: an index of that list, -1 none (Back) */
     void (*two_handed_sword)(int on);   /* (Triforce VR) his sword is the Biggoron's (both hands on it), no item in his hand */
     int (*arms_own)(void);   /* (Triforce VR) his arms as the game's animation has them now: a bow or slingshot drawn, a hammer swing */
     void (*game_paused)(int on);   /* (Triforce VR) the game paused by its menus: no full-picture fade looked for in the HUD */

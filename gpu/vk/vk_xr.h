@@ -98,6 +98,8 @@ void vk_xr_untracked(void);
 // its palm's facing (the grip's +x out of the left palm, into the right), unit directions; a hand not tracked all 0. 1
 // when any is tracked and the head's view is on
 int vk_xr_hands(double pos[6], double point[6], double palm[6]);
+void vk_xr_item_menu(const MkwVkItemMenu *menu);
+int vk_xr_item_pick(void);
 
 // vk_draw.cpp, the game's scene upscaled into target (w x h, format), the HUD still to
 // be drawn over it: the image VR keeps it in (the caller copies it there in its stream), VK_NULL_HANDLE when the HUD's

@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <thread>
 
 #include "vk_internal.h"
@@ -96,5 +97,13 @@ bool menu_embedded();   // open over the game's own Options screen
 bool menu_game_options();   // ((Triforce VR) the game's own Options screen runs (our tabs drawn over its header): vk_menu.cpp
 }
 int menu_perf_rect(int r[4]);
+namespace mkwvk {
+void menu_record_item_panel(VkCommandBuffer cmd, VkImage image, VkImageView view, uint32_t w, uint32_t h, const MkwVkItemMenu& m,
+                            const int* order, int pick, int sort);
+}
+namespace mkwvk::ui {
+VkFormat draw_format();
+void items_want(const char* mals);
+}
 inline int menu_is_open() { return mkwvk::menu_is_open(); }
 inline int menu_embedded() { return mkwvk::menu_embedded(); }

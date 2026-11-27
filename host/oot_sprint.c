@@ -33,8 +33,11 @@ static int log_on(void) {
 }
 
 /* The button and the mode: the menu's rows once the renderer answers, the options file's before, the test switches
-   over both */
+   over both. ((Triforce VR) A VR session playing Simplified: the left stick click, toggled, whatever they say (the hand
+   controllers' left click is it there, vk_xr.cpp) */
+int vr_simplified_sprint(void);
 static int setting_button(void) {
+    if (vr_simplified_sprint()) return OOT_SPRINT_LS;
     static int env = -2, file = -1;
     if (env == -2) {
         const char *e = getenv("HOS_SPRINT");
@@ -46,6 +49,7 @@ static int setting_button(void) {
     return v == OOT_SPRINT_LS || v == OOT_SPRINT_B ? v : OOT_SPRINT_OFF;
 }
 static int setting_hold(void) {
+    if (vr_simplified_sprint()) return 0;
     static int env = -2, file = -1;
     if (env == -2) env = getenv("HOS_SPRINT_HOLD") ? atoi(getenv("HOS_SPRINT_HOLD")) != 0 : -1;
     if (env >= 0) return env;

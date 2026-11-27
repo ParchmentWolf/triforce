@@ -97,6 +97,7 @@ struct Drawn {
     double base[3]{}, bx = 0, bz = 1;
     bool aim = false;      // Link aims: the game's camera's ray (aim_o, aim_d) in the head's view (x right, y up, z back)
     float aim_o[3]{}, aim_d[3]{};
+    bool aim_wait = false;   // ((Triforce VR) the game's aim still turning onto the pointer: Simplified's reticle not shown yet
 };
 
 
@@ -149,6 +150,7 @@ struct Xr {
     Drawn drawn;
     float render_scale = 1.0f;   // the lens the game draws with over the one shown (VR_VIEW_SCALE)
     bool aim_on = false;         // vr_game.c vk_xr_aim: Link aims, along the game's own camera's ray (world)
+    bool aim_wait = false;       // ((Triforce VR) vk_xr_aim's 2: aiming, the game's aim not onto the pointer yet
     // pointed aim (vr_game.c vk_xr_aim_freeze): the view's base yaw held where it was while the controller steers the
     // game's aim (else the view would turn with the aim it chases); the yaw now (cur) for the controller's ray
     bool aim_freeze = false, frozen_ok = false;
@@ -276,7 +278,7 @@ struct Xr {
     bool grip_ok[2]{};
     uint64_t hands_at = 0;   // when they were last read (plat_now_ns), 0 never
     std::atomic<bool> ocarina{false};   // vr_game.c: Link plays the ocarina (the controllers' Ocarina mode)
-    std::atomic<bool> weapon_out{false};   // vr_game.c: Link holds his sword and shield (or another weapon) out
+    std::atomic<int> weapon_out{0};   // vr_game.c: Link holds his sword and shield (or another weapon) out; 2 the sword seen in his hand
     std::atomic<bool> child{true};         // vr_game.c: Link is a child (his hands' model)
     std::atomic<bool> two_handed_sword{false};   // ((Triforce VR) vr_game.c: his sword is the Biggoron's
     std::atomic<bool> game_paused{false};        // ((Triforce VR) vr_game.c: the game paused by its menus (no fade looked for)
@@ -286,6 +288,14 @@ struct Xr {
     std::atomic<bool> airborne{false};     // ((Triforce VR) vr_game.c: Link in the air (jumping, falling)
     std::atomic<int> combo_want{-1};       // ((Triforce VR) the gesture-chosen slash's combo counter (vr_game.c takes it): -1 none
     std::atomic<int> head_request{0};      // ((Triforce VR) the gestures' ask for his head (vr_game.c takes it): 1 mask on, 2 Lens on, 3 off         // ((Triforce VR) vr_game.c: 0 nothing on his head, 1 a mask, 2 the Lens of Truth)
+    std::atomic<bool> wheel_live{false};   // (VR_CONTROLS=simplified) the right trigger holds the item panel open
+    std::mutex item_mu;
+    MkwVkItemMenu items{};   // (item_mu) the item panel's list, from vr_game.c at its open
+    std::vector<std::string> recent;   // (item_mu) the actors picked, the last first: the panel's other order
+    std::atomic<int> item_pick{-1}, item_sort{0};
+    VkImage item_img = VK_NULL_HANDLE;   // the panel drawn over the HUD's box: the window's format, the box's size
+    VkImageView item_view = VK_NULL_HANDLE;
+    uint32_t item_w = 0, item_h = 0;
     std::atomic<bool> in_play{false};      // vr_game.c: play (not a menu, a pause, an event): the grips' and swing's play roles
     // the last picture drawn from the head whose world scene8 and eye8 still hold (the present's thread alone): a paused
     // game's menus go on the HUD's panel in front of that world, frozen as it was
@@ -672,9 +682,11 @@ bool make_boxes(VkFormat window) {
 
 // A device-local 2D image (one level, one layer) and a view of it; UNDEFINED until the caller's barrier
 bool make_image(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage, VkImage &image, VkImageView &view,
-                VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT) {
+                VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT, VkFormat view_format = VK_FORMAT_UNDEFINED) {
     Xr &x = xr();
+    if (view_format == VK_FORMAT_UNDEFINED) view_format = format;
     VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    if (view_format != format) ci.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     ci.imageType = VK_IMAGE_TYPE_2D, ci.format = format, ci.extent = {w, h, 1};
     ci.mipLevels = ci.arrayLayers = 1, ci.samples = VK_SAMPLE_COUNT_1_BIT, ci.tiling = VK_IMAGE_TILING_OPTIMAL, ci.usage = usage;
     if (vkCreateImage(x.device, &ci, nullptr, &image) != VK_SUCCESS) return false;
@@ -697,7 +709,7 @@ bool make_image(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage
         return false;
     }
     VkImageViewCreateInfo vc{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    vc.image = image, vc.viewType = VK_IMAGE_VIEW_TYPE_2D, vc.format = format, vc.subresourceRange = {aspect, 0, 1, 0, 1};
+    vc.image = image, vc.viewType = VK_IMAGE_VIEW_TYPE_2D, vc.format = view_format, vc.subresourceRange = {aspect, 0, 1, 0, 1};
     return vkCreateImageView(x.device, &vc, nullptr, &view) == VK_SUCCESS;
 }
 
@@ -768,7 +780,7 @@ bool make_hud_pipeline() {
     return r == VK_SUCCESS;
 }
 
-// ((Triforce VR) the sword's hand: the last two-grip draw's, else the Handedness row's)
+// ((Triforce VR) the sword's hand: the last two-grip draw's, else Controls' Right handed Link)
 // ((Triforce VR) research: while triforce-runs/gestures_in_immersive.txt exists, Immersive uses the gesture rules too (to see them
 // from outside), a second's check
 static bool gestures_in_immersive() {
@@ -881,8 +893,6 @@ int sword_hand_now() {
 // VR_STEREO=balanced: each game frame drawn from one eye in turn (true geometry), the game's time held for the right
 // eye's update so both eyes show one moment, rather than performant's depth stereo from the head
 bool stereo_balanced() { return strcmp(cfg_value("VR_STEREO"), "balanced") == 0; }
-// ((Triforce VR) the hand controllers' control scheme (VR Controls' Control Scheme): Full Gesture, or another (placeholder_play)
-bool scheme_full_gesture() { return strcmp(cfg_value("VR_SCHEME"), "placeholder") != 0; }
 bool stereo_turns() { return stereo_balanced(); }
 // VR_STEREO=accurate: the game draws the left eye's picture and the renderer the same frame again for the right (true depth,
 // both eyes the same moment, the game's full rate)
@@ -1071,12 +1081,13 @@ bool make_keep_pipeline() {
 bool make_aim_pipeline() {
     Xr &x = xr();
     if (!x.push_set || !x.nearest) return false;
-    const VkDescriptorSetLayoutBinding b[2] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-                                               {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+    const VkDescriptorSetLayoutBinding b[3] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                               {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                               {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, li.bindingCount = 2, li.pBindings = b;
+    li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, li.bindingCount = 3, li.pBindings = b;
     if (vkCreateDescriptorSetLayout(x.device, &li, nullptr, &x.aim_set) != VK_SUCCESS) return false;
-    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(float) * 12};
+    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(float) * 14};
     VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pi.setLayoutCount = 1, pi.pSetLayouts = &x.aim_set, pi.pushConstantRangeCount = 1, pi.pPushConstantRanges = &pr;
     if (vkCreatePipelineLayout(x.device, &pi, nullptr, &x.aim_layout) != VK_SUCCESS) return false;
@@ -1092,8 +1103,17 @@ bool make_aim_pipeline() {
     return r == VK_SUCCESS;
 }
 
+// ((Triforce VR) Simplified: the game's own reticle moved to where the aim lands (xr_aim.comp's move), not VR's ring; its
+// radius on the panel, the same disc the other schemes cut off it (aim_cut)
+bool game_reticle() { return strcmp(cfg_value("VR_CONTROLS"), "simplified") == 0; }
+int aim_cut(const Drawn &d) {
+    Xr &x = xr();
+    return d.aim ? (int)(0.06f * (float)x.hud_h) : 0;
+}
+
 // (vk_xr_capture, hud_mu held, after make_panel, before make_eyes) the reticle drawn into scene8 where the aim's ray
-// first goes behind the scene's depth, while Link aims
+// first goes behind the scene's depth, while Link aims. ((Triforce VR) Simplified: the game's own, from the panel's middle
+// (make_panel left it there), taken off the panel; when it cannot be moved it stays there)
 void make_aim(VkCommandBuffer cb, const Drawn &d) {
     Xr &x = xr();
     float planes[2];
@@ -1107,20 +1127,29 @@ void make_aim(VkCommandBuffer cb, const Drawn &d) {
     }
     if (!x.aim_pipe) return;
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.aim_pipe);
-    const VkDescriptorImageInfo info[2] = {{x.nearest, x.depth_view, VK_IMAGE_LAYOUT_GENERAL},
-                                           {VK_NULL_HANDLE, x.scene8_view, VK_IMAGE_LAYOUT_GENERAL}};
-    VkWriteDescriptorSet w[2]{};
-    for (uint32_t i = 0; i < 2; i++) {
+    const VkDescriptorImageInfo info[3] = {{x.nearest, x.depth_view, VK_IMAGE_LAYOUT_GENERAL},
+                                           {VK_NULL_HANDLE, x.scene8_view, VK_IMAGE_LAYOUT_GENERAL},
+                                           {VK_NULL_HANDLE, x.panel8_view, VK_IMAGE_LAYOUT_GENERAL}};
+    VkWriteDescriptorSet w[3]{};
+    for (uint32_t i = 0; i < 3; i++) {
         w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, w[i].dstBinding = i, w[i].descriptorCount = 1;
         w[i].descriptorType = i ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         w[i].pImageInfo = &info[i];
     }
-    vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.aim_layout, 0, 2, w);
-    const float pc[12] = {(float)x.hud_w, (float)x.hud_h, d.aim_o[0], d.aim_o[1], d.aim_o[2], d.aim_d[0], d.aim_d[1],
-                          d.aim_d[2], d.lens.r * d.scale, d.lens.u * d.scale, planes[0], planes[1]};
+    vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.aim_layout, 0, 3, w);
+    // (negative: the game's reticle only taken off the panel, not shown, while the game's aim turns onto the pointer)
+    const float move = game_reticle() ? (d.aim_wait ? -1.0f : 1.0f) * (float)aim_cut(d) : 0.0f;
+    // ((Triforce VR) a panel pixel in the scene's: the panel (VR_HUD_SIZE cm wide, a metre off) spans tan = half its width
+    // across hud_w, the scene tan_x across the same)
+    const float tan_x = d.lens.r * d.scale;
+    const float panel_scale = tan_x > 0.0f ? 0.005f * (float)cfg_int("VR_HUD_SIZE") / tan_x : 1.0f;
+    const float pc[14] = {(float)x.hud_w, (float)x.hud_h, d.aim_o[0], d.aim_o[1], d.aim_o[2], d.aim_d[0], d.aim_d[1],
+                          d.aim_d[2], tan_x, d.lens.u * d.scale, planes[0], planes[1], move, panel_scale};
     vkCmdPushConstants(cb, x.aim_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+    barrier(cb, x.panel8, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);   // (the HUD shader's panel, read here)
     vkCmdDispatch(cb, 1, 1, 1);
     barrier(cb, x.scene8, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+    barrier(cb, x.panel8, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
 }
 
 
@@ -1395,8 +1424,44 @@ bool eyes_from(VkCommandBuffer cb, const float shift[2], const float planes[2]) 
     return true;
 }
 
+// the item panel's order into out, its count: the list's (By Type), or (sort 1) the actors picked lately first
+int item_order(const MkwVkItemMenu &m, const std::vector<std::string> &recent, int sort, int out[MKWVK_ITEM_MENU_MAX]) {
+    int n = 0;
+    bool used[MKWVK_ITEM_MENU_MAX]{};
+    if (sort)
+        for (const std::string &a : recent)
+            for (int i = 0; i < m.item_n; i++)
+                if (!used[i] && a == m.item_list[i].item_actor) used[i] = true, out[n++] = i;
+    for (int i = 0; i < m.item_n; i++)
+        if (!used[i]) out[n++] = i;
+    return n;
+}
+void item_step(int dir) {
+    Xr &x = xr();
+    std::lock_guard<std::mutex> lk(x.item_mu);
+    int order[MKWVK_ITEM_MENU_MAX];
+    const int n = item_order(x.items, x.recent, x.item_sort.load(), order);
+    if (!n) return;
+    int at = 0;
+    for (int k = 0; k < n; k++)
+        if (order[k] == x.item_pick.load()) at = k;
+    x.item_pick.store(order[std::clamp(at + dir, 0, n - 1)]);
+}
+void item_remember() {
+    Xr &x = xr();
+    std::lock_guard<std::mutex> lk(x.item_mu);
+    const int p = x.item_pick.load();
+    if (p >= 0 && p < x.items.item_n) {
+        const std::string a = x.items.item_list[p].item_actor;
+        x.recent.erase(std::remove(x.recent.begin(), x.recent.end(), a), x.recent.end());
+        x.recent.insert(x.recent.begin(), a);
+        if (x.recent.size() > MKWVK_ITEM_MENU_MAX) x.recent.pop_back();
+    }
+    x.items.item_n = 0;
+}
+
 // The hand controllers through OpenXR's actions, bound for the Touch controllers (Quest), read each headset frame onto
-// the pad's buttons (input_map.h bits): A and B their own, X and Y A and B again; either stick's click alone X (jump); the left grip ZL (the Z lock), the right grip ZR; on the PSVR2 both sticks' clicks together (L3+R3, as its Options cannot reach OpenXR) or the Touch left Menu tapped Plus (the inventory), held a second
+// the pad's buttons (input_map.h bits): A and B their own, X and Y A and B again; either stick's click alone X (jump; Simplified: the right's, the left's the left stick click, the sprint's toggle); the left grip ZL (the Z lock), the right grip ZR; on the PSVR2 both sticks' clicks together (L3+R3, as its Options cannot reach OpenXR) or the Touch left Menu tapped Plus (the inventory), held a second
 // Minus; the sword hand (VR_HANDEDNESS, the left by default) swung fast Y tapped, or held while the swing went
 // outward and left the hand out to the side (the charge), until the hand comes back in. The shield hand's shield turned to face ahead before its own side's eye holds ZL (the Z lock), as Link
 // holds his shield. Both arms shaken upward press the D-pad's down (the boots), both hands together before the face
@@ -1511,8 +1576,30 @@ struct Controls {
     float head_y[4]{};
     uint64_t head_t[4]{}, nod_up_at = 0, nod_down_at = 0, nod_at = 0;
     int head_n = 0;
+    bool draw_armed = true;
+    bool grip_zr[2]{};   // in play: the item button held by that grip (pressed behind the head, or with an item out)
+    bool wheel = false;   // (VR_CONTROLS=simplified) the right trigger holds the item panel, from a pull in play until let go
+    int pick_dir = 0;
+    uint64_t pick_at = 0;
+    bool back_down = false, sort_down = false, eat_back = false;
+    int act_bit = -1;
+    int simple_hold = -1;   // the hand the panel's item is used with: Right handed Link's
+    uint64_t act_at = 0;
+    // (Simplified) the panel's last choice: -1 none yet, 1 the item (simple_item, the panel's actor); the right grip takes it out
+    int simple_pick = -1;
+    bool simple_model = false;   // (Simplified) the item chosen has no held state of the game's: a swing uses it (nothing drawn here)
+    int keep_grip = -1;   // ((Triforce VR) Simplified: the grip that took out an item no panel chose, its button until let go
+    char simple_item[48] = "";
+    // (Simplified) a ranged item (the bow, the slingshot, the hookshot, the boomerang) by the right grip alone: as Full
+    // Gesture's pull then draw, a tap of ZR takes it out, a gap, then ZR held while the grip is, and let go the shot
+    uint64_t grip_tap_at = 0;
+    bool simple_zr_was = false;
+    static constexpr uint64_t grip_gap_ns = 150000000ull;
+    bool pad_grip = false;   // (VR_CONTROLS=simplified) the item panel is open: the left stick is the D-pad
+    int pad_dir = -1;   // the D-pad bit the left stick holds then
     int tap_bit = Y;     // what the swing's tap presses: Y (the sword) or ZR (the hammer, the stick, an empty bottle)
     static constexpr float shield_on = 0.79f, shield_off = 1.05f, shield_reach = 0.70f;   // radians, radians, metres
+    static constexpr float shield_on_simple = 0.44f;   // (Simplified) the raise's narrower turn, radians
     bool shielding = false;
     uint64_t draw_at = 0, draw_until = 0;
     uint64_t weapon_seen_at = 0;   // ((Triforce VR) the last moment a weapon was out)
@@ -1616,15 +1703,6 @@ struct Controls {
         return XR_SUCCEEDED(xr().xrGetActionStateFloat(session, &gi, &st)) && st.isActive ? st.currentState : 0.0f;
     }
     // this headset frame's buttons, sticks and grips (time: the frame's predicted display time) into the Xr's
-    // ((Triforce VR) [PlaceHolder]: the play of a control scheme other than Full Gesture, while Link is in play (menus, pauses and
-    // events keep the common buttons above). In: the pad's bits as the common buttons set them (A, B, X from the face buttons and
-    // the stick clicks, L and R from the triggers, Plus and Minus from the Menu button) and the sticks (-1..1, x right, y up);
-    // each grip's pose and whether it is tracked, its velocity in m/s, and the head's pose, all in the play space (OpenXR's x
-    // right, y up, z back). Out: bits and sticks as the game is to read them (bits |= 1ull << ZR...). Nothing yet
-    void placeholder_play(uint64_t &bits, float (&sticks)[2][2], const Pose (&poses)[2], const bool (&pose_ok)[2],
-                          const float (&velocity)[2][3], const Pose &head_pose) {
-        (void)bits, (void)sticks, (void)poses, (void)pose_ok, (void)velocity, (void)head_pose;
-    }
     // ((Triforce VR) the game's rumble on the hand controllers (vk_xr_rumble: each side's strength, the left Joy-Con's on the left
     // hand, after the Controls tab's Rumble strength and Vibration curve): a short pulse renewed each frame while it lasts, stopped
     // when it ends
@@ -1672,30 +1750,69 @@ struct Controls {
             } else click_since = 0;
             click_x = click_since && now - click_since >= click_wait_ns;
         }
-        bool squeezed_before[2] = {squeeze_on[0], squeeze_on[1]};
+        bool squeezed_before[2] = {squeeze_on[0], squeeze_on[1]}, triggered_before[2] = {trigger_on[0], trigger_on[1]};
         for (int h = 0; h < 2; h++) {   // pressed past 0.6, released under 0.4
             const float t = value(session, trigger, hand[h]), s = value(session, squeeze, hand[h]);
             trigger_on[h] = trigger_on[h] ? t > 0.4f : t > 0.6f;
             squeeze_on[h] = squeeze_on[h] ? s > 0.4f : s > 0.6f;
         }
         const bool in_play = x.in_play.load() && !menu_is_open();   // (this menu over play: its buttons, no play roles)
+        {   // ((Triforce VR) Controls' Right handed Link turned on or off: the hands' last choice (sword hand, mirror) is let go,
+            // so the sword hand and Link's mirror follow the option again until the next draw or grip
+            static int last_right = -1;
+            const int right = strcmp(cfg_value("VR_HANDEDNESS"), "right") == 0 ? 1 : 0;
+            if (last_right >= 0 && right != last_right) {
+                g_live_sword.store(-1), g_live_mirror.store(-1);
+                rt_log("vr: Right handed Link %s: the sword hand follows it again", right ? "on" : "off");
+            }
+            last_right = right;
+            // ((Triforce VR) Simplified: the sword hand is always the option's (its shield the other), never one Full Gesture's
+            // draws or shield chose before the switch)
+            if (strcmp(cfg_value("VR_CONTROLS"), "simplified") == 0 && g_live_sword.load() >= 0 && g_live_sword.load() != right) {
+                g_live_sword.store(-1), g_live_mirror.store(-1), shield_alone = false;
+                rt_log("vr: Simplified: the sword hand follows Right handed Link again");
+            }
+        }
+        const bool simple = strcmp(cfg_value("VR_CONTROLS"), "simplified") == 0;
+        if (simple && trigger_on[1] && !triggered_before[1] && in_play) wheel = true;
+        if (!simple || !trigger_on[1]) wheel = false;
+        {   // the item panel: B backs out (no change), Y changes its order
+            const bool back = on(session, b, XR_NULL_PATH), sort = on(session, yb, XR_NULL_PATH);
+            if (wheel && back && !back_down) wheel = false, eat_back = true, x.item_pick.store(-1), rt_log("vr: the item panel: Back");
+            if (wheel && sort && !sort_down) x.item_sort.fetch_xor(1);
+            if (!back) eat_back = false;
+            back_down = back, sort_down = sort;
+        }
+        const bool chosen = simple && x.wheel_live.load(std::memory_order_relaxed) && !wheel && x.item_pick.load() >= 0;   // (shut, not by Back)
+        if (chosen) {
+            std::lock_guard<std::mutex> lk(x.item_mu);
+            const int p = x.item_pick.load();
+            snprintf(simple_item, sizeof simple_item, "%s", p < x.items.item_n ? x.items.item_list[p].item_actor : "");
+        }
+        if (x.wheel_live.load(std::memory_order_relaxed) && !wheel) item_remember();
+        x.wheel_live.store(wheel, std::memory_order_relaxed);
+        pad_grip = simple && wheel;
         if (!in_play) {
             // menus, pauses and events (and this menu over play): a pad's buttons as labelled, the triggers L and R, the grips
             // ZL and ZR, each stick's click its own
             set_bit(A, on(session, a, XR_NULL_PATH)), set_bit(B, on(session, b, XR_NULL_PATH));
             set_bit(X, on(session, xb, XR_NULL_PATH)), set_bit(Y, on(session, yb, XR_NULL_PATH));
             set_bit(STICK_L, click_l && !combo_latch), set_bit(STICK_R, click_r && !combo_latch);   // (not the PSVR2's L3+R3 Menu)
-            set_bit(L, trigger_on[0]), set_bit(R, trigger_on[1]);
+            set_bit(L, trigger_on[0]), set_bit(R, trigger_on[1] && !wheel);
             set_bit(ZL, squeeze_on[0]), set_bit(ZR, squeeze_on[1]);
         } else {
             // play: X and Y mirror A and B, and either stick's click jumps (X), so a controller with fewer buttons plays it all
             set_bit(A, on(session, a, XR_NULL_PATH) || on(session, xb, XR_NULL_PATH));
-            set_bit(B, on(session, b, XR_NULL_PATH) || on(session, yb, XR_NULL_PATH));
-            set_bit(X, click_x);
+            set_bit(B, on(session, b, XR_NULL_PATH) || (on(session, yb, XR_NULL_PATH) && !simple));
+            set_bit(Y, on(session, yb, XR_NULL_PATH) && simple);   // (Simplified: the left Y is the sword's button)
+            // ((Triforce VR) Simplified: the right click alone jumps; the left is the pad's left stick click, the sprint's toggle
+            // (host/oot_sprint.c takes it as Sprint button Left stick click, Toggle, while VR plays Simplified)
+            set_bit(X, click_x && (!simple || click_r));
+            set_bit(STICK_L, simple && click_x && click_l);
             // the triggers L and R: the game's item bars; ((Triforce VR) the Biggoron's Sword out: not the other hand's, which the
             // sword hand's controller presses by accident on the close two-handed grip)
             const int no_trig = x.weapon_out.load() && x.two_handed_sword.load() ? 1 - sword_hand_now() : -1;
-            set_bit(L, trigger_on[0] && no_trig != 0), set_bit(R, trigger_on[1] && no_trig != 1);
+            set_bit(L, trigger_on[0] && !simple && no_trig != 0), set_bit(R, trigger_on[1] && !simple && no_trig != 1);   // (simple: ZL and ZR)
         }
         // the Menu: a tap is Plus for a moment at its release, a second's hold Minus for a moment then
         if (combo_latch || on(session, menu, XR_NULL_PATH)) {
@@ -1713,6 +1830,21 @@ struct Controls {
             XrActionStateVector2f st{XR_TYPE_ACTION_STATE_VECTOR2F};
             if (XR_SUCCEEDED(x.xrGetActionStateVector2f(session, &gi, &st)) && st.isActive)
                 sticks[h][0] = st.currentState.x, sticks[h][1] = st.currentState.y;
+        }
+        float dpad_stick[2] = {0, 0};   // the left stick while the panel is open: it presses the D-pad below
+        if (wheel) {   // the right stick past 0.6 steps the pick, again after 0.5 s held, then every 0.25 s; the game gets neither
+            dpad_stick[0] = sticks[0][0], dpad_stick[1] = sticks[0][1];
+            const float sx = sticks[1][0];
+            const int dir = sx > 0.6f ? 1 : sx < -0.6f ? -1 : std::fabs(sx) < 0.4f ? 0 : pick_dir;
+            if (dir && (dir != pick_dir || now >= pick_at)) {
+                const bool repeat = dir == pick_dir;
+                pick_at = now + (repeat ? 250000000ull : 500000000ull), item_step(dir);
+                rt_log("vr: the item panel: step %+d%s (stick x %.2f), the pick %d", dir, repeat ? " (held)" : "", sx, x.item_pick.load());
+            }
+            pick_dir = dir;
+            sticks[0][0] = sticks[0][1] = sticks[1][0] = sticks[1][1] = 0;
+        } else {
+            pick_dir = 0;
         }
         const bool ocarina = x.ocarina.load();
         if (now >= dpad_from && now < dpad_until) set_bit(dpad_bit, true);
@@ -1781,11 +1913,6 @@ struct Controls {
             }
             x.hands_at = now;
         };
-        if (!scheme_full_gesture()) {   // ((Triforce VR) another scheme's play: none of Full Gesture's below
-            if (in_play) placeholder_play(bits, sticks, poses, pose_ok, hv, head_pose);
-            publish();
-            return;
-        }
         if (in_play) {   // ((Triforce VR) the head's nods: the Lens of Truth on and off, while it is the head's item
             const int i = head_n++ & 3;
             head_y[i] = head[1], head_t[i] = now;
@@ -1877,7 +2004,7 @@ struct Controls {
                 near_mouth = dx * dx + dy * dy + dz * dz < 0.30f * 0.30f;
             }
             const bool still = sideways && lat[0] * (ocarina_left ? -1.0f : 1.0f) > 0.4f && near_mouth;
-            if (x.ocarina.load()) {   // out of the pose a moment: B ends it (the game's ocarina is not "in play": no gate)
+            if (x.ocarina.load() && !simple) {   // out of the pose a moment: B ends it (the game's ocarina is not "in play": no gate)
                 if (still) ocarina_off_since = 0;
                 else if (!ocarina_off_since) ocarina_off_since = now;
                 else if (ocarina_off_since != 1 && now - ocarina_off_since > 300000000ull)
@@ -1887,7 +2014,7 @@ struct Controls {
         pose_since[0] = at_face ? (pose_since[0] ? pose_since[0] : now) : 0;
         pose_since[1] = beside ? (pose_since[1] ? pose_since[1] : now) : 0;
         if (x.carrying.load()) pose_since[0] = pose_since[1] = 0;   // ((Triforce VR) his hands are full: none of these
-        else if (in_play && !x.ocarina.load() && now - dpad_gesture_at >= dpad_refractory_ns) {
+        else if (in_play && !simple && !x.ocarina.load() && now - dpad_gesture_at >= dpad_refractory_ns) {
             int bit = -1;
             (void)wave;   // ((Triforce VR) the mask: the grips on and before the head now, below)
             // ((Triforce VR) the hands apart (30 cm or more): a two-handed grip's raise, such as the Biggoron's jump slash, is not it)
@@ -1910,7 +2037,105 @@ struct Controls {
             std::lock_guard<std::mutex> lk(x.gear_mu);
             std::memcpy(held_item, x.held_item, sizeof held_item);
         }
-        if (in_play && !x.ocarina.load()) {
+        if (chosen) {   // the panel shut on an item: the game has it on the item button (ZR), the right grip presses it
+            simple_pick = 1, simple_hold = strcmp(cfg_value("VR_HANDEDNESS"), "right") == 0 ? 1 : 0;
+            // (an item the game has no held state for: a swing uses it, and the game puts it in his hand then)
+            simple_model = strstr(simple_item, "DekuStick") || strstr(simple_item, "DekuNut") || strstr(simple_item, "Item_Bottle") ||
+                         strstr(simple_item, "Item_Bomb") || strstr(simple_item, "Hammer");
+            act_bit = held_item[0] && strcmp(held_item, simple_item) ? B : -1;   // (something else out: put away)
+            act_at = now + 150000000ull;
+            rt_log("vr: the item panel: %s chosen (held now: \"%s\"%s)", simple_item, held_item, act_bit == B ? ", B to put it away" : "");
+        }
+        if (act_bit >= 0 && now >= act_at) {
+            set_bit(act_bit, now < act_at + 120000000ull);
+            if (now >= act_at + 120000000ull) act_bit = -1;
+        }
+        // the bow's and slingshot's string: the other hand's grip, squeezed near the holding hand and drawn away, holds ZR
+        const auto bow_step = [&](const bool sq[2], const bool fresh[2]) {
+            bool drawing = false;
+            if ((strstr(held_item, "Bow") || strstr(held_item, "SlingShot") || strstr(held_item, "Slingshot") ||
+                 strstr(held_item, "Pachinko")) && pull_hand >= 0 &&
+                pose_ok[0] && pose_ok[1]) {
+                const int hold = pull_hand, pull = 1 - pull_hand;
+                // ((Triforce VR) the slingshot: from its stone, on the string above the handle, not the hand on it)
+                const bool sling = !strstr(held_item, "Bow");
+                static const float out_of_fist[3] = {0, 0, -1};
+                float d2 = 0, dv[3], up_handle[3];
+                rotate(poses[hold].q, out_of_fist, up_handle);
+                for (int c = 0; c < 3; c++)
+                    dv[c] = poses[hold].p[c] + (sling ? sling_up * up_handle[c] : 0.0f) - poses[pull].p[c], d2 += dv[c] * dv[c];
+                const float reach = sling ? sling_reach : draw_reach;
+                if (!sq[pull]) bow_arm = bow_drawn = false;
+                else if (fresh[pull]) {
+                    if (d2 < reach * reach) bow_arm = true, sling_took = std::sqrt(d2);
+                    else rt_log("vr: grips: a draw out of reach (%.0f cm of %.0f)", std::sqrt(d2) * 100.0f, reach * 100.0f);
+                }
+                const float pulled = sling_took + (sling ? sling_pull : bow_pull), returned = sling_took + 0.04f;
+                if (bow_arm && !bow_drawn && d2 > pulled * pulled) bow_drawn = true, rt_log("vr: grips: drawn");
+                if (bow_drawn && d2 < returned * returned) bow_drawn = bow_arm = false, rt_log("vr: grips: brought back: the shot");
+                drawing = bow_drawn;
+                if (drawing) {
+                    const float n = std::sqrt(d2);
+                    std::lock_guard<std::mutex> lk(x.hands_mu);
+                    for (int c = 0; c < 3; c++) g_draw_dir[c] = dv[c] / n;
+                }
+            } else bow_arm = bow_drawn = false;
+            g_draw_on.store(drawing);
+            return drawing;
+        };
+        if (in_play && simple) {
+            grip_zr[0] = grip_zr[1] = false;
+            const bool sq[2] = {squeeze_on[0], squeeze_on[1]};
+            const bool fresh[2] = {sq[0] && !squeezed_before[0], sq[1] && !squeezed_before[1]};
+            pull_hand = simple_pick == 1 ? simple_hold : -1;   // (the item chosen's hand, out or not yet)
+            if (simple_model && (on(session, b, XR_NULL_PATH) || on(session, yb, XR_NULL_PATH)))
+                simple_model = false, rt_log("vr: item: %s put away (B)", simple_item);
+            if (held_item[0] && simple_hold >= 0 && strcmp(held_item, item_seen)) {   // the item out: in the hand that chose it
+                snprintf(item_seen, sizeof item_seen, "%s", held_item);
+                g_live_mirror.store(item_mirrored_right(held_item) ? simple_hold : 1 - simple_hold);
+                rt_log("vr: item: %s in the %s hand: %s", held_item, simple_hold ? "right" : "left", g_live_mirror.load() ? "mirrored" : "as made");
+            }
+            if (!held_item[0] && item_seen[0]) {   // (put away: back to the sword's hand)
+                item_seen[0] = 0;
+                if (g_live_sword.load() >= 0) g_live_mirror.store(g_live_sword.load());
+            }
+            // ((Triforce VR) both ways: the other hand's draw on the string (aimed along it), or the item's hand alone, pointed
+            // (vk_xr_pointer), its grip held and let go)
+            const bool drawing = bow_step(sq, fresh);
+            const auto ranged = [](const char *it) {
+                return strstr(it, "Bow") || strstr(it, "SlingShot") || strstr(it, "Slingshot") || strstr(it, "Pachinko") ||
+                       strstr(it, "Hookshot") || strstr(it, "Longshot") || strstr(it, "Boomerang");
+            };
+            // ((Triforce VR) an item out that no panel chose this session (on the button from the save, or put there by the game):
+            // taken as chosen, in the hand Right handed Link holds items in, so it is pointed from the first draw
+            if (simple_pick != 1 && held_item[0]) {
+                simple_pick = 1, simple_hold = strcmp(cfg_value("VR_HANDEDNESS"), "right") == 0 ? 1 : 0, simple_model = false;
+                snprintf(simple_item, sizeof simple_item, "%s", held_item);
+                pull_hand = simple_hold, keep_grip = sq[0] ? 0 : sq[1] ? 1 : -1;
+                rt_log("vr: item: %s out with no pick: taken as chosen, in the %s hand", held_item, simple_hold ? "right" : "left");
+            }
+            // (the item button, as a pad's: the right grip; an aimed item's, the grip of the hand holding it, which points it)
+            int fire = simple_pick == 1 && simple_hold >= 0 && (ranged(simple_item) || ranged(held_item)) ? simple_hold : 1;
+            if (keep_grip >= 0) {   // (the grip that took it out stays its button while held, so the draw is not cut off)
+                if (sq[keep_grip]) fire = keep_grip;
+                else keep_grip = -1;
+            }
+            bool right_zr = sq[fire];
+            if (fresh[fire] && simple_pick == 1 && ranged(simple_item) && !ranged(held_item))
+                grip_tap_at = now, rt_log("vr: grips: %s taken out by the %s grip (ZR tapped, then held)", simple_item, fire ? "right" : "left");
+            if (grip_tap_at) {   // (its tap, then nothing a moment, then the grip as it is: the aim, and let go the shot)
+                const uint64_t t = now - grip_tap_at;
+                right_zr = t < press_ns;
+                if (t >= press_ns + grip_gap_ns || (!sq[fire] && t >= press_ns)) grip_tap_at = 0, right_zr = sq[fire] && t >= press_ns + grip_gap_ns;
+            }
+            const bool zr = drawing || right_zr;
+            // (let go: the shot, the aim held where it was just before, as Full Gesture's (vk_xr_pointer))
+            if (simple_zr_was && !zr && ranged(held_item)) g_shot_at.store(now);
+            if (zr != simple_zr_was) rt_log("vr: Simplified: ZR %s at %llu ms", zr ? "down" : "up", (unsigned long long)(now / 1000000ull));
+            simple_zr_was = zr;
+            set_bit(ZL, trigger_on[0]), set_bit(ZR, zr);
+            g_item_hand.store(pull_hand);
+        } else if (in_play && !x.ocarina.load()) {
             const bool sq[2] = {squeeze_on[0], squeeze_on[1]};
             const bool fresh[2] = {sq[0] && !squeezed_before[0], sq[1] && !squeezed_before[1]};
             const bool weapon = x.weapon_out.load();
@@ -2036,35 +2261,7 @@ struct Controls {
                     }
                 }
             }
-            bool drawing = false;
-            if ((strstr(held_item, "Bow") || strstr(held_item, "SlingShot") || strstr(held_item, "Slingshot") ||
-                 strstr(held_item, "Pachinko")) && pull_hand >= 0 &&
-                pose_ok[0] && pose_ok[1]) {
-                const int hold = pull_hand, pull = 1 - pull_hand;
-                // ((Triforce VR) the slingshot: from its stone, on the string above the handle, not the hand on it)
-                const bool sling = !strstr(held_item, "Bow");
-                static const float out_of_fist[3] = {0, 0, -1};
-                float d2 = 0, dv[3], up_handle[3];
-                rotate(poses[hold].q, out_of_fist, up_handle);
-                for (int c = 0; c < 3; c++)
-                    dv[c] = poses[hold].p[c] + (sling ? sling_up * up_handle[c] : 0.0f) - poses[pull].p[c], d2 += dv[c] * dv[c];
-                const float reach = sling ? sling_reach : draw_reach;
-                if (!sq[pull]) bow_arm = bow_drawn = false;
-                else if (fresh[pull]) {
-                    if (d2 < reach * reach) bow_arm = true, sling_took = std::sqrt(d2);
-                    else rt_log("vr: grips: a draw out of reach (%.0f cm of %.0f)", std::sqrt(d2) * 100.0f, reach * 100.0f);
-                }
-                const float pulled = sling_took + (sling ? sling_pull : bow_pull), returned = sling_took + 0.04f;
-                if (bow_arm && !bow_drawn && d2 > pulled * pulled) bow_drawn = true, rt_log("vr: grips: drawn");
-                if (bow_drawn && d2 < returned * returned) bow_drawn = bow_arm = false, rt_log("vr: grips: brought back: the shot");
-                drawing = bow_drawn;
-                if (drawing) {
-                    const float n = std::sqrt(d2);
-                    std::lock_guard<std::mutex> lk(x.hands_mu);
-                    for (int c = 0; c < 3; c++) g_draw_dir[c] = dv[c] / n;
-                }
-            } else bow_arm = bow_drawn = false;
-            g_draw_on.store(drawing);
+            const bool drawing = bow_step(sq, fresh);
             // ((Triforce VR) the hookshot and the boomerang: their own hand's trigger is the aim (ZR held), and that trigger is
             // not its item bar (L or R) while one is out. The hookshot: let go, the shot. The boomerang: let go with the hand
             // moving ahead (throw_speed), the throw; let go still, it stays aimed until such a move)
@@ -2137,7 +2334,7 @@ struct Controls {
                 // ((Triforce VR) away from the face: ahead of the eyes or below them (a mask's grab at the face is no shield)
                 const bool off_face = staying ? fwd[hd] > 0.20f || up[hd] < -0.15f : fwd[hd] > 0.25f || up[hd] < -0.20f;
                 return staying ? ahead > std::cos(shield_off) && off_eye < 0.19f && in_reach && off_face
-                               : ahead > std::cos(shield_on) && off_eye < 0.12f && in_reach && !at_face && off_face;
+                               : ahead > std::cos(simple ? shield_on_simple : shield_on) && off_eye < 0.12f && in_reach && !at_face && off_face;
             };
             // ((Triforce VR) the Biggoron's Sword out: both hands hold it, its guard raised by the sword hand)
             // (not the shield raised alone: with the Biggoron's Sword put away, its shield out is no Biggoron guard)
@@ -2145,14 +2342,15 @@ struct Controls {
             int shield = biggoron_out ? sword_hand_now() : 1 - sword_hand_now();
             biggoron_guard = biggoron_out;
             bool keep = false;
-            // (the sword out: its other hand's shield; ((Triforce VR) the shield raised alone stays only while its grip is held)
-            if (x.weapon_out.load()) keep = raised(shield, shielding) && (!shield_alone || squeeze_on[shield]);
+            // (the sword out: its other hand's shield; ((Triforce VR) the shield raised alone stays only while its grip is held. weapon_out is any item out too: Simplified raises it with the sword alone)
+            if (simple ? x.weapon_out.load() == 2 && !held_item[0] : x.weapon_out.load())
+                keep = raised(shield, shielding) && (!shield_alone || squeeze_on[shield]);
             if (biggoron_guard && keep && !shielding) {   // ((Triforce VR) the guard begins only from a hand held fairly still, not
                                                           // within 0.4 s of a swing: a swing passes through the guard's pose)
                 const float gs = std::sqrt(hv[shield][0] * hv[shield][0] + hv[shield][1] * hv[shield][1] + hv[shield][2] * hv[shield][2]);
                 if (gs > 1.0f || now - swing_at < 400000000ull || swinging) keep = false;
             }
-            else {
+            else if (!simple) {   // (Simplified: none; the shield comes out with the sword)
                 // ((Triforce VR) no sword out: either hand's raise with its grip held is Link's lock with the shield alone, the shield
                 // in that hand: the left mirrors him (the sword then the right's), the right does not; the last one kept while held)
                 if (shielding && squeeze_on[shield] && raised(shield, true)) keep = true;
@@ -2185,11 +2383,14 @@ struct Controls {
                 };
                 const bool ranged = strstr(held_item, "Bow") || strstr(held_item, "SlingShot") || strstr(held_item, "Slingshot") ||
                                     strstr(held_item, "Pachinko") || strstr(held_item, "Hookshot");
-                const bool by_head = strstr(held_item, "Item_Bomb") || (!held_item[0] && x.weapon_out.load() && x.two_handed_sword.load());
-                const int hand = ranged ? (hook_hand >= 0 ? hook_hand : pull_hand) : -1;
+                const bool by_head = strstr(held_item, "Item_Bomb") || (!held_item[0] && x.weapon_out.load() > (simple ? 1 : 0) && x.two_handed_sword.load());
+                // ((Triforce VR) not in Simplified: there the aiming hand turns freely, the left trigger is Z)
+                const int hand = ranged && !simple ? (hook_hand >= 0 ? hook_hand : pull_hand) : -1;
                 const float tilt = hand >= 0 && pose_ok[hand] ? tilt_of(poses[hand].q) : by_head ? tilt_of(head_pose.q) : 0.0f;
                 const bool was = tilt_z;
-                tilt_z = (hand >= 0 || by_head) && in_play && !x.ocarina.load() && (tilt > 35.0f || (tilt_z && tilt > 25.0f));
+                // ((Triforce VR) in Simplified only the Biggoron's Sword's head tilt is Z (no hand's, no bomb's))
+                const bool tilt_ok = !simple || (by_head && !held_item[0]);
+                tilt_z = tilt_ok && (hand >= 0 || by_head) && in_play && !x.ocarina.load() && (tilt > 35.0f || (tilt_z && tilt > 25.0f));
                 if (tilt_z != was) rt_log("vr: %s tilt: Z-target %s", hand >= 0 ? "hand" : "head", tilt_z ? "on" : "off");
                 if (tilt_z) set_bit(ZL, true);
             }
@@ -2207,7 +2408,8 @@ struct Controls {
         const int item_owner = held_item[0] && pull_hand >= 0 ? pull_hand : held_item[0] && item_hand >= 0 ? item_hand : -1;
         // ((Triforce VR) the hammer: its head end is Link's other hand, so that hand's swing is the hammer's; the gripping hand's
         // is none)
-        const int sword = item_owner >= 0 ? (strstr(held_item, "Hammer") ? 1 - item_owner : item_owner) : sword_hand_now();
+        const int sword = item_owner >= 0 ? (strstr(held_item, "Hammer") ? 1 - item_owner : item_owner)
+                          : simple && simple_pick == 1 && simple_hold >= 0 ? simple_hold : sword_hand_now();
         if (sword != swing_hand) swing_hand = sword, swing_n = 0, swinging = false;
         if (pose_ok[sword]) {   // the velocity over the last 4 frames
             const float hx = poses[sword].p[0] - head[0], hz = poses[sword].p[2] - head[2];
@@ -2228,6 +2430,7 @@ struct Controls {
                 // ((Triforce VR) the Deku Stick and the hammer: downward swings only; a bottle: inward only (the right hand's
                 // right to left, the left's left to right); the sword any way)
                 bool way = true;
+                const char *swing_item = held_item[0] ? held_item : simple && simple_model ? simple_item : "";
                 // ((Triforce VR) a thing held in both hands: the other hand at the holding controller's bottom (past its handle's
                 // end along the controller's own down, within 18 cm, however it is tilted), and swinging with it)
                 const int oh = 1 - sword;
@@ -2240,12 +2443,12 @@ struct Controls {
                     under = l[2] > 0.03f && l[0] * l[0] + l[1] * l[1] + l[2] * l[2] < 0.18f * 0.18f;
                 }
                 const float os = std::sqrt(hv[oh][0] * hv[oh][0] + hv[oh][1] * hv[oh][1] + hv[oh][2] * hv[oh][2]);
-                if (strstr(held_item, "Hammer")) way = v[1] < -0.6f * speed;
-                else if (strstr(held_item, "DekuStick"))   // (the Deku Stick: both swinging down)
+                if (strstr(swing_item, "Hammer")) way = v[1] < -0.6f * speed;
+                else if (strstr(swing_item, "DekuStick"))   // (the Deku Stick: both swinging down)
                     way = v[1] < -0.6f * speed && under && os > 0.5f * speed && hv[oh][1] < -0.6f * os;
-                else if (!held_item[0] && x.two_handed_sword.load())   // (the Biggoron's Sword: both swinging, any way)
+                else if (!swing_item[0] && x.two_handed_sword.load())   // (the Biggoron's Sword: both swinging, any way)
                     way = under && os > 0.5f * speed;
-                else if (!strcmp(held_item, "Item_Bottle")) {
+                else if (!strcmp(swing_item, "Item_Bottle")) {
                     const float lat = v[0] * rx + v[2] * rz;
                     way = sword ? lat < -0.5f * speed : lat > 0.5f * speed;
                     // ((Triforce VR) and held as at the face for the ocarina: its pointer's level part sideways, inward (the right
@@ -2501,7 +2704,11 @@ struct Controls {
             const bool swinger = strstr(held_item, "Hammer") || strstr(held_item, "DekuStick") || !strcmp(held_item, "Item_Bottle") ||
                                  strstr(held_item, "Item_Bomb");
             // (something of the world's carried: the throw, Y, whatever item was out before)
-            tap_bit = !in_play ? -1 : carry ? Y : swinger ? ZR : !held_item[0] && x.weapon_out.load() ? Y : -1;   // (no swing in menus)
+            // (Simplified: with nothing in the hand a swing is Y even with the sword away: the game draws it, the shield with it)
+            // (Simplified: an item drawn in the hand: the swing hands it to the game, ZR: the stick's draw-and-swing, the nut's throw,
+            // the bottle's scoop or drink, the bomb's throw, the hammer's swing)
+            const bool drawn = simple && simple_model && !held_item[0];
+            tap_bit = !in_play ? -1 : carry ? Y : swinger || drawn ? ZR : !held_item[0] && (x.weapon_out.load() || simple) ? Y : -1;   // (no swing in menus)
             if (tap_bit == Y && slash_code == 20 && now < slash_extra_until) tap_bit = A;   // ((Triforce VR) the jump slash: A)
             queued = false;
             // (the charge: the sword's; ((Triforce VR) a gesture-chosen slash's press comes once it is chosen, often after the swing has
@@ -2521,7 +2728,7 @@ struct Controls {
             g_two_hands.store(hammer || stick ? (pull_hand >= 0 ? pull_hand : by_mirror) : shield_alone ? 2 : -1);
         }
         if (now < draw_until) set_bit(draw_bit, true);
-        if (ocarina) {   // the notes: the right stick's left, up, right and down Y, X, A and R; the A button L
+        if (ocarina && !simple) {   // the notes: the right stick's left, up, right and down Y, X, A and R; the A button L
             const bool a_down = bits & (1ull << A);
             bits &= ~(1ull << A | 1ull << X | 1ull << Y | 1ull << L | 1ull << R);
             y_down = 0, charging = false, queued = false;   // no sword meanwhile
@@ -2530,6 +2737,19 @@ struct Controls {
             if (sx * sx + sy * sy > 0.25f)
                 set_bit(std::fabs(sx) > std::fabs(sy) ? (sx < 0 ? Y : A) : (sy > 0 ? X : R), true);
         }
+        if (pad_grip && !ocarina) {   // the left stick past 0.6 holds the D-pad its way until back under 0.4
+            const float sx = dpad_stick[0], sy = dpad_stick[1], m = std::fmax(std::fabs(sx), std::fabs(sy));
+            if (m < 0.4f) pad_dir = -1;
+            else if (m > 0.6f && pad_dir < 0) {
+                pad_dir = std::fabs(sx) > std::fabs(sy) ? (sx > 0 ? RIGHT : LEFT) : (sy > 0 ? UP : DOWN);
+                dpad_bit = pad_dir, dpad_from = now, dpad_until = now + press_ns;
+                wheel = false, rt_log("vr: the item panel: D-pad %d, the panel shut", pad_dir);
+            }
+            if (pad_dir >= 0) set_bit(pad_dir, true);
+        } else {
+            pad_dir = -1;
+        }
+        if (wheel || eat_back) bits &= ~(1ull << A | 1ull << B | 1ull << X | 1ull << Y);
         publish();
     }
     void log_profile(XrSession session) {
@@ -2885,14 +3105,14 @@ void run(void *) {
         const bool show_hud = shown_drawn.tracked && shown_drawn.hud && hud_has && hud_swapchain && !x.hud_hidden.load();
         const XrCompositionLayerBaseHeader *screen = curved ? (const XrCompositionLayerBaseHeader *)&curve
                                                             : (const XrCompositionLayerBaseHeader *)&quad;
-        const XrCompositionLayerBaseHeader *layers[] = {shown_drawn.tracked ? (const XrCompositionLayerBaseHeader *)&proj
-                                                                            : screen,
-                                                        (const XrCompositionLayerBaseHeader *)&hud};
+        const XrCompositionLayerBaseHeader *layers[14] = {shown_drawn.tracked ? (const XrCompositionLayerBaseHeader *)&proj : screen};
+        uint32_t layer_n = 1;
+        if (show_hud || show_menu) layers[layer_n++] = (const XrCompositionLayerBaseHeader *)&hud;
         if (shown_drawn.tracked) tracked_frames++;
         XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
         ei.displayTime = fs.predictedDisplayTime;
         ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-        ei.layerCount = have_image && fs.shouldRender ? (show_hud || show_menu ? 2 : 1) : 0;
+        ei.layerCount = have_image && fs.shouldRender ? layer_n : 0;
         ei.layers = layers;
         r = x.xrEndFrame(session, &ei);
         if (XR_FAILED(r)) rt_log("vr: xrEndFrame failed (%d)", (int)r);
@@ -3096,7 +3316,7 @@ extern "C" int vk_xr_pad(uint64_t *buttons, int32_t left[2], int32_t right[2]) {
         bits = x.hand_buttons;
         std::memcpy(sticks, x.hand_sticks, sizeof sticks);
     }
-    if (x.ocarina.load()) sticks[1][0] = sticks[1][1] = 0, right[0] = right[1] = 0;   // the right stick plays the notes
+    if (x.ocarina.load() && strcmp(cfg_value("VR_CONTROLS"), "simplified") != 0) sticks[1][0] = sticks[1][1] = 0, right[0] = right[1] = 0;   // the right stick plays the notes
     int used = bits != 0;
     int32_t *out[2] = {left, right};
     for (int h = 0; h < 2; h++) {   // a small dead zone, then the stick farther out of the two (the gamepad's or this)
@@ -3115,16 +3335,18 @@ extern "C" int vk_xr_pad(uint64_t *buttons, int32_t left[2], int32_t right[2]) {
 
 extern "C" void vk_xr_ocarina(int on) { xr().ocarina.store(on != 0); }
 
-extern "C" void vk_xr_weapon_out(int out) { xr().weapon_out.store(out != 0); }
+extern "C" void vk_xr_weapon_out(int out) { xr().weapon_out.store(out); }
 extern "C" void vk_xr_two_handed_sword(int on) { xr().two_handed_sword.store(on != 0); }
 extern "C" void vk_xr_game_paused(int on) { xr().game_paused.store(on != 0); }
 extern "C" void vk_xr_turning(float strength) { g_turning.store(strength), g_turning_at.store(plat_now_ns()); }
 extern "C" void vk_xr_rumble(int side, float strength) { g_rumble[side & 1].store(strength), g_rumble_at[side & 1].store(plat_now_ns()); }
 // ((Triforce VR) vr_body.c: Link's arms as the game's animation has them now, not on the controllers: the bow or the slingshot
-// drawn (its ZR), the hammer's swing
+// drawn (its ZR), the hammer's swing. ((Triforce VR) Simplified: not the draw: both hands stay on the controllers, the
+// holding hand pointing the slingshot or bow as the one-handed aim does)
 extern "C" int vk_xr_arms_own(void) {
     const uint64_t swung = g_hammer_swung.load();
-    return g_draw_on.load() || (swung && plat_now_ns() - swung < kHammerSwingNs);
+    const bool draw_own = g_draw_on.load() && strcmp(cfg_value("VR_CONTROLS"), "simplified") != 0;
+    return draw_own || (swung && plat_now_ns() - swung < kHammerSwingNs);
 }
 extern "C" void vk_xr_child(int child) { xr().child.store(child != 0); }
 
@@ -3248,15 +3470,99 @@ extern "C" void vk_xr_hand_item(const char *model) {
 extern "C" void vk_xr_aim(int on, const double origin[3], const double dir[3]) {
     Xr &x = xr();
     std::lock_guard<std::mutex> lk(x.frame_mu);
-    x.aim_on = on != 0;
+    if (x.aim_on != (on != 0))   // ((Triforce VR) when the reticle's aim starts and ends, against the grips' ZR lines)
+        rt_log("vr: aim %s at %llu ms", on ? "on" : "off", (unsigned long long)(plat_now_ns() / 1000000ull));
+    x.aim_on = on != 0, x.aim_wait = on == 2;
     if (on) std::memcpy(x.aim_o, origin, sizeof x.aim_o), std::memcpy(x.aim_d, dir, sizeof x.aim_d);
 }
 
 
+// TRIFORCE_VR_TEST_GRIP=<file>: while that file exists the item panel is held as by the right trigger (test runs)
+static bool test_grip() {
+    static const char *grip_file = std::getenv("TRIFORCE_VR_TEST_GRIP");
+    if (!grip_file || !*grip_file) return false;
+    static std::atomic<uint64_t> at{0};
+    static std::atomic<bool> held{false};
+    const uint64_t now = plat_now_ns();
+    if (now - at.load(std::memory_order_relaxed) > 100000000ull) {
+        at.store(now, std::memory_order_relaxed);
+        std::FILE *f = std::fopen(grip_file, "rb");
+        if (f) std::fclose(f);
+        held.store(f != nullptr, std::memory_order_relaxed);
+    }
+    return held.load(std::memory_order_relaxed);
+}
+
+// 1: Stereo Balanced's hold; 2: the item panel open, the game's time frozen (host/nn_vi.c)
 extern "C" int vk_xr_holds_time(void) {
     Xr &x = xr();
-    return stereo_balanced() && x.ok && x.head_view.load(std::memory_order_relaxed) &&
-           x.running.load(std::memory_order_relaxed);
+    if (!x.ok || !x.head_view.load(std::memory_order_relaxed) || !x.running.load(std::memory_order_relaxed)) return 0;
+    if (x.wheel_live.load(std::memory_order_relaxed) || test_grip()) return 2;
+    return stereo_balanced() ? 1 : 0;
+}
+
+extern "C" void vk_xr_item_menu(const MkwVkItemMenu *menu) {
+    Xr &x = xr();
+    char mals[8] = "USen";
+    {
+        std::lock_guard<std::mutex> lk(x.item_mu);
+        x.items = *menu;
+        x.items.item_n = std::clamp(x.items.item_n, 0, MKWVK_ITEM_MENU_MAX);
+        x.item_pick.store(x.items.item_n ? std::clamp(menu->item_pick, 0, x.items.item_n - 1) : -1);
+        if (menu->item_mals[0]) {
+            snprintf(mals, sizeof mals, "%s", menu->item_mals);
+            for (int i = 0; i < 2 && mals[i]; i++) mals[i] = (char)std::toupper((unsigned char)mals[i]);   // (usen: USen.Product.110.sarc.zs)
+        }
+    }
+    rt_log("vr: the item panel: %d items, the pick %d", x.items.item_n, x.item_pick.load());
+    mkwvk::ui::items_want(mals);
+}
+extern "C" int vk_xr_item_pick(void) { return xr().item_pick.load(); }
+
+// (VR_CONTROLS=simplified) the item panel drawn over a copy of the HUD's box (item_img: the window's format), copied back
+void compose_items(VkCommandBuffer cb, int slot, VkFormat window, Drawn &d) {
+    Xr &x = xr();
+    if (!x.wheel_live.load(std::memory_order_relaxed) && !test_grip()) return;
+    MkwVkItemMenu m;
+    int order[MKWVK_ITEM_MENU_MAX];
+    {
+        std::lock_guard<std::mutex> lk(x.item_mu);
+        if (!x.items.item_n) return;
+        m = x.items;
+        item_order(m, x.recent, x.item_sort.load(), order);
+    }
+    const VkFormat view_format = mkwvk::ui::draw_format();
+    if (view_format == VK_FORMAT_UNDEFINED) return;
+    if (!x.item_img || x.item_w != x.width || x.item_h != x.height) {
+        x.item_img = VK_NULL_HANDLE, x.item_view = VK_NULL_HANDLE;   // (another size's is left behind, as the scene's)
+        if (!make_image(x.width, x.height, window,
+                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                        x.item_img, x.item_view, VK_IMAGE_ASPECT_COLOR_BIT, view_format)) {
+            x.item_img = VK_NULL_HANDLE;
+            return;
+        }
+        x.item_w = x.width, x.item_h = x.height;
+        rt_log("vr: the item panel's picture: %ux%u, format %d (drawn through %d)", x.width, x.height, (int)window, (int)view_format);
+    }
+    const VkImage hb = x.hud_boxes[slot];
+    VkImageBlit b{};
+    b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    b.srcOffsets[1] = b.dstOffsets[1] = {(int32_t)x.width, (int32_t)x.height, 1};
+    barrier(cb, x.item_img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    if (d.hud) {
+        vkCmdBlitImage(cb, hb, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, x.item_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_NEAREST);
+    } else {
+        const VkClearColorValue clear{};
+        const VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cb, x.item_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &all);
+    }
+    barrier(cb, x.item_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    mkwvk::menu_record_item_panel(cb, x.item_img, x.item_view, x.width, x.height, m, order, x.item_pick.load(), x.item_sort.load());
+    barrier(cb, x.item_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    barrier(cb, hb, d.hud ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    vkCmdBlitImage(cb, x.item_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, hb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_NEAREST);
+    barrier(cb, hb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    d.hud = true;
 }
 
 extern "C" void vk_xr_update_step(double seconds) { update_step.store(seconds, std::memory_order_relaxed); }
@@ -3351,7 +3657,7 @@ extern "C" int vk_xr_camera(double pos[3], double at[3], float up[3], int in_pla
     x.drawn.tracked = true, x.drawn.pose = head, x.drawn.lens = frustum(eyes, x.picture_ratio.load());
     x.drawn.eye = eye;
     std::memcpy(x.drawn.base, base, sizeof base), x.drawn.bx = bx, x.drawn.bz = bz;
-    x.drawn.aim = x.aim_on;
+    x.drawn.aim = x.aim_on, x.drawn.aim_wait = x.aim_wait;
     if (x.aim_on) {   // the aim's ray in the view: right, up and back (-forward)
         double o[3];
         for (int c = 0; c < 3; c++) o[c] = x.aim_o[c] - pos[c];
@@ -3654,7 +3960,9 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
     if (d.tracked) {
         std::lock_guard<std::mutex> lk(x.hud_mu);
         const bool pair = d.eye == 0 && stereo_accurate() && x.acc_ready;   // (Accurate: the left eye's target as its pass left it)
-        made = make_panel(cb, d.aim ? (int)(0.06f * (float)x.hud_h) : 0, pair ? x.target_l_view : VK_NULL_HANDLE);
+        // ((Triforce VR) Simplified: the game's reticle left on the panel, make_aim moves it)
+        const int cut = game_reticle() ? 0 : aim_cut(d);
+        made = make_panel(cb, cut, pair ? x.target_l_view : VK_NULL_HANDLE);
         hw = x.hud_w, hh = x.hud_h;
         if (made) make_aim(cb, d);
         if (made && depth && d.eye < 0) d.stereo = make_eyes(cb, d);
@@ -3669,8 +3977,12 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
             rotate(d.pose.q, right, hr2);
             const float shift = x.acc_shift.load(std::memory_order_relaxed);
             for (int c = 0; c < 3; c++) r.pose.p[c] += shift * hr2[c];
-            if (make_panel(cb, d.aim ? (int)(0.06f * (float)x.hud_h) : 0, x.target_view, x.scene_r_view)) {
+            if (make_panel(cb, cut, x.target_view, x.scene_r_view)) {
                 desat_right(cb);   // (its colours down to the left eye's)
+                if (game_reticle() && r.aim) {   // ((Triforce VR) the right eye's reticle too: the aim's start seen from it
+                    r.aim_o[0] -= shift;
+                    make_aim(cb, r);
+                }
                 keep_eye(cb, r);
                 d = r;
             }
@@ -3714,6 +4026,7 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
     }
     barrier(cb, box, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     if (d.tracked) {
+        compose_items(cb, slot, format, d);
         overlay_onto_hud(cb, slot, window, extent, d);
         x.box_drawn[slot] = d;
         if (have_picture) {   // last: the headset's copies are made
@@ -3797,7 +4110,9 @@ extern "C" const MkwVkXr *vk_xr_table(void) {
         vk_xr_cfg, vk_xr_head_active, vk_xr_camera, vk_xr_lens, vk_xr_holds_time, vk_xr_update_step, vk_xr_pad,
         vk_xr_ocarina, vk_xr_weapon_out, vk_xr_child,
         vk_xr_hand_item, vk_xr_in_play, vk_xr_item_bar, vk_xr_aim_freeze, vk_xr_pointer, vk_xr_aim, vk_xr_untracked, vk_xr_hands,
-        vk_xr_active, vk_xr_head_worn, vk_xr_hud_hidden, vk_xr_carrying, vk_xr_head_request, vk_xr_two_handed_sword, vk_xr_arms_own, vk_xr_game_paused, vk_xr_rumble, vk_xr_turning, vk_xr_combo_want, vk_xr_airborne};
+        vk_xr_active, vk_xr_head_worn, vk_xr_hud_hidden, vk_xr_carrying, vk_xr_head_request, vk_xr_item_menu,
+        vk_xr_item_pick, vk_xr_two_handed_sword, vk_xr_arms_own, vk_xr_game_paused,
+        vk_xr_rumble, vk_xr_turning, vk_xr_combo_want, vk_xr_airborne};
     return &t;
 }
 

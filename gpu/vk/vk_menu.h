@@ -259,7 +259,7 @@ struct Options {
     int vr_swing_speed = 230;   // a sword swing's hand speed, cm a second (100 to 500)
     int vr_charge_reach = 35;   // how far out from the head a swing must leave the hand to hold the charge, cm (25 to 70)
     int vr_hud_size = 100;      // the HUD panel's width, cm a metre away (40 to 200)
-    int vr_scheme = 0;          // the VR hand controllers' control scheme: 0 Full Gesture, 1 [PlaceHolder] (vk_xr.cpp)
+    int vr_scheme = 0;          // the VR hand controllers' control scheme: 0 Full Gesture, 1 Simplified (vk_xr.cpp)
     int vr_body = 1;            // first person: 0 Link hidden, 1 his arms on the controllers and his head hidden (host/vr_body.c)
     int vr_arm_reach = 135;     // the arms' stretch to reach the controllers, percent of their length (100 to 160)
     // ((Triforce) 11-24) the Graphics tab's ReShade preset (reshade/fx_builtin.h): 0 Off, the default; 1 Warm, 2 Cool, 3 User (its
@@ -368,6 +368,9 @@ VkImageView menu_tv_layer(VkCommandBuffer cmd);
 /// (headless shots, RX_VK_SHOT_MENU) The menu and the counter over another image: TRANSFER_DST_OPTIMAL before and after,
 /// R8G8B8A8_UNORM with colour-attachment use, view a view of it
 void menu_record_image(VkCommandBuffer cmd, VkImage image, VkImageView view, uint32_t w, uint32_t h);
+/// (Triforce VR) The Simplified item panel (the game's ShortCut_01 layout) over an image in TRANSFER_DST; sort 1: By Recently Selected
+void menu_record_item_panel(VkCommandBuffer cmd, VkImage image, VkImageView view, uint32_t w, uint32_t h, const MkwVkItemMenu& m,
+                            const int* order, int pick, int sort);
 /// (hookshot) The start-up screen while the shaders are prepared (vk_main.cpp, vk_progress.h), drawn by menu_record under the
 /// counter and the menu. Null takes it away.
 struct StartupView;

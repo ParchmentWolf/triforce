@@ -27,6 +27,13 @@ struct Art {
     bool mask = false;   // ((Triforce) one channel, white with its shape in alpha: the game's layout gives it its colour, as the drawing must)
 };
 const Art* art(const char* name);
+/// (Triforce VR) The item panel's pictures (romfs/UI/Tex/Icon) and texts in a Mals language ("USen"): read on a thread from
+/// the first call; item_icon null and item_text "" until then, or for a name the files do not have
+void items_want(const char* mals);
+const Art* item_icon(const char* actor);
+const char* item_text(const char* label);
+/// (Triforce VR) The format the overlays' pipeline draws into (the window images' views), UNDEFINED before the first begin
+VkFormat draw_format();
 /// (Triforce) The button icons' font asked for: read at the next begin, the one the game was served this run
 /// (host/prompts.c: the controller's face) or the game's own
 void want_glyphs();

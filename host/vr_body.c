@@ -34,7 +34,7 @@ static const char *body_cfg(const char *key) {
     return x && x->cfg ? x->cfg(key) : "";
 }
 static int body_arms(void) { return !strcmp(body_cfg("VR_BODY"), "arms"); }
-/* the sword's hand in VR: the last two-grip draw's (VR_SWORD_HAND), else the Handedness row's; 1 right */
+/* the sword's hand in VR: the last two-grip draw's (VR_SWORD_HAND), else Controls' Right handed Link; 1 right */
 static int vr_sword_right(void) {
     const char *live = body_cfg("VR_SWORD_HAND");
     return live[0] ? !strcmp(live, "right") : !strcmp(body_cfg("VR_HANDEDNESS"), "right");
@@ -557,6 +557,8 @@ static int weapons_drawn(Ctx *c, uint64_t actor) {
    1024), walked every 2 s (a weapon changed in the menu is found within that); each Link update each one's materials are
    hidden again while they should be (the game may show them again), and shown once when they should not */
 #define WORN_MAX 16
+static char sword_actor[48];   /* (the last walk's Weapon_Sword_* actor) */
+const char *vr_body_sword(void) { return sword_actor; }
 static volatile int weapon_drawn;   /* (the sword out, as hide_back_items last asked) */
 static void armor_caps_find(Ctx *c, const uint64_t *actors, int n);   /* (below, by cap_hide) */
 static void hide_back_items(Ctx *c, uint64_t link, int first_person) {
@@ -576,6 +578,7 @@ static void hide_back_items(Ctx *c, uint64_t link, int first_person) {
         for (int i = 0; plausible(list, 1024 * 0x60) && i < 1024 && m < WORN_MAX; i++) {
             const uint64_t w = recomp_load64(c, list + (uint64_t)i * 0x60 + 0x40);
             if (!w || !plausible(w, 0x40) || recomp_load64(c, w) != 0x84b45e18ULL || !actor_name(c, w, name)) continue;
+            if (!strncmp(name, "Weapon_Sword_", 13)) snprintf(sword_actor, sizeof sword_actor, "%s", name);
             for (unsigned k = 0; k < sizeof back_items / sizeof *back_items; k++)
                 if (!strncmp(name, back_items[k].prefix, strlen(back_items[k].prefix))) {
                     got[m++] = w;

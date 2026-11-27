@@ -3,17 +3,34 @@
 // makes the eyes from it, so it stands at the depth of what it lies on. The aim is the game's own camera's ray (from
 // over Link's shoulder), given in the head's view: its points from near to far are put in the picture and the first one
 // behind the scene's depth there is where it lands (the sky's far end when none is).
+// ((Triforce VR) move > 0 (Simplified): the game's own reticle, the HUD panel's disc of that many pixels at its middle,
+// moved there at the size the panel shows it (scale) and taken off the panel; else VR's ring and dot)
 // glslangValidator -V --target-env vulkan1.3 --vn XR_AIM_COMP_SPV -o xr_aim_comp_spv.h xr_aim.comp
 layout(local_size_x = 64) in;
 layout(binding = 0) uniform sampler2D depth;   // the scene's depth (R32F, as stored)
 layout(binding = 1, rgba8) uniform image2D scene;
+layout(binding = 2, rgba8) uniform image2D panel;   // the HUD's panel (premultiplied, the scene's size)
 layout(push_constant) uniform Push {
     float w, h;              // the scene's picture, pixels
     float ox, oy, oz;        // the ray's start in the head's view (x right, y up, z back), metres
     float dx, dy, dz;        // its direction
     float tan_x, tan_y;      // the lens: x_ndc = x / (-z tan_x)
     float plane_a, plane_b;  // the stored depth d is plane_a + plane_b / distance
+    float move;              // the game's reticle's radius on the panel, pixels (negative: hidden for now); 0 VR's own reticle
+    float scale;             // a panel pixel's size in the scene's pixels (the panel is seen smaller than the view)
 } p;
+
+// the panel at a point (pixels, their middles at +0.5), linear between its four nearest (premultiplied: mixed as they are)
+vec4 panel_at(vec2 q, ivec2 size) {
+    const vec2 f = q - 0.5, b = floor(f), t = f - b;
+    const ivec2 i = ivec2(b);
+    vec4 c[4];
+    for (int k = 0; k < 4; k++) {
+        const ivec2 j = i + ivec2(k & 1, k >> 1);
+        c[k] = any(lessThan(j, ivec2(0))) || any(greaterThanEqual(j, size)) ? vec4(0.0) : imageLoad(panel, j);
+    }
+    return mix(mix(c[0], c[1], t.x), mix(c[2], c[3], t.x), t.y);
+}
 
 const int STEPS = 512;
 const float NEAR = 0.3, FAR = 200.0;
@@ -42,8 +59,39 @@ void main() {
     }
     barrier();
     const vec3 v = at_step(first < uint(STEPS) ? int(first) : STEPS - 1);
-    if (v.z > -0.05) return;
+    const bool shown = v.z <= -0.05;
     const vec2 c = to_uv(v) * vec2(p.w, p.h);
+    if (p.move != 0.0) {
+        // the game's reticle: the panel's disc at its middle, put where the aim lands at the size the panel shows it
+        // ((Triforce VR) move < 0: only taken off the panel, the game's aim still turning onto the pointer)
+        const int r = int(abs(p.move));
+        const ivec2 size = ivec2(p.w, p.h), mid = size / 2;
+        const float s_ = max(p.scale, 0.05);
+        const int rt = int(ceil(float(r) * s_)) + 1, st = 2 * rt + 1;   // (its disc in the scene)
+        const ivec2 at_c = ivec2(floor(c));
+        if (shown && p.move > 0.0)
+            for (int k = int(id); k < st * st; k += 64) {
+                const ivec2 to = at_c + ivec2(k % st - rt, k / st - rt);
+                if (any(lessThan(to, ivec2(0))) || any(greaterThanEqual(to, size))) continue;
+                const vec2 o = (vec2(to) + 0.5 - c) / s_;   // (in the panel's pixels from its middle)
+                if (dot(o, o) > float(r * r)) continue;
+                const vec4 g = panel_at(vec2(size) * 0.5 + o, size);
+                if (g.a <= 0.0 && max(g.r, max(g.g, g.b)) <= 0.0) continue;
+                vec4 s = imageLoad(scene, to);
+                s.rgb = g.rgb + s.rgb * (1.0 - g.a);   // (premultiplied over)
+                imageStore(scene, to, s);
+            }
+        memoryBarrierImage();
+        barrier();
+        const int side = 2 * r + 1;
+        for (int k = int(id); k < side * side; k += 64) {   // (off the panel: it is in the scene now, or nowhere to be seen)
+            const ivec2 o = ivec2(k % side - r, k / side - r), from = mid + o;
+            if (dot(vec2(o), vec2(o)) > float(r * r) || any(lessThan(from, ivec2(0))) || any(greaterThanEqual(from, size))) continue;
+            imageStore(panel, from, vec4(0.0));
+        }
+        return;
+    }
+    if (!shown) return;
     const float r = 0.012 * p.h, line = max(1.5, 0.003 * p.h), edge = max(1.0, 0.0015 * p.h);
     const int half_side = int(r + line + edge + 2.0), side = 2 * half_side + 1;
     for (int k = int(id); k < side * side; k += 64) {
