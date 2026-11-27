@@ -2064,7 +2064,7 @@ def main():
                                 if f.endswith(".h"))
     if LINUX:
         host_deps += b"".join(open(os.path.join(POSIX, f), "rb").read() for f in sorted(os.listdir(POSIX)) if f.endswith(".h"))
-        host_deps += open(os.path.join(GPU, "vk", "vk_api.h"), "rb").read()
+    host_deps += open(os.path.join(GPU, "vk", "vk_api.h"), "rb").read()   # (rx_backend.c's MKWVK_API_VERSION, vr_game.c's MkwVkXr)
     host_deps += open(os.path.join(GPU, "vk", "dlss_math.h"), "rb").read()   # (host/rx_backend.c's DLSS jitter)
     host_blob, host_extras = host_deps, ffmpeg_version_key()
     host_roots = (HOST, gen, rt64, GPU, os.path.join(OPUS, "include"), os.path.join(kit.HERE, "..", "third_party", "zstd", "lib"))
