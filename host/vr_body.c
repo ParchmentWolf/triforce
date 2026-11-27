@@ -1116,6 +1116,38 @@ static void bangle_place(Ctx *c) {
     for (int k = 0; k < 4; k++)
         for (int r = 0; r < 3; r++) st_f(c, e + k * 16 + r * 4, want.m[r][k]);
 }
+/* ((Scout, 11-26) a placing of his: the thing's base (its place in the world: base +0x30 and its instance's origin) within
+   0.75 m of one of his bones' places. The things to mirror are found by name in the game's list of every actor (mirrored_item),
+   so a thing of the same name elsewhere was mirrored too: Kakariko's Hylian Shield on show (0.8 scale, 7.6 m from him) was
+   reflected and given his strap (strap_place), its strap mesh stretched from that shield across tens of metres, the long
+   orange rod by his left arm. His own things are placed on him (hands, back, belt); another's from its own holder */
+static int on_him(Ctx *c, int it, uint64_t base) {
+    const MaPart *mp = &ma.part[0];
+    const int part = ma_part_index(c, mp->bones);
+    const uint64_t inst = mi_inst[it];
+    if (part < 0 || !plausible(inst + 0x2d0, 12)) return 1;   /* (not known: as before) */
+    const uint64_t link_inst = recomp_load64(c, recomp_load64(c, recomp_load64(c, ma.model + 0x28) + (uint64_t)part * 8));
+    const uint64_t worlds = recomp_load64(c, mp->bones + 0x20);
+    if (!plausible(link_inst + 0x2d0, 12) || !plausible(worlds, (uint64_t)mp->n * 64)) return 1;
+    double at[3];
+    for (int r = 0; r < 3; r++)
+        at[r] = ld_f(c, base + 0x30 + (uint64_t)r * 4) + ld_f(c, inst + 0x2d0 + (uint64_t)r * 4) - ld_f(c, link_inst + 0x2d0 + (uint64_t)r * 4);
+    double best = 1e18;
+    for (int b = 0; b < mp->n; b++) {
+        double d2 = 0;
+        for (int r = 0; r < 3; r++) {
+            const double d = ld_f(c, worlds + (uint64_t)b * 64 + 0x30 + (uint64_t)r * 4) - at[r];
+            d2 += d * d;
+        }
+        if (d2 < best) best = d2;
+    }
+    const int his = best < 0.75 * 0.75;
+    static int told;   /* (the first few) */
+    if (!his && told < 10)
+        told++, hos_log("vr: body: mirrored animation: a %s placed %.1f m from his bones: not his, left alone",
+                        mir_items[mi_item[it]].prefix, sqrt(best));
+    return his;
+}
 /* a thing placed in one of his hands (its base within 12 cm of Weapon_L's or Weapon_R's place, in the world): mirrored only
    there; put away (his back, his belt) it sits on his body, which is not mirrored */
 static int in_his_hand(Ctx *c, uint64_t bones, uint64_t base) {
@@ -1261,6 +1293,7 @@ static int mirror_attach(Ctx *c, uint64_t fn) {
     const int it = mirrored_item(c, c->x[0]);
     const uint64_t base = c->x[1];
     if (it < 0 || !plausible(base, 64)) return 0;
+    if (!on_him(c, it, base)) return 0;   /* ((Scout, 11-26) a thing of the same name placed elsewhere: not his */
     if (mi_back[it] == -2) {   /* ((Triforce VR) a thing only ever in his hand (a trade item): which, for the hands (vr_game.c) */
         snprintf(quest_name, sizeof quest_name, "%s", mir_items[mi_item[it]].prefix);
         __atomic_store_n(&quest_at, hos_now_ns(), __ATOMIC_RELEASE);
