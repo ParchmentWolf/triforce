@@ -81,6 +81,14 @@ void vk_xr_turning(float strength);   // ((Triforce VR) vr_game.c: Smooth turnin
 void vk_xr_child(int child);
 // vr_game.c, the game's thread: the item Link uses now, by its model's name ("Item_DekuStick"), "" none
 void vk_xr_hand_item(const char *model);
+// vr_physics.c: an item's size from its mesh (vk_xr_item_shape)
+int vk_xr_item_shape(const char *actor, float out[3]);
+// vr_game.c's room capture: shot >= 0 saves that shot from this camera (cam: pos, at, up), -1 only says it runs
+void vk_xr_room_shot(int shot, const double cam[9], const double link[3]);
+// vr_body.c, each frame: Link's Weapon_L then Weapon_R in the world (rows of a 3x4, metres); ok bit 0 left, bit 1 right
+void vk_xr_hand_bones(const float bones[24], int ok);
+/* (Triforce VR) the physics' shapes for Show physics shapes: n capsules of 8 floats (end a x y z, radius, end b x y z, kind), world, metres */
+void vk_xr_phys_shapes(const float *caps, int n);
 // vr_game.c, the game's thread: in play now (not a menu, a pause, an event), the Touch controllers' play roles on
 void vk_xr_in_play(int on);
 void vk_xr_item_bar(int open);
@@ -98,6 +106,12 @@ void vk_xr_untracked(void);
 // its palm's facing (the grip's +x out of the left palm, into the right), unit directions; a hand not tracked all 0. 1
 // when any is tracked and the head's view is on
 int vk_xr_hands(double pos[6], double point[6], double palm[6]);
+void vk_xr_item_menu(const MkwVkItemMenu *menu);
+int vk_xr_item_pick(void);
+// host/vr_physics.c, the grab: the grips squeezed in play (bit 0 left, 1 right; 0 out of play or without a session), and the
+// hands it marks as near a body it can take or holding one: their grips then have no play roles (item, sword, bow, mask, shield)
+int vk_xr_grips(void);
+void vk_xr_grab_hands(int hands);
 
 // vk_draw.cpp, the game's scene upscaled into target (w x h, format), the HUD still to
 // be drawn over it: the image VR keeps it in (the caller copies it there in its stream), VK_NULL_HANDLE when the HUD's
@@ -129,6 +143,7 @@ void vk_xr_captured(const VkSemaphoreSubmitInfo *signal);
 // vk_temporal.cpp, the scene's camera: its projection (row major, clip = P * view position) and whether the depth's clip range is
 // -w..w; vk_xr_planes then gives the stored depth d of a view distance z as planes[0] + planes[1] / z, 0 without a recent one
 void vk_xr_note_projection(const float proj[16], int minus_w);
+void vk_xr_note_view(const float view[12]);
 int vk_xr_planes(float planes[2]);
 // a session runs: frame generation and the present's hold stand aside
 int vk_xr_active(void);

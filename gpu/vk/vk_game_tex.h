@@ -294,6 +294,20 @@ inline bool make_skin(std::vector<unsigned char>&& bntx_bytes, Skin& skin) {
         out.name = n;
         if (e && bntx.decode(*e, out.img)) skin.images.push_back(std::move(out));
     }
+    static const char* const item_panel[] = {   // ((Triforce VR) the item panel: ShortCut_01, PaShortCutSlideList_00, PaItemBtn_00)
+        "SelectItemBase_00", "SelectItemBase_01", "ShortCutCursorLine_00", "ShortCutCursorGlow_00", "MenuArrow_00",
+        "MenuArrowSh_00", "ShortCutScrollBar_00", "SortPage_On", "SortPage_Off", "ShortCutTextBg_00"};
+    for (const char* n : item_panel) {
+        const Bntx::Entry* e = bntx.find(n);
+        Skin::Entry out;
+        out.name = n;
+        if (e && bntx.decode(*e, out.img)) skin.images.push_back(std::move(out));
+    }
+    if (skin.get("ShortCutCursorLine_00") && skin.get("ShortCutCursorGlow_00")) {   // ((Triforce VR) ramps, as the Options cursor's)
+        Skin::Entry sl{"shortcut_cursor_line", {}}, sg{"shortcut_cursor_glow", {}};
+        make_cursor(*skin.get("ShortCutCursorLine_00"), *skin.get("ShortCutCursorGlow_00"), &sl.img, &sg.img);
+        skin.images.push_back(std::move(sl)), skin.images.push_back(std::move(sg));
+    }
     const Image *shape = skin.get("BtnThinBase_00"), *grain = skin.get("BtnThinBase_05");
     Skin::Entry row{"plate_row", make_plate(*shape, *grain, skin.get("BtnThinBase_04"), kPlateBlack, kPlateWhite, kPlateLine)};
     Skin::Entry row_sel{"plate_row_sel", row.img};   // (the selected row's plate is the same: the game marks it with the cursor alone)

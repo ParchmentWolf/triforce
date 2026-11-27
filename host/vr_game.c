@@ -358,6 +358,8 @@ static int link_aims(void) {
 }
 
 
+static volatile int g_hand_out;
+int vr_game_hand_held(void) { return g_hand_out; }
 static volatile int g_ocarina;   /* (vr_tick: Link plays the ocarina) */
 static volatile int g_held_boomerang;    /* (vr_tick: the boomerang in his hand) */
 static volatile int g_held_hookshot;     /* (vr_tick: the hookshot or the longshot in his hand) */
@@ -384,7 +386,13 @@ int vr_session_on(void) {
     const MkwVkXr *x = xr();
     return x && x->active && x->active() && x->head_active && x->head_active();
 }   /* ((Triforce VR) vr_body.c: the arms put on the controllers again before the mirror */
+/* ((Triforce VR) oot_sprint.c: VR plays Simplified, whose left stick click is the sprint's toggle (vk_xr.cpp) */
+int vr_simplified_sprint(void) {
+    const MkwVkXr *x = xr();
+    return x && x->active && x->active() && !strcmp(cfg_value("VR_CONTROLS"), "simplified");
+}
 static uint64_t zr_at, y_at;   /* the item button's (ZR) and the sword's (Y) last presses, vr_pad_read */
+static int sword_in_hand;      /* (Triforce VR) a sword's attack, or its draw just after Y, seen since it was last put away */
 
 /* Whether Link holds something out, and the item in his hand as VR's hands draw it (a model of the game's files), "" for
    the sword. His state's names (all of component 107's, one after another) tell it: a weapon or item out (CommonUpper,
@@ -462,7 +470,7 @@ static int hand_item(char out[96]) {
     }
     {   /* an area entered (a new Link): everything put away */
         static uint64_t was;
-        if (actor != was) was = actor, held = NULL;
+        if (actor != was) was = actor, held = NULL, sword_in_hand = 0;
     }
     if (strstr(names, "Hammer") && now_item && !strcmp(now_item, "Item_Hammer")) held = now_item;
     /* ((Triforce VR) a sword's attack: the sword is in his hand, so nothing else is (an item kept from a press the game took no
@@ -483,6 +491,10 @@ static int hand_item(char out[96]) {
        none of those names, and a swing taken as the sword's would swap it for the sword) */
     const int away = strstr(names, " WeaponEquipOff") != NULL;
     if (away) held = NULL;
+    if (!held && ((strstr(names, " Cut") && !strstr(names, "Hammer")) || strstr(names, " Charge") ||
+                  (strstr(names, " WeaponEquipOnUpper ") && t - y_at < 600000000ull)))
+        sword_in_hand = 1;
+    if (away || held || t - out_at > 500000000ull) sword_in_hand = 0;
     if (away || t - out_at > 500000000ull) return 0;
     if (!held) return 1;
     if (held[1]) {
@@ -504,11 +516,215 @@ static int hand_item(char out[96]) {
 }
 
 
+// (VR_CONTROLS=simplified) the item panel's boxes, as romfs UI/Pouch/PouchTable's ItemArray: each box's actors (the first owned shows)
+static const struct {
+    const char *actors[13];
+    unsigned char adult, child;
+    const char *count, *bag;   // (the count shown: an item's, and the bag whose size makes it green)
+    int bottles;
+} item_boxes[] = {
+    {{"Item_DekuStick"}, 0, 1, "Item_DekuStick", "DekuStick", 0},
+    {{"Weapon_Range_SlingShot"}, 0, 1, "Item_DekuSeed", "DekuSeed", 0},
+    {{"Item_Boomerang"}, 0, 1, 0, 0, 0},
+    {{"Item_DekuNut"}, 1, 1, "Item_DekuNut", "DekuNut", 0},
+    {{"Item_Bomb"}, 1, 1, "Item_Bomb", "Bomb", 0},
+    {{"Item_Bombchu"}, 1, 1, "Item_Bombchu", 0, 0},
+    {{"Item_Hammer"}, 1, 0, 0, 0, 0},
+    {{"Item_Longshot", "Item_Hookshot"}, 1, 0, 0, 0, 0},
+    {{"Item_Arrow_Normal", "Weapon_Range_Bow"}, 1, 0, "Item_Arrow_Normal", "Arrow", 0},
+    {{"Item_Arrow_Fire", "Pouch_Range_BowAndArrow_Fire"}, 1, 0, 0, 0, 0},
+    {{"Item_Arrow_Ice", "Pouch_Range_BowAndArrow_Ice"}, 1, 0, 0, 0, 0},
+    {{"Item_Arrow_Light", "Pouch_Range_BowAndArrow_Light"}, 1, 0, 0, 0, 0},
+    {{"Item_MagicBean"}, 0, 1, "Item_MagicBean", 0, 0},
+    {{"Item_DinFire"}, 1, 1, 0, 0, 0},
+    {{"Item_FaroreWind"}, 1, 1, 0, 0, 0},
+    {{"Item_NayruLove"}, 1, 1, 0, 0, 0},
+    {{"Item_Bottle", "Item_Bottle_BigPoe", "Item_Bottle_BlueFire", "Item_Bottle_BluePotion", "Item_Bottle_Bug", "Item_Bottle_Fairy",
+      "Item_Bottle_Fish", "Item_Bottle_GreenPotion", "Item_Bottle_HalfMilk", "Item_Bottle_Letter", "Item_Bottle_Milk",
+      "Item_Bottle_Poe", "Item_Bottle_RedPotion"}, 1, 1, 0, 0, 5},
+    {{"Item_ScrubBusinessSeed"}, 1, 1, 0, 0, 0},
+    {{"Item_ClaimCheck", "Item_EyeDrop", "Item_EyeballFrog", "Item_Prescription", "Item_BrokenSword", "Item_PoacherSaw",
+      "Item_OddPowder", "Item_OddMushroom", "Item_CojiroCucco", "Item_PocketCucco", "Item_PocketEgg"}, 1, 0, 0, 0, 0},
+    {{"Item_ZeldaLetter", "Item_AlarmCucco", "Item_WeirdEgg"}, 0, 1, 0, 0, 0},
+};
+int hos_oot_pouch_count(Ctx *c, const char *name);
+const char *vr_body_sword(void);
+int hos_oot_capacity(Ctx *c, const char *what);
+const char *hos_mals_language(void);
+
+// a game function called with up to five arguments, its stack at sp (below what the caller keeps there)
+static uint64_t game_call5(Ctx *c, uint64_t fn, uint64_t sp, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) {
+    const A64Fn f = a64_lookup(fn);
+    if (!f) return 0;
+    const Ctx saved = *c;
+    c->x[31] = sp, c->x[0] = a0, c->x[1] = a1, c->x[2] = a2, c->x[3] = a3, c->x[4] = a4;
+    f(c);
+    const uint64_t r = c->x[0];
+    *c = saved;
+    return r;
+}
+static void store_bytes(Ctx *c, uint64_t at, const void *v, size_t n) {
+    for (size_t k = 0; k < n; k++) recomp_store8_sp(c, at + k, ((const uint8_t *)v)[k]);
+}
+// the game data [[main+0x4c7e0d0]] and the item button [[main+0x4c7e2a8]]+0x5c0, as the game's panel puts its pick on (main+0x33c98f0)
+static uint64_t items_data(void) {
+    const uint64_t slot = rd_ptr(OOT_DATA_MAIN + 0x4c7e0d0);
+    return slot ? rd_ptr(slot) : 0;
+}
+static int item_button(void) {
+    const uint64_t slot = rd_ptr(OOT_DATA_MAIN + 0x4c7e2a8), ui = slot ? rd_ptr(slot) : 0;
+    uint8_t b = 0;
+    return ui && rd(ui + 0x5c0, &b, 1) ? b : -1;
+}
+// an actor's index for the item button: its name object (char* +0, size +8) to main+0x58ed10, the index from its +0x28 (main+0xa668c0)
+static int item_index(Ctx *c, const char *actor, uint64_t frame) {
+    const size_t n = strlen(actor);
+    if (n >= 0x60) return -1;
+    const uint64_t text = frame + 0x40, size = 0x60;
+    const int32_t none = -1;
+    store_bytes(c, text, actor, n + 1);
+    store_bytes(c, frame, &text, 8);
+    store_bytes(c, frame + 8, &size, 4);
+    store_bytes(c, frame + 0x20, &none, 4);
+    const uint64_t info = game_call5(c, OOT_DATA_MAIN + 0x58ed10, frame, frame, 0, 0, 0, 0);
+    if (!info) return -1;
+    game_call5(c, OOT_DATA_MAIN + 0xa668c0, frame, frame + 0x20, info + 0x28, 0, 0, 0);
+    int32_t index = -1;
+    rd(frame + 0x20, &index, 4);
+    return index;
+}
+// (once) the names and indexes in the game's bottle list (main+0xa6fae0 of [[gd+0x10]+0x150]; nodes +0x18 next, +8 count, +0x10 entries; main+0xa6fb40 an entry's name object; its index at +0x40)
+static void bottle_list_log(Ctx *c, uint64_t gd, uint64_t frame) {
+    static int done;
+    const uint64_t holder = gd ? rd_ptr(gd + 0x10) : 0, from = holder ? rd_ptr(holder + 0x150) : 0;
+    if (done || !from || !a64_lookup(OOT_DATA_MAIN + 0xa6fae0) || !a64_lookup(OOT_DATA_MAIN + 0xa6fb40)) return;
+    done = 1;
+    uint64_t node = game_call5(c, OOT_DATA_MAIN + 0xa6fae0, frame, from, 0, 0, 0, 0);
+    for (int k = 0; node && k < 32; k++, node = rd_ptr(node + 0x18)) {
+        int32_t n = 0;
+        rd(node + 8, &n, 4);
+        const uint64_t list = rd_ptr(node + 0x10);
+        for (int i = 0; list && i < n && i < 64; i++) {
+            const uint64_t e = rd_ptr(list + 8ull * i), obj = e ? game_call5(c, OOT_DATA_MAIN + 0xa6fb40, frame, e, 0, 0, 0, 0) : 0;
+            const uint64_t text = obj ? rd_ptr(obj) : 0;
+            char name[64] = "";
+            if (text) rd(text, name, sizeof name - 1);
+            int32_t index = -1;
+            rd(e + 0x40, &index, 4);
+            hos_log("vr: the bottle list: node %d entry %d: %s, index %d", k, i, name, index);
+        }
+    }
+}
+// an owned bottle's content (BottleInfo.Bottle<slot>.IsValid, .BottleItem) as its picture's actor, NULL not owned or not known
+static const char *bottle_actor(char slot, uint32_t *what) {
+    static const struct { const char *value, *actor; } contents[] = {
+        {"Empty", "Item_Bottle"}, {"RedPotion", "Item_Bottle_RedPotion"}, {"GreenPotion", "Item_Bottle_GreenPotion"},
+        {"BluePotion", "Item_Bottle_BluePotion"}, {"Fish", "Item_Bottle_Fish"}, {"BlueFire", "Item_Bottle_BlueFire"},
+        {"Bug", "Item_Bottle_Bug"}, {"Poe", "Item_Bottle_Poe"}, {"BigPoe", "Item_Bottle_BigPoe"}, {"Fairy", "Item_Bottle_Fairy"},
+        {"MaxMilk", "Item_Bottle_Milk"}, {"HalfMilk", "Item_Bottle_HalfMilk"}, {"Letter", "Item_Bottle_Letter"}};
+    char key[96];
+    int owned = 0;
+    *what = 0;
+    snprintf(key, sizeof key, "PlayerStatus.AssignableItem.BottleInfo.Bottle%c.IsValid", slot);
+    if (!oot_data_flag(gw(), key, &owned) || !owned) return NULL;
+    snprintf(key, sizeof key, "PlayerStatus.AssignableItem.BottleInfo.Bottle%c.BottleItem", slot);
+    oot_data_enum(gw(), key, what);
+    for (size_t i = 0; i < sizeof contents / sizeof *contents; i++)
+        if (*what == oot_data_hash(contents[i].value)) return contents[i].actor;
+    return NULL;
+}
+static MkwVkItemMenu item_menu;
+static int item_menu_index[MKWVK_ITEM_MENU_MAX];
+static int item_on, item_was_on;   // the pick on the button now; the one on it at the open, -1 none of the list
+static void item_panel_open(Ctx *c, const MkwVkXr *x) {
+    const int child = oot_childhood(), button = item_button();
+    const uint64_t gd = items_data(), frame = (c->x[31] - 0x200) & ~0xfULL;
+    const int current = gd && button >= 0 ? (int)(int32_t)game_call5(c, OOT_DATA_MAIN + 0x17b6e0, frame, gd, (uint64_t)button, 0, 0, 0) : -1;
+    memset(&item_menu, 0, sizeof item_menu);
+    snprintf(item_menu.item_mals, sizeof item_menu.item_mals, "%s", hos_mals_language());
+    snprintf(item_menu.item_sword, sizeof item_menu.item_sword, "%s", vr_body_sword());
+    item_menu.item_pick = 0;
+    for (size_t b = 0; b < sizeof item_boxes / sizeof *item_boxes; b++) {
+        if (!(child ? item_boxes[b].child : item_boxes[b].adult)) continue;
+        if (item_boxes[b].bottles) {
+            bottle_list_log(c, gd, frame);
+            for (char slot = 'A'; slot <= 'E' && item_menu.item_n < MKWVK_ITEM_MENU_MAX; slot++) {
+                uint32_t what = 0;
+                const char *actor = bottle_actor(slot, &what);
+                if (!actor) continue;
+                char name[16];
+                snprintf(name, sizeof name, "Bottle%c", slot);
+                /* a bottle's index for the item button is its item slot, whatever it holds: A..D 0xe..0x11, E 0x32 (the game's
+                   own item menu put 0xf on the button for bottle B; main+0x33c3f60 reads the bottles from these slots;
+                   notes/ghidra/link-skeleton-equipment.md). The bottle list's indexes are its contents', not the button's */
+                const int index = slot == 'E' ? 0x32 : 0xe + (slot - 'A');
+                hos_log("vr: the item panel: %s holds %s (%#x): index %#x", name, actor, what, index);
+                const int i = item_menu.item_n++;
+                snprintf(item_menu.item_list[i].item_actor, sizeof item_menu.item_list[i].item_actor, "%s", actor);
+                item_menu.item_list[i].item_count = -1;
+                item_menu_index[i] = index;
+                if (current >= 0 && item_menu_index[i] == current) item_menu.item_pick = i;
+            }
+            continue;
+        }
+        int shown = 0;
+        for (int a = 0; a < 13 && item_boxes[b].actors[a] && item_menu.item_n < MKWVK_ITEM_MENU_MAX; a++) {
+            const char *actor = item_boxes[b].actors[a];
+            const int have = hos_oot_pouch_count(c, actor);
+            for (int k = 0; k < (item_boxes[b].bottles ? have : have > 0) && shown < (item_boxes[b].bottles ? item_boxes[b].bottles : 1); k++, shown++) {
+                const int i = item_menu.item_n++;
+                snprintf(item_menu.item_list[i].item_actor, sizeof item_menu.item_list[i].item_actor, "%s", actor);
+                item_menu.item_list[i].item_count = item_boxes[b].count ? hos_oot_pouch_count(c, item_boxes[b].count) : -1;
+                const int most = item_boxes[b].bag ? hos_oot_capacity(c, item_boxes[b].bag) : 0;
+                item_menu.item_list[i].item_full = most > 0 && item_menu.item_list[i].item_count >= most;
+                item_menu_index[i] = item_index(c, actor, frame);
+                if (current >= 0 && item_menu_index[i] == current) item_menu.item_pick = i;
+            }
+            if (shown && !item_boxes[b].bottles) break;
+        }
+    }
+    item_on = item_menu.item_pick, item_was_on = current >= 0 && item_menu.item_n && item_menu_index[item_menu.item_pick] == current ? item_menu.item_pick : -1;
+    hos_log("vr: the item panel opened: %d items (%s, the button %d holds %d), the sword %s", item_menu.item_n, child ? "child" : "adult",
+            button, current, item_menu.item_sword[0] ? item_menu.item_sword : "not known");
+    for (int i = 0; i < item_menu.item_n; i++)
+        hos_log("vr: the item panel: %s, count %d, index %d", item_menu.item_list[i].item_actor, item_menu.item_list[i].item_count, item_menu_index[i]);
+    x->item_menu(&item_menu);
+}
+static void item_put_on(Ctx *c, int pick) {
+    const int button = item_button();
+    const uint64_t gd = items_data(), frame = (c->x[31] - 0x200) & ~0xfULL;
+    if (pick < 0 || pick >= item_menu.item_n) return;
+    item_on = pick;
+    const char *actor = item_menu.item_list[pick].item_actor;
+    const int index = item_menu_index[pick];
+    if (!gd || button < 0 || index < 0) {
+        hos_log("vr: the item panel: %s not put on (game data %s, button %d, index %d)", actor, gd ? "yes" : "no", button, index);
+        return;
+    }
+    game_call5(c, OOT_DATA_MAIN + 0x1211c00, frame, gd, (uint64_t)button, (uint64_t)(uint32_t)index, 1, 1);
+    const int now_on = (int)(int32_t)game_call5(c, OOT_DATA_MAIN + 0x17b6e0, frame, gd, (uint64_t)button, 0, 0, 0);
+    hos_log("vr: the item panel: %s (index %d) put on button %d, which now holds %d", actor, index, button, now_on);
+}
+static void item_panel(Ctx *c, const MkwVkXr *x, int want) {
+    static int was, warmed;
+    if (!warmed && x->item_menu) {   // (the pictures and texts read ahead, before the first open)
+        MkwVkItemMenu none;
+        memset(&none, 0, sizeof none);
+        snprintf(none.item_mals, sizeof none.item_mals, "%s", hos_mals_language());
+        x->item_menu(&none);
+        warmed = 1;
+    }
+    if (want && !was) item_panel_open(c, x);
+    const int pick = was || want ? x->item_pick() : -1;
+    if (want && pick >= 0 && pick != item_on) item_put_on(c, pick);
+    if (!want && was && pick < 0 && item_was_on >= 0 && item_on != item_was_on) item_put_on(c, item_was_on), hos_log("vr: the item panel: Back");
+    was = want;
+}
+
 /* The game's thread at each pad read: whether Link plays the ocarina (a DemoOcarina state, a lesson's too), what he holds,
    and whether the game is in play (the gameplay camera updated a moment ago, not the title, a load or an event; Link there and
    not in one of his scripted Demo states; the game not paused by its menus), for the controllers' play roles */
 static void vr_tick(Ctx *c, const MkwVkXr *x) {
-    (void)c;
     char state[48];
     oot_link_state_at(state, 0x244);
     g_ocarina = !strncmp(state, "DemoOcarina", 11);
@@ -516,8 +732,11 @@ static void vr_tick(Ctx *c, const MkwVkXr *x) {
     {   /* what he holds out, for the controllers' gestures */
         char item[96] = "";
         x->child(oot_childhood());
-        x->weapon_out(hand_item(item));
+        const int out = hand_item(item);
+        x->weapon_out(out && !item[0] && sword_in_hand ? 2 : out);   /* 2: the sword seen in his hand */
         x->hand_item(item);
+        g_hand_out = !out ? VR_HELD_NONE : !item[0] ? VR_HELD_SWORD : !strcmp(item, "Item_DekuStick") ? VR_HELD_DEKU_STICK
+                   : !strcmp(item, "Item_Hammer") ? VR_HELD_HAMMER : VR_HELD_OTHER;
         g_item_out = item[0] != 0;
         snprintf(g_held, sizeof g_held, "%s", item);
         if (x->two_handed_sword) x->two_handed_sword(vr_game_two_handed());
@@ -580,6 +799,7 @@ static void vr_tick(Ctx *c, const MkwVkXr *x) {
     /* ((Triforce VR) aiming counts as play whatever camera the aim has: the hookshot's trigger is its aim, not an item bar) */
     const int play = (camera || link_aims()) && !oot_event_playing() && state[0] && strncmp(state, "Demo", 4);
     x->in_play(play && !oot_paused());
+    if (!strcmp(cfg_value("VR_CONTROLS"), "simplified") && x->item_menu) item_panel(c, x, x->holds_time && x->holds_time() == 2);
 }
 
 // first person: the left stick outside RUN_CONE strafes through the game's own strafe test (hos_oot_strafe_yes)
@@ -692,7 +912,8 @@ void vr_pad_read(Ctx *c, uint64_t *buttons, int32_t stick[4]) {
             }
         } else want = -1;
     }
-    if (!rx_option(1, 0)) vr_pad(buttons, &stick[0], &stick[1]), vr_turn(&stick[2]);   /* (not while the Insert menu is open) */
+    const int wheel = !strcmp(cfg_value("VR_CONTROLS"), "simplified") && x->holds_time && x->holds_time() == 2;   // (the item panel's pick)
+    if (!rx_option(1, 0) && !wheel) vr_pad(buttons, &stick[0], &stick[1]), vr_turn(&stick[2]);   /* (not while the Insert menu is open) */
     if (!rx_option(1, 0) && now_ns() - __atomic_load_n(&stick_aim_at, __ATOMIC_ACQUIRE) < 150000000ull) {
         stick[2] = stick_aim[0], stick[3] = stick_aim[1];   /* ((Triforce VR) the pointed aim's stick: steer_aim */
         /* (the game's own camera inversions turned back: the steering pushes the way the pointer is) */
@@ -807,14 +1028,16 @@ static int set_aim(uint64_t state, const double t[3]) {
     if (!state || !poke(state + 0xa384, &target, 4) || !poke(state + 0xa38c, &target, 4) || !poke(state + 0x1178, &target, 4)) return 0;
     return 1;
 }
-static void steer_aim(const MkwVkXr *x, const double d[3], uint64_t state, const double pos[3]) {
+/* (the degrees the game's aim is still off the pointer, -1 when it is not steered onto one) */
+static double steer_aim(const MkwVkXr *x, const double d[3], uint64_t state, const double pos[3]) {
     /* ((Triforce VR) not in Immersive (third person): there the right stick aims, as on a gamepad) */
     const int immersive_view = !strcmp(cfg_value("VR_VIEW"), "head") && !strcmp(cfg_value("VR_CAMERA"), "third");
+    /* ((Triforce VR) Simplified too: the item's hand points it (vk_xr_pointer, its hand g_item_hand) */
     const int pointed = d && g_aiming && !strcmp(cfg_value("VR_PLAY"), "motion") && x->head_active() && !immersive_view;
     x->aim_freeze(pointed);
     double t[3];
     const int pointer = pointed && x->pointer(t);
-    if (!pointer) return;
+    if (!pointer) return -1;
     {   /* ((Triforce VR) the aim onto the pointer: the bow's and the slingshot's pitch set in the camera's state (set_aim); the
            rest through the right stick, which the game's aim always takes (its own yaw, the hookshot's and the boomerang's
            aim are made again each update from a state not found): full past kStickFull degrees off, in proportion below,
@@ -824,7 +1047,7 @@ static void steer_aim(const MkwVkXr *x, const double d[3], uint64_t state, const
         char upper[48];
         oot_link_state_at(upper, 0x34c);
         const int pose = link_aims(), boomerang = g_held_boomerang, hookshot = g_held_hookshot || !strncmp(upper, "Hookshot", 8);
-        if (!pose && !boomerang && !hookshot) return;
+        if (!pose && !boomerang && !hookshot) return -1;
         if (boomerang && !pose) {   /* (the boomerang's aim is the game's camera's, behind and above him: in first person that
                                        camera is turned onto the point 15 m out along the gaze from his eyes) */
             double eye[3];
@@ -846,6 +1069,7 @@ static void steer_aim(const MkwVkXr *x, const double d[3], uint64_t state, const
 #undef STICK_PUSH
         stick_aim[0] = (int32_t)(sx * 32767), stick_aim[1] = (int32_t)(sy * 32767);
         __atomic_store_n(&stick_aim_at, now_ns(), __ATOMIC_RELEASE);
+        return fmax(fabs(yaw_err), pitch_set ? 0.0 : fabs(up_err));
     }
 }
 
@@ -878,7 +1102,7 @@ static double update_seconds(void) {
 void vr_update_step(double seconds) { step_seconds = seconds; }
 int vr_holds_time(void) {
     const MkwVkXr *x = xr();
-    return x && x->holds_time();
+    return x ? x->holds_time() : 0;
 }
 
 /* ((Triforce VR) how the event playing is seen, by its name and Link's state: from Link's eyes always (load zones, a void out,
@@ -920,7 +1144,147 @@ static int event_view(uint64_t event) {
     return strcmp(cfg_value("VR_CUTSCENES"), "first") ? EV_CUTSCENE : EV_EYES;
 }
 
+/* room-capture.go in the game's folder starts it; the renderer saves each shot (vk_xr_room_shot). The file's words: "all"
+   the whole set (room-shot-000..233.bin), else the check alone (room-shot-1NNN.bin: the centre at 1.5 m six ways, and
+   down from 1.0 m), to see that Link, his gear, the ocarina and Navi are gone before the whole set is taken; "nomove"
+   leaves Navi where she is; "poses": the cameras in room-poses.txt (room-shot-2NNN.bin; lines "x y z  ax ay az  fov": the
+   eye, a point it looks at, in the world, and its vertical view in degrees: the room kit's outside_spots.py puts cameras
+   out of the house, above it and just past the door and the window, for the room's outside). The shots go to room-shots\
+   beside the game; the kit's shotpack.py packs them there into a file a group */
+enum { ROOM_SPOTS = 39, ROOM_SHOTS = ROOM_SPOTS * 6, ROOM_HOLD = 14, ROOM_ASK = 10, ROOM_CHECK_ID = 1000, ROOM_POSE_ID = 2000,
+       ROOM_POSES_MAX = 512 };
+static const double room_centre[3] = {-44.68, 118.46, 15.64};   /* his house's floor: notes/vr-room/FINDINGS.md */
+static const float room_fov_all = 1.7453f;   /* 100 degrees, vertical */
+static float room_fov = 1.7453f;   /* (the shot's own: a pose's may be narrower) */
+static const int room_check[] = {78, 79, 80, 81, 82, 83, 5};   /* (spot 13 six ways, spot 0 down) */
+static int room_shot = -1, room_held, room_step, room_steps, room_all, room_move, room_posed;
+static double room_poses[ROOM_POSES_MAX][7];   /* (eye, the point it looks at, the vertical view in degrees) */
+
+/* the game's fade (hide_link) on every fade component of an actor, not only the two slots Link's are in */
+static void fade_actor(uint64_t actor) {
+    static const float hidden = -1.0f;
+    const uint64_t components = rd_ptr(actor + 0x270);
+    const unsigned size = game_rw(components, 0x400) ? 0x400 : game_rw(components, 0x280) ? 0x280 : 0;
+    for (unsigned slot = 0; slot < size; slot += 8) {
+        const uint64_t object = rd_ptr(components + slot);
+        if (!game_rw(object, 0x138)) continue;
+        const uint64_t vt = rd_ptr(object);
+        if (vt == OOT_DATA_MAIN + 0x4b4a5a0) poke(object + 0x118, &hidden, sizeof hidden);
+        else if (vt == OOT_DATA_MAIN + 0x4b4b4a8) poke(object + 0x130, &hidden, sizeof hidden);
+    }
+}
+/* Navi 30 m under his feet for the capture: her glow ball is an effect at her place, not her model. Her place guessed at
+   Link's offsets (+0x31c; component 0's matrix, +0x1f8): each written only while it is near him or already moved */
+static void navi_away(uint64_t navi, int log) {
+    float feet[3], p[3], t[12];
+    if (!player_pos(feet)) return;
+    const uint64_t components = rd_ptr(navi + 0x270), c0 = components ? rd_ptr(components) : 0, m = c0 ? rd_ptr(c0 + 0x60) : 0;
+    const int have_p = rd(navi + 0x31c, p, sizeof p) && isfinite(p[0]) && isfinite(p[1]) && isfinite(p[2]);
+    const int have_t = game_rw(m, 0x1f8 + sizeof t) && rd(m + 0x1f8, t, sizeof t) && isfinite(t[3]) && isfinite(t[7]) && isfinite(t[11]);
+    if (log)
+        hos_log("vr: room capture: Link %.2f %.2f %.2f; Navi +0x31c %s %.2f %.2f %.2f, matrix %s %.2f %.2f %.2f", feet[0], feet[1], feet[2],
+                have_p ? "" : "(none)", have_p ? p[0] : 0, have_p ? p[1] : 0, have_p ? p[2] : 0, have_t ? "" : "(none)",
+                have_t ? t[3] : 0, have_t ? t[7] : 0, have_t ? t[11] : 0);
+    const float under = feet[1] - 30.0f;
+    /* (she flies up to the canopy, 4.2 m over his feet seen: the house's size) */
+    #define NEAR(x, y, z) ((hypotf((x) - feet[0], (z) - feet[2]) < 6.0f && fabsf((y) - feet[1]) < 8.0f) || fabsf((y) - under) < 1.0f)
+    if (have_p && NEAR(p[0], p[1], p[2])) {
+        const float q[3] = {feet[0], under, feet[2]};
+        poke(navi + 0x31c, q, sizeof q);
+    }
+    if (have_t && NEAR(t[3], t[7], t[11])) t[3] = feet[0], t[7] = under, t[11] = feet[2], poke(m + 0x1f8, t, sizeof t);
+    #undef NEAR
+}
+
+static void room_pose(int shot, double pos[3], double at[3], float up[3]) {
+    static const double heights[3] = {1.0, 1.5, 2.0};
+    const int spot = shot / 6, way = shot % 6, k = spot % 13;
+    const double ring = k == 0 ? 0.0 : k <= 6 ? 0.75 : 1.6;
+    const double angle = k <= 6 ? (k - 1) * M_PI / 3 : M_PI / 6 + (k - 7) * M_PI / 3;
+    pos[0] = room_centre[0] + ring * cos(angle);
+    pos[1] = room_centre[1] + heights[spot / 13];
+    pos[2] = room_centre[2] + ring * sin(angle);
+    static const double ways[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}, {0, 1, 0}, {0, -1, 0}};
+    static const float ups[6][3] = {{0, 1, 0}, {0, 1, 0}, {0, 1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1}};
+    for (int i = 0; i < 3; i++) at[i] = pos[i] + ways[way][i], up[i] = ups[way][i];
+}
+
+static int room_capture(const MkwVkXr *x, double pos[3], double at[3], float up[3]) {
+    if (room_shot < 0) {
+        static unsigned polled;
+        if (++polled % 30) return 0;
+        FILE *f = fopen("room-capture.go", "rb");
+        if (!f) return 0;
+        char words[128] = "";
+        words[fread(words, 1, sizeof words - 1, f)] = 0;
+        fclose(f);
+        remove("room-capture.go");
+        float feet[3];
+        const double away = player_pos(feet) ? hypot(feet[0] - room_centre[0], feet[2] - room_centre[2]) : 1e9;
+        if (!x->room_shot || away > 6.0) {
+            hos_log("vr: room capture not started: %s", x->room_shot ? "Link is not in his house" : "the renderer has no room capture");
+            return 0;
+        }
+        room_all = strstr(words, "all") != NULL, room_move = !strstr(words, "nomove");
+        room_steps = room_all ? ROOM_SHOTS : (int)(sizeof room_check / sizeof *room_check);
+        room_posed = strstr(words, "poses") != NULL;
+        if (room_posed) {
+            FILE *pf = fopen("room-poses.txt", "r");
+            int n = 0;
+            while (pf && n < ROOM_POSES_MAX) {
+                double *q = room_poses[n];
+                const int got = fscanf(pf, "%lf %lf %lf %lf %lf %lf %lf", &q[0], &q[1], &q[2], &q[3], &q[4], &q[5], &q[6]);
+                if (got != 7) break;
+                if (q[6] > 1.0 && q[6] < 170.0) n++;
+            }
+            if (pf) fclose(pf);
+            if (!n) {
+                hos_log("vr: room capture not started: room-poses.txt has no poses");
+                return 0;
+            }
+            room_steps = n, room_all = 0;
+        }
+        hos_log("vr: room capture: %s, %d shots, Navi %s, Link's feet %.2f %.2f %.2f", room_posed ? "poses" : room_all ? "all" : "check", room_steps,
+                room_move ? "moved away" : "not moved", feet[0], feet[1], feet[2]);
+        room_step = 0, room_held = -60;
+        vr_body_hide_navi(1);
+    }
+    room_shot = room_posed ? room_step : room_all ? room_step : room_check[room_step];
+    if (room_posed) {
+        const double *q = room_poses[room_step];
+        for (int i = 0; i < 3; i++) pos[i] = q[i], at[i] = q[3 + i], up[i] = i == 1;
+        room_fov = (float)(q[6] * M_PI / 180.0);
+    } else {
+        room_pose(room_shot, pos, at, up);
+        room_fov = room_fov_all;
+    }
+    const uint64_t actor = player();
+    if (actor) hide_link(actor);
+    for (int i = 0; i < 8; i++) {
+        const uint64_t a = vr_body_room_actor(i);
+        if (!a) continue;
+        fade_actor(a);
+        if (i == 0 && room_move) navi_away(a, room_held == ROOM_ASK && (room_step == 0 || room_step == room_steps - 1));
+    }
+    double cam[9], link[3] = {0, 0, 0};
+    float feet[3];
+    if (player_pos(feet)) link[0] = feet[0], link[1] = feet[1], link[2] = feet[2];
+    for (int i = 0; i < 3; i++) cam[i] = pos[i], cam[3 + i] = at[i], cam[6 + i] = up[i];
+    x->room_shot(room_held == ROOM_ASK ? room_shot + (room_posed ? ROOM_POSE_ID : room_all ? 0 : ROOM_CHECK_ID) : -1, cam, link);
+    if (++room_held >= ROOM_HOLD) {
+        room_held = 0;
+        if (++room_step >= room_steps) {
+            room_shot = -1;
+            vr_body_hide_navi(0);
+            hos_log("vr: room capture done (%s)", room_posed ? "poses" : room_all ? "all" : "check");
+        }
+    }
+    return 1;
+}
+
+void hos_vr_physics(Ctx *c);   /* (vr_physics.c) */
 void hos_vr_camera(Ctx *c) {
+    hos_vr_physics(c);
     static const int up_reg[3] = {7, 16, 6};
     const MkwVkXr *x = xr();
     const int scene = x ? scene_camera(c->x[19]) : 0;
@@ -982,8 +1346,22 @@ void hos_vr_camera(Ctx *c) {
         double d[3] = {at[0] - pos[0], at[1] - pos[1], at[2] - pos[2]};
         const double l = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
         if (l > 1e-6) d[0] /= l, d[1] /= l, d[2] /= l;
-        x->aim((aims || g_aiming) && l > 1e-6, pos, d);   /* ((Triforce VR) the boomerang's and the slingshot's too */
-        steer_aim(x, l > 1e-6 ? d : NULL, c->x[19], pos);
+        /* ((Triforce VR) the boomerang's and the slingshot's too. 2: aiming, the game's aim still turning onto the pointer from
+           where the camera faced (the stick's turn, some 49 degrees a second): its reticle not shown yet. Shown once within
+           4 degrees of it, or 1.5 s on, and kept until the aim ends */
+        const int aiming_now = (aims || g_aiming) && l > 1e-6;
+        static int aim_shown;
+        static uint64_t aim_from;
+        if (!aiming_now) aim_shown = 0, aim_from = 0;
+        else if (!aim_from) aim_from = now_ns();
+        const double off = steer_aim(x, l > 1e-6 ? d : NULL, c->x[19], pos);
+        /* (not steered (-1) counts only after 250 ms: the steering can start a few frames after the aim, once the item is known) */
+        const uint64_t aim_for = now_ns() - aim_from;
+        if (aiming_now && !aim_shown && ((off >= 0 ? off < 4.0 : aim_for > 250000000ull) || aim_for > 1500000000ull)) {
+            aim_shown = 1;
+            hos_log("vr: aim: the reticle shown %.0f ms in (%.1f degrees off the pointer; -1 not steered)", aim_for / 1e6, off);
+        }
+        x->aim(aiming_now ? (aim_shown ? 1 : 2) : 0, pos, d);
     }
     double eye[3];
     int fp_eye = 0;
@@ -1021,9 +1399,11 @@ void hos_vr_camera(Ctx *c) {
     }
     x->update_step(step_seconds < 0 ? -1 : update_seconds());
     if (!x->camera(pos, at, up, fp_eye)) return;
+    const int room = scene == 1 && room_capture(x, pos, at, up);
     for (int i = 0; i < 3; i++) set_d(c, i, pos[i]), set_d(c, 3 + i, at[i]), set_s(c, up_reg[i], up[i]);
     memcpy(out_pos[k], pos, sizeof pos), memcpy(out_at[k], at, sizeof at), have_out[k] = 1;
     head_camera = c->x[19];
+    if (room) return;
     if (fp_eye) fp_eye_at = now_ns();   /* (vr_body.c: his head hidden; his arms on the controllers in play alone: the anchor) */
     if (scene != 1) return;   /* Link turns in play alone */
     {   /* (vr_body.c: where Link stood for this view, the hands' anchor; and first person's eyes on him) */
@@ -1042,7 +1422,8 @@ void hos_vr_camera(Ctx *c) {
 void hos_vr_lens(Ctx *c) {
     const MkwVkXr *x = xr();
     float headset;
-    if (x && head_camera && c->x[19] == head_camera && x->lens(&headset) && isfinite(headset) && headset > 0.05f &&
-        headset < 3.0f)
+    if (x && head_camera && c->x[19] == head_camera && room_shot >= 0) set_s(c, 0, room_fov);
+    else if (x && head_camera && c->x[19] == head_camera && x->lens(&headset) && isfinite(headset) && headset > 0.05f &&
+             headset < 3.0f)
         set_s(c, 0, headset);
 }

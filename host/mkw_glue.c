@@ -808,7 +808,9 @@ static DWORD WINAPI thread_times_thread(void *p) {
 /* HOS_WATCH=<file> (diagnostic): when <file> exists (up to 4 guest addresses in hex), CPU data breakpoints on them on
    every guest thread: 4 s on reads and writes, then 4 s on writes; <file>.out gets, by address and the host place of
    the access, how many; then <file> is renamed <file>.done and the next one may come. */
+#define WATCH_DEPTH 12
 static uint64_t watch_keys[8192];
+static uint64_t watch_stacks[8192][WATCH_DEPTH];
 static volatile LONG watch_counts[8192];
 static volatile LONG watch_phase;
 static LONG CALLBACK watch_handler(EXCEPTION_POINTERS *e) {
@@ -817,13 +819,26 @@ static LONG CALLBACK watch_handler(EXCEPTION_POINTERS *e) {
     if (!hit) return EXCEPTION_CONTINUE_SEARCH;
     int idx = 0;
     while (!(hit >> idx & 1)) idx++;
-    const uint64_t key = ((uint64_t)(watch_phase & 1) << 62) | ((uint64_t)idx << 58) | (uint64_t)e->ExceptionRecord->ExceptionAddress;
+    uint64_t stack[WATCH_DEPTH] = {(uint64_t)e->ExceptionRecord->ExceptionAddress};
+    {
+        CONTEXT ctx = *e->ContextRecord;
+        const StackRange s = own_stack();
+        for (int d = 1; d < WATCH_DEPTH; d++) {
+            if (!unwind_step(&ctx, s) || !ctx.Rip) break;
+            stack[d] = ctx.Rip;
+        }
+    }
+    uint64_t h = stack[0];
+    for (int d = 1; d < WATCH_DEPTH; d++) h = h * 0x9e3779b97f4a7c15ULL ^ stack[d];
+    const uint64_t key = ((uint64_t)(watch_phase & 1) << 62) | ((uint64_t)idx << 58) | (h & ((1ULL << 58) - 1)) | 1;
     for (uint32_t i = (uint32_t)((key >> 2) * 2654435761u) & 8191, n = 0; n < 8192; n++, i = (i + 1) & 8191) {
         uint64_t k = __atomic_load_n(&watch_keys[i], __ATOMIC_RELAXED);
         if (!k) {
             uint64_t expect = 0;
-            if (__atomic_compare_exchange_n(&watch_keys[i], &expect, key, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) k = key;
-            else k = expect;
+            if (__atomic_compare_exchange_n(&watch_keys[i], &expect, key, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+                memcpy(watch_stacks[i], stack, sizeof stack);
+                k = key;
+            } else k = expect;
         }
         if (k == key) { InterlockedIncrement(&watch_counts[i]); break; }
     }
@@ -867,6 +882,7 @@ static DWORD WINAPI watch_thread(void *p) {
         while (n < 4 && fscanf(f, "%llx", &v) == 1) addr[n++] = v;
         fclose(f);
         memset(watch_keys, 0, sizeof watch_keys);
+        memset(watch_stacks, 0, sizeof watch_stacks);
         memset((void *)watch_counts, 0, sizeof watch_counts);
         for (int k = 0; k < n; k++) hos_log("watch: %llx holds %08x", (unsigned long long)addr[k], *(uint32_t *)GP(addr[k]));
         for (int ph = 0; ph < 2; ph++) {
@@ -884,14 +900,22 @@ static DWORD WINAPI watch_thread(void *p) {
         if (f) {
             for (int i = 0; i < 8192; i++)
                 if (watch_keys[i]) {
-                    const uint64_t k = watch_keys[i], rip = k & ((1ULL << 58) - 1);
-                    HMODULE m = NULL;
-                    char full[MAX_PATH] = "?";
-                    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)rip, &m);
-                    if (m) GetModuleFileNameA(m, full, sizeof full);
-                    const char *name = strrchr(full, 92) ? strrchr(full, 92) + 1 : full;
-                    fprintf(f, "%llx %s %s+%llx %ld\n", (unsigned long long)addr[(k >> 58) & 3], k >> 62 & 1 ? "w" : "rw", name,
-                            (unsigned long long)(rip - (uint64_t)m), watch_counts[i]);
+                    const uint64_t k = watch_keys[i];
+                    char where[WATCH_DEPTH][MAX_PATH + 24];
+                    int nd = 0;
+                    for (; nd < WATCH_DEPTH && watch_stacks[i][nd]; nd++) {
+                        const uint64_t rip = watch_stacks[i][nd];
+                        HMODULE m = NULL;
+                        char full[MAX_PATH] = "?";
+                        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)rip, &m);
+                        if (m) GetModuleFileNameA(m, full, sizeof full);
+                        const char *name = strrchr(full, 92) ? strrchr(full, 92) + 1 : full;
+                        snprintf(where[nd], sizeof where[nd], "%s+%llx", name, (unsigned long long)(rip - (uint64_t)m));
+                    }
+                    fprintf(f, "%llx %s %s %ld", (unsigned long long)addr[(k >> 58) & 3], k >> 62 & 1 ? "w" : "rw",
+                            nd ? where[0] : "?", watch_counts[i]);
+                    for (int d = 1; d < nd; d++) fprintf(f, " %s", where[d]);
+                    fputc('\n', f);
                 }
             fclose(f);
         }

@@ -1561,6 +1561,13 @@ static const struct { const char *code, *mals; } title_languages[] = {   /* (nn_
     {"es", "eues"}, {"es-419", "uses"}, {"pt-BR", "uspt"}, {"nl", "eunl"}, {"pl", "eupl"}, {"ru", "euru"},
     {"ja", "jpja"}, {"ko", "krko"}, {"zh-Hans", "cnzh"}, {"zh-Hant", "twzh"},
 };
+/* (Triforce VR) the language's Mals name ("usen"), for the VR item panel's texts */
+const char *hos_mals_language(void) {
+    const char *lang = hos_desired_language(), *mals = "usen";
+    for (size_t i = 0; i < sizeof title_languages / sizeof *title_languages; i++)
+        if (!strcmp(lang, title_languages[i].code)) mals = title_languages[i].mals;
+    return mals;
+}
 static int title_messages(const char *key, char *out, size_t cap) {
     char dir[MAX_PATH], want[16];
     int face;

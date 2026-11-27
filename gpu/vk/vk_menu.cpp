@@ -228,7 +228,7 @@ const char* tx_flat3d_screen(int v) {
 }
 const char* tx_vr_stereo(int v) { return v == 2 ? "Accurate" : v == 1 ? "Balanced" : "Performant"; }
 const char* tx_vr_body(int v) { return v ? "Shown" : "Hidden"; }
-const char* tx_vr_scheme(int v) { return v ? "[PlaceHolder]" : "Full Gesture"; }
+const char* tx_vr_scheme(int v) { return v ? "Simplified" : "Full Gesture"; }
 const char* tx_unit(int v, const char* fmt) {
     static char b[24];
     snprintf(b, sizeof b, fmt, v);
@@ -2447,7 +2447,10 @@ Row rows[] = {
     // ((Triforce VR) the VR Controls page: Link's body, then the hand controllers' swings and pointing
     {TAB_VRPAGE, "Control Scheme", &opts.vr_scheme, 0, 1, 1, tx_vr_scheme,
      "How the hand controllers play. Full Gesture: Link's moves from your own: draw from behind your head, swing to slash, "
-     "raise the shield, pull back the bow, point to aim. [PlaceHolder]: a scheme still to come.", nullptr, false, true, -1,
+     "raise the shield, pull back the bow, point to aim. Simplified: fewer gestures. In play the right trigger holds the item "
+     "panel over the item box (the right stick picks, let go to choose; the left stick presses the D-pad meanwhile), and "
+     "the right grip uses the item chosen, as a pad's item button, whatever it is (a swing does too). The left trigger "
+     "locks on (Z); the left Y button is the sword's button; the shield is raised only with the sword in his hand.", nullptr, false, true, -1,
      false, "vr_scheme"},
     MENU_HEADING(TAB_VRPAGE, "Camera"),
     {TAB_VRPAGE, "Turn Speed", &opts.vr_turn_speed, 1, 50, 1, tx_tenths,
@@ -2539,6 +2542,10 @@ Row rows[] = {
      "Moves your eyes up or down from the game's own cutscene camera.", nullptr, false, true, -1, false, "vr_event_up"},
     // ---- Debug: the tools' switch, the tools themselves below it while they are on (cheat: menu_tick does what they do),
     // then the developer's rows ----
+    {TAB_DEBUG, "Show physics shapes", &opts.vr_phys_show, 0, 1, 1, tx_onoff,
+     "VR: draws what the hands touch the world with: the arms (blue), the hands (green), the sword or item (yellow) and each "
+     "hand's grab reach (white, cyan near something to take, red holding it). Faint where something is in front.",
+     nullptr, false, true, -1, false, "vr_phys_show"},
     {TAB_DEBUG, "Debug tools", &opts.debug_tools, 0, 1, 1, tx_onoff,
      "Testing tools: no-clip flight, a free camera, teleport, Link's age, the inventory, the clock, heart protection and "
      "movement speed. Off puts flight, the free camera and heart protection away and Link back to his own speed.", nullptr,
@@ -3427,11 +3434,12 @@ const VrKey vr_keys[] = {
     {"VR_TURN", &opts.vr_turn, "smooth|snap"},
     {"VR_SNAP_ANGLE", &opts.vr_snap_angle, nullptr},
     {"VR_VIGNETTE", &opts.vr_vignette, "off|on"},
+    {"VR_PHYS_SHOW", &opts.vr_phys_show, nullptr},
     {"VR_SWING_SPEED", &opts.vr_swing_speed, nullptr},
     {"VR_CHARGE_REACH", &opts.vr_charge_reach, nullptr},
     {"VR_HUD_SIZE", &opts.vr_hud_size, nullptr},
     {"VR_BODY", &opts.vr_body, "hidden|arms"},
-    {"VR_SCHEME", &opts.vr_scheme, "gesture|placeholder"},
+    {"VR_SCHEME", &opts.vr_scheme, "gesture|simplified"},
     {"VR_ARM_REACH", &opts.vr_arm_reach, nullptr},
 };
 const char* ini_key(const Row& r) {
@@ -10625,6 +10633,65 @@ void menu_record_image(VkCommandBuffer cmd, VkImage image, VkImageView view, uin
     ui::record_to(cmd, image, view, w, h);
 }
 
+// (Triforce VR) the item panel's places, layout units of the game's 3840 x 2160 grid: the HUD's item box, its middle from
+// the top right corner (measured on a 1280 x 720 shot), the grid's step and its columns
+constexpr float kItemFromRight = 294, kItemFromTop = 258, kItemBox = 250, kItemStep = 270;
+constexpr int kItemColumns = 8;
+
+void menu_record_item_panel(VkCommandBuffer cmd, VkImage image, VkImageView view, uint32_t w, uint32_t h, const MkwVkItemMenu& m,
+                            const int* order, int pick, int sort) {
+    (void)sort;
+    if (!ui::begin(w, h)) return;
+    ImDrawList* d = ImGui::GetBackgroundDrawList();
+    const ui::Fonts& fonts = ui::fonts();
+    ImFont* digits = fonts.number ? fonts.number : fonts.menu ? fonts.menu : fonts.body;
+    const float k = (float)h / 2160.0f, bx = (float)w - kItemFromRight * k, by = kItemFromTop * k;
+    const int64_t now = prof_now();
+    static int64_t last = 0, opened = 0;
+    if (!last || now - last > 300000000LL) opened = now;   // (shut for a while: a new open)
+    last = now;
+    const float in = std::clamp((float)((now - opened) / 1.5e8), 0.0f, 1.0f);
+    const int cols = std::max(1, std::min(m.item_n, kItemColumns));
+    auto col = [&](int r, int g, int b, float a) { return IM_COL32(r, g, b, (int)(std::clamp(a * in, 0.0f, 1.0f) * 255 + 0.5f)); };
+    auto spot = [&](int j, float& x, float& y) { x = (float)(j % cols - (cols - 1)) * kItemStep, y = (float)(j / cols) * kItemStep; };
+    auto pic = [&](const ui::Art* t, float x, float y, float sw, ImU32 c) {   // (x, y: layout units from the item box's middle)
+        if (t) d->AddImage(t->tex->GetTexRef(), ImVec2(bx + (x - sw / 2) * k, by + (y - sw / 2) * k), ImVec2(bx + (x + sw / 2) * k, by + (y + sw / 2) * k), ImVec2(0, 0), ImVec2(1, 1), c);
+    };
+    auto icon_of = [](const char* actor) {
+        const ui::Art* t = ui::item_icon((std::string(actor) + "_PouchIcon").c_str());
+        return t ? t : ui::item_icon(actor);
+    };
+    int pick_at = -1;
+    for (int j = 0; j < m.item_n; j++)
+        if (order[j] == pick) pick_at = j;
+    float px = 0, py = 0;
+    if (pick_at >= 0) spot(pick_at, px, py);
+    const float pulse = 0.75f + 0.25f * std::sin((float)(now / 1e9) * 3.0f);
+    if (pick_at >= 0) pic(ui::art("shortcut_cursor_glow"), px, py, kItemBox * 1.38f, col(255, 255, 255, 0.8f * pulse));
+    for (int j = 0; j < m.item_n; j++) {
+        const int i = order[j];
+        float x, y;
+        spot(j, x, y);
+        const bool chosen = j == pick_at;
+        const float box = chosen ? kItemBox * 1.06f : kItemBox;
+        pic(ui::art("SelectItemBase_00"), x, y, box, col(70, 56, 38, 0.85f));
+        pic(ui::art("SelectItemBase_01"), x, y, box, col(214, 196, 150, chosen ? 1.0f : 0.7f));
+        pic(icon_of(m.item_list[i].item_actor), x, y, box * 0.86f, col(255, 255, 255, 1.0f));
+        if (m.item_list[i].item_count >= 0 && digits) {
+            char nb[16];
+            snprintf(nb, sizeof nb, "%d", m.item_list[i].item_count);
+            const float size = 72 * k;
+            const ImVec2 sz = digits->CalcTextSizeA(size, FLT_MAX, 0, nb);
+            const ImVec2 p(bx + (x + box * 0.44f) * k - sz.x, by + (y + box * 0.34f) * k - sz.y * 0.5f);
+            d->AddText(digits, size, ImVec2(p.x + 3 * k, p.y + 3 * k), col(0, 0, 0, 0.6f), nb);
+            d->AddText(digits, size, p, m.item_list[i].item_full ? col(120, 220, 80, 1.0f) : col(255, 255, 255, 1.0f), nb);
+        }
+    }
+    if (pick_at >= 0) pic(ui::art("shortcut_cursor_line"), px, py, kItemBox * 1.22f, col(255, 255, 255, 0.95f));
+    ::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);   // (Dear ImGui records into cmd directly: what this thread recorded through vk_work.h reaches cmd first)
+    ui::record_to(cmd, image, view, w, h);
+}
+
 } // namespace mkwvk
 
 // (Triforce VR) a VR row's value by its key, as text: a choice's name, else the number; "" for a key that is not a VR row
@@ -10633,8 +10700,11 @@ extern "C" int vk_xr_live_mirror(void);
 extern "C" int vk_xr_two_hands(void);
 extern "C" const char* vk_xr_cfg(const char* key) {
     static thread_local char b[24];
-    // ((Triforce VR) motion play (the pointed aim, vr_game.c) is Full Gesture's; another scheme starts from none
-    if (!strcmp(key, "VR_PLAY")) return mkwvk::opts.vr_scheme == 0 ? "motion" : "stationary";
+    // ((Triforce VR) the hand controllers always play, with motion; a gamepad alongside them as a pad (no rows for these now).
+    // Control Scheme's Simplified (1): Full Gesture with fewer gestures (vk_xr.cpp, vr_game.c: VR_CONTROLS "simplified")
+    if (!strcmp(key, "VR_CONTROLS")) return mkwvk::opts.vr_scheme == 1 ? "simplified" : "meta";
+    // ((Triforce VR) motion play (the pointed aim, vr_game.c): both schemes'
+    if (!strcmp(key, "VR_PLAY")) return "motion";
     // ((Triforce VR) the sword hand before a draw chooses one: Controls' Right handed Link (no VR row for it now)
     if (!strcmp(key, "VR_HANDEDNESS")) return mkwvk::opts.right_handed ? "right" : "left";
     if (!strcmp(key, "VR_MIRROR")) {   // ((Triforce VR) Link mirrored for what the hands last did, "" before: vk_xr.cpp)

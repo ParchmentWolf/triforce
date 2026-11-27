@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <atomic>
 #include <cstring>
+#include <map>
 #include <filesystem>   // ((Triforce) folder_files: the Debug tab's name pages)
 #include <mutex>
 #include <string>
@@ -24,6 +25,7 @@
 #include "backends/imgui_impl_vulkan.h"
 #include "vk_game_font.h"   // (third_party/zstd: the game's font files)
 #include "vk_game_tex.h"    // (Triforce: the game's menu textures)
+#include "vk_msbt.h"
 #include "vk_paths.h"       // (the game folder: the button icons the host served)
 #include "vk_menu.h"        // (opts.hdr_white: the overlays' white on an HDR10 display)
 #include "vk_menu_i18n.h"   // ((Triforce) the menu's language: the letters its fonts need, language_fonts)
@@ -362,6 +364,70 @@ void art_make() {   // (the presenting thread, before a frame: the images as ImG
     art_state.store(3, std::memory_order_release);
 }
 
+std::atomic<int> items_state{0};   // (0 not asked, 1 being read, 2 read, 3 made textures)
+std::string items_mals;
+std::vector<game_tex::Skin::Entry> item_images;
+std::map<std::string, std::string> item_texts;
+std::vector<Named> item_arts;
+game_tex::Image half_size(const game_tex::Image& m) {
+    game_tex::Image out;
+    out.w = m.w / 2, out.h = m.h / 2, out.srgb = m.srgb, out.mask = m.mask;
+    out.rgba.assign((size_t)out.w * out.h * 4, 0);
+    for (uint32_t y = 0; y < out.h; y++)
+        for (uint32_t x = 0; x < out.w; x++) {
+            uint32_t c[3] = {}, a = 0;
+            for (uint32_t v = 0; v < 2; v++)
+                for (uint32_t u = 0; u < 2; u++) {
+                    const unsigned char* p = &m.rgba[((size_t)(2 * y + v) * m.w + 2 * x + u) * 4];
+                    for (int k = 0; k < 3; k++) c[k] += p[k] * p[3];
+                    a += p[3];
+                }
+            unsigned char* o = &out.rgba[((size_t)y * out.w + x) * 4];
+            for (int k = 0; k < 3; k++) o[k] = (unsigned char)(a ? c[k] / a : 0);
+            o[3] = (unsigned char)((a + 2) / 4);
+        }
+    return out;
+}
+void items_thread() {
+    game_font::Reader reader;
+    std::vector<unsigned char> bytes;
+    if (reader.open(romfs_dir())) {
+        const char* const ending = ".bntx.zs";
+        for (const std::string& file : folder_files(reader.romfs + "UI/Tex/Icon", ending)) {
+            const std::string name = file.substr(0, file.size() - strlen(ending));
+            game_tex::Bntx b;
+            game_tex::Skin::Entry e;
+            e.name = name;
+            if (!reader.read_packed(("UI/Tex/Icon/" + file).c_str(), bytes) || !b.parse(std::move(bytes))) continue;
+            const game_tex::Bntx::Entry* t = b.find(name.c_str());
+            if (!t || !b.decode(*t, e.img)) continue;
+            if (e.img.w >= 256) e.img = half_size(e.img);
+            item_images.push_back(std::move(e));
+        }
+        std::vector<unsigned char> sarc;
+        if (reader.read_packed(("Mals/" + items_mals + ".Product.110.sarc.zs").c_str(), sarc))
+            for (const char* file : {"ActorMsg/PouchContent.msbt", "LayoutMsg/ShortCut_01.msbt"}) {
+                size_t at = 0, n = 0;
+                if (!msbt::sarc_member(sarc, file, &at, &n)) continue;
+                for (auto& [label, text] : msbt::texts(sarc.data() + at, n)) item_texts[label] = text;
+            }
+    }
+    logf("vk: ui: the item panel's pictures (%d) and texts (%d, %s)", (int)item_images.size(), (int)item_texts.size(), items_mals.c_str());
+    items_state.store(2, std::memory_order_release);
+}
+void items_make() {
+    for (game_tex::Skin::Entry& e : item_images) {
+        ImTextureData* t = IM_NEW(ImTextureData)();
+        t->Create(ImTextureFormat_RGBA32, (int)e.img.w, (int)e.img.h);
+        memcpy(t->GetPixels(), e.img.rgba.data(), e.img.rgba.size());
+        t->UseColors = true;
+        ImGui::RegisterUserTexture(t);
+        item_arts.push_back({e.name, Art{t, (float)e.img.w, (float)e.img.h, e.img.mask}});
+    }
+    std::vector<game_tex::Skin::Entry>().swap(item_images);
+    items_state.store(3, std::memory_order_release);
+}
+
 // ---- textures: made and updated on the present's command buffer, let go some frames later ----
 struct Tex {
     VkImage image = VK_NULL_HANDLE;
@@ -671,6 +737,7 @@ bool begin(uint32_t w, uint32_t h) {
     io.DeltaTime = last && now > last ? std::min((float)((now - last) / 1e9), 0.25f) : 1.0f / 60.0f;
     last = now;
     if (art_state.load(std::memory_order_acquire) == 2) art_make();
+    if (items_state.load(std::memory_order_acquire) == 2) items_make();
     if (glyphs_state.load(std::memory_order_acquire) == 2) load_glyphs();
     glyphs_follow();
     language_fonts();   // ((Triforce) the letters of the menu's language and of the languages' names shown, merged in once)
@@ -686,6 +753,25 @@ const Art* art(const char* name) {
         if (n.name == name) return &n.art;
     return nullptr;
 }
+void items_want(const char* mals) {
+    int none = 0;
+    if (!items_state.compare_exchange_strong(none, 1)) return;
+    items_mals = mals && *mals ? mals : "USen";
+    std::thread(items_thread).detach();
+}
+const Art* item_icon(const char* actor) {
+    if (items_state.load(std::memory_order_acquire) != 3) return nullptr;
+    for (const Named& n : item_arts)
+        if (n.name == actor) return &n.art;
+    return nullptr;
+}
+const char* item_text(const char* label) {
+    if (items_state.load(std::memory_order_acquire) < 2) return "";
+    const auto it = item_texts.find(label);
+    return it == item_texts.end() ? "" : it->second.c_str();
+}
+VkFormat draw_format() { return pipeline_format; }
+std::string romfs_folder() { return romfs_dir(); }
 void want_glyphs() {
     int none = 0;
     if (glyphs_state.compare_exchange_strong(none, 1)) std::thread(read_glyphs).detach();

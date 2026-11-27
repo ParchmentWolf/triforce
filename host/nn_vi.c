@@ -794,7 +794,15 @@ static void realtime_step(int64_t now) {
     if (timed_step < 0) timed_step = !(getenv("HOS_FPS_STEP") && !atoi(getenv("HOS_FPS_STEP")));
     /* ((Triforce VR) and while Stereo Balanced holds the game's time for every second update: host/vr_game.c) */
     const int holds = vr_holds_time();
+    const int frozen = holds == 2;   /* ((Triforce VR) the item panel open: the game's time frozen, its updates still run) */
     const int timed = (pace > 60 || holds) && timed_step && hos_step_probe;
+    {
+        static int was_holds = -1;
+        if (holds != was_holds)
+            was_holds = holds, hos_log("vi: the VR time hold %d: timed %d (step hook %s, HOS_FPS_STEP %s)%s", holds, timed,
+                                       hos_step_probe ? "in" : "not in this build", timed_step ? "on" : "off",
+                                       frozen && timed ? ": the game's time frozen" : frozen ? ": NOT frozen" : "");
+    }
     const int top = timed ? 60 : pace;
     const double shortest = 1.0 / (pace > 240 ? pace : 240);   /* ((Triforce) the timed step's floor: a 240th, or the cap's above it) */
     /* (Triforce, after NX2navi's steady step: host/step_steady.h) HOS_STEP_STEADY (on unless =0): the step is not the mean of the last five
@@ -820,7 +828,9 @@ static void realtime_step(int64_t now) {
                time, so the two eyes in turn are drawn at one moment of the game) */
             static int held;
             static double owed;
-            if (holds) {
+            if (frozen) {
+                held = 0, owed = 0, given = 1.0 / 4000.0;
+            } else if (holds) {
                 if (held) owed = secs - shortest, given = shortest;
                 else given = secs + owed, owed = 0;
                 held ^= 1;
@@ -828,7 +838,7 @@ static void realtime_step(int64_t now) {
                 held = 0, owed = 0;
             }
         }
-        const float f = (float)(given > 4.0 / 60.0 ? 4.0 / 60.0 : given < shortest ? shortest : given);
+        const float f = (float)(given > 4.0 / 60.0 ? 4.0 / 60.0 : given < shortest && !frozen ? shortest : given);
         uint32_t bits;
         memcpy(&bits, &f, 4);
         __atomic_store_n(&hos_frame_seconds_bits, bits, __ATOMIC_RELAXED);   /* (read by the game's threads) */

@@ -31,7 +31,10 @@
 #include <cstring>
 #include <mutex>
 #include <cctype>
+#include <filesystem>
+#include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 #ifndef _WIN32
 #include <dirent.h>
@@ -41,13 +44,17 @@
 #include "vk_pace.h"
 #include "vk_paths.h"
 #include "vk_present_rect.h"
+#include "vk_salesman.h"
 #include "shaders/xr_aim_comp_spv.h"
+#include "shaders/xr_phys_comp_spv.h"
 #include "shaders/xr_depth_keep_comp_spv.h"
 #include "shaders/xr_depth_comp_spv.h"
 #include "shaders/xr_flat3d_comp_spv.h"
 #include "shaders/xr_desat_comp_spv.h"
 #include "shaders/xr_flat3d_conv_comp_spv.h"
 #include "shaders/xr_hud_comp_spv.h"
+#include "shaders/xr_room_frag_spv.h"
+#include "shaders/xr_room_vert_spv.h"
 #include "vk_work.h"
 
 // the picture's place in a window of dw x dh, as the present puts a cw x ch picture there (vk_replay.cpp present_rect)
@@ -68,7 +75,7 @@ namespace {
     X(xrLocateViews) X(xrLocateSpace) X(xrStringToPath) X(xrPathToString) X(xrCreateActionSet) X(xrCreateAction)   \
     X(xrSuggestInteractionProfileBindings) X(xrAttachSessionActionSets) X(xrSyncActions) X(xrGetActionStateBoolean)  \
     X(xrGetActionStateFloat) X(xrGetActionStateVector2f) X(xrCreateActionSpace) X(xrGetCurrentInteractionProfile)    \
-    X(xrApplyHapticFeedback) X(xrStopHapticFeedback)
+    X(xrApplyHapticFeedback) X(xrStopHapticFeedback) X(xrEnumerateViewConfigurationViews)
 
 // Tangents of a lens's four edges (left and down negative), as OpenXR's angles are
 struct Lens {
@@ -97,6 +104,13 @@ struct Drawn {
     double base[3]{}, bx = 0, bz = 1;
     bool aim = false;      // Link aims: the game's camera's ray (aim_o, aim_d) in the head's view (x right, y up, z back)
     float aim_o[3]{}, aim_d[3]{};
+    bool aim_wait = false;   // ((Triforce VR) the game's aim still turning onto the pointer: Simplified's reticle not shown yet
+    int bones_ok = 0;           // vk_xr_hand_bones: bit 0 Weapon_L known, bit 1 Weapon_R
+    float bones[2][12]{};        // their world matrices, rows of a 3x4 (metres)
+    // ((Triforce VR) Show physics shapes, VR_PHYS_SHOW) vk_xr_phys_shapes' capsules in the head's view (x right, y up,
+    // z back): end a, radius, end b, kind
+    int phys_n = 0;
+    float phys[16][8]{};
 };
 
 
@@ -148,7 +162,14 @@ struct Xr {
     bool frame_on = false;
     Drawn drawn;
     float render_scale = 1.0f;   // the lens the game draws with over the one shown (VR_VIEW_SCALE)
+    int phys_n = 0;              // (frame_mu) vk_xr_phys_shapes' capsules, world
+    float phys_w[16][8]{};
+    bool phys_tried = false;
+    VkDescriptorSetLayout phys_set = VK_NULL_HANDLE;
+    VkPipelineLayout phys_layout = VK_NULL_HANDLE;
+    VkPipeline phys_pipe = VK_NULL_HANDLE;
     bool aim_on = false;         // vr_game.c vk_xr_aim: Link aims, along the game's own camera's ray (world)
+    bool aim_wait = false;       // ((Triforce VR) vk_xr_aim's 2: aiming, the game's aim not onto the pointer yet
     // pointed aim (vr_game.c vk_xr_aim_freeze): the view's base yaw held where it was while the controller steers the
     // game's aim (else the view would turn with the aim it chases); the yaw now (cur) for the controller's ray
     bool aim_freeze = false, frozen_ok = false;
@@ -276,7 +297,7 @@ struct Xr {
     bool grip_ok[2]{};
     uint64_t hands_at = 0;   // when they were last read (plat_now_ns), 0 never
     std::atomic<bool> ocarina{false};   // vr_game.c: Link plays the ocarina (the controllers' Ocarina mode)
-    std::atomic<bool> weapon_out{false};   // vr_game.c: Link holds his sword and shield (or another weapon) out
+    std::atomic<int> weapon_out{0};   // vr_game.c: Link holds his sword and shield (or another weapon) out; 2 the sword seen in his hand
     std::atomic<bool> child{true};         // vr_game.c: Link is a child (his hands' model)
     std::atomic<bool> two_handed_sword{false};   // ((Triforce VR) vr_game.c: his sword is the Biggoron's
     std::atomic<bool> game_paused{false};        // ((Triforce VR) vr_game.c: the game paused by its menus (no fade looked for)
@@ -286,7 +307,18 @@ struct Xr {
     std::atomic<bool> airborne{false};     // ((Triforce VR) vr_game.c: Link in the air (jumping, falling)
     std::atomic<int> combo_want{-1};       // ((Triforce VR) the gesture-chosen slash's combo counter (vr_game.c takes it): -1 none
     std::atomic<int> head_request{0};      // ((Triforce VR) the gestures' ask for his head (vr_game.c takes it): 1 mask on, 2 Lens on, 3 off         // ((Triforce VR) vr_game.c: 0 nothing on his head, 1 a mask, 2 the Lens of Truth)
+    std::atomic<bool> wheel_live{false};   // (VR_CONTROLS=simplified) the right trigger holds the item panel open
+    std::mutex item_mu;
+    MkwVkItemMenu items{};   // (item_mu) the item panel's list, from vr_game.c at its open
+    std::vector<std::string> recent;   // (item_mu) the actors picked, the last first: the panel's other order
+    std::atomic<int> item_pick{-1}, item_sort{0};
+    VkImage item_img = VK_NULL_HANDLE;   // the panel drawn over the HUD's box: the window's format, the box's size
+    VkImageView item_view = VK_NULL_HANDLE;
+    uint32_t item_w = 0, item_h = 0;
     std::atomic<bool> in_play{false};      // vr_game.c: play (not a menu, a pause, an event): the grips' and swing's play roles
+    // ((Triforce VR) the grab, host/vr_physics.c) grip_held: the grips squeezed in play (bit 0 left, 1 right), for the game's
+    // side; grab_hands: the hands it marks as near a body it can take or holding one (their grips have no play roles)
+    std::atomic<int> grip_held{0}, grab_hands{0};
     // the last picture drawn from the head whose world scene8 and eye8 still hold (the present's thread alone): a paused
     // game's menus go on the HUD's panel in front of that world, frozen as it was
     Drawn frozen;
@@ -672,9 +704,11 @@ bool make_boxes(VkFormat window) {
 
 // A device-local 2D image (one level, one layer) and a view of it; UNDEFINED until the caller's barrier
 bool make_image(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage, VkImage &image, VkImageView &view,
-                VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT) {
+                VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT, VkFormat view_format = VK_FORMAT_UNDEFINED) {
     Xr &x = xr();
+    if (view_format == VK_FORMAT_UNDEFINED) view_format = format;
     VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    if (view_format != format) ci.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     ci.imageType = VK_IMAGE_TYPE_2D, ci.format = format, ci.extent = {w, h, 1};
     ci.mipLevels = ci.arrayLayers = 1, ci.samples = VK_SAMPLE_COUNT_1_BIT, ci.tiling = VK_IMAGE_TILING_OPTIMAL, ci.usage = usage;
     if (vkCreateImage(x.device, &ci, nullptr, &image) != VK_SUCCESS) return false;
@@ -697,7 +731,7 @@ bool make_image(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage
         return false;
     }
     VkImageViewCreateInfo vc{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    vc.image = image, vc.viewType = VK_IMAGE_VIEW_TYPE_2D, vc.format = format, vc.subresourceRange = {aspect, 0, 1, 0, 1};
+    vc.image = image, vc.viewType = VK_IMAGE_VIEW_TYPE_2D, vc.format = view_format, vc.subresourceRange = {aspect, 0, 1, 0, 1};
     return vkCreateImageView(x.device, &vc, nullptr, &view) == VK_SUCCESS;
 }
 
@@ -768,7 +802,7 @@ bool make_hud_pipeline() {
     return r == VK_SUCCESS;
 }
 
-// ((Triforce VR) the sword's hand: the last two-grip draw's, else the Handedness row's)
+// ((Triforce VR) the sword's hand: the last two-grip draw's, else Controls' Right handed Link)
 // ((Triforce VR) research: while triforce-runs/gestures_in_immersive.txt exists, Immersive uses the gesture rules too (to see them
 // from outside), a second's check
 static bool gestures_in_immersive() {
@@ -881,8 +915,6 @@ int sword_hand_now() {
 // VR_STEREO=balanced: each game frame drawn from one eye in turn (true geometry), the game's time held for the right
 // eye's update so both eyes show one moment, rather than performant's depth stereo from the head
 bool stereo_balanced() { return strcmp(cfg_value("VR_STEREO"), "balanced") == 0; }
-// ((Triforce VR) the hand controllers' control scheme (VR Controls' Control Scheme): Full Gesture, or another (placeholder_play)
-bool scheme_full_gesture() { return strcmp(cfg_value("VR_SCHEME"), "placeholder") != 0; }
 bool stereo_turns() { return stereo_balanced(); }
 // VR_STEREO=accurate: the game draws the left eye's picture and the renderer the same frame again for the right (true depth,
 // both eyes the same moment, the game's full rate)
@@ -1071,12 +1103,13 @@ bool make_keep_pipeline() {
 bool make_aim_pipeline() {
     Xr &x = xr();
     if (!x.push_set || !x.nearest) return false;
-    const VkDescriptorSetLayoutBinding b[2] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-                                               {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+    const VkDescriptorSetLayoutBinding b[3] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                               {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                               {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, li.bindingCount = 2, li.pBindings = b;
+    li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, li.bindingCount = 3, li.pBindings = b;
     if (vkCreateDescriptorSetLayout(x.device, &li, nullptr, &x.aim_set) != VK_SUCCESS) return false;
-    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(float) * 12};
+    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(float) * 14};
     VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pi.setLayoutCount = 1, pi.pSetLayouts = &x.aim_set, pi.pushConstantRangeCount = 1, pi.pPushConstantRanges = &pr;
     if (vkCreatePipelineLayout(x.device, &pi, nullptr, &x.aim_layout) != VK_SUCCESS) return false;
@@ -1092,8 +1125,17 @@ bool make_aim_pipeline() {
     return r == VK_SUCCESS;
 }
 
+// ((Triforce VR) Simplified: the game's own reticle moved to where the aim lands (xr_aim.comp's move), not VR's ring; its
+// radius on the panel, the same disc the other schemes cut off it (aim_cut)
+bool game_reticle() { return strcmp(cfg_value("VR_CONTROLS"), "simplified") == 0; }
+int aim_cut(const Drawn &d) {
+    Xr &x = xr();
+    return d.aim ? (int)(0.06f * (float)x.hud_h) : 0;
+}
+
 // (vk_xr_capture, hud_mu held, after make_panel, before make_eyes) the reticle drawn into scene8 where the aim's ray
-// first goes behind the scene's depth, while Link aims
+// first goes behind the scene's depth, while Link aims. ((Triforce VR) Simplified: the game's own, from the panel's middle
+// (make_panel left it there), taken off the panel; when it cannot be moved it stays there)
 void make_aim(VkCommandBuffer cb, const Drawn &d) {
     Xr &x = xr();
     float planes[2];
@@ -1107,6 +1149,71 @@ void make_aim(VkCommandBuffer cb, const Drawn &d) {
     }
     if (!x.aim_pipe) return;
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.aim_pipe);
+    const VkDescriptorImageInfo info[3] = {{x.nearest, x.depth_view, VK_IMAGE_LAYOUT_GENERAL},
+                                           {VK_NULL_HANDLE, x.scene8_view, VK_IMAGE_LAYOUT_GENERAL},
+                                           {VK_NULL_HANDLE, x.panel8_view, VK_IMAGE_LAYOUT_GENERAL}};
+    VkWriteDescriptorSet w[3]{};
+    for (uint32_t i = 0; i < 3; i++) {
+        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, w[i].dstBinding = i, w[i].descriptorCount = 1;
+        w[i].descriptorType = i ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w[i].pImageInfo = &info[i];
+    }
+    vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.aim_layout, 0, 3, w);
+    // (negative: the game's reticle only taken off the panel, not shown, while the game's aim turns onto the pointer)
+    const float move = game_reticle() ? (d.aim_wait ? -1.0f : 1.0f) * (float)aim_cut(d) : 0.0f;
+    // ((Triforce VR) a panel pixel in the scene's: the panel (VR_HUD_SIZE cm wide, a metre off) spans tan = half its width
+    // across hud_w, the scene tan_x across the same)
+    const float tan_x = d.lens.r * d.scale;
+    const float panel_scale = tan_x > 0.0f ? 0.005f * (float)cfg_int("VR_HUD_SIZE") / tan_x : 1.0f;
+    const float pc[14] = {(float)x.hud_w, (float)x.hud_h, d.aim_o[0], d.aim_o[1], d.aim_o[2], d.aim_d[0], d.aim_d[1],
+                          d.aim_d[2], tan_x, d.lens.u * d.scale, planes[0], planes[1], move, panel_scale};
+    vkCmdPushConstants(cb, x.aim_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+    barrier(cb, x.panel8, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);   // (the HUD shader's panel, read here)
+    vkCmdDispatch(cb, 1, 1, 1);
+    barrier(cb, x.scene8, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+    barrier(cb, x.panel8, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+}
+
+// ((Triforce VR) Show physics shapes) shaders/xr_phys.comp: the scene's depth sampled, scene8 read and written
+bool make_phys_pipeline() {
+    Xr &x = xr();
+    if (!x.push_set || !x.nearest) return false;
+    const VkDescriptorSetLayoutBinding b[2] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                               {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+    VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, li.bindingCount = 2, li.pBindings = b;
+    if (vkCreateDescriptorSetLayout(x.device, &li, nullptr, &x.phys_set) != VK_SUCCESS) return false;
+    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(float) * 32};
+    VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pi.setLayoutCount = 1, pi.pSetLayouts = &x.phys_set, pi.pushConstantRangeCount = 1, pi.pPushConstantRanges = &pr;
+    if (vkCreatePipelineLayout(x.device, &pi, nullptr, &x.phys_layout) != VK_SUCCESS) return false;
+    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    mi.codeSize = sizeof XR_PHYS_COMP_SPV, mi.pCode = XR_PHYS_COMP_SPV;
+    VkShaderModule m = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(x.device, &mi, nullptr, &m) != VK_SUCCESS) return false;
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main", nullptr};
+    ci.layout = x.phys_layout;
+    const VkResult r = vkCreateComputePipelines(x.device, VK_NULL_HANDLE, 1, &ci, nullptr, &x.phys_pipe);
+    vkDestroyShaderModule(x.device, m, nullptr);
+    return r == VK_SUCCESS;
+}
+
+// (vk_xr_capture, hud_mu held, after make_aim) the physics' capsules drawn into scene8, three to a pass (the push
+// constants' 128 bytes): solid where nothing of the scene is in front of them, faint where something is
+void make_phys(VkCommandBuffer cb, const Drawn &d) {
+    Xr &x = xr();
+    float planes[2];
+    if (!d.phys_n || !x.depth_kept || !vk_xr_planes(planes)) return;
+    if (!x.phys_tried) {
+        x.phys_tried = true;
+        if (!make_phys_pipeline()) {
+            rt_log("vr: the physics shapes' shader could not be made");
+            x.phys_pipe = VK_NULL_HANDLE;
+        }
+    }
+    if (!x.phys_pipe) return;
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.phys_pipe);
     const VkDescriptorImageInfo info[2] = {{x.nearest, x.depth_view, VK_IMAGE_LAYOUT_GENERAL},
                                            {VK_NULL_HANDLE, x.scene8_view, VK_IMAGE_LAYOUT_GENERAL}};
     VkWriteDescriptorSet w[2]{};
@@ -1115,12 +1222,17 @@ void make_aim(VkCommandBuffer cb, const Drawn &d) {
         w[i].descriptorType = i ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         w[i].pImageInfo = &info[i];
     }
-    vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.aim_layout, 0, 2, w);
-    const float pc[12] = {(float)x.hud_w, (float)x.hud_h, d.aim_o[0], d.aim_o[1], d.aim_o[2], d.aim_d[0], d.aim_d[1],
-                          d.aim_d[2], d.lens.r * d.scale, d.lens.u * d.scale, planes[0], planes[1]};
-    vkCmdPushConstants(cb, x.aim_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
-    vkCmdDispatch(cb, 1, 1, 1);
-    barrier(cb, x.scene8, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+    vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, x.phys_layout, 0, 2, w);
+    for (int i = 0; i < d.phys_n; i += 3) {
+        float pc[32]{};
+        const int n = d.phys_n - i < 3 ? d.phys_n - i : 3;
+        pc[0] = (float)x.hud_w, pc[1] = (float)x.hud_h, pc[2] = d.lens.r * d.scale, pc[3] = d.lens.u * d.scale;
+        pc[4] = planes[0], pc[5] = planes[1], pc[6] = (float)n;
+        std::memcpy(pc + 8, d.phys[i], sizeof(float) * 8 * (size_t)n);
+        vkCmdPushConstants(cb, x.phys_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+        vkCmdDispatch(cb, (x.hud_w + 7) / 8, (x.hud_h + 7) / 8, 1);
+        barrier(cb, x.scene8, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+    }
 }
 
 
@@ -1395,8 +1507,44 @@ bool eyes_from(VkCommandBuffer cb, const float shift[2], const float planes[2]) 
     return true;
 }
 
+// the item panel's order into out, its count: the list's (By Type), or (sort 1) the actors picked lately first
+int item_order(const MkwVkItemMenu &m, const std::vector<std::string> &recent, int sort, int out[MKWVK_ITEM_MENU_MAX]) {
+    int n = 0;
+    bool used[MKWVK_ITEM_MENU_MAX]{};
+    if (sort)
+        for (const std::string &a : recent)
+            for (int i = 0; i < m.item_n; i++)
+                if (!used[i] && a == m.item_list[i].item_actor) used[i] = true, out[n++] = i;
+    for (int i = 0; i < m.item_n; i++)
+        if (!used[i]) out[n++] = i;
+    return n;
+}
+void item_step(int dir) {
+    Xr &x = xr();
+    std::lock_guard<std::mutex> lk(x.item_mu);
+    int order[MKWVK_ITEM_MENU_MAX];
+    const int n = item_order(x.items, x.recent, x.item_sort.load(), order);
+    if (!n) return;
+    int at = 0;
+    for (int k = 0; k < n; k++)
+        if (order[k] == x.item_pick.load()) at = k;
+    x.item_pick.store(order[std::clamp(at + dir, 0, n - 1)]);
+}
+void item_remember() {
+    Xr &x = xr();
+    std::lock_guard<std::mutex> lk(x.item_mu);
+    const int p = x.item_pick.load();
+    if (p >= 0 && p < x.items.item_n) {
+        const std::string a = x.items.item_list[p].item_actor;
+        x.recent.erase(std::remove(x.recent.begin(), x.recent.end(), a), x.recent.end());
+        x.recent.insert(x.recent.begin(), a);
+        if (x.recent.size() > MKWVK_ITEM_MENU_MAX) x.recent.pop_back();
+    }
+    x.items.item_n = 0;
+}
+
 // The hand controllers through OpenXR's actions, bound for the Touch controllers (Quest), read each headset frame onto
-// the pad's buttons (input_map.h bits): A and B their own, X and Y A and B again; either stick's click alone X (jump); the left grip ZL (the Z lock), the right grip ZR; on the PSVR2 both sticks' clicks together (L3+R3, as its Options cannot reach OpenXR) or the Touch left Menu tapped Plus (the inventory), held a second
+// the pad's buttons (input_map.h bits): A and B their own, X and Y A and B again; either stick's click alone X (jump; Simplified: the right's, the left's the left stick click, the sprint's toggle); the left grip ZL (the Z lock), the right grip ZR; on the PSVR2 both sticks' clicks together (L3+R3, as its Options cannot reach OpenXR) or the Touch left Menu tapped Plus (the inventory), held a second
 // Minus; the sword hand (VR_HANDEDNESS, the left by default) swung fast Y tapped, or held while the swing went
 // outward and left the hand out to the side (the charge), until the hand comes back in. The shield hand's shield turned to face ahead before its own side's eye holds ZL (the Z lock), as Link
 // holds his shield. Both arms shaken upward press the D-pad's down (the boots), both hands together before the face
@@ -1432,6 +1580,9 @@ struct Controls {
     // within out_off, 10 cm nearer
     static constexpr float swing_off = 1.0f;   // metres a second
     static constexpr uint64_t refractory_ns = 300000000ull;
+    static constexpr uint64_t grab_quiet_ns = 600000000ull;   // no swing this long after a grabbed body is let go
+    bool grab_lock[2]{};   // a grip squeezed while its hand grabbed: no play roles until it is let go
+    uint64_t grab_quiet_until = 0;
     uint64_t swing_at = 0;
     static constexpr uint64_t tap_ns = 80000000ull, gap_ns = 80000000ull;
     float swing_p[4][3]{};
@@ -1511,8 +1662,30 @@ struct Controls {
     float head_y[4]{};
     uint64_t head_t[4]{}, nod_up_at = 0, nod_down_at = 0, nod_at = 0;
     int head_n = 0;
+    bool draw_armed = true;
+    bool grip_zr[2]{};   // in play: the item button held by that grip (pressed behind the head, or with an item out)
+    bool wheel = false;   // (VR_CONTROLS=simplified) the right trigger holds the item panel, from a pull in play until let go
+    int pick_dir = 0;
+    uint64_t pick_at = 0;
+    bool back_down = false, sort_down = false, eat_back = false;
+    int act_bit = -1;
+    int simple_hold = -1;   // the hand the panel's item is used with: Right handed Link's
+    uint64_t act_at = 0;
+    // (Simplified) the panel's last choice: -1 none yet, 1 the item (simple_item, the panel's actor); the right grip takes it out
+    int simple_pick = -1;
+    bool simple_model = false;   // (Simplified) the item chosen has no held state of the game's: a swing uses it (nothing drawn here)
+    int keep_grip = -1;   // ((Triforce VR) Simplified: the grip that took out an item no panel chose, its button until let go
+    char simple_item[48] = "";
+    // (Simplified) a ranged item (the bow, the slingshot, the hookshot, the boomerang) by the right grip alone: as Full
+    // Gesture's pull then draw, a tap of ZR takes it out, a gap, then ZR held while the grip is, and let go the shot
+    uint64_t grip_tap_at = 0;
+    bool simple_zr_was = false;
+    static constexpr uint64_t grip_gap_ns = 150000000ull;
+    bool pad_grip = false;   // (VR_CONTROLS=simplified) the item panel is open: the left stick is the D-pad
+    int pad_dir = -1;   // the D-pad bit the left stick holds then
     int tap_bit = Y;     // what the swing's tap presses: Y (the sword) or ZR (the hammer, the stick, an empty bottle)
     static constexpr float shield_on = 0.79f, shield_off = 1.05f, shield_reach = 0.70f;   // radians, radians, metres
+    static constexpr float shield_on_simple = 0.44f;   // (Simplified) the raise's narrower turn, radians
     bool shielding = false;
     uint64_t draw_at = 0, draw_until = 0;
     uint64_t weapon_seen_at = 0;   // ((Triforce VR) the last moment a weapon was out)
@@ -1616,15 +1789,6 @@ struct Controls {
         return XR_SUCCEEDED(xr().xrGetActionStateFloat(session, &gi, &st)) && st.isActive ? st.currentState : 0.0f;
     }
     // this headset frame's buttons, sticks and grips (time: the frame's predicted display time) into the Xr's
-    // ((Triforce VR) [PlaceHolder]: the play of a control scheme other than Full Gesture, while Link is in play (menus, pauses and
-    // events keep the common buttons above). In: the pad's bits as the common buttons set them (A, B, X from the face buttons and
-    // the stick clicks, L and R from the triggers, Plus and Minus from the Menu button) and the sticks (-1..1, x right, y up);
-    // each grip's pose and whether it is tracked, its velocity in m/s, and the head's pose, all in the play space (OpenXR's x
-    // right, y up, z back). Out: bits and sticks as the game is to read them (bits |= 1ull << ZR...). Nothing yet
-    void placeholder_play(uint64_t &bits, float (&sticks)[2][2], const Pose (&poses)[2], const bool (&pose_ok)[2],
-                          const float (&velocity)[2][3], const Pose &head_pose) {
-        (void)bits, (void)sticks, (void)poses, (void)pose_ok, (void)velocity, (void)head_pose;
-    }
     // ((Triforce VR) the game's rumble on the hand controllers (vk_xr_rumble: each side's strength, the left Joy-Con's on the left
     // hand, after the Controls tab's Rumble strength and Vibration curve): a short pulse renewed each frame while it lasts, stopped
     // when it ends
@@ -1672,30 +1836,76 @@ struct Controls {
             } else click_since = 0;
             click_x = click_since && now - click_since >= click_wait_ns;
         }
-        bool squeezed_before[2] = {squeeze_on[0], squeeze_on[1]};
+        bool squeezed_before[2] = {squeeze_on[0], squeeze_on[1]}, triggered_before[2] = {trigger_on[0], trigger_on[1]};
         for (int h = 0; h < 2; h++) {   // pressed past 0.6, released under 0.4
             const float t = value(session, trigger, hand[h]), s = value(session, squeeze, hand[h]);
             trigger_on[h] = trigger_on[h] ? t > 0.4f : t > 0.6f;
             squeeze_on[h] = squeeze_on[h] ? s > 0.4f : s > 0.6f;
         }
         const bool in_play = x.in_play.load() && !menu_is_open();   // (this menu over play: its buttons, no play roles)
+        // ((Triforce VR) the grab: a grip near a body the game's side can take, or holding one, is that hand's alone: no item,
+        // sword, bow, mask or shield; play_sq is the grips left for those roles)
+        x.grip_held.store(in_play ? (squeeze_on[0] ? 1 : 0) | (squeeze_on[1] ? 2 : 0) : 0);
+        const int grabbing = in_play ? x.grab_hands.load() : 0;
+        for (int h = 0; h < 2; h++) grab_lock[h] = squeeze_on[h] && (grab_lock[h] || (grabbing >> h & 1));
+        if (grab_lock[0] || grab_lock[1]) grab_quiet_until = now + grab_quiet_ns;
+        const bool play_sq[2] = {squeeze_on[0] && !(grabbing & 1) && !grab_lock[0], squeeze_on[1] && !(grabbing & 2) && !grab_lock[1]};
+        {   // ((Triforce VR) Controls' Right handed Link turned on or off: the hands' last choice (sword hand, mirror) is let go,
+            // so the sword hand and Link's mirror follow the option again until the next draw or grip
+            static int last_right = -1;
+            const int right = strcmp(cfg_value("VR_HANDEDNESS"), "right") == 0 ? 1 : 0;
+            if (last_right >= 0 && right != last_right) {
+                g_live_sword.store(-1), g_live_mirror.store(-1);
+                rt_log("vr: Right handed Link %s: the sword hand follows it again", right ? "on" : "off");
+            }
+            last_right = right;
+            // ((Triforce VR) Simplified: the sword hand is always the option's (its shield the other), never one Full Gesture's
+            // draws or shield chose before the switch)
+            if (strcmp(cfg_value("VR_CONTROLS"), "simplified") == 0 && g_live_sword.load() >= 0 && g_live_sword.load() != right) {
+                g_live_sword.store(-1), g_live_mirror.store(-1), shield_alone = false;
+                rt_log("vr: Simplified: the sword hand follows Right handed Link again");
+            }
+        }
+        const bool simple = strcmp(cfg_value("VR_CONTROLS"), "simplified") == 0;
+        if (simple && trigger_on[1] && !triggered_before[1] && in_play) wheel = true;
+        if (!simple || !trigger_on[1]) wheel = false;
+        {   // the item panel: B backs out (no change), Y changes its order
+            const bool back = on(session, b, XR_NULL_PATH), sort = on(session, yb, XR_NULL_PATH);
+            if (wheel && back && !back_down) wheel = false, eat_back = true, x.item_pick.store(-1), rt_log("vr: the item panel: Back");
+            if (wheel && sort && !sort_down) x.item_sort.fetch_xor(1);
+            if (!back) eat_back = false;
+            back_down = back, sort_down = sort;
+        }
+        const bool chosen = simple && x.wheel_live.load(std::memory_order_relaxed) && !wheel && x.item_pick.load() >= 0;   // (shut, not by Back)
+        if (chosen) {
+            std::lock_guard<std::mutex> lk(x.item_mu);
+            const int p = x.item_pick.load();
+            snprintf(simple_item, sizeof simple_item, "%s", p < x.items.item_n ? x.items.item_list[p].item_actor : "");
+        }
+        if (x.wheel_live.load(std::memory_order_relaxed) && !wheel) item_remember();
+        x.wheel_live.store(wheel, std::memory_order_relaxed);
+        pad_grip = simple && wheel;
         if (!in_play) {
             // menus, pauses and events (and this menu over play): a pad's buttons as labelled, the triggers L and R, the grips
             // ZL and ZR, each stick's click its own
             set_bit(A, on(session, a, XR_NULL_PATH)), set_bit(B, on(session, b, XR_NULL_PATH));
             set_bit(X, on(session, xb, XR_NULL_PATH)), set_bit(Y, on(session, yb, XR_NULL_PATH));
             set_bit(STICK_L, click_l && !combo_latch), set_bit(STICK_R, click_r && !combo_latch);   // (not the PSVR2's L3+R3 Menu)
-            set_bit(L, trigger_on[0]), set_bit(R, trigger_on[1]);
+            set_bit(L, trigger_on[0]), set_bit(R, trigger_on[1] && !wheel);
             set_bit(ZL, squeeze_on[0]), set_bit(ZR, squeeze_on[1]);
         } else {
             // play: X and Y mirror A and B, and either stick's click jumps (X), so a controller with fewer buttons plays it all
             set_bit(A, on(session, a, XR_NULL_PATH) || on(session, xb, XR_NULL_PATH));
-            set_bit(B, on(session, b, XR_NULL_PATH) || on(session, yb, XR_NULL_PATH));
-            set_bit(X, click_x);
+            set_bit(B, on(session, b, XR_NULL_PATH) || (on(session, yb, XR_NULL_PATH) && !simple));
+            set_bit(Y, on(session, yb, XR_NULL_PATH) && simple);   // (Simplified: the left Y is the sword's button)
+            // ((Triforce VR) Simplified: the right click alone jumps; the left is the pad's left stick click, the sprint's toggle
+            // (host/oot_sprint.c takes it as Sprint button Left stick click, Toggle, while VR plays Simplified)
+            set_bit(X, click_x && (!simple || click_r));
+            set_bit(STICK_L, simple && click_x && click_l);
             // the triggers L and R: the game's item bars; ((Triforce VR) the Biggoron's Sword out: not the other hand's, which the
             // sword hand's controller presses by accident on the close two-handed grip)
             const int no_trig = x.weapon_out.load() && x.two_handed_sword.load() ? 1 - sword_hand_now() : -1;
-            set_bit(L, trigger_on[0] && no_trig != 0), set_bit(R, trigger_on[1] && no_trig != 1);
+            set_bit(L, trigger_on[0] && !simple && no_trig != 0), set_bit(R, trigger_on[1] && !simple && no_trig != 1);   // (simple: ZL and ZR)
         }
         // the Menu: a tap is Plus for a moment at its release, a second's hold Minus for a moment then
         if (combo_latch || on(session, menu, XR_NULL_PATH)) {
@@ -1713,6 +1923,21 @@ struct Controls {
             XrActionStateVector2f st{XR_TYPE_ACTION_STATE_VECTOR2F};
             if (XR_SUCCEEDED(x.xrGetActionStateVector2f(session, &gi, &st)) && st.isActive)
                 sticks[h][0] = st.currentState.x, sticks[h][1] = st.currentState.y;
+        }
+        float dpad_stick[2] = {0, 0};   // the left stick while the panel is open: it presses the D-pad below
+        if (wheel) {   // the right stick past 0.6 steps the pick, again after 0.5 s held, then every 0.25 s; the game gets neither
+            dpad_stick[0] = sticks[0][0], dpad_stick[1] = sticks[0][1];
+            const float sx = sticks[1][0];
+            const int dir = sx > 0.6f ? 1 : sx < -0.6f ? -1 : std::fabs(sx) < 0.4f ? 0 : pick_dir;
+            if (dir && (dir != pick_dir || now >= pick_at)) {
+                const bool repeat = dir == pick_dir;
+                pick_at = now + (repeat ? 250000000ull : 500000000ull), item_step(dir);
+                rt_log("vr: the item panel: step %+d%s (stick x %.2f), the pick %d", dir, repeat ? " (held)" : "", sx, x.item_pick.load());
+            }
+            pick_dir = dir;
+            sticks[0][0] = sticks[0][1] = sticks[1][0] = sticks[1][1] = 0;
+        } else {
+            pick_dir = 0;
         }
         const bool ocarina = x.ocarina.load();
         if (now >= dpad_from && now < dpad_until) set_bit(dpad_bit, true);
@@ -1781,11 +2006,6 @@ struct Controls {
             }
             x.hands_at = now;
         };
-        if (!scheme_full_gesture()) {   // ((Triforce VR) another scheme's play: none of Full Gesture's below
-            if (in_play) placeholder_play(bits, sticks, poses, pose_ok, hv, head_pose);
-            publish();
-            return;
-        }
         if (in_play) {   // ((Triforce VR) the head's nods: the Lens of Truth on and off, while it is the head's item
             const int i = head_n++ & 3;
             head_y[i] = head[1], head_t[i] = now;
@@ -1877,7 +2097,7 @@ struct Controls {
                 near_mouth = dx * dx + dy * dy + dz * dz < 0.30f * 0.30f;
             }
             const bool still = sideways && lat[0] * (ocarina_left ? -1.0f : 1.0f) > 0.4f && near_mouth;
-            if (x.ocarina.load()) {   // out of the pose a moment: B ends it (the game's ocarina is not "in play": no gate)
+            if (x.ocarina.load() && !simple) {   // out of the pose a moment: B ends it (the game's ocarina is not "in play": no gate)
                 if (still) ocarina_off_since = 0;
                 else if (!ocarina_off_since) ocarina_off_since = now;
                 else if (ocarina_off_since != 1 && now - ocarina_off_since > 300000000ull)
@@ -1887,7 +2107,7 @@ struct Controls {
         pose_since[0] = at_face ? (pose_since[0] ? pose_since[0] : now) : 0;
         pose_since[1] = beside ? (pose_since[1] ? pose_since[1] : now) : 0;
         if (x.carrying.load()) pose_since[0] = pose_since[1] = 0;   // ((Triforce VR) his hands are full: none of these
-        else if (in_play && !x.ocarina.load() && now - dpad_gesture_at >= dpad_refractory_ns) {
+        else if (in_play && !simple && !x.ocarina.load() && now - dpad_gesture_at >= dpad_refractory_ns) {
             int bit = -1;
             (void)wave;   // ((Triforce VR) the mask: the grips on and before the head now, below)
             // ((Triforce VR) the hands apart (30 cm or more): a two-handed grip's raise, such as the Biggoron's jump slash, is not it)
@@ -1910,8 +2130,106 @@ struct Controls {
             std::lock_guard<std::mutex> lk(x.gear_mu);
             std::memcpy(held_item, x.held_item, sizeof held_item);
         }
-        if (in_play && !x.ocarina.load()) {
-            const bool sq[2] = {squeeze_on[0], squeeze_on[1]};
+        if (chosen) {   // the panel shut on an item: the game has it on the item button (ZR), the right grip presses it
+            simple_pick = 1, simple_hold = strcmp(cfg_value("VR_HANDEDNESS"), "right") == 0 ? 1 : 0;
+            // (an item the game has no held state for: a swing uses it, and the game puts it in his hand then)
+            simple_model = strstr(simple_item, "DekuStick") || strstr(simple_item, "DekuNut") || strstr(simple_item, "Item_Bottle") ||
+                         strstr(simple_item, "Item_Bomb") || strstr(simple_item, "Hammer");
+            act_bit = held_item[0] && strcmp(held_item, simple_item) ? B : -1;   // (something else out: put away)
+            act_at = now + 150000000ull;
+            rt_log("vr: the item panel: %s chosen (held now: \"%s\"%s)", simple_item, held_item, act_bit == B ? ", B to put it away" : "");
+        }
+        if (act_bit >= 0 && now >= act_at) {
+            set_bit(act_bit, now < act_at + 120000000ull);
+            if (now >= act_at + 120000000ull) act_bit = -1;
+        }
+        // the bow's and slingshot's string: the other hand's grip, squeezed near the holding hand and drawn away, holds ZR
+        const auto bow_step = [&](const bool sq[2], const bool fresh[2]) {
+            bool drawing = false;
+            if ((strstr(held_item, "Bow") || strstr(held_item, "SlingShot") || strstr(held_item, "Slingshot") ||
+                 strstr(held_item, "Pachinko")) && pull_hand >= 0 &&
+                pose_ok[0] && pose_ok[1]) {
+                const int hold = pull_hand, pull = 1 - pull_hand;
+                // ((Triforce VR) the slingshot: from its stone, on the string above the handle, not the hand on it)
+                const bool sling = !strstr(held_item, "Bow");
+                static const float out_of_fist[3] = {0, 0, -1};
+                float d2 = 0, dv[3], up_handle[3];
+                rotate(poses[hold].q, out_of_fist, up_handle);
+                for (int c = 0; c < 3; c++)
+                    dv[c] = poses[hold].p[c] + (sling ? sling_up * up_handle[c] : 0.0f) - poses[pull].p[c], d2 += dv[c] * dv[c];
+                const float reach = sling ? sling_reach : draw_reach;
+                if (!sq[pull]) bow_arm = bow_drawn = false;
+                else if (fresh[pull]) {
+                    if (d2 < reach * reach) bow_arm = true, sling_took = std::sqrt(d2);
+                    else rt_log("vr: grips: a draw out of reach (%.0f cm of %.0f)", std::sqrt(d2) * 100.0f, reach * 100.0f);
+                }
+                const float pulled = sling_took + (sling ? sling_pull : bow_pull), returned = sling_took + 0.04f;
+                if (bow_arm && !bow_drawn && d2 > pulled * pulled) bow_drawn = true, rt_log("vr: grips: drawn");
+                if (bow_drawn && d2 < returned * returned) bow_drawn = bow_arm = false, rt_log("vr: grips: brought back: the shot");
+                drawing = bow_drawn;
+                if (drawing) {
+                    const float n = std::sqrt(d2);
+                    std::lock_guard<std::mutex> lk(x.hands_mu);
+                    for (int c = 0; c < 3; c++) g_draw_dir[c] = dv[c] / n;
+                }
+            } else bow_arm = bow_drawn = false;
+            g_draw_on.store(drawing);
+            return drawing;
+        };
+        if (in_play && simple) {
+            grip_zr[0] = grip_zr[1] = false;
+            const bool sq[2] = {play_sq[0], play_sq[1]};
+            const bool fresh[2] = {sq[0] && !squeezed_before[0], sq[1] && !squeezed_before[1]};
+            pull_hand = simple_pick == 1 ? simple_hold : -1;   // (the item chosen's hand, out or not yet)
+            if (simple_model && (on(session, b, XR_NULL_PATH) || on(session, yb, XR_NULL_PATH)))
+                simple_model = false, rt_log("vr: item: %s put away (B)", simple_item);
+            if (held_item[0] && simple_hold >= 0 && strcmp(held_item, item_seen)) {   // the item out: in the hand that chose it
+                snprintf(item_seen, sizeof item_seen, "%s", held_item);
+                g_live_mirror.store(item_mirrored_right(held_item) ? simple_hold : 1 - simple_hold);
+                rt_log("vr: item: %s in the %s hand: %s", held_item, simple_hold ? "right" : "left", g_live_mirror.load() ? "mirrored" : "as made");
+            }
+            if (!held_item[0] && item_seen[0]) {   // (put away: back to the sword's hand)
+                item_seen[0] = 0;
+                if (g_live_sword.load() >= 0) g_live_mirror.store(g_live_sword.load());
+            }
+            // ((Triforce VR) both ways: the other hand's draw on the string (aimed along it), or the item's hand alone, pointed
+            // (vk_xr_pointer), its grip held and let go)
+            const bool drawing = bow_step(sq, fresh);
+            const auto ranged = [](const char *it) {
+                return strstr(it, "Bow") || strstr(it, "SlingShot") || strstr(it, "Slingshot") || strstr(it, "Pachinko") ||
+                       strstr(it, "Hookshot") || strstr(it, "Longshot") || strstr(it, "Boomerang");
+            };
+            // ((Triforce VR) an item out that no panel chose this session (on the button from the save, or put there by the game):
+            // taken as chosen, in the hand Right handed Link holds items in, so it is pointed from the first draw
+            if (simple_pick != 1 && held_item[0]) {
+                simple_pick = 1, simple_hold = strcmp(cfg_value("VR_HANDEDNESS"), "right") == 0 ? 1 : 0, simple_model = false;
+                snprintf(simple_item, sizeof simple_item, "%s", held_item);
+                pull_hand = simple_hold, keep_grip = sq[0] ? 0 : sq[1] ? 1 : -1;
+                rt_log("vr: item: %s out with no pick: taken as chosen, in the %s hand", held_item, simple_hold ? "right" : "left");
+            }
+            // (the item button, as a pad's: the right grip; an aimed item's, the grip of the hand holding it, which points it)
+            int fire = simple_pick == 1 && simple_hold >= 0 && (ranged(simple_item) || ranged(held_item)) ? simple_hold : 1;
+            if (keep_grip >= 0) {   // (the grip that took it out stays its button while held, so the draw is not cut off)
+                if (sq[keep_grip]) fire = keep_grip;
+                else keep_grip = -1;
+            }
+            bool right_zr = sq[fire];
+            if (fresh[fire] && simple_pick == 1 && ranged(simple_item) && !ranged(held_item))
+                grip_tap_at = now, rt_log("vr: grips: %s taken out by the %s grip (ZR tapped, then held)", simple_item, fire ? "right" : "left");
+            if (grip_tap_at) {   // (its tap, then nothing a moment, then the grip as it is: the aim, and let go the shot)
+                const uint64_t t = now - grip_tap_at;
+                right_zr = t < press_ns;
+                if (t >= press_ns + grip_gap_ns || (!sq[fire] && t >= press_ns)) grip_tap_at = 0, right_zr = sq[fire] && t >= press_ns + grip_gap_ns;
+            }
+            const bool zr = drawing || right_zr;
+            // (let go: the shot, the aim held where it was just before, as Full Gesture's (vk_xr_pointer))
+            if (simple_zr_was && !zr && ranged(held_item)) g_shot_at.store(now);
+            if (zr != simple_zr_was) rt_log("vr: Simplified: ZR %s at %llu ms", zr ? "down" : "up", (unsigned long long)(now / 1000000ull));
+            simple_zr_was = zr;
+            set_bit(ZL, trigger_on[0]), set_bit(ZR, zr);
+            g_item_hand.store(pull_hand);
+        } else if (in_play && !x.ocarina.load()) {
+            const bool sq[2] = {play_sq[0], play_sq[1]};
             const bool fresh[2] = {sq[0] && !squeezed_before[0], sq[1] && !squeezed_before[1]};
             const bool weapon = x.weapon_out.load();
             {   // ((Triforce VR) the last moment a weapon was out: the hands are chosen only when one is pulled out)
@@ -2036,35 +2354,7 @@ struct Controls {
                     }
                 }
             }
-            bool drawing = false;
-            if ((strstr(held_item, "Bow") || strstr(held_item, "SlingShot") || strstr(held_item, "Slingshot") ||
-                 strstr(held_item, "Pachinko")) && pull_hand >= 0 &&
-                pose_ok[0] && pose_ok[1]) {
-                const int hold = pull_hand, pull = 1 - pull_hand;
-                // ((Triforce VR) the slingshot: from its stone, on the string above the handle, not the hand on it)
-                const bool sling = !strstr(held_item, "Bow");
-                static const float out_of_fist[3] = {0, 0, -1};
-                float d2 = 0, dv[3], up_handle[3];
-                rotate(poses[hold].q, out_of_fist, up_handle);
-                for (int c = 0; c < 3; c++)
-                    dv[c] = poses[hold].p[c] + (sling ? sling_up * up_handle[c] : 0.0f) - poses[pull].p[c], d2 += dv[c] * dv[c];
-                const float reach = sling ? sling_reach : draw_reach;
-                if (!sq[pull]) bow_arm = bow_drawn = false;
-                else if (fresh[pull]) {
-                    if (d2 < reach * reach) bow_arm = true, sling_took = std::sqrt(d2);
-                    else rt_log("vr: grips: a draw out of reach (%.0f cm of %.0f)", std::sqrt(d2) * 100.0f, reach * 100.0f);
-                }
-                const float pulled = sling_took + (sling ? sling_pull : bow_pull), returned = sling_took + 0.04f;
-                if (bow_arm && !bow_drawn && d2 > pulled * pulled) bow_drawn = true, rt_log("vr: grips: drawn");
-                if (bow_drawn && d2 < returned * returned) bow_drawn = bow_arm = false, rt_log("vr: grips: brought back: the shot");
-                drawing = bow_drawn;
-                if (drawing) {
-                    const float n = std::sqrt(d2);
-                    std::lock_guard<std::mutex> lk(x.hands_mu);
-                    for (int c = 0; c < 3; c++) g_draw_dir[c] = dv[c] / n;
-                }
-            } else bow_arm = bow_drawn = false;
-            g_draw_on.store(drawing);
+            const bool drawing = bow_step(sq, fresh);
             // ((Triforce VR) the hookshot and the boomerang: their own hand's trigger is the aim (ZR held), and that trigger is
             // not its item bar (L or R) while one is out. The hookshot: let go, the shot. The boomerang: let go with the hand
             // moving ahead (throw_speed), the throw; let go still, it stays aimed until such a move)
@@ -2137,7 +2427,7 @@ struct Controls {
                 // ((Triforce VR) away from the face: ahead of the eyes or below them (a mask's grab at the face is no shield)
                 const bool off_face = staying ? fwd[hd] > 0.20f || up[hd] < -0.15f : fwd[hd] > 0.25f || up[hd] < -0.20f;
                 return staying ? ahead > std::cos(shield_off) && off_eye < 0.19f && in_reach && off_face
-                               : ahead > std::cos(shield_on) && off_eye < 0.12f && in_reach && !at_face && off_face;
+                               : ahead > std::cos(simple ? shield_on_simple : shield_on) && off_eye < 0.12f && in_reach && !at_face && off_face;
             };
             // ((Triforce VR) the Biggoron's Sword out: both hands hold it, its guard raised by the sword hand)
             // (not the shield raised alone: with the Biggoron's Sword put away, its shield out is no Biggoron guard)
@@ -2145,17 +2435,18 @@ struct Controls {
             int shield = biggoron_out ? sword_hand_now() : 1 - sword_hand_now();
             biggoron_guard = biggoron_out;
             bool keep = false;
-            // (the sword out: its other hand's shield; ((Triforce VR) the shield raised alone stays only while its grip is held)
-            if (x.weapon_out.load()) keep = raised(shield, shielding) && (!shield_alone || squeeze_on[shield]);
+            // (the sword out: its other hand's shield; ((Triforce VR) the shield raised alone stays only while its grip is held. weapon_out is any item out too: Simplified raises it with the sword alone)
+            if (simple ? x.weapon_out.load() == 2 && !held_item[0] : x.weapon_out.load())
+                keep = raised(shield, shielding) && (!shield_alone || squeeze_on[shield]);
             if (biggoron_guard && keep && !shielding) {   // ((Triforce VR) the guard begins only from a hand held fairly still, not
                                                           // within 0.4 s of a swing: a swing passes through the guard's pose)
                 const float gs = std::sqrt(hv[shield][0] * hv[shield][0] + hv[shield][1] * hv[shield][1] + hv[shield][2] * hv[shield][2]);
                 if (gs > 1.0f || now - swing_at < 400000000ull || swinging) keep = false;
             }
-            else {
+            else if (!simple) {   // (Simplified: none; the shield comes out with the sword)
                 // ((Triforce VR) no sword out: either hand's raise with its grip held is Link's lock with the shield alone, the shield
                 // in that hand: the left mirrors him (the sword then the right's), the right does not; the last one kept while held)
-                if (shielding && squeeze_on[shield] && raised(shield, true)) keep = true;
+                if (shielding && play_sq[shield] && raised(shield, true)) keep = true;
                 // ((Triforce VR) not while the sword is being drawn, nor until 1.5 s after a weapon was last out: the hands of
                 // a sword and shield already out never swap)
                 const bool settled = !draw_arm && !drawn_by_grips && !sword_release_at && now - weapon_seen_at > 1500000000ULL &&
@@ -2163,7 +2454,7 @@ struct Controls {
                 for (int hd = 0; hd < 2 && !keep && settled; hd++)
                     // ((Triforce VR) not a hand that holds an item or owns its trigger: a boomerang aimed up before the face is
                     // no shield)
-                    if (squeeze_on[hd] && raised(hd, false) && hd != pull_hand && hd != hook_hand) {
+                    if (play_sq[hd] && raised(hd, false) && hd != pull_hand && hd != hook_hand) {
                         keep = shield_alone = true, shield = hd;
                         if (g_live_sword.load() != 1 - hd || g_live_mirror.load() != (hd == 0 ? 1 : 0)) {
                             g_live_sword.store(1 - hd), g_live_mirror.store(hd == 0 ? 1 : 0);
@@ -2185,11 +2476,14 @@ struct Controls {
                 };
                 const bool ranged = strstr(held_item, "Bow") || strstr(held_item, "SlingShot") || strstr(held_item, "Slingshot") ||
                                     strstr(held_item, "Pachinko") || strstr(held_item, "Hookshot");
-                const bool by_head = strstr(held_item, "Item_Bomb") || (!held_item[0] && x.weapon_out.load() && x.two_handed_sword.load());
-                const int hand = ranged ? (hook_hand >= 0 ? hook_hand : pull_hand) : -1;
+                const bool by_head = strstr(held_item, "Item_Bomb") || (!held_item[0] && x.weapon_out.load() > (simple ? 1 : 0) && x.two_handed_sword.load());
+                // ((Triforce VR) not in Simplified: there the aiming hand turns freely, the left trigger is Z)
+                const int hand = ranged && !simple ? (hook_hand >= 0 ? hook_hand : pull_hand) : -1;
                 const float tilt = hand >= 0 && pose_ok[hand] ? tilt_of(poses[hand].q) : by_head ? tilt_of(head_pose.q) : 0.0f;
                 const bool was = tilt_z;
-                tilt_z = (hand >= 0 || by_head) && in_play && !x.ocarina.load() && (tilt > 35.0f || (tilt_z && tilt > 25.0f));
+                // ((Triforce VR) in Simplified only the Biggoron's Sword's head tilt is Z (no hand's, no bomb's))
+                const bool tilt_ok = !simple || (by_head && !held_item[0]);
+                tilt_z = tilt_ok && (hand >= 0 || by_head) && in_play && !x.ocarina.load() && (tilt > 35.0f || (tilt_z && tilt > 25.0f));
                 if (tilt_z != was) rt_log("vr: %s tilt: Z-target %s", hand >= 0 ? "hand" : "head", tilt_z ? "on" : "off");
                 if (tilt_z) set_bit(ZL, true);
             }
@@ -2207,9 +2501,11 @@ struct Controls {
         const int item_owner = held_item[0] && pull_hand >= 0 ? pull_hand : held_item[0] && item_hand >= 0 ? item_hand : -1;
         // ((Triforce VR) the hammer: its head end is Link's other hand, so that hand's swing is the hammer's; the gripping hand's
         // is none)
-        const int sword = item_owner >= 0 ? (strstr(held_item, "Hammer") ? 1 - item_owner : item_owner) : sword_hand_now();
+        const int sword = item_owner >= 0 ? (strstr(held_item, "Hammer") ? 1 - item_owner : item_owner)
+                          : simple && simple_pick == 1 && simple_hold >= 0 ? simple_hold : sword_hand_now();
         if (sword != swing_hand) swing_hand = sword, swing_n = 0, swinging = false;
-        if (pose_ok[sword]) {   // the velocity over the last 4 frames
+        if (now < grab_quiet_until) swing_n = 0, swinging = false, queued = false;
+        else if (pose_ok[sword]) {   // the velocity over the last 4 frames
             const float hx = poses[sword].p[0] - head[0], hz = poses[sword].p[2] - head[2];
             out = std::sqrt(hx * hx + hz * hz);
             const int i = swing_n++ & 3;
@@ -2228,6 +2524,7 @@ struct Controls {
                 // ((Triforce VR) the Deku Stick and the hammer: downward swings only; a bottle: inward only (the right hand's
                 // right to left, the left's left to right); the sword any way)
                 bool way = true;
+                const char *swing_item = held_item[0] ? held_item : simple && simple_model ? simple_item : "";
                 // ((Triforce VR) a thing held in both hands: the other hand at the holding controller's bottom (past its handle's
                 // end along the controller's own down, within 18 cm, however it is tilted), and swinging with it)
                 const int oh = 1 - sword;
@@ -2240,12 +2537,12 @@ struct Controls {
                     under = l[2] > 0.03f && l[0] * l[0] + l[1] * l[1] + l[2] * l[2] < 0.18f * 0.18f;
                 }
                 const float os = std::sqrt(hv[oh][0] * hv[oh][0] + hv[oh][1] * hv[oh][1] + hv[oh][2] * hv[oh][2]);
-                if (strstr(held_item, "Hammer")) way = v[1] < -0.6f * speed;
-                else if (strstr(held_item, "DekuStick"))   // (the Deku Stick: both swinging down)
+                if (strstr(swing_item, "Hammer")) way = v[1] < -0.6f * speed;
+                else if (strstr(swing_item, "DekuStick"))   // (the Deku Stick: both swinging down)
                     way = v[1] < -0.6f * speed && under && os > 0.5f * speed && hv[oh][1] < -0.6f * os;
-                else if (!held_item[0] && x.two_handed_sword.load())   // (the Biggoron's Sword: both swinging, any way)
+                else if (!swing_item[0] && x.two_handed_sword.load())   // (the Biggoron's Sword: both swinging, any way)
                     way = under && os > 0.5f * speed;
-                else if (!strcmp(held_item, "Item_Bottle")) {
+                else if (!strcmp(swing_item, "Item_Bottle")) {
                     const float lat = v[0] * rx + v[2] * rz;
                     way = sword ? lat < -0.5f * speed : lat > 0.5f * speed;
                     // ((Triforce VR) and held as at the face for the ocarina: its pointer's level part sideways, inward (the right
@@ -2501,7 +2798,11 @@ struct Controls {
             const bool swinger = strstr(held_item, "Hammer") || strstr(held_item, "DekuStick") || !strcmp(held_item, "Item_Bottle") ||
                                  strstr(held_item, "Item_Bomb");
             // (something of the world's carried: the throw, Y, whatever item was out before)
-            tap_bit = !in_play ? -1 : carry ? Y : swinger ? ZR : !held_item[0] && x.weapon_out.load() ? Y : -1;   // (no swing in menus)
+            // (Simplified: with nothing in the hand a swing is Y even with the sword away: the game draws it, the shield with it)
+            // (Simplified: an item drawn in the hand: the swing hands it to the game, ZR: the stick's draw-and-swing, the nut's throw,
+            // the bottle's scoop or drink, the bomb's throw, the hammer's swing)
+            const bool drawn = simple && simple_model && !held_item[0];
+            tap_bit = !in_play ? -1 : carry ? Y : swinger || drawn ? ZR : !held_item[0] && (x.weapon_out.load() || simple) ? Y : -1;   // (no swing in menus)
             if (tap_bit == Y && slash_code == 20 && now < slash_extra_until) tap_bit = A;   // ((Triforce VR) the jump slash: A)
             queued = false;
             // (the charge: the sword's; ((Triforce VR) a gesture-chosen slash's press comes once it is chosen, often after the swing has
@@ -2521,7 +2822,7 @@ struct Controls {
             g_two_hands.store(hammer || stick ? (pull_hand >= 0 ? pull_hand : by_mirror) : shield_alone ? 2 : -1);
         }
         if (now < draw_until) set_bit(draw_bit, true);
-        if (ocarina) {   // the notes: the right stick's left, up, right and down Y, X, A and R; the A button L
+        if (ocarina && !simple) {   // the notes: the right stick's left, up, right and down Y, X, A and R; the A button L
             const bool a_down = bits & (1ull << A);
             bits &= ~(1ull << A | 1ull << X | 1ull << Y | 1ull << L | 1ull << R);
             y_down = 0, charging = false, queued = false;   // no sword meanwhile
@@ -2530,6 +2831,19 @@ struct Controls {
             if (sx * sx + sy * sy > 0.25f)
                 set_bit(std::fabs(sx) > std::fabs(sy) ? (sx < 0 ? Y : A) : (sy > 0 ? X : R), true);
         }
+        if (pad_grip && !ocarina) {   // the left stick past 0.6 holds the D-pad its way until back under 0.4
+            const float sx = dpad_stick[0], sy = dpad_stick[1], m = std::fmax(std::fabs(sx), std::fabs(sy));
+            if (m < 0.4f) pad_dir = -1;
+            else if (m > 0.6f && pad_dir < 0) {
+                pad_dir = std::fabs(sx) > std::fabs(sy) ? (sx > 0 ? RIGHT : LEFT) : (sy > 0 ? UP : DOWN);
+                dpad_bit = pad_dir, dpad_from = now, dpad_until = now + press_ns;
+                wheel = false, rt_log("vr: the item panel: D-pad %d, the panel shut", pad_dir);
+            }
+            if (pad_dir >= 0) set_bit(pad_dir, true);
+        } else {
+            pad_dir = -1;
+        }
+        if (wheel || eat_back) bits &= ~(1ull << A | 1ull << B | 1ull << X | 1ull << Y);
         publish();
     }
     void log_profile(XrSession session) {
@@ -2545,6 +2859,475 @@ struct Controls {
         }
     }
 };
+
+// vr-room-surround.bin (notes/vr-room/scripts/room_build.py): Link's house around the flat screen, drawn on the session's thread
+namespace {
+struct Surround {
+    struct Tex {
+        uint32_t w = 0, h = 0;
+        bool bc7 = false;            // ((local) BC7 blocks, 16 bytes a 4x4 block: the file's width with its top bit set)
+        std::vector<uint8_t> rgba;   // (RGBA8, or the BC7 blocks)
+    };
+    struct Part {
+        uint32_t tex = 0, first = 0, count = 0;
+    };
+    std::atomic<int> state{0};   // 1 reading, 2 read, 3 no file
+    std::vector<Tex> texs;
+    std::vector<Part> parts;
+    std::vector<float> verts;   // 8 floats a vertex: metres from the floor's middle (the screen toward -z), normal, uv
+    // the screen's place in the room, from the file's end ("VRA1", then its middle x y z, the way it faces as an angle
+    // round y from +z, its width; metres in the vertices' frame: notes/vr-room/scripts/room_anchor.py): the room is
+    // turned and scaled round the screen so that place is always behind it, whatever the screen's size
+    bool anchored = false;
+    float anchor[3] = {0, 0, 0}, anchor_turn = 0, anchor_w = 1;
+    bool up = false, failed = false;
+    VkBuffer vb = VK_NULL_HANDLE;
+    std::vector<VkImageView> views;
+    VkSampler sampler = VK_NULL_HANDLE;
+    VkDescriptorSetLayout set = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    std::vector<std::pair<VkBuffer, VkDeviceMemory>> staging;
+} sur;
+enum { SUR_VF = 8 };
+
+void surround_read() {
+    FILE *f = std::fopen("vr-room-surround.bin", "rb");
+    if (!f) {
+        sur.state = 3;
+        return;
+    }
+    char magic[4];
+    uint32_t nt = 0, np = 0;
+    bool ok = std::fread(magic, 1, 4, f) == 4 && !std::memcmp(magic, "VRC1", 4) && std::fread(&nt, 4, 1, f) == 1 &&
+              std::fread(&np, 4, 1, f) == 1 && nt < 4096 && np < 65536;
+    for (uint32_t i = 0; ok && i < nt; i++) {
+        Surround::Tex t;
+        ok = std::fread(&t.w, 4, 1, f) == 1 && std::fread(&t.h, 4, 1, f) == 1;
+        // ((local) a width with its top bit set: BC7 blocks follow, a quarter of RGBA8's size (notes/vr-room/scripts/room_bc7.py))
+        t.bc7 = ok && (t.w & 0x80000000u) != 0;
+        t.w &= 0x7fffffffu;
+        ok = ok && t.w && t.h && t.w <= 8192 && t.h <= 8192;
+        if (!ok) break;
+        t.rgba.resize(t.bc7 ? (size_t)((t.w + 3) / 4) * ((t.h + 3) / 4) * 16 : (size_t)t.w * t.h * 4);
+        ok = std::fread(t.rgba.data(), 1, t.rgba.size(), f) == t.rgba.size();
+        sur.texs.push_back(std::move(t));
+    }
+    for (uint32_t i = 0; ok && i < np; i++) {
+        Surround::Part p;
+        ok = std::fread(&p.tex, 4, 1, f) == 1 && std::fread(&p.count, 4, 1, f) == 1 && p.tex < nt && p.count < (1u << 24);
+        if (!ok) break;
+        p.first = (uint32_t)(sur.verts.size() / SUR_VF);
+        const size_t n = (size_t)p.count * 3 * SUR_VF;
+        sur.verts.resize(sur.verts.size() + n);
+        ok = std::fread(sur.verts.data() + sur.verts.size() - n, sizeof(float), n, f) == n;
+        p.count *= 3;
+        sur.parts.push_back(p);
+    }
+    if (ok) {
+        char am[4];
+        float a[5];
+        if (std::fread(am, 1, 4, f) == 4 && !std::memcmp(am, "VRA1", 4) && std::fread(a, sizeof(float), 5, f) == 5 &&
+            std::isfinite(a[0]) && std::isfinite(a[1]) && std::isfinite(a[2]) && std::isfinite(a[3]) && a[4] > 0.05f && a[4] < 50.0f) {
+            sur.anchored = true;
+            sur.anchor[0] = a[0], sur.anchor[1] = a[1], sur.anchor[2] = a[2], sur.anchor_turn = a[3], sur.anchor_w = a[4];
+            rt_log("vr: room: the screen's place in it %.2f %.2f %.2f, facing %.0f degrees, %.2f m wide", a[0], a[1], a[2],
+                   a[3] * 57.29578f, a[4]);
+        }
+    }
+    std::fclose(f);
+    rt_log("vr: room: vr-room-surround.bin %s: %u textures, %u parts, %zu triangles", ok ? "read" : "NOT read", nt, np,
+           sur.verts.size() / SUR_VF / 3);
+    sur.state = ok && !sur.parts.empty() ? 2 : 3;
+}
+
+bool sur_staged(VkDeviceSize n, const void *data, VkBuffer &buf) {
+    Xr &x = xr();
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = n, bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    if (vkCreateBuffer(x.device, &bi, nullptr, &buf) != VK_SUCCESS) return false;
+    VkMemoryRequirements mr;
+    vkGetBufferMemoryRequirements(x.device, buf, &mr);
+    VkPhysicalDeviceMemoryProperties mem;
+    vkGetPhysicalDeviceMemoryProperties(x.phys, &mem);
+    const VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    uint32_t type = UINT32_MAX;
+    for (uint32_t i = 0; i < mem.memoryTypeCount && type == UINT32_MAX; i++)
+        if ((mr.memoryTypeBits & (1u << i)) && (mem.memoryTypes[i].propertyFlags & host) == host) type = i;
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = mr.size, ai.memoryTypeIndex = type;
+    VkDeviceMemory dm = VK_NULL_HANDLE;
+    void *map = nullptr;
+    if (type == UINT32_MAX || vkAllocateMemory(x.device, &ai, nullptr, &dm) != VK_SUCCESS ||
+        vkBindBufferMemory(x.device, buf, dm, 0) != VK_SUCCESS || vkMapMemory(x.device, dm, 0, n, 0, &map) != VK_SUCCESS)
+        return false;
+    std::memcpy(map, data, (size_t)n);
+    sur.staging.push_back({buf, dm});
+    return true;
+}
+
+bool sur_image(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect,
+               VkSampleCountFlagBits samples, VkImage &image, VkImageView &view) {
+    Xr &x = xr();
+    VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ci.imageType = VK_IMAGE_TYPE_2D, ci.format = format, ci.extent = {w, h, 1};
+    ci.mipLevels = ci.arrayLayers = 1, ci.samples = samples, ci.tiling = VK_IMAGE_TILING_OPTIMAL, ci.usage = usage;
+    if (vkCreateImage(x.device, &ci, nullptr, &image) != VK_SUCCESS) return false;
+    VkMemoryRequirements mr;
+    vkGetImageMemoryRequirements(x.device, image, &mr);
+    VkPhysicalDeviceMemoryProperties mem;
+    vkGetPhysicalDeviceMemoryProperties(x.phys, &mem);
+    uint32_t type = UINT32_MAX;
+    for (uint32_t i = 0; i < mem.memoryTypeCount && type == UINT32_MAX; i++)
+        if ((mr.memoryTypeBits & (1u << i)) && (mem.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) type = i;
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = mr.size, ai.memoryTypeIndex = type;
+    VkDeviceMemory dm = VK_NULL_HANDLE;
+    if (type == UINT32_MAX || vkAllocateMemory(x.device, &ai, nullptr, &dm) != VK_SUCCESS ||
+        vkBindImageMemory(x.device, image, dm, 0) != VK_SUCCESS)
+        return false;
+    VkImageViewCreateInfo vc{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vc.image = image, vc.viewType = VK_IMAGE_VIEW_TYPE_2D, vc.format = format, vc.subresourceRange = {aspect, 0, 1, 0, 1};
+    return vkCreateImageView(x.device, &vc, nullptr, &view) == VK_SUCCESS;
+}
+
+bool sur_pipeline(VkFormat color) {
+    Xr &x = xr();
+    if (!x.push_set) x.push_set = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(x.device, "vkCmdPushDescriptorSetKHR");
+    if (!x.push_set) return false;
+    VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    si.magFilter = si.minFilter = VK_FILTER_LINEAR, si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if (vkCreateSampler(x.device, &si, nullptr, &sur.sampler) != VK_SUCCESS) return false;
+    const VkDescriptorSetLayoutBinding b{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, li.bindingCount = 1, li.pBindings = &b;
+    if (vkCreateDescriptorSetLayout(x.device, &li, nullptr, &sur.set) != VK_SUCCESS) return false;
+    const VkPushConstantRange pr{VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(float) * 16};
+    VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pi.setLayoutCount = 1, pi.pSetLayouts = &sur.set, pi.pushConstantRangeCount = 1, pi.pPushConstantRanges = &pr;
+    if (vkCreatePipelineLayout(x.device, &pi, nullptr, &sur.layout) != VK_SUCCESS) return false;
+    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
+    mi.codeSize = sizeof XR_ROOM_VERT_SPV, mi.pCode = XR_ROOM_VERT_SPV;
+    if (vkCreateShaderModule(x.device, &mi, nullptr, &vs) != VK_SUCCESS) return false;
+    mi.codeSize = sizeof XR_ROOM_FRAG_SPV, mi.pCode = XR_ROOM_FRAG_SPV;
+    if (vkCreateShaderModule(x.device, &mi, nullptr, &fs) != VK_SUCCESS) return false;
+    VkPipelineShaderStageCreateInfo st[2]{};
+    st[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vs, "main", nullptr};
+    st[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fs, "main", nullptr};
+    const VkVertexInputBindingDescription vb{0, sizeof(float) * SUR_VF, VK_VERTEX_INPUT_RATE_VERTEX};
+    const VkVertexInputAttributeDescription va[2] = {{0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0}, {1, 0, VK_FORMAT_R32G32_SFLOAT, 24}};
+    VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    vi.vertexBindingDescriptionCount = 1, vi.pVertexBindingDescriptions = &vb;
+    vi.vertexAttributeDescriptionCount = 2, vi.pVertexAttributeDescriptions = va;
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL, rs.cullMode = VK_CULL_MODE_NONE, rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_4_BIT;
+    VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    ds.depthTestEnable = ds.depthWriteEnable = VK_TRUE, ds.depthCompareOp = VK_COMPARE_OP_GREATER;   // reversed
+    VkPipelineColorBlendAttachmentState cba{};
+    cba.colorWriteMask = 0xf;
+    VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cbs.attachmentCount = 1, cbs.pAttachments = &cba;
+    const VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dy.dynamicStateCount = 2, dy.pDynamicStates = dyn;
+    VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    ri.colorAttachmentCount = 1, ri.pColorAttachmentFormats = &color, ri.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
+    VkGraphicsPipelineCreateInfo gi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gi.pNext = &ri, gi.stageCount = 2, gi.pStages = st, gi.pVertexInputState = &vi, gi.pInputAssemblyState = &ia;
+    gi.pViewportState = &vp, gi.pRasterizationState = &rs, gi.pMultisampleState = &ms, gi.pDepthStencilState = &ds;
+    gi.pColorBlendState = &cbs, gi.pDynamicState = &dy, gi.layout = sur.layout;
+    const VkResult res = vkCreateGraphicsPipelines(x.device, VK_NULL_HANDLE, 1, &gi, nullptr, &sur.pipe);
+    vkDestroyShaderModule(x.device, vs, nullptr), vkDestroyShaderModule(x.device, fs, nullptr);
+    return res == VK_SUCCESS;
+}
+
+// (the session's command buffer, begun) the vertices and textures onto the card; the staging freed after the submit
+bool sur_upload(VkCommandBuffer cb, VkFormat color) {
+    Xr &x = xr();
+    if (!sur_pipeline(color)) return rt_log("vr: room: the pipeline could not be made"), false;
+    const VkDeviceSize vn = sizeof(float) * sur.verts.size();
+    VkBuffer src = VK_NULL_HANDLE;
+    if (!sur_staged(vn, sur.verts.data(), src) ||
+        !make_buffer(vn, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, sur.vb))
+        return rt_log("vr: room: the vertex buffer could not be made"), false;
+    const VkBufferCopy bc{0, 0, vn};
+    (vkCmdCopyBuffer)(cb, src, sur.vb, 1, &bc);
+    for (const Surround::Tex &t : sur.texs) {
+        VkImage img = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;
+        if (!sur_staged(t.rgba.size(), t.rgba.data(), src) ||
+            !sur_image(t.w, t.h, t.bc7 ? VK_FORMAT_BC7_SRGB_BLOCK : VK_FORMAT_R8G8B8A8_SRGB,
+                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                       VK_IMAGE_ASPECT_COLOR_BIT, VK_SAMPLE_COUNT_1_BIT, img, view))
+            return rt_log("vr: room: a texture %ux%u could not be made", t.w, t.h), false;
+        barrier_direct(cb, img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkBufferImageCopy c{};
+        c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        c.imageExtent = {t.w, t.h, 1};
+        (vkCmdCopyBufferToImage)(cb, src, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+        barrier_direct(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        sur.views.push_back(view);
+    }
+    (void)x;
+    return true;
+}
+
+void sur_free_staging() {
+    Xr &x = xr();
+    for (auto &s : sur.staging) vkDestroyBuffer(x.device, s.first, nullptr), vkFreeMemory(x.device, s.second, nullptr);
+    sur.staging.clear();
+    sur.verts.clear(), sur.verts.shrink_to_fit();
+    for (Surround::Tex &t : sur.texs) t.rgba.clear(), t.rgba.shrink_to_fit();
+}
+
+// column-major 4x4: a * b
+void mat_mul(const float a[16], const float b[16], float out[16]) {
+    for (int c = 0; c < 4; c++)
+        for (int r = 0; r < 4; r++) {
+            float s = 0;
+            for (int k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k];
+            out[c * 4 + r] = s;
+        }
+}
+
+// both eyes side by side (2w x h): msaa resolved into target; model: the room's vertices to LOCAL
+void sur_draw(VkCommandBuffer cb, VkImageView msaa, VkImageView target, VkImageView depth, uint32_t w, uint32_t h,
+              const XrView views[2], const float model[16]) {
+    Xr &x = xr();
+    VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    ca.imageView = msaa, ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    ca.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT, ca.resolveImageView = target;
+    ca.resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    ca.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, ca.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    ca.clearValue.color = {{0.004f, 0.003f, 0.002f, 1.0f}};
+    VkRenderingAttachmentInfo da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    da.imageView = depth, da.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, da.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    da.clearValue.depthStencil = {0.0f, 0};
+    VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    ri.renderArea = {{0, 0}, {2 * w, h}}, ri.layerCount = 1;
+    ri.colorAttachmentCount = 1, ri.pColorAttachments = &ca, ri.pDepthAttachment = &da;
+    (vkCmdBeginRendering)(cb, &ri);
+    (vkCmdBindPipeline)(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, sur.pipe);
+    const VkDeviceSize zero = 0;
+    vkCmdBindVertexBuffers(cb, 0, 1, &sur.vb, &zero);
+    for (int e = 0; e < 2; e++) {
+        const VkViewport vp{(float)(e * w), 0, (float)w, (float)h, 0, 1};
+        const VkRect2D sc{{(int32_t)(e * w), 0}, {w, h}};
+        (vkCmdSetViewport)(cb, 0, 1, &vp), (vkCmdSetScissor)(cb, 0, 1, &sc);
+        const float tl = std::tan(views[e].fov.angleLeft), tr = std::tan(views[e].fov.angleRight);
+        const float tu = std::tan(views[e].fov.angleUp), td = std::tan(views[e].fov.angleDown), near_z = 0.02f;
+        float proj[16] = {};
+        proj[0] = 2.0f / (tr - tl), proj[8] = (tr + tl) / (tr - tl);
+        proj[5] = -2.0f / (tu - td), proj[9] = -(tu + td) / (tu - td);
+        proj[11] = -1.0f, proj[14] = near_z;
+        const float q[4] = {views[e].pose.orientation.x, views[e].pose.orientation.y, views[e].pose.orientation.z,
+                            views[e].pose.orientation.w};
+        const float p[3] = {views[e].pose.position.x, views[e].pose.position.y, views[e].pose.position.z};
+        static const float axis[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+        float rc[3][3];
+        for (int i = 0; i < 3; i++) rotate(q, axis[i], rc[i]);   // the eye's axes in LOCAL
+        float view[16] = {};
+        for (int i = 0; i < 3; i++) {
+            for (int c = 0; c < 3; c++) view[c * 4 + i] = rc[i][c];
+            view[12 + i] = -(rc[i][0] * p[0] + rc[i][1] * p[1] + rc[i][2] * p[2]);
+        }
+        view[15] = 1;
+        float vm[16], clip[16];
+        mat_mul(view, model, vm), mat_mul(proj, vm, clip);
+        (vkCmdPushConstants)(cb, sur.layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof clip, clip);
+        for (const Surround::Part &pt : sur.parts) {
+            const VkDescriptorImageInfo ii{sur.sampler, sur.views[pt.tex], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            VkWriteDescriptorSet wr{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            wr.dstBinding = 0, wr.descriptorCount = 1, wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            wr.pImageInfo = &ii;
+            x.push_set(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, sur.layout, 0, 1, &wr);
+            (vkCmdDraw)(cb, pt.count, 1, pt.first, 0);
+        }
+    }
+    (vkCmdEndRendering)(cb);
+}
+
+// room-snap.go in the game's folder: the room drawn even when the runtime says not to draw (no one wearing the headset)
+bool sur_snap_wanted() {
+    static unsigned polled;
+    static bool wanted;
+    if (++polled % 90 == 0) {
+        FILE *t = std::fopen("room-snap.go", "rb");
+        wanted = t != nullptr;
+        if (t) std::fclose(t);
+    }
+    return wanted;
+}
+
+// (the session's thread) the room into its own swapchain for this frame: false when there is none to show
+bool sur_frame(XrSession session, XrSpace space, XrSpace stage, XrTime at, VkFormat format, VkCommandPool pool, VkCommandBuffer cb,
+               VkFence fence, const XrView views[2], XrSwapchain &chain, std::vector<XrSwapchainImageVulkanKHR> &images,
+               std::vector<VkImageView> &targets, VkImage &msaa, VkImageView &msaa_view, VkImage &depth, VkImageView &depth_view,
+               uint32_t &w, uint32_t &h, XrCompositionLayerProjectionView pv[2], XrCompositionLayerProjection &layer) {
+    Xr &x = xr();
+    if (sur.state.load() != 2 || sur.failed) return false;
+    const auto submit = [&]() {
+        (vkEndCommandBuffer)(cb);
+        VkCommandBufferSubmitInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+        cbi.commandBuffer = cb;
+        VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+        si.commandBufferInfoCount = 1, si.pCommandBufferInfos = &cbi;
+        (vkQueueSubmit2)(x.queue, 1, &si, fence);
+        (vkWaitForFences)(x.device, 1, &fence, VK_TRUE, UINT64_MAX);
+        (vkResetFences)(x.device, 1, &fence);
+    };
+    const auto begin = [&]() {
+        (vkResetCommandPool)(x.device, pool, 0);
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        (vkBeginCommandBuffer)(cb, &bi);
+    };
+    if (!sur.up) {
+        sur.failed = true;
+        XrViewConfigurationView vcv[2] = {{XR_TYPE_VIEW_CONFIGURATION_VIEW}, {XR_TYPE_VIEW_CONFIGURATION_VIEW}};
+        uint32_t vn = 0;
+        if (XR_FAILED(x.xrEnumerateViewConfigurationViews(x.instance, x.system, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 2, &vn,
+                                                          vcv)) || vn != 2)
+            return rt_log("vr: room: the eyes' sizes are not known"), false;
+        w = std::min(vcv[0].recommendedImageRectWidth, 2048u), h = std::min(vcv[0].recommendedImageRectHeight, 2048u);
+        XrSwapchainCreateInfo sw{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+        sw.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+        sw.format = format, sw.sampleCount = 1, sw.width = 2 * w, sw.height = h;
+        sw.faceCount = sw.arraySize = sw.mipCount = 1;
+        uint32_t n = 0;
+        if (XR_FAILED(x.xrCreateSwapchain(session, &sw, &chain)) || XR_FAILED(x.xrEnumerateSwapchainImages(chain, 0, &n, nullptr)))
+            return rt_log("vr: room: no swapchain for it"), false;
+        images.assign(n, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+        x.xrEnumerateSwapchainImages(chain, n, &n, (XrSwapchainImageBaseHeader *)images.data());
+        bool ok = sur_image(2 * w, h, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT,
+                            VK_SAMPLE_COUNT_4_BIT, depth, depth_view) &&
+                  sur_image(2 * w, h, format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_IMAGE_ASPECT_COLOR_BIT, VK_SAMPLE_COUNT_4_BIT,
+                            msaa, msaa_view);
+        for (auto &img : images) {
+            VkImageViewCreateInfo vc{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vc.image = img.image, vc.viewType = VK_IMAGE_VIEW_TYPE_2D, vc.format = format;
+            vc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            VkImageView v = VK_NULL_HANDLE;
+            ok = ok && vkCreateImageView(x.device, &vc, nullptr, &v) == VK_SUCCESS;
+            targets.push_back(v);
+        }
+        if (!ok) return rt_log("vr: room: its images could not be made"), false;
+        begin();
+        ok = sur_upload(cb, format);
+        submit();
+        sur_free_staging();
+        rt_log("vr: room: %s, %ux%u for each eye", ok ? "on the card" : "could not be put on the card", w, h);
+        if (!ok) return false;
+        sur.up = true, sur.failed = false;
+    }
+    uint32_t index = 0;
+    XrSwapchainImageAcquireInfo acq{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wait.timeout = XR_INFINITE_DURATION;
+    if (XR_FAILED(x.xrAcquireSwapchainImage(chain, &acq, &index)) || XR_FAILED(x.xrWaitSwapchainImage(chain, &wait))) return false;
+    float floor_y = -1.6f;
+    XrSpaceLocation fl{XR_TYPE_SPACE_LOCATION};
+    if (stage && XR_SUCCEEDED(x.xrLocateSpace(stage, space, at, &fl)) && (fl.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT))
+        floor_y = fl.pose.position.y;
+    begin();
+    barrier_direct(cb, msaa, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    {
+        const VkImageMemoryBarrier2 b = layout_change(depth, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                                                      VK_IMAGE_ASPECT_DEPTH_BIT);
+        VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        d.imageMemoryBarrierCount = 1, d.pImageMemoryBarriers = &b;
+        (vkCmdPipelineBarrier2)(cb, &d);
+    }
+    // (the room's vertices to LOCAL: on the floor; anchored, turned and scaled so its screen place is the screen's)
+    float model[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, floor_y, 0, 1};
+    if (sur.anchored) {
+        const float wide = 3.14159265f / 180.0f * (float)cfg_int("VR_SCREEN_SIZE");
+        const bool curved = x.cylinder && cfg_bool("VR_SCREEN_CURVE");
+        const float screen_w = curved ? wide * x.screen_distance : 2.0f * x.screen_distance * std::tan(0.5f * std::fmin(wide, 2.6f));
+        const float k = screen_w / sur.anchor_w;
+        const float c = std::cos(-sur.anchor_turn), s = std::sin(-sur.anchor_turn);   // (its facing turned to +z, at the eyes)
+        // p' = S + k R (p - A), R = [c 0 s; 0 1 0; -s 0 c], S = the screen's middle (0, 0, -distance)
+        const float R[3][3] = {{c, 0, s}, {0, 1, 0}, {-s, 0, c}};
+        const float S[3] = {0, 0, -x.screen_distance};
+        for (int r = 0; r < 3; r++) {
+            float t = S[r];
+            for (int col = 0; col < 3; col++) model[col * 4 + r] = k * R[r][col], t -= k * R[r][col] * sur.anchor[col];
+            model[12 + r] = t;
+        }
+        model[3] = model[7] = model[11] = 0, model[15] = 1;
+    }
+    sur_draw(cb, msaa_view, targets[index], depth_view, w, h, views, model);
+    // room-snap.go in the game's folder: this picture of both eyes to room-snap.bin ("RSN1", width, height, VkFormat, pixels)
+    static unsigned polled;
+    static VkBuffer snap = VK_NULL_HANDLE;
+    static void *snap_map = nullptr;
+    bool snapping = false;
+    if (++polled % 90 == 0) {
+        if (FILE *t = std::fopen("room-snap.go", "rb")) {
+            std::fclose(t);
+            std::remove("room-snap.go");
+            if (!snap) {
+                const VkDeviceSize n = (VkDeviceSize)2 * w * h * 4;
+                VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+                bi.size = n, bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                VkMemoryRequirements mr;
+                VkPhysicalDeviceMemoryProperties mem;
+                vkGetPhysicalDeviceMemoryProperties(x.phys, &mem);
+                const VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+                uint32_t type = UINT32_MAX;
+                VkDeviceMemory dm = VK_NULL_HANDLE;
+                if (vkCreateBuffer(x.device, &bi, nullptr, &snap) == VK_SUCCESS) {
+                    vkGetBufferMemoryRequirements(x.device, snap, &mr);
+                    for (uint32_t i = 0; i < mem.memoryTypeCount && type == UINT32_MAX; i++)
+                        if ((mr.memoryTypeBits & (1u << i)) && (mem.memoryTypes[i].propertyFlags & host) == host) type = i;
+                    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                    ai.allocationSize = mr.size, ai.memoryTypeIndex = type;
+                    if (type == UINT32_MAX || vkAllocateMemory(x.device, &ai, nullptr, &dm) != VK_SUCCESS ||
+                        vkBindBufferMemory(x.device, snap, dm, 0) != VK_SUCCESS || vkMapMemory(x.device, dm, 0, n, 0, &snap_map) != VK_SUCCESS)
+                        snap_map = nullptr;
+                }
+            }
+            if (snap_map) {
+                const VkImage img = images[index].image;
+                barrier_direct(cb, img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                VkBufferImageCopy c{};
+                c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                c.imageExtent = {2 * w, h, 1};
+                (vkCmdCopyImageToBuffer)(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, snap, 1, &c);
+                barrier_direct(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+                snapping = true;
+            }
+        }
+    }
+    submit();
+    if (snapping) {
+        if (FILE *f = std::fopen("room-snap.bin", "wb")) {
+            const uint32_t head[4] = {0x314e5352u, 2 * w, h, (uint32_t)format};
+            std::fwrite(head, 4, 4, f), std::fwrite(snap_map, 4, (size_t)2 * w * h, f);
+            std::fclose(f);
+        }
+        rt_log("vr: room: snap written (%ux%u, floor %.2f m below the start)", 2 * w, h, -floor_y);
+    }
+    XrSwapchainImageReleaseInfo rel{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    x.xrReleaseSwapchainImage(chain, &rel);
+    for (int e = 0; e < 2; e++) {
+        pv[e].pose = views[e].pose, pv[e].fov = views[e].fov;
+        pv[e].subImage.swapchain = chain;
+        pv[e].subImage.imageRect = {{e ? (int32_t)w : 0, 0}, {(int32_t)w, (int32_t)h}};
+    }
+    layer.space = space, layer.viewCount = 2, layer.views = pv;
+    return true;
+}
+}   // namespace
 
 // The session's thread: its events, the headset's frames, and each newer box into the swapchain
 void run(void *) {
@@ -2571,6 +3354,19 @@ void run(void *) {
     x.xrCreateReferenceSpace(session, &rs, &space);
     rs.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
     x.xrCreateReferenceSpace(session, &rs, &view_space);
+    XrSpace stage = XR_NULL_HANDLE;
+    rs.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
+    if (XR_FAILED(x.xrCreateReferenceSpace(session, &rs, &stage))) stage = XR_NULL_HANDLE;
+    if (sur.state.load() == 0) {
+        sur.state = 1;
+        std::thread(surround_read).detach();
+    }
+    XrSwapchain room_chain = XR_NULL_HANDLE;
+    std::vector<XrSwapchainImageVulkanKHR> room_images;
+    std::vector<VkImageView> room_targets;
+    VkImage room_msaa = VK_NULL_HANDLE, room_depth = VK_NULL_HANDLE;
+    VkImageView room_msaa_view = VK_NULL_HANDLE, room_depth_view = VK_NULL_HANDLE;
+    uint32_t room_w = 0, room_h = 0;
 
     uint32_t n = 0;
     x.xrEnumerateSwapchainFormats(session, 0, &n, nullptr);
@@ -2690,6 +3486,8 @@ void run(void *) {
         x.xrBeginFrame(session, &bfi);
         frames++;
 
+        XrView eye_views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+        bool eye_ok = false;
         {   // the head and the eyes' lenses at this frame's predicted time: what the game draws its next frame with
             XrViewLocateInfo li{XR_TYPE_VIEW_LOCATE_INFO};
             li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -2700,6 +3498,8 @@ void run(void *) {
             uint32_t count = 0;
             XrSpaceLocation head{XR_TYPE_SPACE_LOCATION};
             const bool views_ok = XR_SUCCEEDED(x.xrLocateViews(session, &li, &vs, 2, &count, views)) && count == 2;
+            eye_ok = views_ok && (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT);
+            if (eye_ok) eye_views[0] = views[0], eye_views[1] = views[1];
             const bool head_ok = XR_SUCCEEDED(x.xrLocateSpace(view_space, space, fs.predictedDisplayTime, &head)) &&
                                  (head.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT);
             if (views_ok && head_ok) {
@@ -2885,14 +3685,31 @@ void run(void *) {
         const bool show_hud = shown_drawn.tracked && shown_drawn.hud && hud_has && hud_swapchain && !x.hud_hidden.load();
         const XrCompositionLayerBaseHeader *screen = curved ? (const XrCompositionLayerBaseHeader *)&curve
                                                             : (const XrCompositionLayerBaseHeader *)&quad;
-        const XrCompositionLayerBaseHeader *layers[] = {shown_drawn.tracked ? (const XrCompositionLayerBaseHeader *)&proj
-                                                                            : screen,
-                                                        (const XrCompositionLayerBaseHeader *)&hud};
+        XrCompositionLayerProjectionView room_pv[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
+                                                       {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
+        XrCompositionLayerProjection room_proj{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+        {
+            static int was = -1;
+            const int why = !have_image ? 1 : !fs.shouldRender && !sur_snap_wanted() ? 2 : shown_drawn.tracked ? 3 : !eye_ok ? 4 : sur.state.load() != 2 ? 5 : 0;
+            if (why != was)
+                rt_log("vr: room: %s", why == 0 ? "shown" : why == 1 ? "not shown (no picture yet)" : why == 2 ? "not shown (the runtime says not to draw)"
+                                   : why == 3 ? "not shown (the head's view)" : why == 4 ? "not shown (no eye poses)" : "not shown (no room read)");
+            was = why;
+        }
+        const bool room_shown = have_image && (fs.shouldRender || sur_snap_wanted()) && !shown_drawn.tracked && eye_ok &&
+                                sur_frame(session, space, stage, fs.predictedDisplayTime, (VkFormat)format, pool, cb, fence, eye_views,
+                                          room_chain, room_images, room_targets, room_msaa, room_msaa_view, room_depth,
+                                          room_depth_view, room_w, room_h, room_pv, room_proj);
+        const XrCompositionLayerBaseHeader *layers[14] = {shown_drawn.tracked ? (const XrCompositionLayerBaseHeader *)&proj
+                                                          : room_shown ? (const XrCompositionLayerBaseHeader *)&room_proj : screen};
+        uint32_t layer_n = 1;
+        if (room_shown) layers[layer_n++] = screen;
+        if (show_hud || show_menu) layers[layer_n++] = (const XrCompositionLayerBaseHeader *)&hud;
         if (shown_drawn.tracked) tracked_frames++;
         XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
         ei.displayTime = fs.predictedDisplayTime;
         ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-        ei.layerCount = have_image && fs.shouldRender ? (show_hud || show_menu ? 2 : 1) : 0;
+        ei.layerCount = have_image && fs.shouldRender ? layer_n : 0;
         ei.layers = layers;
         r = x.xrEndFrame(session, &ei);
         if (XR_FAILED(r)) rt_log("vr: xrEndFrame failed (%d)", (int)r);
@@ -3021,8 +3838,10 @@ extern "C" void vk_xr_device_ready(VkInstance instance, VkPhysicalDevice phys, V
 
 extern "C" int vk_xr_head_wanted(void) { return xr().ok && strcmp(cfg_value("VR_VIEW"), "head") == 0; }
 
+bool room_active();
+
 extern "C" int vk_xr_depth_wanted(void) {   // (Balanced keeps the depth too: the hands and the reticle are hidden by it)
-    return flat_on() || (vk_xr_head_wanted() && (cfg_int("VR_DEPTH") > 0 || stereo_turns() || stereo_accurate()));
+    return flat_on() || (vk_xr_head_wanted() && (cfg_int("VR_DEPTH") > 0 || stereo_turns() || stereo_accurate() || room_active()));
 }
 
 extern "C" void vk_xr_keep_depth(VkCommandBuffer cb, VkImageView depth, uint32_t w, uint32_t h) {
@@ -3096,7 +3915,7 @@ extern "C" int vk_xr_pad(uint64_t *buttons, int32_t left[2], int32_t right[2]) {
         bits = x.hand_buttons;
         std::memcpy(sticks, x.hand_sticks, sizeof sticks);
     }
-    if (x.ocarina.load()) sticks[1][0] = sticks[1][1] = 0, right[0] = right[1] = 0;   // the right stick plays the notes
+    if (x.ocarina.load() && strcmp(cfg_value("VR_CONTROLS"), "simplified") != 0) sticks[1][0] = sticks[1][1] = 0, right[0] = right[1] = 0;   // the right stick plays the notes
     int used = bits != 0;
     int32_t *out[2] = {left, right};
     for (int h = 0; h < 2; h++) {   // a small dead zone, then the stick farther out of the two (the gamepad's or this)
@@ -3115,16 +3934,18 @@ extern "C" int vk_xr_pad(uint64_t *buttons, int32_t left[2], int32_t right[2]) {
 
 extern "C" void vk_xr_ocarina(int on) { xr().ocarina.store(on != 0); }
 
-extern "C" void vk_xr_weapon_out(int out) { xr().weapon_out.store(out != 0); }
+extern "C" void vk_xr_weapon_out(int out) { xr().weapon_out.store(out); }
 extern "C" void vk_xr_two_handed_sword(int on) { xr().two_handed_sword.store(on != 0); }
 extern "C" void vk_xr_game_paused(int on) { xr().game_paused.store(on != 0); }
 extern "C" void vk_xr_turning(float strength) { g_turning.store(strength), g_turning_at.store(plat_now_ns()); }
 extern "C" void vk_xr_rumble(int side, float strength) { g_rumble[side & 1].store(strength), g_rumble_at[side & 1].store(plat_now_ns()); }
 // ((Triforce VR) vr_body.c: Link's arms as the game's animation has them now, not on the controllers: the bow or the slingshot
-// drawn (its ZR), the hammer's swing
+// drawn (its ZR), the hammer's swing. ((Triforce VR) Simplified: not the draw: both hands stay on the controllers, the
+// holding hand pointing the slingshot or bow as the one-handed aim does)
 extern "C" int vk_xr_arms_own(void) {
     const uint64_t swung = g_hammer_swung.load();
-    return g_draw_on.load() || (swung && plat_now_ns() - swung < kHammerSwingNs);
+    const bool draw_own = g_draw_on.load() && strcmp(cfg_value("VR_CONTROLS"), "simplified") != 0;
+    return draw_own || (swung && plat_now_ns() - swung < kHammerSwingNs);
 }
 extern "C" void vk_xr_child(int child) { xr().child.store(child != 0); }
 
@@ -3244,19 +4065,177 @@ extern "C" void vk_xr_hand_item(const char *model) {
     std::snprintf(x.held_item, sizeof x.held_item, "%s", model);
 }
 
+// out: the mesh's far and near end from its origin along its longest axis, the radius 3 in 4 points are within
+namespace {
+// an item's or sword's actor as its model file (romfs Model/<file>.bfres.zs)
+std::string item_model_file(const std::string &actor) {
+    static const struct { const char *actor, *file; } named[] = {
+        {"Item_Hookshot", "Item_Hookshot.Item_Hookshot_Body"}, {"Item_Longshot", "Item_Hookshot.Item_Hookshot_Body"},
+        {"Item_Arrow_Normal", "Weapon_Range_Bow.Weapon_Range_Bow"},
+        {"Item_Arrow_Fire", "Weapon_Range_Bow.Weapon_Range_BowAndArrow_Fire"},
+        {"Pouch_Range_BowAndArrow_Fire", "Weapon_Range_Bow.Weapon_Range_BowAndArrow_Fire"},
+        {"Item_Arrow_Ice", "Weapon_Range_Bow.Weapon_Range_BowAndArrow_Ice"},
+        {"Pouch_Range_BowAndArrow_Ice", "Weapon_Range_Bow.Weapon_Range_BowAndArrow_Ice"},
+        {"Item_Arrow_Light", "Weapon_Range_Bow.Weapon_Range_BowAndArrow_Light"},
+        {"Pouch_Range_BowAndArrow_Light", "Weapon_Range_Bow.Weapon_Range_BowAndArrow_Light"},
+        {"Item_Bottle_BigPoe", "Item_Bottle_Poe.Item_Bottle_Poe"}, {"Item_Bottle_BlueFire", "Item_Bottle.Item_Bottle"},
+        {"Item_Bottle_GreenPotion", "Item_Bottle_RedPotion.Item_Bottle_RedPotion"},   // (the potions share one model)
+        {"Item_Bottle_BluePotion", "Item_Bottle_RedPotion.Item_Bottle_RedPotion"},
+        {"Item_DekuNut", "Obj_DekuNut.Obj_DekuNut"}, {"Item_Bomb", "Obj_Bomb.Obj_Bomb"},
+        {"Item_BrokenSword", "Weapon_Sword_Biggoron.Weapon_Sword_BrokenBiggoron"},
+        {"Weapon_Sword_Giant", "Weapon_Sword_Biggoron.Weapon_Sword_Biggoron"},   // (the Giant's Knife: no model of its own, Biggoron's look)
+        {"Item_CojiroCucco", "Item_PocketCucco.Item_PocketCucco"}, {"Item_AlarmCucco", "Item_PocketCucco.Item_PocketCucco"},
+        {"Item_PocketEgg", "Item_WeirdEgg.Item_WeirdEgg"}};
+    for (const auto &n : named)
+        if (actor == n.actor) return n.file;
+    return actor + "." + actor;
+}
+
+struct ItemShape { std::string actor; int state; float v[3]; };
+std::mutex item_shape_mu;
+std::vector<ItemShape> item_shapes;
+
+void item_shape_measure(std::string actor) {
+    std::vector<float> p;
+    ItemShape r{actor, -1, {0, 0, 0}};
+    if (mkwvk::salesman::prop_points(mkwvk::ui::romfs_folder(), item_model_file(actor), p)) {
+        const size_t n = p.size() / 3;
+        float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+        for (size_t i = 0; i < n; i++)
+            for (int k = 0; k < 3; k++) lo[k] = std::min(lo[k], p[i * 3 + k]), hi[k] = std::max(hi[k], p[i * 3 + k]);
+        int ax = 0;
+        for (int k = 1; k < 3; k++)
+            if (hi[k] - lo[k] > hi[ax] - lo[ax]) ax = k;
+        const int u = (ax + 1) % 3, w = (ax + 2) % 3;
+        const float cu = 0.5f * (lo[u] + hi[u]), cw = 0.5f * (lo[w] + hi[w]);
+        std::vector<float> d(n);
+        for (size_t i = 0; i < n; i++) d[i] = std::hypot(p[i * 3 + u] - cu, p[i * 3 + w] - cw);
+        std::nth_element(d.begin(), d.begin() + n * 3 / 4, d.end());
+        r.state = 1;
+        r.v[0] = std::max(std::fabs(lo[ax]), std::fabs(hi[ax])), r.v[1] = std::min(std::fabs(lo[ax]), std::fabs(hi[ax]));
+        if (lo[ax] * hi[ax] > 0) r.v[1] = 0;   // (the origin outside the mesh: its near end where it starts)
+        r.v[2] = d[n * 3 / 4];
+        rt_log("vr: push: %s's mesh: %zu points, longest along %c from %.3f to %.3f, radius %.3f (3 in 4 points)", actor.c_str(), n,
+             "xyz"[ax], lo[ax], hi[ax], r.v[2]);
+    } else {
+        rt_log("vr: push: %s's mesh could not be read", actor.c_str());
+    }
+    std::lock_guard<std::mutex> g(item_shape_mu);
+    for (ItemShape &s : item_shapes)
+        if (s.actor == actor) s = r;
+}
+}  // namespace
+
+extern "C" int vk_xr_item_shape(const char *actor, float out[3]) {
+    if (!actor || !actor[0]) return -1;
+    std::lock_guard<std::mutex> g(item_shape_mu);
+    for (const ItemShape &s : item_shapes)
+        if (s.actor == actor) {
+            if (s.state == 1) std::memcpy(out, s.v, sizeof s.v);
+            return s.state;
+        }
+    item_shapes.push_back({actor, 0, {0, 0, 0}});
+    std::thread(item_shape_measure, std::string(actor)).detach();
+    return 0;
+}
+
 
 extern "C" void vk_xr_aim(int on, const double origin[3], const double dir[3]) {
     Xr &x = xr();
     std::lock_guard<std::mutex> lk(x.frame_mu);
-    x.aim_on = on != 0;
+    if (x.aim_on != (on != 0))   // ((Triforce VR) when the reticle's aim starts and ends, against the grips' ZR lines)
+        rt_log("vr: aim %s at %llu ms", on ? "on" : "off", (unsigned long long)(plat_now_ns() / 1000000ull));
+    x.aim_on = on != 0, x.aim_wait = on == 2;
     if (on) std::memcpy(x.aim_o, origin, sizeof x.aim_o), std::memcpy(x.aim_d, dir, sizeof x.aim_d);
 }
 
 
+// TRIFORCE_VR_TEST_GRIP=<file>: while that file exists the item panel is held as by the right trigger (test runs)
+static bool test_grip() {
+    static const char *grip_file = std::getenv("TRIFORCE_VR_TEST_GRIP");
+    if (!grip_file || !*grip_file) return false;
+    static std::atomic<uint64_t> at{0};
+    static std::atomic<bool> held{false};
+    const uint64_t now = plat_now_ns();
+    if (now - at.load(std::memory_order_relaxed) > 100000000ull) {
+        at.store(now, std::memory_order_relaxed);
+        std::FILE *f = std::fopen(grip_file, "rb");
+        if (f) std::fclose(f);
+        held.store(f != nullptr, std::memory_order_relaxed);
+    }
+    return held.load(std::memory_order_relaxed);
+}
+
+// 1: Stereo Balanced's hold; 2: the item panel open, the game's time frozen (host/nn_vi.c)
 extern "C" int vk_xr_holds_time(void) {
     Xr &x = xr();
-    return stereo_balanced() && x.ok && x.head_view.load(std::memory_order_relaxed) &&
-           x.running.load(std::memory_order_relaxed);
+    if (!x.ok || !x.head_view.load(std::memory_order_relaxed) || !x.running.load(std::memory_order_relaxed)) return 0;
+    if (x.wheel_live.load(std::memory_order_relaxed) || test_grip()) return 2;
+    return stereo_balanced() ? 1 : 0;
+}
+
+extern "C" void vk_xr_item_menu(const MkwVkItemMenu *menu) {
+    Xr &x = xr();
+    char mals[8] = "USen";
+    {
+        std::lock_guard<std::mutex> lk(x.item_mu);
+        x.items = *menu;
+        x.items.item_n = std::clamp(x.items.item_n, 0, MKWVK_ITEM_MENU_MAX);
+        x.item_pick.store(x.items.item_n ? std::clamp(menu->item_pick, 0, x.items.item_n - 1) : -1);
+        if (menu->item_mals[0]) {
+            snprintf(mals, sizeof mals, "%s", menu->item_mals);
+            for (int i = 0; i < 2 && mals[i]; i++) mals[i] = (char)std::toupper((unsigned char)mals[i]);   // (usen: USen.Product.110.sarc.zs)
+        }
+    }
+    rt_log("vr: the item panel: %d items, the pick %d", x.items.item_n, x.item_pick.load());
+    mkwvk::ui::items_want(mals);
+}
+extern "C" int vk_xr_item_pick(void) { return xr().item_pick.load(); }
+
+// (VR_CONTROLS=simplified) the item panel drawn over a copy of the HUD's box (item_img: the window's format), copied back
+void compose_items(VkCommandBuffer cb, int slot, VkFormat window, Drawn &d) {
+    Xr &x = xr();
+    if (!x.wheel_live.load(std::memory_order_relaxed) && !test_grip()) return;
+    MkwVkItemMenu m;
+    int order[MKWVK_ITEM_MENU_MAX];
+    {
+        std::lock_guard<std::mutex> lk(x.item_mu);
+        if (!x.items.item_n) return;
+        m = x.items;
+        item_order(m, x.recent, x.item_sort.load(), order);
+    }
+    const VkFormat view_format = mkwvk::ui::draw_format();
+    if (view_format == VK_FORMAT_UNDEFINED) return;
+    if (!x.item_img || x.item_w != x.width || x.item_h != x.height) {
+        x.item_img = VK_NULL_HANDLE, x.item_view = VK_NULL_HANDLE;   // (another size's is left behind, as the scene's)
+        if (!make_image(x.width, x.height, window,
+                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                        x.item_img, x.item_view, VK_IMAGE_ASPECT_COLOR_BIT, view_format)) {
+            x.item_img = VK_NULL_HANDLE;
+            return;
+        }
+        x.item_w = x.width, x.item_h = x.height;
+        rt_log("vr: the item panel's picture: %ux%u, format %d (drawn through %d)", x.width, x.height, (int)window, (int)view_format);
+    }
+    const VkImage hb = x.hud_boxes[slot];
+    VkImageBlit b{};
+    b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    b.srcOffsets[1] = b.dstOffsets[1] = {(int32_t)x.width, (int32_t)x.height, 1};
+    barrier(cb, x.item_img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    if (d.hud) {
+        vkCmdBlitImage(cb, hb, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, x.item_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_NEAREST);
+    } else {
+        const VkClearColorValue clear{};
+        const VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cb, x.item_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &all);
+    }
+    barrier(cb, x.item_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    mkwvk::menu_record_item_panel(cb, x.item_img, x.item_view, x.width, x.height, m, order, x.item_pick.load(), x.item_sort.load());
+    barrier(cb, x.item_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    barrier(cb, hb, d.hud ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    vkCmdBlitImage(cb, x.item_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, hb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_NEAREST);
+    barrier(cb, hb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    d.hud = true;
 }
 
 extern "C" void vk_xr_update_step(double seconds) { update_step.store(seconds, std::memory_order_relaxed); }
@@ -3319,6 +4298,14 @@ extern "C" int vk_xr_camera(double pos[3], double at[3], float up[3], int in_pla
         double place[3];
         world(head.p, place);
         for (int c = 0; c < 3; c++) pos[c] -= place[c];
+        static double stand;
+        static uint64_t stand_at;
+        const uint64_t now = plat_now_ns();
+        const double dt = stand_at && now > stand_at ? (now - stand_at) * 1e-9 : 0;
+        if (!stand_at || head.p[1] > stand) stand = head.p[1];
+        else if (dt < 0.5) stand += (head.p[1] - stand) * (1.0 - std::exp(-dt / 30.0));   // 30 s to settle after sitting down
+        stand_at = now;
+        pos[1] -= std::fmin(stand - head.p[1], 0.75);   // m, the eyes stay over the feet for young Link
     }
     // Stereo Balanced: this picture from one eye, the other the next (eyes in turn): the head moved half the eyes'
     // distance (VR_DEPTH percent of it, as depth stereo's) to that eye's side, the game's camera with it
@@ -3351,7 +4338,7 @@ extern "C" int vk_xr_camera(double pos[3], double at[3], float up[3], int in_pla
     x.drawn.tracked = true, x.drawn.pose = head, x.drawn.lens = frustum(eyes, x.picture_ratio.load());
     x.drawn.eye = eye;
     std::memcpy(x.drawn.base, base, sizeof base), x.drawn.bx = bx, x.drawn.bz = bz;
-    x.drawn.aim = x.aim_on;
+    x.drawn.aim = x.aim_on, x.drawn.aim_wait = x.aim_wait;
     if (x.aim_on) {   // the aim's ray in the view: right, up and back (-forward)
         double o[3];
         for (int c = 0; c < 3; c++) o[c] = x.aim_o[c] - pos[c];
@@ -3361,6 +4348,23 @@ extern "C" int vk_xr_camera(double pos[3], double at[3], float up[3], int in_pla
             x.drawn.aim_o[k] = (float)(sign * (o[0] * axis[k][0] + o[1] * axis[k][1] + o[2] * axis[k][2]));
             x.drawn.aim_d[k] = (float)(sign * (x.aim_d[0] * axis[k][0] + x.aim_d[1] * axis[k][1] + x.aim_d[2] * axis[k][2]));
         }
+    }
+    x.drawn.phys_n = 0;   // ((Triforce VR) Show physics shapes: the capsules' ends in the view, as the aim's start
+    if (cfg_int("VR_PHYS_SHOW") > 0) {
+        const double *axis[3] = {wr, wu, wf};
+        for (int i = 0; i < x.phys_n; i++) {
+            float *o = x.drawn.phys[i];
+            const float *w = x.phys_w[i];
+            for (int e = 0; e < 2; e++)
+                for (int k = 0; k < 3; k++) {
+                    const double sign = k == 2 ? -1.0 : 1.0;
+                    double v = 0;
+                    for (int c = 0; c < 3; c++) v += (w[e * 4 + c] - pos[c]) * axis[k][c];
+                    o[e * 4 + k] = (float)(sign * v);
+                }
+            o[3] = w[3], o[7] = w[7];
+        }
+        x.drawn.phys_n = x.phys_n;
     }
     // the game draws a lens this many times the one the headset is told (VR_VIEW_SCALE, 100 % by default: the
     // headset's own): more of the world in the same view, everything smaller above 100 %
@@ -3543,6 +4547,157 @@ extern "C" int vk_xr_wants_capture(int hdr) {
 
 void desat_right(VkCommandBuffer cb);
 
+// room-shot-NNN.bin: Room::Head, then RGBA8 w x h, then R32F depth dw x dh (half the scene's and the depth's sizes)
+namespace {
+float room_proj[16], room_view[12];   // the scene's last projection and view, by rows (vk_xr_note_projection, _view)
+std::mutex room_proj_mu;
+struct Room {
+    struct Head {
+        char magic[4] = {'V', 'R', 'S', '1'};
+        int32_t shot = 0;
+        uint32_t w = 0, h = 0, dw = 0, dh = 0;
+        float planes[2]{}, proj[16]{}, view[12]{};
+        double cam[9]{}, link[3]{};
+    };
+    std::mutex mu;
+    int want = -1;
+    uint64_t want_at = 0;
+    double cam[9]{}, link[3]{};
+    std::atomic<uint64_t> at{0};   // the host's last call (plat_now_ns)
+    std::atomic<int> stage{0};   // 1: copied to the buffer `frames` presents ago, 2: read by the writer's thread
+    int frames = 0;
+    Head head;
+    uint32_t sw = 0, sh = 0, sdw = 0, sdh = 0;
+    VkBuffer buf = VK_NULL_HANDLE;
+    void *map = nullptr;
+    VkDeviceSize have = 0;
+} room;
+
+bool room_buffer(VkDeviceSize n) {
+    Xr &x = xr();
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = n, bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    VkBuffer buf = VK_NULL_HANDLE;
+    if (vkCreateBuffer(x.device, &bi, nullptr, &buf) != VK_SUCCESS) return false;
+    VkMemoryRequirements mr;
+    vkGetBufferMemoryRequirements(x.device, buf, &mr);
+    VkPhysicalDeviceMemoryProperties mem;
+    vkGetPhysicalDeviceMemoryProperties(x.phys, &mem);
+    const VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    uint32_t type = UINT32_MAX;
+    for (int pass = 0; pass < 2; pass++)   // cached first: reading uncached memory runs at a few MB a second
+        for (uint32_t i = 0; i < mem.memoryTypeCount && type == UINT32_MAX; i++) {
+            const VkMemoryPropertyFlags want = pass ? host : host | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+            if ((mr.memoryTypeBits & (1u << i)) && (mem.memoryTypes[i].propertyFlags & want) == want) type = i;
+        }
+    if (type != UINT32_MAX)
+        rt_log("vr: room capture: buffer memory %s", mem.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT ? "cached" : "NOT cached");
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = mr.size, ai.memoryTypeIndex = type;
+    VkDeviceMemory dm = VK_NULL_HANDLE;
+    void *map = nullptr;
+    if (type == UINT32_MAX || vkAllocateMemory(x.device, &ai, nullptr, &dm) != VK_SUCCESS ||
+        vkBindBufferMemory(x.device, buf, dm, 0) != VK_SUCCESS || vkMapMemory(x.device, dm, 0, n, 0, &map) != VK_SUCCESS)
+        return false;
+    room.buf = buf, room.map = map, room.have = n;
+    return true;
+}
+
+void room_write() {
+    Room::Head hd = room.head;
+    hd.w = room.sw / 2, hd.h = room.sh / 2, hd.dw = room.sdw / 2, hd.dh = room.sdh / 2;
+    auto out = std::make_shared<std::vector<uint8_t>>(sizeof hd + (size_t)hd.w * hd.h * 4 + (size_t)hd.dw * hd.dh * 4);
+    std::memcpy(out->data(), &hd, sizeof hd);
+    const uint8_t *rgba = (const uint8_t *)room.map;
+    uint8_t *c = out->data() + sizeof hd;
+    for (uint32_t y = 0; y < hd.h; y++)
+        for (uint32_t xx = 0; xx < hd.w; xx++)
+            for (int k = 0; k < 4; k++) {
+                const size_t a = ((size_t)(2 * y) * room.sw + 2 * xx) * 4 + k, b = a + (size_t)room.sw * 4;
+                *c++ = (uint8_t)((rgba[a] + rgba[a + 4] + rgba[b] + rgba[b + 4] + 2) / 4);
+            }
+    const float *depth = (const float *)(rgba + (size_t)room.sw * room.sh * 4);
+    float *d = (float *)c;
+    for (uint32_t y = 0; y < hd.dh; y++)
+        for (uint32_t xx = 0; xx < hd.dw; xx++) *d++ = depth[(size_t)(2 * y) * room.sdw + 2 * xx];
+    room.stage = 0;
+    // ((local, VR room) into room-shots\ beside the game, not its folder's root: notes/vr-room/scripts/shotpack.py packs
+    // them there into a file a group)
+    std::error_code made;
+    std::filesystem::create_directory("room-shots", made);
+    char name[64];
+    std::snprintf(name, sizeof name, "room-shots/room-shot-%03d.bin", hd.shot);
+    FILE *f = std::fopen(name, "wb");
+    const bool ok = f && std::fwrite(out->data(), 1, out->size(), f) == out->size();
+    if (f) std::fclose(f);
+    rt_log("vr: room capture: shot %d %s", hd.shot, ok ? "written" : "NOT written");
+}
+
+// (hud_mu held, scene8 just made) the shot the host asked for, copied out of scene8 and the kept depth
+void room_copy(VkCommandBuffer cb) {
+    Xr &x = xr();
+    if (room.stage == 1) {
+        if (++room.frames < 4) return;
+        room.stage = 2;
+        std::thread(room_write).detach();
+        return;
+    }
+    if (room.stage != 0) return;
+    int shot;
+    {
+        std::lock_guard<std::mutex> lk(room.mu);
+        shot = room.want, room.want = -1;
+        if (shot < 0) return;
+        if (plat_now_ns() - room.want_at > 150000000ull) {
+            rt_log("vr: room capture: shot %d dropped (asked too long ago)", shot);
+            return;
+        }
+        std::memcpy(room.head.cam, room.cam, sizeof room.cam), std::memcpy(room.head.link, room.link, sizeof room.link);
+    }
+    float planes[2];
+    if (!x.scene8 || !x.depth || !x.depth_kept || !vk_xr_planes(planes)) {
+        rt_log("vr: room capture: shot %d dropped (no scene depth)", shot);
+        return;
+    }
+    const VkDeviceSize need = (VkDeviceSize)x.hud_w * x.hud_h * 4 + (VkDeviceSize)x.depth_w * x.depth_h * 4;
+    if (need > room.have && !room_buffer(need)) {
+        rt_log("vr: room capture: no memory for a %llu MiB buffer", (unsigned long long)(need >> 20));
+        return;
+    }
+    room.head.shot = shot, room.head.planes[0] = planes[0], room.head.planes[1] = planes[1];
+    {
+        std::lock_guard<std::mutex> lk(room_proj_mu);
+        std::memcpy(room.head.proj, room_proj, sizeof room_proj), std::memcpy(room.head.view, room_view, sizeof room_view);
+    }
+    room.sw = x.hud_w, room.sh = x.hud_h, room.sdw = x.depth_w, room.sdh = x.depth_h;
+    memory_barrier(cb);
+    VkBufferImageCopy c{};
+    c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    c.imageExtent = {room.sw, room.sh, 1};
+    vkCmdCopyImageToBuffer(cb, x.scene8, VK_IMAGE_LAYOUT_GENERAL, room.buf, 1, &c);
+    c.bufferOffset = (VkDeviceSize)room.sw * room.sh * 4, c.imageExtent = {room.sdw, room.sdh, 1};
+    vkCmdCopyImageToBuffer(cb, x.depth, VK_IMAGE_LAYOUT_GENERAL, room.buf, 1, &c);
+    VkMemoryBarrier2 m{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    m.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    m.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT, m.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+    VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dep.memoryBarrierCount = 1, dep.pMemoryBarriers = &m;
+    vkCmdPipelineBarrier2(cb, &dep);
+    memory_barrier(cb);
+    room.stage = 1, room.frames = 0;
+}
+}   // namespace
+
+bool room_active() { return plat_now_ns() - room.at.load(std::memory_order_relaxed) < 1000000000ull; }
+
+extern "C" void vk_xr_room_shot(int shot, const double cam[9], const double link[3]) {
+    room.at.store(plat_now_ns(), std::memory_order_relaxed);
+    if (shot < 0) return;
+    std::lock_guard<std::mutex> lk(room.mu);
+    room.want = shot, room.want_at = plat_now_ns();
+    std::memcpy(room.cam, cam, sizeof room.cam), std::memcpy(room.link, link, sizeof room.link);
+}
+
 extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D extent, VkFormat format, VkImage picture,
                               VkImageLayout picture_layout, const int rect[4], VkSemaphoreSubmitInfo *signal) {
     Xr &x = xr();
@@ -3654,9 +4809,13 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
     if (d.tracked) {
         std::lock_guard<std::mutex> lk(x.hud_mu);
         const bool pair = d.eye == 0 && stereo_accurate() && x.acc_ready;   // (Accurate: the left eye's target as its pass left it)
-        made = make_panel(cb, d.aim ? (int)(0.06f * (float)x.hud_h) : 0, pair ? x.target_l_view : VK_NULL_HANDLE);
+        // ((Triforce VR) Simplified: the game's reticle left on the panel, make_aim moves it)
+        const int cut = game_reticle() ? 0 : aim_cut(d);
+        made = make_panel(cb, cut, pair ? x.target_l_view : VK_NULL_HANDLE);
         hw = x.hud_w, hh = x.hud_h;
+        if (made) room_copy(cb);
         if (made) make_aim(cb, d);
+        if (made) make_phys(cb, d);
         if (made && depth && d.eye < 0) d.stereo = make_eyes(cb, d);
         if (made && d.eye >= 0) keep_eye(cb, d);   // Balanced: this eye's picture kept, both shown once both are
         // Accurate: the left eye's panel was made from the scene and the target as the left eye's pass left it (target_l);
@@ -3669,8 +4828,14 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
             rotate(d.pose.q, right, hr2);
             const float shift = x.acc_shift.load(std::memory_order_relaxed);
             for (int c = 0; c < 3; c++) r.pose.p[c] += shift * hr2[c];
-            if (make_panel(cb, d.aim ? (int)(0.06f * (float)x.hud_h) : 0, x.target_view, x.scene_r_view)) {
+            if (make_panel(cb, cut, x.target_view, x.scene_r_view)) {
                 desat_right(cb);   // (its colours down to the left eye's)
+                if (game_reticle() && r.aim) {   // ((Triforce VR) the right eye's reticle too: the aim's start seen from it
+                    r.aim_o[0] -= shift;
+                    make_aim(cb, r);
+                }
+                for (int i = 0; i < r.phys_n; i++) r.phys[i][0] -= shift, r.phys[i][4] -= shift;   // (the shapes seen from it)
+                make_phys(cb, r);
                 keep_eye(cb, r);
                 d = r;
             }
@@ -3714,6 +4879,7 @@ extern "C" void vk_xr_capture(VkCommandBuffer cb, VkImage window, VkExtent2D ext
     }
     barrier(cb, box, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     if (d.tracked) {
+        compose_items(cb, slot, format, d);
         overlay_onto_hud(cb, slot, window, extent, d);
         x.box_drawn[slot] = d;
         if (have_picture) {   // last: the headset's copies are made
@@ -3766,6 +4932,10 @@ extern "C" void vk_xr_note_projection(const float P[16], int minus_w) {
     std::memcpy(&bits, planes, 8);
     planes_bits.store(bits, std::memory_order_relaxed);
     lens_p00.store(P[0], std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lk(room_proj_mu);
+        std::memcpy(room_proj, P, sizeof room_proj);
+    }
     planes_at.store(plat_now_ns(), std::memory_order_relaxed);
     static int lines;
     static float logged[2];
@@ -3777,6 +4947,11 @@ extern "C" void vk_xr_note_projection(const float P[16], int minus_w) {
     }
 }
 
+extern "C" void vk_xr_note_view(const float view[12]) {
+    std::lock_guard<std::mutex> lk(room_proj_mu);
+    std::memcpy(room_view, view, sizeof room_view);
+}
+
 extern "C" int vk_xr_planes(float planes[2]) {
     const uint64_t bits = planes_bits.load(std::memory_order_relaxed);
     if (!bits || plat_now_ns() - planes_at.load(std::memory_order_relaxed) > 1000000000ull) return 0;   // (none for a second)
@@ -3785,19 +4960,38 @@ extern "C" int vk_xr_planes(float planes[2]) {
 }
 
 extern "C" int vk_xr_active(void) { return xr().ok && xr().timeline; }
+extern "C" int vk_xr_grips(void) { return xr().grip_held.load(); }
+extern "C" void vk_xr_grab_hands(int hands) { xr().grab_hands.store(hands & 3); }
 extern "C" void vk_xr_head_worn(int what) { xr().head_worn.store(what); }
 extern "C" void vk_xr_carrying(int on) { xr().carrying.store(on != 0); }
 extern "C" int vk_xr_head_request(void) { return xr().head_request.exchange(0); }
 extern "C" int vk_xr_combo_want(void) { return xr().combo_want.exchange(-1); }
 extern "C" void vk_xr_airborne(int on) { xr().airborne.store(on != 0); }
 extern "C" void vk_xr_hud_hidden(int hidden) { xr().hud_hidden.store(hidden != 0); }
+extern "C" void vk_xr_hand_bones(const float bones[24], int ok) {
+    Xr &x = xr();
+    std::lock_guard<std::mutex> lk(x.frame_mu);
+    x.drawn.bones_ok = ok & 3;
+    std::memcpy(x.drawn.bones, bones, sizeof x.drawn.bones);
+}
+
+extern "C" void vk_xr_phys_shapes(const float *caps, int n) {
+    Xr &x = xr();
+    n = n < 0 ? 0 : n > 16 ? 16 : n;
+    std::lock_guard<std::mutex> lk(x.frame_mu);
+    if (n) std::memcpy(x.phys_w, caps, sizeof(float) * 8 * (size_t)n);
+    x.phys_n = n;
+}
 
 extern "C" const MkwVkXr *vk_xr_table(void) {
     static const MkwVkXr t = {
         vk_xr_cfg, vk_xr_head_active, vk_xr_camera, vk_xr_lens, vk_xr_holds_time, vk_xr_update_step, vk_xr_pad,
         vk_xr_ocarina, vk_xr_weapon_out, vk_xr_child,
         vk_xr_hand_item, vk_xr_in_play, vk_xr_item_bar, vk_xr_aim_freeze, vk_xr_pointer, vk_xr_aim, vk_xr_untracked, vk_xr_hands,
-        vk_xr_active, vk_xr_head_worn, vk_xr_hud_hidden, vk_xr_carrying, vk_xr_head_request, vk_xr_two_handed_sword, vk_xr_arms_own, vk_xr_game_paused, vk_xr_rumble, vk_xr_turning, vk_xr_combo_want, vk_xr_airborne};
+        vk_xr_active, vk_xr_head_worn, vk_xr_hud_hidden, vk_xr_carrying, vk_xr_head_request, vk_xr_item_menu,
+        vk_xr_item_pick, vk_xr_grips, vk_xr_grab_hands, vk_xr_two_handed_sword, vk_xr_arms_own, vk_xr_game_paused,
+        vk_xr_rumble, vk_xr_turning, vk_xr_combo_want, vk_xr_airborne, vk_xr_item_shape, vk_xr_hand_bones,
+        vk_xr_phys_shapes, vk_xr_room_shot};
     return &t;
 }
 
