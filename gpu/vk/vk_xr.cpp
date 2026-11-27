@@ -440,8 +440,8 @@ bool running_runtime(std::string &manifest, std::string &who) {
     return true;
 }
 }   // namespace
-bool make_flat_pipelines();   // ((Triforce VR) below, for VR's desktop 3D too
 #endif
+bool make_flat_pipelines();   // ((Triforce VR) below, for VR's desktop 3D too
 
 namespace {
 
