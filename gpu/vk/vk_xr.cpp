@@ -1506,7 +1506,7 @@ struct Controls {
     bool ocarina_left = false;
     // ((Triforce VR) the head's nods: up then down puts the Lens of Truth on, down then up takes it off; within nod_ns, at least
     // nod_speed metres a second each way, then not again for nod_refractory_ns; none within 0.6 s of a swing (the body's lean)
-    static constexpr float nod_speed = 0.55f;
+    static constexpr float nod_speed = 0.45f;
     static constexpr uint64_t nod_ns = 450000000ull, nod_refractory_ns = 1000000000ull;
     float head_y[4]{};
     uint64_t head_t[4]{}, nod_up_at = 0, nod_down_at = 0, nod_at = 0;
@@ -2016,7 +2016,8 @@ struct Controls {
                     // ((Triforce VR) a mask only, not on already: the Lens of Truth is the nod's)
                     // (a mask in the member, or the Lens of Truth there with a mask worn before it: that mask back, +8)
                     const int hw = x.head_worn.load();
-                    if (((hw & 3) == 1 || ((hw & 3) == 2 && (hw & 8))) && !((hw & 3) == 1 && head_on))
+                    // ((Triforce VR) a mask in the member, or one known to him (+8) with the Lens of Truth or nothing there)
+                    if (((hw & 3) == 1 || ((hw & 3) != 1 && (hw & 8))) && !((hw & 3) == 1 && head_on))
                         x.head_request.store(1), head_on = true, rt_log("vr: grips: mask on");
                     else rt_log("vr: grips: a grip on the head: no mask to put on (the head's item %d%s)", hw & 3,
                                 head_on ? ", one on already" : "");

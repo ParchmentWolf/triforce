@@ -539,6 +539,30 @@ static void vr_tick(Ctx *c, const MkwVkXr *x) {
         char head[64] = "";
         oot_data_text(gw(), "PlayerStatus.EquipHeadArmor", head);
         if (strstr(head, "Mask")) snprintf(last_mask, sizeof last_mask, "%s", head);
+        if (!last_mask[0]) {   /* ((Triforce VR) none in the member since the load (the Lens of Truth there, or nothing): the mask he
+                                  holds, the one with stock in the pouch (the Equipment page's single mask slot), checked twice a second */
+            static uint64_t looked;
+            if (now_ns() - looked > 500000000ull) {
+                looked = now_ns();
+                /* (the shop's later masks first: the one carried is the latest borrowed; every one's stock logged once) */
+                static const char *const masks[] = {"Armor_Child_Mask_Truth", "Armor_Child_Mask_Gerudo", "Armor_Child_Mask_Zora",
+                                                    "Armor_Child_Mask_Goron", "Armor_Child_Mask_Bunny", "Armor_Child_Mask_Spooky",
+                                                    "Armor_Child_Mask_Skull", "Armor_Child_Mask_Keaton"};
+                static int told;
+                char stocks[256];
+                int so = 0;
+                for (size_t i = 0; i < sizeof masks / sizeof *masks; i++) {
+                    char key[96];
+                    int32_t stock = 0;
+                    snprintf(key, sizeof key, "PouchData.%s.StockNum", masks[i]);
+                    const int ok = oot_data_int(gw(), key, &stock);
+                    so += snprintf(stocks + so, sizeof stocks - so, " %s=%d", masks[i] + 17, ok ? stock : -1);
+                    if (ok && stock > 0 && !last_mask[0])
+                        snprintf(last_mask, sizeof last_mask, "%s", masks[i]), hos_log("vr: head: the mask held: %s", masks[i]);
+                }
+                if (!told++) hos_log("vr: head: the masks' stock:%s", stocks);
+            }
+        }
         x->head_worn((strstr(head, "Mask") ? 1 : strstr(head, "GlassTruth") ? 2 : 0) | (worn_head() ? 4 : 0) | (last_mask[0] ? 8 : 0));
     }
     head_sync_step(c);
