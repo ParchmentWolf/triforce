@@ -49,6 +49,15 @@ int vr_game_showing_item(void);
 uint64_t vr_body_link(void);
 /* vr_body.c: 1 and his neck's height over his feet (metres) as the late bone pass last posed it, while that was a moment ago */
 int vr_body_neck_height(double *height);
+/* vr_body.c: each controller's arm (0 left, 1 right) as last posed, in the game's world: shoulder, elbow, wrist; ok[] the
+   arms posed a moment ago; 0 neither */
+int vr_body_arm_joints(float p[2][3][3], int ok[2]);
+/* vr_body.c: 1 when the sword's hand is the right controller */
+int vr_body_sword_right(void);
+int vr_body_hand_bones(float m[24]);   /* (Triforce VR) Weapon_L's, Weapon_R's world 3x4s (rows), bits known; vr_body.c */
+/* vr_game.c: what Link holds out now */
+enum { VR_HELD_NONE, VR_HELD_SWORD, VR_HELD_DEKU_STICK, VR_HELD_HAMMER, VR_HELD_OTHER };
+int vr_game_hand_held(void);
 /* vr_game.c: a VR session playing Simplified: the sprint is Left stick click, Toggle (oot_sprint.c), whatever its rows say */
 int vr_simplified_sprint(void);
 

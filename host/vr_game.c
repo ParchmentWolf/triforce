@@ -352,6 +352,8 @@ static int link_aims(void) {
 }
 
 
+static volatile int g_hand_out;
+int vr_game_hand_held(void) { return g_hand_out; }
 static volatile int g_ocarina;   /* (vr_tick: Link plays the ocarina) */
 static volatile int g_held_boomerang;    /* (vr_tick: the boomerang in his hand) */
 static volatile int g_held_hookshot;     /* (vr_tick: the hookshot or the longshot in his hand) */
@@ -727,6 +729,8 @@ static void vr_tick(Ctx *c, const MkwVkXr *x) {
         const int out = hand_item(item);
         x->weapon_out(out && !item[0] && sword_in_hand ? 2 : out);   /* 2: the sword seen in his hand */
         x->hand_item(item);
+        g_hand_out = !out ? VR_HELD_NONE : !item[0] ? VR_HELD_SWORD : !strcmp(item, "Item_DekuStick") ? VR_HELD_DEKU_STICK
+                   : !strcmp(item, "Item_Hammer") ? VR_HELD_HAMMER : VR_HELD_OTHER;
         g_item_out = item[0] != 0;
         snprintf(g_held, sizeof g_held, "%s", item);
         if (x->two_handed_sword) x->two_handed_sword(vr_game_two_handed());
@@ -1096,7 +1100,9 @@ static int event_view(uint64_t event) {
     return strcmp(cfg_value("VR_CUTSCENES"), "first") ? EV_CUTSCENE : EV_EYES;
 }
 
+void hos_vr_physics(Ctx *c);   /* (vr_physics.c) */
 void hos_vr_camera(Ctx *c) {
+    hos_vr_physics(c);
     static const int up_reg[3] = {7, 16, 6};
     const MkwVkXr *x = xr();
     const int scene = x ? scene_camera(c->x[19]) : 0;

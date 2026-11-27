@@ -2542,6 +2542,10 @@ Row rows[] = {
      "Moves your eyes up or down from the game's own cutscene camera.", nullptr, false, true, -1, false, "vr_event_up"},
     // ---- Debug: the tools' switch, the tools themselves below it while they are on (cheat: menu_tick does what they do),
     // then the developer's rows ----
+    {TAB_DEBUG, "Show physics shapes", &opts.vr_phys_show, 0, 1, 1, tx_onoff,
+     "VR: draws what the hands touch the world with: the arms (blue), the hands (green), the sword or item (yellow) and each "
+     "hand's grab reach (white, cyan near something to take, red holding it). Faint where something is in front.",
+     nullptr, false, true, -1, false, "vr_phys_show"},
     {TAB_DEBUG, "Debug tools", &opts.debug_tools, 0, 1, 1, tx_onoff,
      "Testing tools: no-clip flight, a free camera, teleport, Link's age, the inventory, the clock, heart protection and "
      "movement speed. Off puts flight, the free camera and heart protection away and Link back to his own speed.", nullptr,
@@ -3430,6 +3434,7 @@ const VrKey vr_keys[] = {
     {"VR_TURN", &opts.vr_turn, "smooth|snap"},
     {"VR_SNAP_ANGLE", &opts.vr_snap_angle, nullptr},
     {"VR_VIGNETTE", &opts.vr_vignette, "off|on"},
+    {"VR_PHYS_SHOW", &opts.vr_phys_show, nullptr},
     {"VR_SWING_SPEED", &opts.vr_swing_speed, nullptr},
     {"VR_CHARGE_REACH", &opts.vr_charge_reach, nullptr},
     {"VR_HUD_SIZE", &opts.vr_hud_size, nullptr},

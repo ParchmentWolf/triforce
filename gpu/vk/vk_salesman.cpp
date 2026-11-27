@@ -219,7 +219,7 @@ float attr_num(const Bytes& b, uint64_t at, uint32_t fmt, int c) {
     case 0x1805: case 0x1905: case 0x1705: return b.f32(at + 4 * c);
     case 0x1202: return std::max(b.s16(at + 2 * c) / 32767.0f, -1.0f);
     case 0x1201: return b.u16(at + 2 * c) / 65535.0f;
-    case 0x1205: {
+    case 0x1205: case 0x1505: {
         const uint16_t hbits = b.u16(at + 2 * c);
         const uint32_t sign = (hbits >> 15) & 1, e = (hbits >> 10) & 31, m = hbits & 1023;
         float v = e == 0 ? std::ldexp((float)m, -24) : e == 31 ? 65504.0f : std::ldexp((float)(m | 1024), (int)e - 25);
@@ -953,7 +953,38 @@ void thread_main(std::string romfs) {
     }
 }
 
+std::mutex props_mu;
+std::vector<std::pair<std::string, std::unique_ptr<Model>>> props;   // (props_mu; null: could not be read)
+
+// (Triforce VR) romfs Model/<file>.bfres.zs parsed once (its shape only), for the VR physics' held items
+const Model* prop_model(const std::string& romfs, const std::string& file) {
+    for (auto& p : props)
+        if (p.first == file) return p.second.get();
+    auto md = std::make_unique<Model>();
+    game_font::Reader rd;
+    Bytes mb;
+    std::string why;
+    if (!rd.open(romfs) || !rd.read_packed(("Model/" + file + ".bfres.zs").c_str(), mb.d) || !parse_model(mb, *md, &why)) {
+        logf("vr: the item model %s could not be read%s%s", file.c_str(), why.empty() ? "" : ": ", why.c_str());
+        props.emplace_back(file, nullptr);
+        return nullptr;
+    }
+    props.emplace_back(file, std::move(md));
+    return props.back().second.get();
+}
+
 }  // namespace
+
+bool prop_points(const std::string& romfs, const std::string& file, std::vector<float>& xyz) {
+    std::lock_guard<std::mutex> g(props_mu);
+    const Model* md = prop_model(romfs, file);
+    xyz.clear();
+    if (!md) return false;
+    for (const Part& pt : md->parts)
+        if (pt.mode != 2)
+            for (const V3& p : pt.pos) xyz.push_back(p.x), xyz.push_back(p.y), xyz.push_back(p.z);
+    return !xyz.empty();
+}
 
 void start(const std::string& romfs) {
     {

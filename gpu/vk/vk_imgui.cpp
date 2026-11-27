@@ -771,6 +771,7 @@ const char* item_text(const char* label) {
     return it == item_texts.end() ? "" : it->second.c_str();
 }
 VkFormat draw_format() { return pipeline_format; }
+std::string romfs_folder() { return romfs_dir(); }
 void want_glyphs() {
     int none = 0;
     if (glyphs_state.compare_exchange_strong(none, 1)) std::thread(read_glyphs).detach();

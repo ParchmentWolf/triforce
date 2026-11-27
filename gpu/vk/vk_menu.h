@@ -252,6 +252,7 @@ struct Options {
     int vr_aim_tilt = 35;       // Motion's pointed aim: the controller's ray tilted down, degrees (0 to 60)
     int vr_turn = 0;            // first person's turning with the right stick: 0 Smooth, 1 Snap (host/vr_game.c vr_turn)
     int vr_snap_angle = 45;     // Snap's turn, degrees (15 to 90)
+    int vr_phys_show = 0;       // (Triforce VR, for now) the grab's and push's capsules drawn in the view: 0 Off, 1 On (shaders/xr_phys.comp)
     int vr_vignette = 0;        // the Comfort vignette: moving and turning darken the view's edges: 0 Off, 1 On (shaders/xr_hud.comp)
     int vr_turn_speed = 10;     // the right stick's turn: Immersive's orbit around Link, Full Dive's Smooth turning; tenths (1 to 50, 10 as before)
     int vr_zoom_speed = 10;     // Immersive: the right stick's zoom toward Link, tenths (1 to 50, 10 as before)

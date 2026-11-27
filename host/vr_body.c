@@ -559,6 +559,23 @@ static int weapons_drawn(Ctx *c, uint64_t actor) {
 #define WORN_MAX 16
 static char sword_actor[48];   /* (the last walk's Weapon_Sword_* actor) */
 const char *vr_body_sword(void) { return sword_actor; }
+static volatile float sword_scale;   // drawn size over mesh size; 0 not known
+float vr_body_sword_scale(void) { return sword_scale; }
+static float model_scale(Ctx *c, uint64_t model) {
+    const uint64_t parts = model && plausible(model + 0x28, 8) ? recomp_load64(c, model + 0x28) : 0;
+    const uint64_t pp = plausible(parts, 8) ? recomp_load64(c, parts) : 0;
+    const uint64_t inst = plausible(pp, 8) ? recomp_load64(c, pp) : 0;
+    const uint64_t bones = inst && plausible(inst + 0xf8, 8) ? recomp_load64(c, inst + 0xf8) : 0;
+    const uint64_t w = bones && plausible(bones + 0x20, 8) ? recomp_load64(c, bones + 0x20) : 0;
+    if (!plausible(w, 64)) return 0;
+    double s = 0;
+    for (int col = 0; col < 3; col++) {
+        double l = 0;
+        for (int r = 0; r < 3; r++) l += (double)ld_f(c, w + col * 16 + r * 4) * ld_f(c, w + col * 16 + r * 4);
+        s += sqrt(l) / 3;
+    }
+    return isfinite(s) ? (float)s : 0;
+}
 static volatile int weapon_drawn;   /* (the sword out, as hide_back_items last asked) */
 static void armor_caps_find(Ctx *c, const uint64_t *actors, int n);   /* (below, by cap_hide) */
 static void hide_back_items(Ctx *c, uint64_t link, int first_person) {
@@ -604,10 +621,18 @@ static void hide_back_items(Ctx *c, uint64_t link, int first_person) {
         for (unsigned k = 0; k < sizeof back_items / sizeof *back_items; k++)
             if (!strncmp(name, back_items[k].prefix, strlen(back_items[k].prefix))) kind = (int)k;
         if (kind < 0) continue;
+        const int is_sword = !strcmp(name, sword_actor);
+        uint64_t model = is_sword ? vr_call(c, 0x80994de0ULL, found[i], 0, 0, 0) : 0;
+        if (is_sword) {
+            const float s = model_scale(c, model);
+            static float told;
+            if (s > 0 && fabsf(s - told) > 0.02f && logs < 40) logs++, told = s, hos_log("vr: body: %s drawn at %.3f of its mesh's size", name, s);
+            sword_scale = s;
+        }
         const int hide = first_person && (!back_items[kind].when_put_away || drawn == 0);
         any_hidden |= hide;
         if (!hide && hidden[i] == 0) continue;   /* (shown already: nothing to do) */
-        const uint64_t model = vr_call(c, 0x80994de0ULL, found[i], 0, 0, 0);
+        if (!model) model = vr_call(c, 0x80994de0ULL, found[i], 0, 0, 0);
         int done = 0;
         for (int k = 0; k < BACK_MATS && back_items[kind].mats[k]; k++) done += model_material_vis(c, model, back_items[kind].mats[k], !hide);
         if (hide != hidden[i] && logs < 40)
@@ -1601,6 +1626,44 @@ void hos_oot_world_pass(Ctx *c) {
     ReleaseSRWLockExclusive(&ma_lock);
 }
 
+static struct { float m[24]; int ok; int64_t at; } bones_pub[2];
+static int bones_pub_i;
+static void hand_bones_publish(Ctx *c, const MkwVkXr *x) {
+    float m[24] = {0};
+    int ok = 0;
+    const MaPart *mp = &ma.part[0];
+    const int part = ma.model ? ma_part_index(c, mp->bones) : -1;
+    const uint64_t inst = part >= 0 ? recomp_load64(c, recomp_load64(c, recomp_load64(c, ma.model + 0x28) + (uint64_t)part * 8)) : 0;
+    const uint64_t worlds = part >= 0 ? recomp_load64(c, mp->bones + 0x20) : 0;
+    if (part >= 0 && plausible(inst + 0x2d0, 12) && plausible(worlds, (uint64_t)mp->n * 64))
+        for (int h = 0; h < 2; h++) {
+            const int b = h ? mp->hand_r : mp->hand_l;
+            if (b < 0 || b >= mp->n) continue;
+            const uint64_t e = worlds + (uint64_t)b * 64;   /* (columns of 4 floats: the place last, from his model's origin) */
+            for (int r = 0; r < 3; r++) {
+                for (int k = 0; k < 4; k++) m[h * 12 + r * 4 + k] = ld_f(c, e + (uint64_t)k * 16 + (uint64_t)r * 4);
+                m[h * 12 + r * 4 + 3] += ld_f(c, inst + 0x2d0 + (uint64_t)r * 4);
+            }
+            int finite = 1;
+            for (int k = 0; k < 12; k++) finite &= isfinite(m[h * 12 + k]) != 0;
+            if (finite) ok |= 1 << h;
+        }
+    x->hand_bones(m, ok);
+    {   /* (for vr_physics.c on other threads: two copies, the one last written named by an index set after it) */
+        const int next = __atomic_load_n(&bones_pub_i, __ATOMIC_RELAXED) ^ 1;
+        memcpy(bones_pub[next].m, m, sizeof m), bones_pub[next].ok = ok, bones_pub[next].at = hos_now_ns();
+        __atomic_store_n(&bones_pub_i, next, __ATOMIC_RELEASE);
+    }
+}
+/* (Triforce VR) Weapon_L's and Weapon_R's world matrices as hand_bones_publish last gave them (rows of a 3x4, metres):
+   bits of the ones known, 0 none or older than 0.2 s */
+int vr_body_hand_bones(float m[24]) {
+    const int i = __atomic_load_n(&bones_pub_i, __ATOMIC_ACQUIRE);
+    if (hos_now_ns() - bones_pub[i].at > 200000000LL) return 0;
+    memcpy(m, bones_pub[i].m, sizeof bones_pub[i].m);
+    return bones_pub[i].ok;
+}
+
 void vr_body_lift(Ctx *c, uint64_t actor) {
     ma_seen(c, actor);
     const MkwVkXr *x = rx_xr();
@@ -1610,6 +1673,7 @@ void vr_body_lift(Ctx *c, uint64_t actor) {
     const int fp = on && vr_first_person_now() && !vr_game_paused();   /* ((Triforce VR) the menus show him whole) */
     head_materials_set(c, fp && body_arms());
     hide_back_items(c, actor, fp);
+    if (on && x->hand_bones) hand_bones_publish(c, x);
 }
 
 /* (the One-Euro filter (Casiez, Roussel, Vogel 2012) on a 3-vector, in place: a low-pass whose cut-off rises with the
@@ -1653,6 +1717,33 @@ static const Grip GRIP_BIGGORON_ADULT = {{-0.3929, 0.4328, -0.8114, -0.0885, 0.8
 static const Grip GRIP_HAMMER_ADULT = {{0.0503, 0.2819, 0.9581, -0.9330, -0.3290, 0.1459, 0.3564, -0.9012, 0.2465}, {0.0151, -0.5284, -0.0191}, {-0.3324, 0.0127, -0.9431, 0.0052, -0.9999, -0.0153, -0.9431, -0.0100, 0.3323}};
 /* the head sunk this far into the chest (metres), in the neck's frame */
 #define HEAD_SINK 0.25
+
+static struct {
+    volatile uint32_t seq;
+    int64_t at[2];
+    float p[2][3][3];   // world: shoulder, elbow, wrist
+} arm_pub;
+static void arm_publish(int s, const double j[3][3]) {
+    __atomic_add_fetch(&arm_pub.seq, 1, __ATOMIC_ACQ_REL);
+    for (int i = 0; i < 3; i++)
+        for (int k = 0; k < 3; k++) arm_pub.p[s][i][k] = (float)j[i][k];
+    arm_pub.at[s] = hos_now_ns();
+    __atomic_add_fetch(&arm_pub.seq, 1, __ATOMIC_ACQ_REL);
+}
+int vr_body_arm_joints(float p[2][3][3], int ok[2]) {
+    for (int tries = 0; tries < 4; tries++) {
+        const uint32_t s0 = __atomic_load_n(&arm_pub.seq, __ATOMIC_ACQUIRE);
+        if (s0 & 1) continue;
+        int64_t at[2];
+        memcpy(p, arm_pub.p, sizeof arm_pub.p), memcpy(at, arm_pub.at, sizeof at);
+        if (__atomic_load_n(&arm_pub.seq, __ATOMIC_ACQUIRE) != s0) continue;
+        const int64_t now = hos_now_ns();
+        for (int s = 0; s < 2; s++) ok[s] = at[s] && now - at[s] < 200000000LL;
+        return ok[0] || ok[1];
+    }
+    return 0;
+}
+int vr_body_sword_right(void) { return vr_sword_right(); }
 
 static volatile double neck_height;
 static volatile int64_t neck_at;
@@ -1910,6 +2001,17 @@ void hos_oot_after_anim(Ctx *c) {
                     m3_set(&L3, W);
                 }
                 ob_write(c, b1, &L1), ob_write(c, b1 + 1, &L2), ob_write(c, b1 + 2, &L3);
+                {
+                    Xf a1, a2, a3;
+                    xf_mul(&cn, &L1, &a1), xf_mul(&a1, &L2, &a2), xf_mul(&a2, &L3, &a3);
+                    double j[3][3];
+                    for (int k = 0; k < 3; k++) j[0][k] = a1.m[k][3], j[1][k] = a2.m[k][3], j[2][k] = a3.m[k][3];
+                    for (int i = 0; i < 3; i++) {
+                        if (mirrored && have_inv) xf_pt(&root_now_inv, j[i], j[i]), j[i][0] = -j[i][0], xf_pt(&root_now, j[i], j[i]);
+                        for (int k = 0; k < 3; k++) j[i][k] += origin[k];
+                    }
+                    arm_publish(mirrored ? 1 - s : s, j);
+                }
             }
         static int arms_logged;
         if (!arms_logged++) hos_log("vr: body: Link's arms follow the controllers");

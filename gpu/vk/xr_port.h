@@ -104,6 +104,7 @@ void menu_record_item_panel(VkCommandBuffer cmd, VkImage image, VkImageView view
 namespace mkwvk::ui {
 VkFormat draw_format();
 void items_want(const char* mals);
+std::string romfs_folder();
 }
 inline int menu_is_open() { return mkwvk::menu_is_open(); }
 inline int menu_embedded() { return mkwvk::menu_embedded(); }

@@ -23,8 +23,9 @@ extern "C" {
    jitter_sample, the camera jitter's one whole sample; MkwVkRenderer's nvn_program_created at its end, the load of a
    program at its create call (RX_VK_LOAD=create). 25: all of them together. 26: (Triforce VR) the Simplified item
    panel's calls (item_menu, item_pick) in MkwVkXr, and aim's and weapon_out's 2 (aiming, its aim not on the pointer yet;
-   the sword seen in his hand) */
-#define MKWVK_API_VERSION 26
+   the sword seen in his hand). 27: (Triforce VR) the grab's and push's calls (grips, grab_hands, item_shape, hand_bones,
+   phys_shapes) in MkwVkXr */
+#define MKWVK_API_VERSION 27
 enum { HOS_OPT_CHEAT_HEARTS = 32, HOS_OPT_CHEAT_FLIGHT, HOS_OPT_CHEAT_ACTION, HOS_OPT_CHEAT_CAMERA };
 /* (hookshot) the Motion page's rows (host/pad_sdl.c reads them, vk_replay.cpp's option answers them): Motion controls on
    or off, the horizontal's and the vertical's sensitivity in percent, each turned around, and the deadzone (0 to 2) */
@@ -625,6 +626,8 @@ typedef struct MkwVkXr {
     int (*head_request)(void);   /* (Triforce VR) the gestures' ask for his head, taken: 0 none, 1 the mask on, 2 the Lens of Truth on, 3 off */
     void (*item_menu)(const MkwVkItemMenu *menu);   /* (Triforce VR) the item panel's list, at its open */
     int (*item_pick)(void);   /* (Triforce VR) the item panel's pick: an index of that list, -1 none (Back) */
+    int (*grips)(void);   /* (Triforce VR) the grips squeezed in play: bit 0 left, 1 right (vk_xr_grips) */
+    void (*grab_hands)(int hands);   /* (Triforce VR) the hands near a body to take or holding one: no play roles for their grips */
     void (*two_handed_sword)(int on);   /* (Triforce VR) his sword is the Biggoron's (both hands on it), no item in his hand */
     int (*arms_own)(void);   /* (Triforce VR) his arms as the game's animation has them now: a bow or slingshot drawn, a hammer swing */
     void (*game_paused)(int on);   /* (Triforce VR) the game paused by its menus: no full-picture fade looked for in the HUD */
@@ -632,6 +635,9 @@ typedef struct MkwVkXr {
     void (*turning)(float strength);   /* (Triforce VR) first person's Smooth turn now, 0 to 1 (the Turn vignette) */
     int (*combo_want)(void);   /* (Triforce VR) the gesture-chosen slash's combo counter for the next swing, taken: -1 none */
     void (*airborne)(int on);   /* (Triforce VR) Link in the air (jumping, falling): a downward slash is the game's jump attack */
+    int (*item_shape)(const char *actor, float out[3]);   /* (Triforce VR, 27) vk_xr_item_shape */
+    void (*hand_bones)(const float bones[24], int ok);   /* (Triforce VR, 27) vk_xr_hand_bones */
+    void (*phys_shapes)(const float *caps, int n);   /* (Triforce VR, 27) vk_xr_phys_shapes */
 } MkwVkXr;
 
 /* the DLL's one export: null when Vulkan is not usable (the executable then falls back to WebGPU) */

@@ -1,0 +1,72 @@
+#version 450
+// (Triforce VR) Show physics shapes (VR_PHYS_SHOW, gpu/vk/vk_xr.cpp make_phys): up to three of host/vr_physics.c's
+// capsules (the arms, the hands, the item held out, each hand's grab reach) drawn into the scene the HUD's shader left,
+// a pixel's ray against each: solid and shaded where nothing of the scene is in front, faint where something is (so a
+// shape inside the sword or a wall still shows)
+// glslangValidator -V --target-env vulkan1.3 --vn XR_PHYS_COMP_SPV -o xr_phys_comp_spv.h xr_phys.comp
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D depth;   // the scene's depth (R32F, as stored)
+layout(binding = 1, rgba8) uniform image2D scene;
+layout(push_constant) uniform Push {
+    float w, h;              // the scene's picture, pixels
+    float tan_x, tan_y;      // the lens: x_ndc = x / (-z tan_x)
+    float plane_a, plane_b;  // the stored depth d is plane_a + plane_b / distance
+    float n, pad;            // capsules below (1 to 3)
+    vec4 cap[6];             // each: end a and radius, end b and kind; in the head's view (x right, y up, z back), metres
+} p;
+
+// the ray's distance to the capsule's outside (rd of length 1, from the eye), -1 a miss
+float hit_capsule(vec3 rd, vec3 a, vec3 b, float r) {
+    const vec3 ba = b - a, oa = -a;
+    const float baba = dot(ba, ba);
+    if (baba > 1e-8) {
+        const float bard = dot(ba, rd), baoa = dot(ba, oa), rdoa = dot(rd, oa), oaoa = dot(oa, oa);
+        const float qa = baba - bard * bard, qb = baba * rdoa - baoa * bard, qc = baba * oaoa - baoa * baoa - r * r * baba;
+        const float hq = qb * qb - qa * qc;
+        if (hq < 0.0) return -1.0;
+        const float t = (-qb - sqrt(hq)) / qa, y = baoa + t * bard;
+        if (y > 0.0 && y < baba) return t;
+        const vec3 oc = y <= 0.0 ? oa : -b;   // (an end's ball)
+        const float sb = dot(rd, oc), sc = dot(oc, oc) - r * r, hs = sb * sb - sc;
+        return hs > 0.0 ? -sb - sqrt(hs) : -1.0;
+    }
+    const float sb = dot(rd, oa), sc = dot(oa, oa) - r * r, hs = sb * sb - sc;   // (a ball)
+    return hs > 0.0 ? -sb - sqrt(hs) : -1.0;
+}
+
+vec3 kind_colour(int k) {
+    // 0 an arm, 1 a hand's push, 2 the item, 3 a grab reach, 4 a grab reach near a body, 5 a hand holding one
+    const vec3 c[6] = vec3[6](vec3(0.2, 0.5, 1.0), vec3(0.2, 1.0, 0.4), vec3(1.0, 0.85, 0.1), vec3(1.0, 1.0, 1.0),
+                              vec3(0.1, 1.0, 1.0), vec3(1.0, 0.25, 0.2));
+    return c[clamp(k, 0, 5)];
+}
+
+void main() {
+    const ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= int(p.w) || px.y >= int(p.h)) return;
+    const vec2 uv = (vec2(px) + 0.5) / vec2(p.w, p.h);
+    const vec3 rd = normalize(vec3((uv.x * 2.0 - 1.0) * p.tan_x, (1.0 - uv.y * 2.0) * p.tan_y, -1.0));
+    float best = 1e9;
+    int bi = -1;
+    for (int i = 0; i < int(p.n); i++) {
+        const float t = hit_capsule(rd, p.cap[i * 2].xyz, p.cap[i * 2 + 1].xyz, p.cap[i * 2].w);
+        if (t > 0.05 && t < best) best = t, bi = i;
+    }
+    if (bi < 0) return;
+    const vec3 a = p.cap[bi * 2].xyz, b = p.cap[bi * 2 + 1].xyz, at = rd * best;
+    const vec3 ba = b - a;
+    const float baba = dot(ba, ba), f = baba > 1e-8 ? clamp(dot(at - a, ba) / baba, 0.0, 1.0) : 0.0;
+    const vec3 nrm = normalize(at - (a + ba * f));
+    const float facing = abs(dot(nrm, rd));   // (1 square on, 0 at its rim)
+    const ivec2 dsize = textureSize(depth, 0);
+    const ivec2 t = clamp(ivec2(uv * vec2(dsize)), ivec2(0), dsize - 1);
+    const float surface = (texelFetch(depth, t, 0).r - p.plane_a) / p.plane_b;   // 1 / its distance
+    const bool seen = 1.0 / max(-at.z, 1e-4) >= surface;
+    const vec3 col = kind_colour(int(p.cap[bi * 2 + 1].w + 0.5));
+    // the rim bright, the middle see-through: the shape's outline reads against anything
+    const float rim = 1.0 - smoothstep(0.15, 0.55, facing);
+    const float alpha = seen ? mix(0.35, 0.9, rim) : mix(0.08, 0.35, rim);
+    vec4 s = imageLoad(scene, px);
+    s.rgb = mix(s.rgb, col * (0.6 + 0.4 * facing), alpha);
+    imageStore(scene, px, s);
+}

@@ -21,5 +21,7 @@ void show(bool on, int w, int h);
 void smile(float seconds);
 /// The newest picture when it is newer than *seq: RGBA (straight alpha), w x h
 bool take(std::vector<unsigned char>& rgba, int* w, int* h, uint64_t* seq);
+/// (Triforce VR) romfs Model/<file>'s drawn vertices at rest, x y z in the model's space
+bool prop_points(const std::string& romfs, const std::string& file, std::vector<float>& xyz);
 
 }  // namespace mkwvk::salesman
