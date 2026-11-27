@@ -33,14 +33,14 @@ u32 address_of(u32 index) { return 0x50U + index * 8 + ((index + 1) / 3) * 8; } 
 
 // What native instruction `at` lowered to: opcode `op` with predicate `pred`, landing on what native `to` lowered to; near
 // by a 24-bit offset (BRA 0xe24), far by the target's address in bits 20-51 (JMP 0xe21, JCAL 0xe22)
-template <class Lowered> bool lands(const Lowered& l, u32 at, u32 to, u64 op, u32 pred, bool far) {
+template <class Lowered> bool lands(const Lowered& l, u32 at, u32 to, u64 op, u32 pred, bool far_branch) {
     if (at >= l.source_instruction_offsets.size() || to >= l.source_instruction_offsets.size()) return false;
     const u32 from = l.source_instruction_offsets[at], target = l.source_instruction_offsets[to];
     if (from >= l.instructions.size()) return false;
     const u64 word = l.instructions[from];
     const s64 distance = s64{address_of(target)} - address_of(from) - 8;
     if ((word >> 52) != op || ((word >> 16) & 15) != pred) return false;
-    if (far) return ((word >> 20) & 0xffffffffu) == address_of(target) && (distance > 0x7fffff || distance < -0x800000);
+    if (far_branch) return ((word >> 20) & 0xffffffffu) == address_of(target) && (distance > 0x7fffff || distance < -0x800000);
     return (static_cast<s64>(word << 20) >> 40) == distance;
 }
 
