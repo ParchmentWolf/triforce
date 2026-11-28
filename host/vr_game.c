@@ -303,6 +303,7 @@ static int first_person_eye(double eye[3]) {
        Link 0.97 m and 12 cm, both found right in a Quest 3) */
     const int child = oot_childhood();
     double up = (child ? 0.97 : 1.43) + cfg_int("VR_EYE_UP") / 100.0;
+    double crawl_ahead = 0;   /* ((Triforce VR) crawling: the eyes 10 cm further ahead, eased as the crouch's drop (below) */
     {   /* ((Triforce VR) crouched (a crawlspace too: Crouch, CrouchLockOnMove...): the eyes down by as much as his neck is
            below its height standing still, eased over about a tenth of a second) */
         static double stand = -1, drop, target;
@@ -322,8 +323,13 @@ static int first_person_eye(double eye[3]) {
         at = t;
         drop += (target - drop) * (dt > 0 && dt < 0.5 ? 1.0 - exp(-dt / 0.1) : 1.0);
         up -= drop;
+        /* (crawling, his origin is about at his hips: the eyes there would sit in his body) */
+        static double crawl_fwd;
+        const double crawl_target = !strncmp(state, "Crawl", 5) ? 0.10 : 0.0;
+        crawl_fwd += (crawl_target - crawl_fwd) * (dt > 0 && dt < 0.5 ? 1.0 - exp(-dt / 0.1) : 1.0);
+        crawl_ahead = crawl_fwd;
     }
-    const double ahead = (child ? 0.12 : 0.16) + cfg_int("VR_EYE_FORWARD") / 100.0, side = cfg_int("VR_EYE_SIDE") / 100.0;
+    const double ahead = (child ? 0.12 : 0.16) + cfg_int("VR_EYE_FORWARD") / 100.0 + crawl_ahead, side = cfg_int("VR_EYE_SIDE") / 100.0;
     eye[0] = feet[0] + ahead * fx - side * fz;   /* his right: (-fz, 0, fx) */
     eye[1] = feet[1] + up;
     eye[2] = feet[2] + ahead * fz + side * fx;
