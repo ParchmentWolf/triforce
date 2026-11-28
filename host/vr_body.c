@@ -673,28 +673,12 @@ static struct {
 static SRWLOCK ma_lock = SRWLOCK_INIT;
 static __thread int arms_forced;   /* ((Triforce VR) the world pass's arms call while aiming: past the "unchanged" check */
 static int ma_wanted(void) {
-    static int64_t at;
-    static int off;
     const int64_t now = hos_now_ns();
-    if (now - at > 1000000000LL) {   /* (research: ~/.app/pc_port/triforce-runs/mirror_anim_off.txt there: the mirror off) */
-        at = now;
-        const char *home = getenv("HOME");
-        char path[512];
-        snprintf(path, sizeof path, "%s/.app/pc_port/triforce-runs/mirror_anim_off.txt", home ? home : "");
-        FILE *f = fopen(path, "r");
-        const int was = off;
-        off = f != NULL;
-        if (f) fclose(f);
-        if (off != was) hos_log("vr: body: mirrored animation: %s", off ? "off (research switch)" : "on again");
-    }
-    if (off) return 0;
     static int64_t paused_at;
     static int paused;
     if (now - paused_at > 100000000LL) {   /* (the menus show him posed as the game has him) */
         paused_at = now;
-        const int was = paused;
         paused = vr_game_paused();
-        if (paused != was) hos_log("vr: body: mirrored animation: %s", paused ? "held while the game is paused" : "on again after the pause");
     }
     if (paused) return 0;
     const char *e = getenv("RX_MIRROR_ANIM");
@@ -939,8 +923,7 @@ typedef struct {
 } MirItem;
 static MirItem mir_items[32] = {{"Weapon_Shield_", 0, 1, 0, {0}}};
 static int mir_items_n = 1;
-/* the table as measured in the headset (2026-11-23/24): each thing's mirror in a hand and put away, by age; a file of the same
-   lines (~/.app/pc_port/triforce-runs/mirror_items.txt) in its place while tuning */
+/* the table as measured in the headset (2026-11-23/24): each thing's mirror in a hand and put away, by age */
 static const char mir_items_builtin[] =
     "Weapon_Shield_Hylian@adult x K -0.8537 0.1319 -0.5042 0.1943 0.1245 0.9911 0.0505 -0.0093 -0.5058 0.0202 0.8626 0.0520\n"
     "Weapon_Shield_Hylian@child - -\n"
@@ -980,26 +963,12 @@ static const char mir_items_builtin[] =
     "Item_ClaimCheck - P\n"
     "Item_Prescription - P\n"
     "Item_RutoLetter - P\n";
-static void mir_items_read(void) {
-    static int64_t at;
-    const int64_t now = hos_now_ns();
-    if (now - at < 1000000000LL) return;
-    at = now;
-    const char *home = getenv("HOME");
-    char path[512], line[256];
-    static char text[8192];
-    snprintf(path, sizeof path, "%s/.app/pc_port/triforce-runs/mirror_items.txt", home ? home : "");
-    FILE *f = fopen(path, "r");
-    size_t len = 0;
-    if (f) {
-        len = fread(text, 1, sizeof text - 1, f);
-        fclose(f);
-    } else {
-        len = strlen(mir_items_builtin);
-        if (len > sizeof text - 1) len = sizeof text - 1;
-        memcpy(text, mir_items_builtin, len);
-    }
-    text[len] = 0;
+static void mir_items_read(void) {   /* (the table, once) */
+    static int done;
+    if (done) return;
+    done = 1;
+    char line[256];
+    const char *text = mir_items_builtin;
     static MirItem t[32];
     int n = 0;
     for (const char *q = text; n < 32 && *q;) {
@@ -1041,10 +1010,7 @@ static void mir_items_read(void) {
     }
     int changed = n != mir_items_n;
     for (int k = 0; !changed && k < n; k++) changed = strcmp(t[k].prefix, mir_items[k].prefix) || t[k].hand != mir_items[k].hand || t[k].age != mir_items[k].age || t[k].always != mir_items[k].always || t[k].back != mir_items[k].back || memcmp(t[k].K, mir_items[k].K, sizeof t[k].K);
-    if (changed) {
-        memcpy(mir_items, t, sizeof t[0] * n), mir_items_n = n;
-        for (int k = 0; k < n; k++) hos_log("vr: body: mirrored animation: %s%s reflected in axes %d in a hand, %d put away (x 1, y 2, z 4)", t[k].prefix, t[k].age == 1 ? " (child)" : t[k].age == 2 ? " (adult)" : "", t[k].hand, t[k].back);
-    }
+    if (changed) memcpy(mir_items, t, sizeof t[0] * n), mir_items_n = n;
 }
 static uint64_t mi_bones[16], mi_inst[16];
 static int mi_hand[16], mi_back[16], mi_item[16], mi_always[16], mi_n;
@@ -1080,7 +1046,6 @@ static int mirrored_item(Ctx *c, uint64_t bones) {   /* (this skeleton's index i
                 mi_inst[n] = recomp_load64(c, pk), mi_bones[n] = recomp_load64(c, mi_inst[n] + 0xf8), mi_hand[n] = mir_items[it].hand, mi_item[n] = it, mi_always[n] = mir_items[it].always, mi_back[n++] = mir_items[it].back;
             }
         }
-        if (n != mi_n) hos_log("vr: body: mirrored animation: %d skeleton(s) of mirrored things near him", n);
         mi_n = n;
         ReleaseSRWLockExclusive(&lock);
     }
@@ -1400,154 +1365,6 @@ static int mirror_attach(Ctx *c, uint64_t fn) {
 int hos_oot_shield_attach(Ctx *c) { return mirror_attach(c, 0x81500960ULL); }
 int hos_oot_sword_attach(Ctx *c) { return mirror_attach(c, 0x81500720ULL); }
 
-/* (research, SWORD-TURN: the slash's trail) the bone world accessor's end (f_803a1360: instance x0, bone x2, its world as rows
-   of a 3x4 into x1): his hands asked for, counted by caller (the return address) every 5 s; and, from
-   ~/.app/pc_port/triforce-runs/sword_turn.txt (read once a second; lines "<caller hex, 0 any> <L|R|B> <x|y|z> <degrees>", in
-   order), the answer's turn turned further about its own axis, its place kept */
-static struct { uint64_t at; int64_t n[2]; } jw_callers[32];
-static int jw_n;
-static int64_t jw_told;
-static struct { uint64_t at; int hand, ax; double deg; } jw_turn[16];
-static int jw_turn_n;
-static void jw_turns_read(void) {
-    static int64_t at;
-    const int64_t now = hos_now_ns();
-    if (now - at < 1000000000LL) return;
-    at = now;
-    const char *home = getenv("HOME");
-    char path[512], line[128];
-    snprintf(path, sizeof path, "%s/.app/pc_port/triforce-runs/sword_turn.txt", home ? home : "");
-    FILE *f = fopen(path, "r");
-    int n = 0;
-    while (f && n < 16 && fgets(line, sizeof line, f)) {
-        unsigned long long a;
-        char h, ax;
-        double deg;
-        /* (A: any bone of anything that caller asks for; t: the place raised that many metres instead of a turn) */
-        if (sscanf(line, "%llx %c %c %lf", &a, &h, &ax, &deg) == 4 && (h == 'L' || h == 'R' || h == 'B' || h == 'A') &&
-            ((ax >= 'x' && ax <= 'z') || (ax >= 'X' && ax <= 'Z') || ax == 't'))   /* (X|Y|Z: that axis flipped) */
-            jw_turn[n].at = a, jw_turn[n].hand = h == 'L' ? 1 : h == 'R' ? 2 : h == 'B' ? 3 : 4,
-            jw_turn[n].ax = ax == 't' ? 3 : ax >= 'x' ? ax - 'x' : 4 + ax - 'X',
-            jw_turn[n].deg = deg, n++;
-    }
-    if (f) fclose(f);
-    static char last[256];
-    char now_s[256] = "";
-    for (int k = 0, o = 0; k < n && o < 200; k++)
-        o += snprintf(now_s + o, sizeof now_s - o, " %llx:%d:%c:%g", (unsigned long long)jw_turn[k].at, jw_turn[k].hand,
-                      jw_turn[k].ax == 3 ? 't' : jw_turn[k].ax >= 4 ? 'X' + jw_turn[k].ax - 4 : 'x' + jw_turn[k].ax, jw_turn[k].deg);
-    if (strcmp(now_s, last)) hos_log("vr: body: sword turn:%s", n ? now_s : " none"), snprintf(last, sizeof last, "%s", now_s);
-    jw_turn_n = n;
-}
-static struct { uint64_t at; int64_t n; } jw_all[128];
-static int jw_all_n;
-static int64_t jw_all_told;
-static void jw_all_note(Ctx *c) {
-    static SRWLOCK lk = SRWLOCK_INIT;
-    const uint64_t caller = c->x[30];
-    AcquireSRWLockExclusive(&lk);
-    int i = 0;
-    while (i < jw_all_n && jw_all[i].at != caller) i++;
-    if (i == jw_all_n && jw_all_n < 128) jw_all[jw_all_n++].at = caller;
-    if (i < 128) jw_all[i].n++;
-    jw_turns_read();
-    const int64_t now = hos_now_ns();
-    if (now - jw_all_told > 5000000000LL) {
-        if (jw_all_told) {
-            char line[4096];
-            int o = snprintf(line, sizeof line, "vr: body: bone reads by caller in 5 s:");
-            for (int k = 0; k < jw_all_n && o < (int)sizeof line - 40; k++)
-                if (jw_all[k].n) o += snprintf(line + o, sizeof line - o, " %llx=%lld", (unsigned long long)jw_all[k].at, (long long)jw_all[k].n);
-            hos_log("%s", line);
-        }
-        jw_all_told = now;
-        for (int k = 0; k < jw_all_n; k++) jw_all[k].n = 0;
-    }
-    ReleaseSRWLockExclusive(&lk);
-}
-static void jw_apply(Ctx *c, uint64_t out, int ax, double v) {
-    if (!plausible(out, 48)) return;
-    if (ax == 3) {
-        st_f(c, out + 16 + 12, ld_f(c, out + 16 + 12) + v);
-        return;
-    }
-    if (ax >= 4) {
-        for (int row = 0; row < 3; row++) st_f(c, out + (uint64_t)row * 16 + (uint64_t)(ax - 4) * 4, -ld_f(c, out + (uint64_t)row * 16 + (uint64_t)(ax - 4) * 4));
-        return;
-    }
-    const double r = v * 3.14159265358979 / 180.0, cs = cos(r), sn = sin(r);
-    const int a = (ax + 1) % 3, b = (ax + 2) % 3;   /* (the two columns the turn mixes) */
-    for (int row = 0; row < 3; row++) {
-        const uint64_t ra = out + (uint64_t)row * 16;
-        const double va = ld_f(c, ra + (uint64_t)a * 4), vb = ld_f(c, ra + (uint64_t)b * 4);
-        st_f(c, ra + (uint64_t)a * 4, va * cs + vb * sn), st_f(c, ra + (uint64_t)b * 4, -va * sn + vb * cs);
-    }
-}
-/* (research, SPINE-FLIP: while triforce-runs/spine_flip.txt exists and the mirror is on, a center bone (one that is its own
-   left/right partner: the spine, neck, head, waist) read by the game comes back with its sideways (z) axis turned round: the
-   reflection of the game's own frame, as the trail's renderer fix draws it, for what the game itself works out from those bones
-   (a spin's way round, a sidestep's) */
-static int spine_flip_on(void) {
-    static int on = -1;
-    static int64_t looked;
-    const int64_t now = hos_now_ns();
-    if (now - looked > 1000000000LL) {
-        looked = now;
-        char path[512];
-        const char *home = getenv("HOME");
-        snprintf(path, sizeof path, "%s/.app/pc_port/triforce-runs/spine_flip.txt", home ? home : "");
-        FILE *f = fopen(path, "r");
-        const int v = f != NULL;
-        if (f) fclose(f);
-        if (v != on) hos_log("vr: body: center bones' reads %s", v ? "reflected (spine_flip.txt)" : "as the mirror leaves them");
-        on = v;
-    }
-    return on;
-}
-void hos_oot_joint_world(Ctx *c) {
-    if (spine_flip_on() && ma.parts && ma_wanted() && plausible(c->x[0] + 0xf8, 8)) {
-        const uint64_t bones = recomp_load64(c, c->x[0] + 0xf8);
-        const int bone = (int)(int32_t)c->x[2];
-        for (int i = 0; i < ma.parts; i++)
-            if (ma.part[i].bones == bones) {
-                if (bone >= 0 && bone < ma.part[i].n && ma.part[i].mate[bone] == bone) jw_apply(c, c->x[1], 6, 0);
-                break;
-            }
-    }
-    jw_all_note(c);
-    if (jw_turn_n)
-        for (int k = 0; k < jw_turn_n; k++)
-            if (jw_turn[k].hand == 4 && jw_turn[k].at == c->x[30]) jw_apply(c, c->x[1], jw_turn[k].ax, jw_turn[k].deg);
-    if (!ma.parts || !ma_wanted()) return;
-    const MaPart *mp = &ma.part[0];
-    const int bone = (int)(int32_t)c->x[2];
-    if (bone != mp->hand_l && bone != mp->hand_r) return;
-    if (!plausible(c->x[0] + 0xf8, 8) || recomp_load64(c, c->x[0] + 0xf8) != mp->bones) return;
-    const uint64_t caller = c->x[30], out = c->x[1];
-    static SRWLOCK lock = SRWLOCK_INIT;
-    AcquireSRWLockExclusive(&lock);
-    int i = 0;
-    while (i < jw_n && jw_callers[i].at != caller) i++;
-    if (i == jw_n && jw_n < 32) jw_callers[jw_n++].at = caller;
-    if (i < 32) jw_callers[i].n[bone == mp->hand_r]++;
-    const int hand = bone == mp->hand_l ? 1 : 2;
-    for (int k = 0; k < jw_turn_n; k++) {
-        if (jw_turn[k].hand == 4 || (jw_turn[k].at && jw_turn[k].at != caller) || !(jw_turn[k].hand & hand)) continue;
-        jw_apply(c, out, jw_turn[k].ax, jw_turn[k].deg);
-    }
-    const int64_t now = hos_now_ns();
-    if (now - jw_told > 5000000000LL) {
-        if (jw_told)
-            for (int k = 0; k < jw_n; k++)
-                if (jw_callers[k].n[0] + jw_callers[k].n[1])
-                    hos_log("vr: body: hands asked for by %#llx: Weapon_L %lld, Weapon_R %lld in 5 s", (unsigned long long)jw_callers[k].at,
-                            (long long)jw_callers[k].n[0], (long long)jw_callers[k].n[1]);
-        jw_told = now;
-        for (int k = 0; k < jw_n; k++) jw_callers[k].n[0] = jw_callers[k].n[1] = 0;
-    }
-    ReleaseSRWLockExclusive(&lock);
-}
-
 /* ((Scout, 11-26) right-handed: the charged spin turned the same way as the left-handed game's. The game picks between its two
    charged spins (states ChargeAttack and ChargeAttackReverse: the spin and the same spin the other way round) from his pose as
    he charges, and that pose is the mirrored one, so it picked the reverse spin, which the mirror turned round again: the
@@ -1622,7 +1439,6 @@ void hos_oot_world_pass(Ctx *c) {
     }
     const int64_t now = hos_now_ns();
     if (now - ma.told_at > 5000000000LL) {
-        if (ma.told_at) hos_log("vr: body: mirrored animation: %lld poses mirrored in 5 s, %lld world passes with nothing new", (long long)ma_done, (long long)ma_skipped);
         ma.told_at = now, ma_done = ma_skipped = 0;
     }
     ReleaseSRWLockExclusive(&ma_lock);
@@ -1887,38 +1703,6 @@ int vr_body_neck_height(double *height) {
     return isfinite(*height);
 }
 
-/* (HANDS-CAPTURE, research: Link hidden (Visibility Hidden), so his arms are the game's own animation, and a file
-   ~/.app/pc_port/triforce-runs/hand_capture.txt there: twice a second his wrists' and root's world entries (rows of 3x4) and
-   what he holds, for the two-handed things' hands) */
-static void hands_capture(Ctx *c) {
-    static int64_t at, looked;
-    static int on;
-    const int64_t now = hos_now_ns();
-    if (now - looked > 1000000000LL) {
-        looked = now;
-        char path[512];
-        const char *home = getenv("HOME");
-        snprintf(path, sizeof path, "%s/.app/pc_port/triforce-runs/hand_capture.txt", home ? home : "");
-        FILE *f = fopen(path, "r");
-        on = f != NULL;
-        if (f) fclose(f);
-    }
-    if (!on || now - at < 500000000LL) return;
-    at = now;
-    char line[1600];
-    int n = snprintf(line, sizeof line, "vr: hands capture: %s \"%s\" mirror %d", vr_game_childhood() ? "child" : "adult", vr_game_held(), ma.parts && ma_wanted());
-    static const int bones[3] = {OB_ROOT, OB_WRIST_L, OB_WRIST_R};
-    static const char *const names[3] = {"root", "L", "R"};
-    for (int b = 0; b < 3 && n < (int)sizeof line - 200; b++) {
-        Xf w;
-        xf_load(c, ob.world[bones[b]], &w);
-        n += snprintf(line + n, sizeof line - n, " %s", names[b]);
-        for (int r = 0; r < 3; r++)
-            for (int k = 0; k < 4; k++) n += snprintf(line + n, sizeof line - n, " %.4f", w.m[r][k]);
-    }
-    hos_log("%s", line);
-}
-
 void hos_oot_after_anim(Ctx *c) {
     /* (it follows every model's late bone pass, hundreds a frame: the cheapest checks first) */
     if (!ob.valid || !vr_first_person_now()) return;
@@ -1946,7 +1730,6 @@ void hos_oot_after_anim(Ctx *c) {
         neck_at = hos_now_ns();
     }
     if (!arms) {
-        hands_capture(c);
         ReleaseSRWLockExclusive(&ob_lock);
         return;
     }

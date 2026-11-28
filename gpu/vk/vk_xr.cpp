@@ -66,6 +66,9 @@ static void gfx_fit_rect(int cw, int ch, int dw, int dh, int out[4]) {
 
 namespace {
 
+// ((Triforce VR) the gestures' own lines (grips, slashes, the head's, the fishing rod's, tracking): nothing in a release; the
+// vr-debug branch prints them
+#define rt_trace(...) ((void)0)
 #define XR_FUNCS(X)                                                                                                    \
     X(xrDestroyInstance) X(xrGetInstanceProperties) X(xrGetSystem) X(xrGetSystemProperties) X(xrPollEvent)            \
     X(xrCreateSession) X(xrBeginSession) X(xrEndSession) X(xrWaitFrame) X(xrBeginFrame) X(xrEndFrame)                 \
@@ -804,25 +807,6 @@ bool make_hud_pipeline() {
 }
 
 // ((Triforce VR) the sword's hand: the last two-grip draw's, else Controls' Right handed Link)
-// ((Triforce VR) research: while triforce-runs/gestures_in_immersive.txt exists, Immersive uses the gesture rules too (to see them
-// from outside), a second's check
-static bool gestures_in_immersive() {
-    static bool on;
-    static uint64_t looked;
-    const uint64_t now = plat_now_ns();
-    if (now - looked > 1000000000ull) {
-        looked = now;
-        const char *home = getenv("HOME");
-        char path[512];
-        snprintf(path, sizeof path, "%s/.app/pc_port/triforce-runs/gestures_in_immersive.txt", home ? home : "");
-        FILE *f = fopen(path, "r");
-        const bool v = f != nullptr;
-        if (f) fclose(f);
-        if (v != on) rt_log("vr: gestures in Immersive %s", v ? "on (research)" : "off");
-        on = v;
-    }
-    return on;
-}
 // ((Triforce VR) the sword's gesture-chosen slashes: what a swing is, from its path in the head's frame (X toward the sword hand's
 // side, U up, F ahead, metres) and what came before it (a pause, a raise). Codes: 0 none (ignored), 1-5 the combo's steps, 6 its
 // finisher, 10/11 the steep slash from the sword hand's side / across the face, 12 the steep finisher, 20 the jump slash, 21 the
@@ -1919,9 +1903,9 @@ struct Controls {
         // the Menu, the X button on every controller: a tap is Plus for a moment at its release, a second's hold Minus for a moment then
         if (on(session, xb, XR_NULL_PATH)) {
             if (!menu_down) menu_down = now, minus_sent = false;
-            if (!minus_sent && now - menu_down >= hold_ns) minus_until = now + press_ns, minus_sent = true, rt_log("vr: X held: Minus");
+            if (!minus_sent && now - menu_down >= hold_ns) minus_until = now + press_ns, minus_sent = true, rt_trace("vr: X held: Minus");
         } else if (menu_down) {
-            if (!minus_sent) plus_until = now + press_ns, rt_log("vr: X tapped: Plus");
+            if (!minus_sent) plus_until = now + press_ns, rt_trace("vr: X tapped: Plus");
             menu_down = 0;
         }
         set_bit(PLUS, now < plus_until), set_bit(MINUS, now < minus_until);
@@ -2004,7 +1988,7 @@ struct Controls {
             hspeed[h] = std::sqrt(hv[h][0] * hv[h][0] + hv[h][1] * hv[h][1] + hv[h][2] * hv[h][2]);
         }
         for (int h = 0; h < 2; h++)   // ((Triforce VR) a controller's tracking lost or found: said as it happens
-            if (pose_ok[h] != grip_seen[h]) grip_seen[h] = pose_ok[h], rt_log("vr: the %s controller's tracking %s", h ? "right" : "left", pose_ok[h] ? "found again" : "lost");
+            if (pose_ok[h] != grip_seen[h]) grip_seen[h] = pose_ok[h], rt_trace("vr: the %s controller's tracking %s", h ? "right" : "left", pose_ok[h] ? "found again" : "lost");
         // ((Triforce VR) what every scheme hands on: the buttons and sticks, the grips' poses (for Link's arms), the aim's turns
         const auto publish = [&]() {
             std::lock_guard<std::mutex> lk(x.hands_mu);
@@ -2029,13 +2013,13 @@ struct Controls {
                 if (now - nod_at >= nod_refractory_ns && now - swing_at >= 600000000ull) {
                     if (vy > nod_speed) {
                         if (nod_down_at && now - nod_down_at < nod_ns) {
-                            nod_at = now, nod_down_at = 0, rt_log("vr: head: down then up: the Lens of Truth off");
+                            nod_at = now, nod_down_at = 0, rt_trace("vr: head: down then up: the Lens of Truth off");
                             if ((x.head_worn.load() & 3) == 2 && head_on) x.head_request.store(3), head_on = false;
                         }
                         else if (!nod_up_at || now - nod_up_at > nod_ns) nod_up_at = now;
                     } else if (vy < -nod_speed) {
                         if (nod_up_at && now - nod_up_at < nod_ns) {
-                            nod_at = now, nod_up_at = 0, rt_log("vr: head: up then down: the Lens of Truth on");
+                            nod_at = now, nod_up_at = 0, rt_trace("vr: head: up then down: the Lens of Truth on");
                             if (!((x.head_worn.load() & 3) == 2 && head_on)) x.head_request.store(2), head_on = true;   // (from a mask too)
                         }
                         else if (!nod_down_at || now - nod_down_at > nod_ns) nod_down_at = now;
@@ -2060,7 +2044,7 @@ struct Controls {
                         shake_at = now, shake_flips = 0;
                         if ((x.head_worn.load() & 3) && head_on)
                             x.head_request.store(3), head_on = false,
-                            rt_log("vr: head: shaken no: %s off", (x.head_worn.load() & 3) == 2 ? "the Lens of Truth" : "mask");
+                            rt_trace("vr: head: shaken no: %s off", (x.head_worn.load() & 3) == 2 ? "the Lens of Truth" : "mask");
                     }
                 }
             }
@@ -2177,11 +2161,11 @@ struct Controls {
                 if (!sq[pull]) bow_arm = bow_drawn = false;
                 else if (fresh[pull]) {
                     if (d2 < reach * reach) bow_arm = true, sling_took = std::sqrt(d2);
-                    else rt_log("vr: grips: a draw out of reach (%.0f cm of %.0f)", std::sqrt(d2) * 100.0f, reach * 100.0f);
+                    else rt_trace("vr: grips: a draw out of reach (%.0f cm of %.0f)", std::sqrt(d2) * 100.0f, reach * 100.0f);
                 }
                 const float pulled = sling_took + (sling ? sling_pull : bow_pull), returned = sling_took + 0.04f;
-                if (bow_arm && !bow_drawn && d2 > pulled * pulled) bow_drawn = true, rt_log("vr: grips: drawn");
-                if (bow_drawn && d2 < returned * returned) bow_drawn = bow_arm = false, rt_log("vr: grips: brought back: the shot");
+                if (bow_arm && !bow_drawn && d2 > pulled * pulled) bow_drawn = true, rt_trace("vr: grips: drawn");
+                if (bow_drawn && d2 < returned * returned) bow_drawn = bow_arm = false, rt_trace("vr: grips: brought back: the shot");
                 drawing = bow_drawn;
                 if (drawing) {
                     const float n = std::sqrt(d2);
@@ -2231,7 +2215,7 @@ struct Controls {
             }
             bool right_zr = sq[fire];
             if (fresh[fire] && simple_pick == 1 && ranged(simple_item) && !ranged(held_item))
-                grip_tap_at = now, rt_log("vr: grips: %s taken out by the %s grip (ZR tapped, then held)", simple_item, fire ? "right" : "left");
+                grip_tap_at = now, rt_trace("vr: grips: %s taken out by the %s grip (ZR tapped, then held)", simple_item, fire ? "right" : "left");
             if (grip_tap_at) {   // (its tap, then nothing a moment, then the grip as it is: the aim, and let go the shot)
                 const uint64_t t = now - grip_tap_at;
                 right_zr = t < press_ns;
@@ -2251,13 +2235,13 @@ struct Controls {
             {   // ((Triforce VR) the last moment a weapon was out: the hands are chosen only when one is pulled out)
                 static bool was_weapon;
                 if (weapon) weapon_seen_at = now;
-                if (weapon != was_weapon) rt_log("vr: weapon out: %s", weapon ? "yes" : "no"), was_weapon = weapon;
+                if (weapon != was_weapon) rt_trace("vr: weapon out: %s", weapon ? "yes" : "no"), was_weapon = weapon;
             }
             // both: the sword and shield
             if (!draw_arm && pose_ok[0] && pose_ok[1] && sq[0] && sq[1] && (fresh[0] || fresh[1]) && back_any[0] > behind_on &&
                 back_any[1] > behind_on && std::fabs(poses[0].p[1] - poses[1].p[1]) > draw_gap) {
                 draw_arm = true, draw_sword = poses[1].p[1] > poses[0].p[1] ? 1 : 0, item_arm = -1;
-                rt_log("vr: grips: sword and shield armed, the sword in the %s hand", draw_sword ? "right" : "left");
+                rt_trace("vr: grips: sword and shield armed, the sword in the %s hand", draw_sword ? "right" : "left");
             }
             // ((Triforce VR) the Biggoron's Sword equipped: both grips held, the sword hand alone behind the shoulder (Link draws it
             // with one hand and takes it in both on the way); the other hand anywhere)
@@ -2266,26 +2250,26 @@ struct Controls {
                 const bool both_back = back_any[0] > behind_on && back_any[1] > behind_on;
                 draw_arm = true, item_arm = -1;
                 draw_sword = both_back ? (poses[1].p[1] > poses[0].p[1] ? 1 : 0) : back_any[1] > behind_on ? 1 : 0;
-                rt_log("vr: grips: the Biggoron's Sword armed, in the %s hand", draw_sword ? "right" : "left");
+                rt_trace("vr: grips: the Biggoron's Sword armed, in the %s hand", draw_sword ? "right" : "left");
             }
             if (draw_arm && (!sq[0] || !sq[1])) draw_arm = false;
             if (draw_arm && pose_ok[draw_sword] && back_any[draw_sword] < -ahead_on) {
                 draw_arm = false;
                 if (fishing) {   // ((Triforce VR) the rod: in the hand drawn with, nothing pressed (the game holds it already)
                     rod_hand = draw_sword, g_live_sword.store(draw_sword), g_live_mirror.store(draw_sword);
-                    rt_log("vr: fishing: the rod in the %s hand", draw_sword ? "right" : "left");
+                    rt_trace("vr: fishing: the rod in the %s hand", draw_sword ? "right" : "left");
                 } else if (!weapon) {
                     g_live_sword.store(draw_sword), g_live_mirror.store(draw_sword);   // (the sword: mirrored in the right hand)
                     draw_bit = Y, draw_at = now, draw_until = now + press_ns, drawn_by_grips = true;
                     y_down = 0, charging = false, queued = false;   // a swing on the way there is not one
-                    rt_log("vr: grips: sword and shield drawn, the sword in the %s hand", draw_sword ? "right" : "left");
+                    rt_trace("vr: grips: sword and shield drawn, the sword in the %s hand", draw_sword ? "right" : "left");
                 }
             }
             if (drawn_by_grips && !draw_arm && (!sq[0] || !sq[1])) sword_release_at = now, drawn_by_grips = false;
             if (sword_release_at) {
                 if (sq[0] && sq[1]) sword_release_at = 0;   // (gripped again: kept out)
                 else if (weapon && now - sword_sent_at >= resend_ns)
-                    draw_bit = B, draw_until = now + press_ns, sword_sent_at = now, rt_log("vr: grips: let go: sword and shield put away");
+                    draw_bit = B, draw_until = now + press_ns, sword_sent_at = now, rt_trace("vr: grips: let go: sword and shield put away");
                 if (now - sword_release_at > release_wait_ns || (!weapon && sword_sent_at)) sword_release_at = 0, sword_sent_at = 0;
             }
             // one: an item. ((Triforce VR) One at a time: the hand that pulled it out owns it until it is put away for good
@@ -2301,7 +2285,7 @@ struct Controls {
                     empty_since = now;   // (the game shows it a few frames later: not put away meanwhile)
                     item_seen[0] = 0;    // ((Triforce VR) a new pull: its hand found again, the same item in the other hand too
                     take_at = now, take_tries = 0;
-                    rt_log("vr: grips: item taken out by the %s hand", item_hand ? "right" : "left");
+                    rt_trace("vr: grips: item taken out by the %s hand", item_hand ? "right" : "left");
                 }
             }
             // (an item read as none for a moment, around a shot, is still out: half a second before it counts as put away, or
@@ -2309,7 +2293,7 @@ struct Controls {
             if (held_item[0]) take_at = 0;   // ((Triforce VR) a pull the game ignored (a put-away still playing): pressed again,
             else if (take_at && pull_hand >= 0 && sq[pull_hand] && now - take_at > 700000000ull && take_tries < 2)   // twice at most
                 zr_until = now + press_ns, take_at = now, take_tries++, empty_since = now,
-                rt_log("vr: grips: the item not out yet: pulled again");
+                rt_trace("vr: grips: the item not out yet: pulled again");
             if (held_item[0]) empty_since = 0;
             else if (!empty_since) empty_since = now;
             // ((Triforce VR) the hookshot or the boomerang: its hand's trigger stays its shot until that grip is let go; the game
@@ -2326,10 +2310,10 @@ struct Controls {
                 item_release_at = 0, item_sent_at = 0, item_hand = pull_hand;
             if (item_release_at) {   // (pressed again every resend_ns while it shows out: until it is gone, however long)
                 if (bomb) {   // (a bomb or a Bombchu: dropped or let go once (A); the game shows it held still, after, so done)
-                    a_until = now + press_ns, rt_log("vr: grips: let go: %s dropped (A)", held_item);
+                    a_until = now + press_ns, rt_trace("vr: grips: let go: %s dropped (A)", held_item);
                     item_release_at = 0, item_sent_at = 0, pull_hand = -1;
                 } else if (held_item[0] && now - item_sent_at >= resend_ns) {
-                    b_until = now + press_ns, rt_log("vr: grips: let go: item put away");
+                    b_until = now + press_ns, rt_trace("vr: grips: let go: item put away");
                     item_sent_at = now;
                 }
                 if (gone) item_release_at = 0, item_sent_at = 0;   // (not a moment's none, as around a shot: really put away)
@@ -2340,7 +2324,7 @@ struct Controls {
             if (pull_hand >= 0 && held_item[0] && strcmp(held_item, item_seen)) {
                 snprintf(item_seen, sizeof item_seen, "%s", held_item);
                 g_live_mirror.store(item_mirrored_right(held_item) ? pull_hand : 1 - pull_hand);
-                rt_log("vr: grips: %s in the %s hand: %s", held_item, pull_hand ? "right" : "left", g_live_mirror.load() ? "mirrored" : "as made");
+                rt_trace("vr: grips: %s in the %s hand: %s", held_item, pull_hand ? "right" : "left", g_live_mirror.load() ? "mirrored" : "as made");
             }
             // ((Triforce VR) an item put away for good: the hand it was in is kept (the next draw or pull chooses again))
             if (gone && item_seen[0]) item_seen[0] = 0;
@@ -2355,11 +2339,11 @@ struct Controls {
                     const int hw = x.head_worn.load();
                     // ((Triforce VR) a mask in the member, or one known to him (+8) with the Lens of Truth or nothing there)
                     if (((hw & 3) == 1 || ((hw & 3) != 1 && (hw & 8))) && !((hw & 3) == 1 && head_on))
-                        x.head_request.store(1), head_on = true, rt_log("vr: grips: mask on");
-                    else rt_log("vr: grips: a grip on the head: no mask to put on (the head's item %d%s)", hw & 3,
+                        x.head_request.store(1), head_on = true, rt_trace("vr: grips: mask on");
+                    else rt_trace("vr: grips: a grip on the head: no mask to put on (the head's item %d%s)", hw & 3,
                                 head_on ? ", one on already" : "");
                 } else if (fresh[h] && up[h] > 0.0f && std::fabs(side[h]) < 0.25f && std::fabs(fwd[h]) < 0.25f) {
-                    rt_log("vr: grips: a grip near the head's top, not on it (up %.2f, side %.2f, ahead %.2f m)", up[h], side[h], fwd[h]);
+                    rt_trace("vr: grips: a grip near the head's top, not on it (up %.2f, side %.2f, ahead %.2f m)", up[h], side[h], fwd[h]);
                 } else if (fresh[h] && fwd[h] > 0.04f && fwd[h] < 0.25f && up[h] > -0.20f && up[h] < 0.05f && std::fabs(side[h]) < 0.12f) {
                     mask_pull[h] = true, std::memcpy(mask_from[h], poses[h].p, sizeof mask_from[h]);
                 } else if (mask_pull[h]) {
@@ -2369,7 +2353,7 @@ struct Controls {
                         mask_pull[h] = false;
                         if ((x.head_worn.load() & 3) && head_on)   // ((Triforce VR) the mask or the Lens of Truth, while on)
                             x.head_request.store(3), head_on = false,
-                            rt_log("vr: grips: %s off", (x.head_worn.load() & 3) == 2 ? "the Lens of Truth" : "mask");
+                            rt_trace("vr: grips: %s off", (x.head_worn.load() & 3) == 2 ? "the Lens of Truth" : "mask");
                     }
                 }
             }
@@ -2382,7 +2366,7 @@ struct Controls {
             if (hook_hand >= 0) {
                 static bool trig_was;
                 const bool trig = trigger_on[hook_hand];
-                if (trig && !trig_was) rt_log("vr: grips: %s aimed by the %s trigger", boomerang ? "boomerang" : "hookshot", hook_hand ? "right" : "left");
+                if (trig && !trig_was) rt_trace("vr: grips: %s aimed by the %s trigger", boomerang ? "boomerang" : "hookshot", hook_hand ? "right" : "left");
                 trig_was = trig;
                 const float ahead = hv[hook_hand][0] * fx + hv[hook_hand][2] * fz;
                 // ((Triforce VR) a throw: the hand ahead fast after the trigger is let go, or in the 300 ms before (a throw lets go
@@ -2391,7 +2375,7 @@ struct Controls {
                 if (ahead > throw_speed) ahead_at = now;
                 if (trig) boom_wait = boomerang;
                 else if (boom_wait && (ahead > throw_speed || now - ahead_at < 300000000ull))
-                    boom_wait = false, rt_log("vr: grips: boomerang thrown");
+                    boom_wait = false, rt_trace("vr: grips: boomerang thrown");
                 if (!boomerang) boom_wait = false;
                 hook_aim = trig || boom_wait;
                 bits &= ~(1ull << (hook_hand ? R : L));
@@ -2402,10 +2386,10 @@ struct Controls {
                 const bool trig = trigger_on[rh];
                 const float ahead = hv[rh][0] * fx + hv[rh][2] * fz;
                 if (ahead > throw_speed) cast_ahead_at = now;
-                if (trig && !cast_wait) rt_log("vr: fishing: aimed by the %s trigger", rh ? "right" : "left");
+                if (trig && !cast_wait) rt_trace("vr: fishing: aimed by the %s trigger", rh ? "right" : "left");
                 if (trig) cast_wait = true;
                 else if (cast_wait && (ahead > throw_speed || now - cast_ahead_at < 300000000ull))
-                    cast_wait = false, rt_log("vr: fishing: cast");
+                    cast_wait = false, rt_trace("vr: fishing: cast");
                 bits &= ~(1ull << (rh ? R : L));   // (the rod's trigger is not its item bar)
                 // the reel: the other hand near the rod's (within 45 cm), on its inner side, its motion's direction in the plane
                 // ahead and up turning one way, each frame's turn (not a reversal's) kept with a half second's decay
@@ -2431,7 +2415,7 @@ struct Controls {
                 }
                 const bool was = reeling;
                 reeling = std::fabs(reel_turn) > (reeling ? 1.5f : 3.0f);
-                if (reeling != was) rt_log("vr: fishing: %s", reeling ? "reeling" : "reel stopped");
+                if (reeling != was) rt_trace("vr: fishing: %s", reeling ? "reeling" : "reel stopped");
                 fish_zr = cast_wait || reeling;
             }
             g_gaze_aim.store((boomerang && hook_hand >= 0) || (fishing && cast_wait));
@@ -2552,7 +2536,7 @@ struct Controls {
         // the swinging hand: the item's when one was taken out by a hand, else the sword's
         {
             const bool carries = x.carrying.load();
-            if (carries && !carry) g_live_mirror.store(0), rt_log("vr: carry: lifted");
+            if (carries && !carry) g_live_mirror.store(0), rt_trace("vr: carry: lifted");
             carry = carries;
         }
         const int item_owner = held_item[0] && pull_hand >= 0 ? pull_hand : held_item[0] && item_hand >= 0 ? item_hand : -1;
@@ -2615,7 +2599,7 @@ struct Controls {
                     way = way && (sword ? aim_lat < -0.6f : aim_lat > 0.6f);
                 }
                 // ((Triforce VR) Immersive (third person): any solid swing, whichever way, for every item (no direction or two-hand rule)
-                if (!strcmp(cfg_value("VR_VIEW"), "head") && !strcmp(cfg_value("VR_CAMERA"), "third") && !gestures_in_immersive()) way = true;
+                if (!strcmp(cfg_value("VR_VIEW"), "head") && !strcmp(cfg_value("VR_CAMERA"), "third")) way = true;
                 if (!swinging && speed > swing_on && now - swing_at >= refractory_ns && !back && way) {
                     swinging = swung = true;
                     swing_at = now;
@@ -2631,8 +2615,8 @@ struct Controls {
         static int slash_code = -1;
         static uint64_t slash_wait_at = 0, slash_extra_until = 0;
         static bool slash_zl = false, slash_fwd = false;   // (the press's Z held, the left stick forward with it)
-        {   // ((Triforce VR) research, SWING-LOG: each swing's path in the head's frame (side to the right, up, ahead), its peak
-            // speed and the half second before it (a pause, a slow start), logged when it ends, for the gesture-chosen slashes)
+        {   // ((Triforce VR) each swing's path in the head's frame (side to the right, up, ahead) and speed, for the gesture-chosen
+            // slashes' live choice
             struct Pt { uint64_t t; float s, u, f, v; };
             static Pt path[192];
             static int path_n, start_at = -1;
@@ -2655,8 +2639,7 @@ struct Controls {
                 static uint64_t l_quiet, l_fast, l_soft;
                 static bool l_raised;
                 // ((Triforce VR) not in Immersive (third person): there any solid swing is the sword's plain swing, as before)
-                const bool immersive_view = !strcmp(cfg_value("VR_VIEW"), "head") && !strcmp(cfg_value("VR_CAMERA"), "third") &&
-                                            !gestures_in_immersive();
+                const bool immersive_view = !strcmp(cfg_value("VR_VIEW"), "head") && !strcmp(cfg_value("VR_CAMERA"), "third");
                 if (swung && in_play && !carry && !held_item[0] && x.weapon_out.load() && start_at >= 0 && !immersive_view) {
                     int st = start_at;
                     while (st > path_n - 190 && st > 0 && at(st - 1).v >= swing_off && now - at(st - 1).t < 1500000000ull) st--;
@@ -2697,123 +2680,11 @@ struct Controls {
                         in.zt = (bits & 1ull << ZL) != 0, in.air = x.airborne.load(), in.start_up = a0.u;
                         const char *why = "";
                         slash_code = slash_classify(in, &why), slash_ready = true;
-                        rt_log("vr: slash: %s (counter %d, %.0f ms in)", why, slash_counter(slash_code), (double)(now - slash_wait_at) * 1e-6);
+                        rt_trace("vr: slash: %s (counter %d, %.0f ms in)", why, slash_counter(slash_code), (double)(now - slash_wait_at) * 1e-6);
                     }
                 }
             }
-            if (was_swinging && !swinging && start_at >= 0 && path_n - start_at < 180) {
-                // its start: back from the trigger to where the hand was last under swing_off (0.3 s at most)
-                int st = start_at;
-                while (st > path_n - 190 && st > 0 && at(st - 1).v >= swing_off && now - at(st - 1).t < 1500000000ull) st--;
-                // its end: the point farthest from its start (a hand brought back after it is not part of it)
-                int fe = st;
-                float far2 = 0;
-                for (int i = st; i < path_n; i++) {
-                    const float a1 = at(i).s - at(st).s, b1 = at(i).u - at(st).u, c1 = at(i).f - at(st).f, d2 = a1 * a1 + b1 * b1 + c1 * c1;
-                    if (d2 > far2) far2 = d2, fe = i;
-                }
-                const Pt &a = at(st), &b = at(fe);
-                float peak = 0;
-                for (int i = st; i <= fe; i++) peak = std::fmax(peak, at(i).v);
-                // before it: the slowest and the fastest of the 0.6 s before, how long it was still (under 0.15 m/s) right
-                // before, and its mean speed over the 0.25 s before
-                float pre_min = 1e9f, pre_max = 0, mean25 = 0;
-                int n25 = 0;
-                uint64_t still_ns = 0;
-                bool still_run = true;
-                for (int i = st - 1; i > st - 180 && i >= 0 && a.t - at(i).t < 600000000ull; i--) {
-                    const Pt &p = at(i);
-                    pre_min = std::fmin(pre_min, p.v), pre_max = std::fmax(pre_max, p.v);
-                    if (a.t - p.t < 250000000ull) mean25 += p.v, n25++;
-                    if (still_run && p.v < 0.15f) still_ns = a.t - p.t;
-                    else still_run = false;
-                }
-                // the speed over the 0.5 s before it, 50 ms a step (oldest first), and how far it went forward in its first 80 ms
-                char prof[160];
-                int po = 0;
-                for (int k = 9; k >= 0; k--) {
-                    float sum = 0;
-                    int cnt = 0;
-                    for (int i = st - 1; i > st - 180 && i >= 0; i--) {
-                        const uint64_t ago = a.t - at(i).t;
-                        if (ago >= (uint64_t)k * 50000000ull && ago < (uint64_t)(k + 1) * 50000000ull) sum += at(i).v, cnt++;
-                        if (ago > 600000000ull) break;
-                    }
-                    po += snprintf(prof + po, sizeof prof - po, "%s%.2f", k == 9 ? "" : " ", cnt ? sum / (float)cnt : 0.0f);
-                }
-                float first_fwd = 0;
-                for (int i = st; i <= fe; i++)
-                    if (at(i).t - a.t <= 80000000ull) first_fwd = at(i).f - a.f;
-                const float ds = b.s - a.s, du = b.u - a.u, df = b.f - a.f, flat = std::sqrt(ds * ds + df * df);
-                const float steep = std::atan2(std::fabs(du), flat) * 57.2958f;
-                const float out_s = sword ? 1.0f : -1.0f;   // (+ toward the sword hand's side)
-                rt_log("vr: swing: %s hand, %.0f ms, peak %.2f m/s; from side %+.2f up %+.2f ahead %+.2f to side %+.2f up %+.2f ahead %+.2f "
-                       "(toward sword side %+.2f, up %+.2f, ahead %+.2f; steep %.0f deg); before: still %.0f ms, slowest %.2f, fastest %.2f, "
-                       "mean of 0.25 s %.2f; profile [%s]; first 80 ms ahead %+.3f; item \"%s\" biggoron %d weapon %d shield %d",
-                       sword ? "right" : "left", (double)(b.t - a.t) * 1e-6, peak, a.s, a.u, a.f, b.s, b.u, b.f, ds * out_s, du, df, steep,
-                       (double)still_ns * 1e-6, pre_min < 1e8f ? pre_min : 0.0f, pre_max, n25 ? mean25 / (float)n25 : 0.0f, prof, first_fwd, held_item,
-                       (int)x.two_handed_sword.load(), (int)x.weapon_out.load(), (int)shielding);
-                {   // ((Triforce VR) research, SWING-CLASS: the slash these rules would choose (log only), from the whole swing and
-                    // from its first 100 ms (what a live choice would have)
-                    // before it: the longest run under 0.3 m/s in the 0.5 s before, the time since the hand last moved over 1 m/s, and
-                    // how far it rose in the second before (a jump slash's raise)
-                    uint64_t quiet = 0, run = 0, soft = 0, soft_run = 0, last_fast = 600000000ull, prev_t = a.t;
-                    bool fast_seen = false;
-                    float u_min = a.u;
-                    for (int i = st - 1; i > st - 190 && i >= 0; i--) {
-                        const Pt &p = at(i);
-                        const uint64_t ago = a.t - p.t;
-                        if (ago > 1000000000ull) break;
-                        u_min = std::fmin(u_min, p.u);
-                        // (a softer pause for the finishers: under 0.5 m/s, anywhere in the second before)
-                        if (p.v < 0.5f) soft_run += prev_t - p.t, soft = std::max(soft, soft_run);
-                        else soft_run = 0;
-                        if (ago <= 500000000ull) {
-                            if (p.v < 0.3f) run += prev_t - p.t, quiet = std::max(quiet, run);
-                            else run = 0;
-                            if (!fast_seen && p.v > 1.0f) last_fast = ago, fast_seen = true;
-                        }
-                        prev_t = p.t;
-                    }
-                    const bool raised = a.u - u_min > 0.35f;
-                    const float s0 = a.s * out_s;   // (its start toward the sword hand's side)
-                    const bool big = !held_item[0] && x.two_handed_sword.load();
-                    // (early: the live choice at 30 cm: a strict hesitation and the speed reached by then (4.5 m/s) mark a finisher)
-                    const auto classify = [&](float X, float U, float F, float pk, float fwd0, bool early_rule = false) -> const char * {
-                        const SlashIn in{X, U, F, pk, fwd0, a.s, a.f, s0, quiet, last_fast, soft, raised, big, early_rule};
-                        const char *why = "";
-                        slash_classify(in, &why);
-                        return why;
-                    };
-                    int e = st;   // (100 ms in)
-                    float pk_e = 0;
-                    for (int i = st; i <= fe && at(i).t - a.t <= 100000000ull; i++) e = i, pk_e = std::fmax(pk_e, at(i).v);
-                    const Pt &m = at(e);
-                    const char *full = (b.t - a.t < 120000000ull || peak > 30.0f) ? "ignored (tracking glitch)"
-                                     : classify(ds * out_s, du, df, peak, first_fwd);
-                    const char *early = classify((m.s - a.s) * out_s, m.u - a.u, m.f - a.f, pk_e, first_fwd);
-                    // (and once it has gone 20 cm and 30 cm from its start: the verdict and when)
-                    char at_d[2][96];
-                    for (int k = 0; k < 2; k++) {
-                        const float dd = k ? 0.30f : 0.20f;
-                        snprintf(at_d[k], sizeof at_d[k], "never");
-                        float pk_d = 0;
-                        for (int i = st; i <= fe; i++) {
-                            const Pt &q = at(i);
-                            pk_d = std::fmax(pk_d, q.v);
-                            const float a1 = q.s - a.s, b1 = q.u - a.u, c1 = q.f - a.f;
-                            if (a1 * a1 + b1 * b1 + c1 * c1 >= dd * dd) {
-                                snprintf(at_d[k], sizeof at_d[k], "%s at %.0f ms, %.2f m/s", classify(a1 * out_s, b1, c1, pk_d, first_fwd, true),
-                                         (double)(q.t - a.t) * 1e-6, pk_d);
-                                break;
-                            }
-                        }
-                    }
-                    rt_log("vr: swing class: %s | early (100 ms): %s | 20 cm: %s | 30 cm: %s | quiet %.0f ms, last fast %.0f ms ago, raised %d, soft pause %.0f ms",
-                           full, early, at_d[0], at_d[1], (double)quiet * 1e-6, (double)last_fast * 1e-6, (int)raised, (double)soft * 1e-6);
-                }
-                start_at = -1;
-            }
+            if (was_swinging && !swinging && start_at >= 0 && path_n - start_at < 180) start_at = -1;
             was_swinging = swinging;
         }
         if (carry) {   // (both hands together, neither back toward the body nor down, as it is put down; one alone throws nothing)
@@ -2824,7 +2695,7 @@ struct Controls {
             const float m = std::sqrt(vm[0] * vm[0] + vm[1] * vm[1] + vm[2] * vm[2]);
             if (pose_ok[0] && pose_ok[1] && hspeed[0] > least && hspeed[1] > least && dot > carry_same * hspeed[0] * hspeed[1] &&
                 vm[0] * fx + vm[2] * fz > -0.5f * m && vm[1] > -0.7f * m && now - swing_at >= refractory_ns)
-                swung = true, swing_at = now, rt_log("vr: carry: thrown by both hands");
+                swung = true, swing_at = now, rt_trace("vr: carry: thrown by both hands");
         }
         if (swung && !slash_wait) queued = true;
         if (slash_wait && slash_ready) {   // ((Triforce VR) the gesture-chosen slash: its step set, then the swing's press; none ignored

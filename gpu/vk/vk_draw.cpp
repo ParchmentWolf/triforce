@@ -528,25 +528,9 @@ void stats_dump_stage(uint64_t prog, const NvnState& s, int stage) {
     for (int i = 0; i < 16; i++) dump("ubo", i, s.ubo[stage][i]);
     for (int i = 0; i < 16; i++) dump("ssbo", i, s.ssbo[stage][i]);
 }
-// ((Triforce VR, research) the draw statistics' two switches from files beside the run logs when not set: a set RX_VK_ switch
-// is part of the shader caches' key, so setting it started every shader over (~/.app/pc_port/triforce-runs/draw_stats_dir.txt:
-// RX_VK_DRAW_STATS's folder; draw_stats_progs.txt: RX_VK_DRAW_STATS_PROGS's keys; their first line, read once at the start)
-static const char* stats_switch(const char* env, const char* file) {
-    if (const char* e = getenv(env)) return e;
-    const char* home = getenv("HOME");
-    char path[512];
-    snprintf(path, sizeof path, "%s/.app/pc_port/triforce-runs/%s", home ? home : "", file);
-    FILE* f = fopen(path, "r");
-    if (!f) return nullptr;
-    static char lines[2][1024];
-    char* l = lines[strcmp(file, "draw_stats_dir.txt") ? 1 : 0];
-    if (!fgets(l, 1024, f)) l[0] = 0;
-    fclose(f);
-    l[strcspn(l, "\r\n")] = 0;
-    return l[0] ? l : nullptr;
-}
-static const char* stats_dir_switch() { static const char* v = stats_switch("RX_VK_DRAW_STATS", "draw_stats_dir.txt"); return v; }
-static const char* stats_progs_switch() { static const char* v = stats_switch("RX_VK_DRAW_STATS_PROGS", "draw_stats_progs.txt"); return v; }
+static const char* stats_switch(const char* env) { return getenv(env); }
+static const char* stats_dir_switch() { static const char* v = stats_switch("RX_VK_DRAW_STATS"); return v; }
+static const char* stats_progs_switch() { static const char* v = stats_switch("RX_VK_DRAW_STATS_PROGS"); return v; }
 bool stats_prog_wanted(uint64_t key) {
     static const std::vector<uint64_t> want = [] {
         std::vector<uint64_t> v;
@@ -6543,7 +6527,6 @@ int desc_keep_mode() {
                                                "RX_VK_LOG_MIRROR_USE", "RX_VK_SSBO_STRETCH", "RX_VK_SSBO_WIDE"};
         for (const char* n : off_with)
             if (m && getenv(n)) m = 0, why = n;
-        if (m && stats_dir_switch()) m = 0, why = "draw_stats_dir.txt";   // ((Triforce VR) the draw statistics from its file too
         if (const char* v = getenv("RX_VK_SAMPLER_CACHE"); m && v && atoi(v) == 0) m = 0, why = "RX_VK_SAMPLER_CACHE=0";
         if (const char* v = getenv("RX_VK_LATE_DEFER"); m && v && atoi(v) != 0) m = 0, why = "RX_VK_LATE_DEFER";
         logf("vk: per-binding descriptor reuse %s%s%s", m == 2 ? "on, each kept result checked (RX_VK_DESC_KEEP=check)" : m ? "on" : "off",
@@ -16600,13 +16583,6 @@ bool xr_draw_mirrored(const NvnState& s) {
         bool same = true;
         for (int q = 0; q < 12 && same; q++) same = fabsf(r[q] - t[q]) < 2e-3f;   // (rows with their places: no other thing shares one)
         if (!same) continue;
-        static uint64_t frame_at = 0;
-        static int flips = 0, frames = 0;
-        if (texture_frame_no() != frame_at) {
-            if (frame_at && frames++ % 300 == 0) logf("vk: xr mirror: %d draws' faces turned in frame %llu", flips, (unsigned long long)frame_at);
-            frame_at = texture_frame_no(), flips = 0;
-        }
-        flips++;
         return true;
     }
     return false;

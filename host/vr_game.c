@@ -440,13 +440,6 @@ static int hand_item(char out[96]) {
     const char *now_item = NULL;
     for (size_t i = 0; i < sizeof items / sizeof *items && !now_item; i++)
         if (item == oot_data_hash(items[i].value)) now_item = items[i].model;
-    {   /* ((Triforce VR) research: an item set to the button whose name is not known here, once each) */
-        static uint32_t told[16];
-        static int n_told;
-        int seen = !item || now_item;
-        for (int i = 0; i < n_told && !seen; i++) seen = told[i] == item;
-        if (!seen && n_told < 16) told[n_told++] = item, hos_log("vr: an item not known to the hands: %#x", item);
-    }
     static const char *held;   /* what the last button put in his hand (NULL the sword) */
     int quest_now = 0;
     {   /* ((Triforce VR) a trade item (not on the item slot this reads: it shows Empty) seen in his hand: that one held, until gone */
@@ -487,15 +480,9 @@ static int hand_item(char out[96]) {
                         strstr(names, " FaceBattleBoomerang ")) && now_item;
     if (aiming) held = now_item;
     g_aiming = aiming;
-    /* ((Triforce VR) the fishing pond's rod: a state of his own, not an item on a button. His states' names tell it (each set of
-       them logged while he fishes, at most 40, to learn the casting's, reeling's and hooking's own) */
+    /* ((Triforce VR) the fishing pond's rod: a state of his own, not an item on a button. His states' names tell it */
     const int fishing = strstr(names, "Fish") || strstr(names, "Lure");
     if (fishing) held = "Weapon_FishingRod";
-    {
-        static char told[512];
-        static int n_told;
-        if (fishing && strcmp(told, names) && n_told < 40) snprintf(told, sizeof told, "%s", names), n_told++, hos_log("vr: fishing: his states:%s", names);
-    }
     static uint64_t out_at;
     const uint64_t t = now_ns();
     if (fishing || aiming || strstr(names, " CommonUpper ") || strstr(names, " WeaponEquipOnUpper ") || strstr(names, "Bottle") ||
@@ -1130,7 +1117,7 @@ static int event_view(uint64_t event) {
     if (event != was) {
         oot_event_name(event, name);
         was = event, shot = flinched = 0;
-        hos_log("vr: event \"%s\"", name);
+        (void)name;   /* ((Triforce VR) its name: logged on the vr-debug branch */
     }
     char state[48];
     oot_link_state_at(state, 0x244);
@@ -1309,19 +1296,10 @@ void hos_vr_camera(Ctx *c) {
     const int event = event_now != 0;
     const int view = event ? event_view(event_now) : EV_CUTSCENE;
     if (x->hud_hidden) x->hud_hidden(view == EV_EYES_NO_HUD);
-    {
-        static int was_view = -1, was_event = -1;
-        if (view != was_view || event != was_event)
-            hos_log("vr: event view: %s", !event ? "none (play)" : view == EV_EYES_NO_HUD ? "Link's eyes, no HUD" : view == EV_EYES ? "Link's eyes" : "the cutscene's");
-        was_view = view, was_event = event;
-    }
-    {   /* (research: Link's state names as they change) */
-        static char was[48], was_up[48];
-        char st[48], up[48];
-        oot_link_state_at(st, 0x244), oot_link_state_at(up, 0x34c);
-        if (strcmp(st, was) || strcmp(up, was_up)) hos_log("vr: state: \"%s\" upper \"%s\"", st, up);
+    {   /* (a sideways step: vr_body.c's legs) */
+        char st[48];
+        oot_link_state_at(st, 0x244);
         g_sidestep = !strcmp(st, "SideStep") || !strcmp(st, "SideStepLand") || !strcmp(st, "LockOnMove");
-        memcpy(was, st, sizeof was), memcpy(was_up, up, sizeof was_up);
     }
     const int k = scene - 1;
     if (scene == 1) head_camera = 0;

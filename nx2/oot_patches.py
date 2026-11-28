@@ -204,22 +204,6 @@ def patch_shield(source):
     return source, 1
 
 
-JOINT_TAIL = "L_803a13d0:;\nreturn;\n}\n"   # (the end of f_803a1360, a bone's world 3x4 (x1) of an instance (x0), bone x2)
-
-
-def patch_joint(source):
-    """(source, 1 when the hook is in: made here or before)"""
-    hooked = "L_803a13d0:;\n    hos_oot_joint_world(c);\nreturn;\n}\n"
-    if hooked in source:
-        return source, 1
-    if source.count(JOINT_TAIL) != 1:
-        return source, 0
-    source = source.replace(JOINT_TAIL, hooked, 1)
-    if "extern void hos_oot_joint_world(Ctx *c);" not in source:
-        source = source.replace('#include "a64.h"\n', '#include "a64.h"\nextern void hos_oot_joint_world(Ctx *c);\n', 1)
-    return source, 1
-
-
 SWORD_HEAD = "void f_81500720(Ctx *__restrict A64_NOESC c) {\n"   # (the sword's and others' bones placed from a base matrix x1)
 
 
@@ -2332,9 +2316,6 @@ def apply(gen, *, protect_hearts=False, required=False):
             out, n = patch_vr_screens(out)
             if n:
                 print("oot_patches: VR's screen hooks at %d node(s) in %s" % (n, os.path.basename(path)))
-            out, n = patch_joint(out)
-            if n:
-                print("oot_patches: the bone accessor's research hook in %s" % os.path.basename(path))
             out, n = patch_sword(out)
             if n:
                 sword_sites += n
