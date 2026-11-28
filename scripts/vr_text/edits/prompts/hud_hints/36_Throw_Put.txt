@@ -1,0 +1,13 @@
+# HUD control hint set 36: Throw_Put
+# Each step: the button icon shown, the word beside it (LayoutMsg/CtrlGuide_00, by its label).
+# Write the icon you want under [VR icon] (an icon file's name from your folder) and the word under [VR].
+# [VR2 icon] / [VR2]: the Simplified controls' (empty: [VR icon] / [VR] there too).
+# Note: a word is shared by every set that shows it (listed): changing it changes it in all of them.
+
+=== Step 1: Throw ===
+[Icon] ZR
+[VR icon] Swing
+[VR] 
+[VR2 icon] 
+[VR2] 
+

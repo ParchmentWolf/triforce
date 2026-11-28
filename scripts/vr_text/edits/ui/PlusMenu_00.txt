@@ -1,0 +1,221 @@
+# LayoutMsg/PlusMenu_00.msbt
+# Under each label: your text under [VR] (Full Gesture) and [VR2] (Simplified); empty or <game> keeps the game's.
+# Button icons: [A] [B] [X] [Y] [L] [R] [ZL] [ZR] [Plus] [Minus] [LS] [RS] [Up] [Down] [Left] [Right] ...
+# Keep the {..} tags you want (colours, pauses, a new box {0.4:}); see README.txt.
+
+=== Pa_System_00-Pa_SystemController_00-Pa_BtnZL_00-T_IconL_00 ===
+[VR]
+[U+F6CC]
+
+[VR2]
+[U+F6C0]
+
+
+=== Pa_System_00-Pa_SystemController_00-Pa_BtnZL_00-T_GuideL_00 ===
+[VR]
+Target: Shield to Chest
+
+[VR2]
+<game>
+
+
+=== Pa_System_00-Pa_SystemController_00-Pa_BtnZR_00-T_IconR_00 ===
+[VR]
+[U+F6C3]
+
+[VR2]
+[U+F6C3]
+
+
+=== Pa_System_00-Pa_SystemController_00-Pa_BtnL_00-T_IconL_00 ===
+[VR]
+[U+F6C0]
+
+[VR2]
+[U+F6CA]
+
+
+=== Pa_System_00-Pa_SystemController_00-Pa_BtnL_00-T_GuideL_00 ===
+[VR]
+
+
+[VR2]
+Sprint (Toggle)
+
+
+=== Pa_System_00-Pa_SystemController_00-Pa_BtnR_00-T_IconR_00 ===
+[VR]
+[U+F6C1]
+
+[VR2]
+[U+F6C1]
+
+
+=== Pa_System_00-Pa_SystemController_00-Pa_BtnMinus_00-T_IconL_00 ===
+[VR]
+[U+F6C8]
+
+[VR2]
+
+
+
+=== Pa_System_00-Pa_SystemController_00-Pa_BtnMinus_00-T_GuideL_00 ===
+[VR]
+Open Map (Hold)
+
+[VR2]
+
+
+
+=== Pa_System_00-Pa_SystemController_00-Pa_BtnA_00-T_IconR_00 ===
+[VR]
+[U+F6C6]
+
+[VR2]
+
+
+
+=== Pa_System_00-Pa_SystemController_00-Pa_BtnB_00-T_IconR_00 ===
+[VR]
+[U+F6C7]
+
+[VR2]
+
+
+
+=== Pa_System_00-Pa_SystemController_00-Pa_BtnX_00-T_IconR_00 ===
+[VR]
+[U+F6C2]
+
+[VR2]
+[U+F6CC]
+
+
+=== Jump ===
+[VR]
+Draw: Grips Behind Head
+
+[VR2]
+Shield to Chest
+
+
+=== Pa_System_00-Pa_SystemController_00-Pa_BtnY_00-T_IconR_00 ===
+[VR]
+[U+F6C4]
+
+[VR2]
+
+
+
+=== Pa_System_00-Pa_SystemController_00-T_GuideBtnRStick_00 ===
+[VR]
+Jump (Press)
+
+[VR2]
+
+
+
+=== Pa_System_00-Pa_SystemController_00-Pa_BtnZR_00-T_GuideR_00 ===
+[VR]
+Item: Reach Back & Pull
+
+[VR2]
+<game>
+
+
+=== Pa_System_00-Pa_SystemController_00-Pa_BtnR_00-T_GuideR_00 ===
+[VR]
+
+
+[VR2]
+Item Panel (Hold)
+
+
+=== Pa_System_00-Pa_SystemController_00-Pa_BtnPlus_00-T_IconR_00 ===
+[VR]
+[U+F6C8]
+
+[VR2]
+
+
+
+=== Pa_System_00-Pa_SystemController_00-Pa_BtnPlus_00-T_GuideR_00 ===
+[VR]
+Open Menu (Tap)
+
+[VR2]
+
+
+
+=== Pa_System_00-Pa_SystemController_00-Pa_BtnY_00-T_GuideR_00 ===
+[VR]
+Attack: Swing Sword
+
+[VR2]
+Attack: Swing or Y
+
+
+=== Pa_System_00-Pa_SystemController_00-Pa_BtnUp_00-T_IconL_00 ===
+[VR]
+[U+F6CC]
+
+[VR2]
+[U+F6C1]
+
+
+=== Pa_System_00-Pa_SystemController_00-Pa_BtnUp_00-T_GuideL_00 ===
+[VR]
+Mask: Grip Head, Lens: Nod
+
+[VR2]
+RT + Up: Accessory
+
+
+=== Pa_System_00-Pa_SystemController_00-Pa_BtnLeft_00-T_IconL_00 ===
+[VR]
+[U+F6CC]
+
+[VR2]
+[U+F6C1]
+
+
+=== Pa_System_00-Pa_SystemController_00-Pa_BtnLeft_00-T_GuideL_00 ===
+[VR]
+Ocarina: Hands at Mouth
+
+[VR2]
+RT + Left: Ocarina
+
+
+=== Pa_System_00-Pa_SystemController_00-Pa_BtnRight_00-T_IconL_00 ===
+[VR]
+[U+F6CC]
+
+[VR2]
+[U+F6C1]
+
+
+=== Pa_System_00-Pa_SystemController_00-Pa_BtnRight_00-T_GuideL_00 ===
+[VR]
+Navi: Hands Cover Ears
+
+[VR2]
+RT + Right: Navi
+
+
+=== Pa_System_00-Pa_SystemController_00-Pa_BtnDown_00-T_IconL_00 ===
+[VR]
+[U+F6CC]
+
+[VR2]
+[U+F6C1]
+
+
+=== Pa_System_00-Pa_SystemController_00-Pa_BtnDown_00-T_GuideL_00 ===
+[VR]
+Boots: Shake Arms Up
+
+[VR2]
+RT + Down: Boots
+
+

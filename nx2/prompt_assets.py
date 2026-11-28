@@ -173,8 +173,9 @@ BIND_BASE = 0xF000
 _FACES_CACHE = {}
 
 
-def faces_font(otf):
-    """(Triforce) the game's font (decrypted) with every controller face's icons added (LIVE_FACES), once for each game font:
+def faces_font(otf, letters=None):
+    """(Triforce) the game's font (decrypted) with every controller face's icons added (LIVE_FACES), and ((Triforce VR) the hand
+    controllers' (nx2/prompt_vr.py; letters: the game's font its T and G are cut from), once for each game font:
     (the font's bytes, {code: glyph name} of the codes added, {face: [its glyph per pad input]}, {face: {STATIC code: glyph}})"""
     key = hash(otf)
     if key in _FACES_CACHE:
@@ -262,6 +263,11 @@ def faces_font(otf):
         for b in range(len(SWITCH)):
             for i in range(len(PADS)):
                 placed[BIND_BASE + (n * len(SWITCH) + b) * len(PADS) + i] = pads[face][i]
+    try:   # ((Triforce VR) the hand controllers' icons, for host/prompts.c while a VR session plays)
+        import prompt_vr
+        placed.update(prompt_vr.add_icons(gset, cmap, chars, hmtx, add, copy, letters))
+    except ImportError:
+        pass
     taken = sorted(c for c in placed if c in cmap)
     if taken:
         raise SystemExit("prompts: the game's font already has code points %s: no room for the faces' icons" %
@@ -273,14 +279,14 @@ def faces_font(otf):
     return got
 
 
-def face_font(otf, face):
+def face_font(otf, face, letters=None):
     """the game's font (decrypted) with every controller face's icons (faces_font) and this face's on the codes the game and the
     overlay read: a pad icon per input at PAD_BASE + its number, the Switch buttons' code points on the default controls' icons,
     the d-pad's (STATIC) on the face's. (the font, the glyph of each pad input's icon: write_hint's names)"""
     from fontTools.ttLib import TTFont
     from fontTools.ttLib.tables.DefaultTable import DefaultTable
 
-    plain, placed, pads, statics = faces_font(otf)
+    plain, placed, pads, statics = faces_font(otf, letters)
     game = TTFont(io.BytesIO(plain))
     gid = {n: i for i, n in enumerate(game.getGlyphOrder())}
     mapping = {c: gid[n] for c, n in TTFont(io.BytesIO(otf)).getBestCmap().items() if c <= 0xFFFF}
@@ -1695,6 +1701,12 @@ def main():
     dictionary = zs_dictionary(a.romfs)
     game_font = read_zs(a.romfs, FONT, dictionary)
     key, otf = unwrap(game_font)
+    letters = None
+    try:   # ((Triforce VR) the letters of the hand controllers' trigger and grip icons, nx2/prompt_vr.py)
+        import prompt_vr
+        letters = unwrap(read_zs(a.romfs, prompt_vr.LETTERS, dictionary))[1]
+    except (Exception, SystemExit) as e:
+        print(f"prompts: the VR trigger and grip icons keep the game's letters ({e})", file=sys.stderr)
     textures = None
     if not a.no_textures:
         try:
@@ -1730,7 +1742,7 @@ def main():
             prompt_keys.write_binds(os.path.join(d, "keys.bin"), binds)
             names = prompt_keys.hint_names()
         else:
-            plain, names = face_font(otf, face)
+            plain, names = face_font(otf, face, letters)
         font = wrap(key, plain)
         if hint:
             write_hint(os.path.join(d, "hint.bin"), plain, hint, names)

@@ -313,12 +313,30 @@ static void mods_scan(void) {
     hos_log("mods: %d mods from %s: %zu RomFS entries", nmods, root, table_n);
 }
 
+/* ((Triforce VR) VR's texts and HUD hints: vr_text/<scheme>/romfs beside the game, laid out as a mod's romfs (the text tools'
+   vr_build.py writes them, one folder per Control Scheme: gesture, simplified). With VR on (the options file's vr=1) the
+   Control Scheme's (vr_scheme: 0 Full Gesture, 1 Simplified) are put over the mods' own; with VR off, none: the game's texts.
+   The game reads its texts once, at its start, as it takes VR's switch: either changed, at the next start */
+static void vr_text_scan(void) {
+    int hos_ini_option(const char *key, int otherwise);
+    if (!hos_ini_option("vr", 0)) return;
+    char root[MAX_PATH];
+    hos_game_path_a(root, sizeof root);
+    char *slash = (char *)last_sep(root);
+    if (!slash) return;
+    const char *scheme = hos_ini_option("vr_scheme", 0) == 1 ? "simplified" : "gesture";
+    snprintf(slash + 1, sizeof root - (size_t)(slash + 1 - root), "vr_text\\%s\\romfs", scheme);
+    if (GetFileAttributesA(root) == INVALID_FILE_ATTRIBUTES) return;
+    hos_log("mods: VR's texts (%s): %d RomFS files", scheme, index_romfs(root, "", 0));
+}
+
 /* hos_main.c, once the image is loaded (image_path: not used; exefs patches are applied when the game is built) */
 void hos_mods_init(const char *image_path) {
     void hos_mod_cheats_ready(void);
     (void)image_path;
     code_record_load();
     mods_scan();
+    vr_text_scan();   /* ((Triforce VR) after the mods: over theirs */
     code_patches_gone();
     hos_mod_cheats_ready();   /* (mod_cheats.c: every mod's cheat file is read) */
 }

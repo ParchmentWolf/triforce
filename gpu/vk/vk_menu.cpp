@@ -30,6 +30,7 @@
 // (merged_rows.h: HDR with RenoDX, Frame generation with DLSS's, Frame pacing with Steady, Low latency for Reflex or Anti-Lag
 // 2, the Upscaler's native AA as the Render resolution's Native (100%)), and the Quality preset, the Window scaling filter,
 // the Reflex frame limit, the Handheld profile and the shared Stick dead zone are gone, their jobs done otherwise.
+#include <map>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -1141,7 +1142,9 @@ void n64_act(int action) {
     save();
 }
 /// A row with nothing else to choose here: shown without its arrows, Left and Right leave it (and the saved value) alone
+bool vr_row_locked(const int* value);   // ((Triforce VR) below
 bool row_fixed(const int* value) {
+    if (vr_row_locked(value)) return true;
     // ((Triforce) the Ultrawide row while the Output resolution's own shape or HOS_ASPECT is the picture's; the Custom rows
     // while HOS_OUTPUT_SIZE is Custom's size)
     if (value == &opts.ultrawide && shape_owner() != 0) return true;
@@ -3495,6 +3498,64 @@ const char* ini_key(const Row& r) {
 /// (Triforce) A row kept in triforce_options.ini: every row with a value but the Game language, whose choice is
 /// language.txt's
 bool ini_row(const Row& r) { return r.value && r.value != &opts.language && !is_merged(r.value) && r.value != &output_pick; }
+
+// ((Triforce VR) VR's settings: with VR on, the picture's rows (the Display and Graphics tabs and the pages they open, and the
+// saved values their merged rows stand for: HDR, RenoDX, frame generation, pacing, low latency) are held at the built-in
+// defaults (Options{}: HDR, RenoDX and frame generation off), which VR is known to work with (HDR on gave a black headset), and
+// cannot be changed there: the 3D Style (VR's own switch), the VR Settings page and the rows below stay the player's. The
+// player's own values are kept (vr_flat, saved as vr_flat_<key>= lines) and put back when VR is turned off
+const int* const kVrFree[] = {&merged.view3d, &opts.gpu_device, &opts.fullscreen, &opts.fs_screen, &opts.show_fps, &opts.colour_vision};
+const int* const kVrHeld[] = {&opts.hdr, &opts.renodx, &opts.framegen, &opts.dlssg, &opts.pace, &opts.steady_fps, &opts.reflex, &opts.antilag};
+std::map<std::string, int> vr_flat;
+bool vr_tab(int tab) { return tab == TAB_DISPLAY || tab == TAB_GRAPHICS || tab == TAB_N64 || tab == TAB_SIM_TURF; }
+bool vr_free(const int* v) {
+    for (const int* f : kVrFree)
+        if (v == f) return true;
+    return false;
+}
+/// a row the player cannot change while VR is on (shown, fixed)
+bool vr_row_locked(const int* value) {
+    if (!opts.vr || !value || vr_free(value)) return false;
+    for (const Row& r : rows)
+        if (r.value == value) return vr_tab(r.tab) && !r.heading;
+    return false;
+}
+/// a saved value held at its default while VR is on
+bool vr_held(const Row& r) {
+    if (!ini_row(r) || vr_free(r.value)) return false;
+    for (const int* h : kVrHeld)
+        if (r.value == h) return true;
+    return vr_tab(r.tab) && !r.heading && (const char*)r.value >= (const char*)&opts &&
+           (const char*)r.value < (const char*)&opts + sizeof opts;
+}
+/// VR turned on: the player's values kept and the defaults put in their place; turned off: the player's back. Saved at once
+/// (the host reads some at the next start, renodx_hdr= among them)
+bool vr_save_due = false;   // (changed at the start, before the file may be written: saved at the first tick)
+void vr_settings_sync(bool write = true) {
+    if (write && vr_save_due) vr_save_due = false, save();
+    const bool on = opts.vr != 0;
+    if (on == !vr_flat.empty()) return;
+    static const Options defaults{};
+    int n = 0;
+    for (const Row& r : rows) {
+        if (!vr_held(r)) continue;
+        int* v = r.value;
+        if (on) {
+            vr_flat[ini_key(r)] = *v;
+            *v = *(const int*)((const char*)&defaults + ((const char*)v - (const char*)&opts));
+        } else {
+            const auto it = vr_flat.find(ini_key(r));
+            if (it != vr_flat.end()) *v = std::min(std::max(it->second, r.lo), r.hi);
+        }
+        n++;
+    }
+    if (on && vr_flat.empty()) vr_flat["vr"] = 1;   // (nothing to keep: still marked as done)
+    if (!on) vr_flat.clear();
+    logf("menu: VR %s: %d picture settings %s", on ? "on" : "off", n, on ? "held at VR's defaults (yours kept)" : "back as you had them");
+    merged_sync();
+    if (write) save();
+    else vr_save_due = true;
+}
 // ((Triforce, handoff §9) The options file's other writers. ini_base: what the game had for each of the file's lines when it last
 // read (menu_init) or wrote (save) the file; save merges each line it writes by its key with what the file has now
 // (ini_merge.h) and writes the file whole (file_whole.h: a reader at a start, the host's or the renderer's, never meets half a
@@ -3724,7 +3785,7 @@ void save() {
             // (Triforce: the RivaTuner limit row of the test builds is gone, RivaTuner being the limiter wherever it can be:
             // its line is read by nothing and is not written again. (options_version 7) Nor are the lines of the rows whose job
             // is done otherwise now: merged_rows.h kDropped, read once by menu_init's migration)
-            mine |= key == "rivatuner_limit";
+            mine |= key == "rivatuner_limit" || !strncmp(key.c_str(), "vr_flat_", 8);   // ((Triforce VR) written below
             for (const char* dropped : merged_rows::kDropped) mine |= key == dropped;
             for (const Row& r : rows)
                 if (!mine && r.value && key == ini_key(r)) mine = true;
@@ -3744,6 +3805,8 @@ void save() {
     };
     for (const Row& r : rows)
         if (ini_row(r)) put(ini_key(r), std::to_string(*r.value));
+    for (const auto& [k, v] : vr_flat)   // ((Triforce VR) the player's own picture settings, kept while VR is on
+        put("vr_flat_" + k, std::to_string(v));
     if (remembered_custom.h) put("output_custom_size", std::to_string(remembered_custom.w) + "x" + std::to_string(remembered_custom.h));
     else if (own_custom && disk.count("output_custom_size")) put("output_custom_size", "");
     if (!mic_want.empty()) put("microphone_device", mic_want);   // (hookshot: also while it is unplugged)
@@ -7819,6 +7882,7 @@ void menu_init() {
             if (!strcmp(line, "microphone_device")) {   // (hookshot: the microphone, by its name)
                 mic_want = mic_key(eq + 1);
             }
+            if (!strncmp(line, "vr_flat_", 8)) vr_flat[line + 8] = atoi(eq + 1);   // ((Triforce VR) the player's own, kept while VR is on
             if (!strcmp(line, "gpu_device_name")) gpu_want = mic_key(eq + 1);   // ((Triforce) 11-20: the GPU device row's card, by its name)
             if (!strcmp(line, "fullscreen_screen_name")) fs_screen_want = fs_key(mic_key(eq + 1));   // ((Triforce) 11-24: the Fullscreen screen, by its name)
         }
@@ -7839,7 +7903,7 @@ void menu_init() {
         }
         // ((Triforce) options_version 8 (7 in the 436f9ac-based builds; v0.5.1's 7 still had the rows): the handheld profile is
         // an Output resolution, the shared stick dead zone each stick's own; the other rows that went keep nothing to move (merged_rows.h kDropped). Before the values at the start are taken)
-
+        vr_settings_sync(false);   // ((Triforce VR) VR on: the picture's rows held at VR's defaults before anything starts with them
         hdr_at_start = opts.hdr;   // (local, RenoDX port: vk_menu.h)
         renodx_at_start = opts.renodx, upscale_pre_at_start = opts.upscale_pre;
         tex_detail_at_start = evil_hd::tex_detail(opts.evil_hd, opts.tex_detail);   // ((Triforce, 11-23) Evil HD: Full)
@@ -9301,6 +9365,7 @@ void mic_test_tick(bool focused) {
 }
 void menu_tick() {
     std::lock_guard<std::recursive_mutex> bridge_lk(menu_mu);   // ((Triforce) the control bridge's settings: menu_setting_set)
+    vr_settings_sync();   // ((Triforce VR) VR turned on or off since
     auto_tick();   // ((Triforce) Auto (this PC): a step its tuning asked for
     if (sim_turf_tick(prof_now())) menu_refresh = true;   // ((Triforce, 11-24) the Simulated turf page: its rows' changes, the area)
     menu_debug_rows(opts.descriptor_reuse, opts.sampler_cache);   // ((Triforce) the two Debug rows, taken in play: vk_draw.cpp)
@@ -9445,6 +9510,9 @@ void menu_tick() {
             if (order[k] != pad_confirm && order[k] != pad_back) pad_clear = order[k];
     }
     if (pad(HOS_PAD_GUIDE) || chord_now) press[0] = true;
+    // ((Triforce VR) the headset's Menu, or the PSVR2's both sticks clicked: the options opened or shut, wherever the keys may not)
+    const bool xr_toggle = vk_xr_options_toggle_take() != 0;
+    if (xr_toggle) press[0] = true, pad_last = auto_pad = true;
     // (Menu shortcut's touchpad choices: a DualShock 4's or DualSense's touchpad click is F1, it opens and closes the menu as
     // the key does, where the keys open it at all: menu_allowed below)
     if (opts.menu_shortcut >= 3 && pad(HOS_PAD_TOUCHPAD)) press[6] = true;
@@ -9821,7 +9889,7 @@ void menu_tick() {
         later();
     } else if ((press[0] || press[6]) && open_now.load() && restart_ask()) {
         page = 5, ask_sel = 0, listening = 0, changed = true;
-    } else if (((press[0] || press[6]) && (menu_allowed || open_now.load())) || esc_opens) {
+    } else if (((press[0] || press[6]) && (menu_allowed || open_now.load() || xr_toggle)) || esc_opens) {
         open_now = !open_now.load(), changed = true;
         page = 0, listening = 0;
         // (the layout row shows the controls as they are: host/nn_hid.c keeps them, the ini's pad_ lines, and a saved

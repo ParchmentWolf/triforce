@@ -129,6 +129,8 @@ void vk_xr_note_upscale(int taken);
 // the hand controllers' buttons (HOS_SW_* bits, as labelled) and sticks while they are a menu's (not in play): 1, for this
 // menu's own input (vk_menu.cpp); 0 none
 int vk_xr_menu_buttons(uint64_t *buttons, float sticks[2][2]);
+// the options overlay asked open or shut by the headset (its Menu button; the PSVR2's both sticks clicked): 1 once per ask
+int vk_xr_options_toggle_take(void);
 
 // vk_replay.cpp present_image: 1 when VR takes this present's window image (then in TRANSFER_SRC_OPTIMAL for
 // vk_xr_capture); 0 records nothing

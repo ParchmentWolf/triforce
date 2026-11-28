@@ -1,0 +1,23 @@
+# Tutorial pop-up: Ocarina (LayoutMsg/ActionGuide_00)
+# Title_ is the heading, Msg_ its line, Guide_..._00/_01/_02 the words beside each step's button icon.
+# The icon beside a step is chosen by the game's code (not a text): write the one you want under [VR icon].
+# [VR2] / [VR2 icon]: the Simplified controls' (empty: [VR] / [VR icon] there too).
+
+=== Guide_Ocarina_00 ===
+[VR icon] -
+[VR]
+Hands Together at Mouth
+
+[VR2 icon] R_Grip
+[VR2]
+<game>
+
+
+=== Msg_Ocarina ===
+[VR]
+Hold both hands together at your mouth to play it.
+
+[VR2]
+<game>
+
+

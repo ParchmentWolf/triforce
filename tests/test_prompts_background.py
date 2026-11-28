@@ -117,8 +117,10 @@ class PromptsInTheBackground(unittest.TestCase):
     def game_files(self):
         """a romfs with every file the tool reads, as stand-ins; their names under the romfs"""
         import prompt_assets
+        import prompt_vr
         romfs = self.out / "romfs"
         names = ["Pack/ZsDic.pack.zs", prompt_assets.FONT, prompt_assets.TEXTURES, prompt_assets.LAYOUTS, prompt_assets.CAMERA,
+                 prompt_vr.LETTERS,
                  "System/Resource/ResourceSizeTable.Product.110.rsizetable.zs",
                  prompt_assets.MALS + "/EUen.Product.110.sarc.zs", prompt_assets.MALS + "/JPja.Product.110.sarc.zs"]
         for n in names:
@@ -185,7 +187,7 @@ class PromptsInTheBackground(unittest.TestCase):
         src = (ROOT / "nx2/prompt_assets.py").read_text(encoding="utf-8")
         opened = set(re.findall(r"read_zs\((?:a\.)?romfs, ([^,]+),", src))
         # ("rel" is read_zs's own definition)
-        self.assertEqual(opened, {"rel", "FONT", "TEXTURES", "LAYOUTS", "CAMERA", 'f"System/Resource/{name}"', 'f"{MALS}/{name}"'},
+        self.assertEqual(opened, {"rel", "FONT", "TEXTURES", "LAYOUTS", "CAMERA", "prompt_vr.LETTERS", 'f"System/Resource/{name}"', 'f"{MALS}/{name}"'},
                          "prompt_assets.py reads a game file this test does not know: add it to make_game.prompt_game_files")
         joined = set(re.findall(r"os\.path\.join\(romfs, ([^)]+)\)", src))
         self.assertEqual(joined, {'"Pack", "ZsDic.pack.zs"', "rel", '"System", "Resource"', "MALS"},
@@ -193,7 +195,7 @@ class PromptsInTheBackground(unittest.TestCase):
         key = (ROOT / "nx2/make_game.py").read_text(encoding="utf-8")
         body = key[key.index("def prompt_game_files(romfs):"):key.index("def prompts_key(")]
         for part in ('"Pack/ZsDic.pack.zs"', "prompt_assets.FONT", "prompt_assets.TEXTURES", "prompt_assets.LAYOUTS",
-                     "prompt_assets.CAMERA", '"ResourceSizeTable."', "prompt_assets.MALS", '".sarc.zs"'):
+                     "prompt_assets.CAMERA", "prompt_vr.LETTERS", '"ResourceSizeTable."', "prompt_assets.MALS", '".sarc.zs"'):
             self.assertIn(part, body)
 
     def test_a_drawing_that_fails_leaves_no_prompts(self):

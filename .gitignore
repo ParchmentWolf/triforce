@@ -48,3 +48,7 @@ setup/out/
 build1.done
 # (Triforce) RenHDrum built by hand (scripts/renhdrum.py): the .dll is *.dll above
 third_party/renhdrum/renhdrum.so
+
+# ((Triforce VR) scripts/vr_text: made from the game on your PC (work/ is above)
+scripts/vr_text/work_all/
+scripts/vr_text/vr_edits.tsv

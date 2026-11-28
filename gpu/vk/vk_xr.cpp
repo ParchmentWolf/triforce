@@ -116,7 +116,7 @@ struct Drawn {
 
 struct Xr {
     bool tried = false, ok = false;
-    bool psvr2 = false;   // the headset is a PSVR2 (its system name): its Options cannot reach OpenXR, so L3+R3 are the Menu
+    bool psvr2 = false;   // the headset is a PSVR2 (its system name): its Options cannot reach OpenXR, so L3+R3 are its Menu
     PFN_xrGetInstanceProcAddr gipa = nullptr;
 #define XR_DECLARE(f) PFN_##f f = nullptr;
     XR_FUNCS(XR_DECLARE)
@@ -327,6 +327,7 @@ struct Xr {
 // ((Triforce VR) the sword's hand as the last draw by both grips chose it (the higher hand): -1 none yet, 0 left, 1 right;
 // the host's mirror reads it as VR_SWORD_HAND (vk_menu.cpp vk_xr_cfg))
 static std::atomic<int> g_live_sword{-1};
+static std::atomic<int> g_options_toggle{0};   // (the headset's ask to open or shut the options overlay: vk_xr_options_toggle_take)
 extern "C" int vk_xr_live_sword(void) { return g_live_sword.load(); }
 // ((Triforce VR) Link's animation mirrored for what the hands did last: -1 not yet, 0 as made, 1 mirrored (VR_MIRROR))
 static std::atomic<int> g_live_mirror{-1};
@@ -1544,8 +1545,10 @@ void item_remember() {
 }
 
 // The hand controllers through OpenXR's actions, bound for the Touch controllers (Quest), read each headset frame onto
-// the pad's buttons (input_map.h bits): A and B their own, X and Y A and B again; either stick's click alone X (jump; Simplified: the right's, the left's the left stick click, the sprint's toggle); the left grip ZL (the Z lock), the right grip ZR; on the PSVR2 both sticks' clicks together (L3+R3, as its Options cannot reach OpenXR) or the Touch left Menu tapped Plus (the inventory), held a second
-// Minus; the sword hand (VR_HANDEDNESS, the left by default) swung fast Y tapped, or held while the swing went
+// the pad's buttons (input_map.h bits): A and B their own; Full Gesture: Y B again; X the Menu on every controller (tapped Plus, the
+// inventory; held a second Minus); either stick's click alone X (jump; Simplified: the right's, the left's the left stick click,
+// the sprint's toggle); the left grip ZL (the Z lock), the right grip ZR; the headset's Menu (the PSVR2's both sticks clicked)
+// opens and shuts the options overlay; the sword hand (VR_HANDEDNESS, the left by default) swung fast Y tapped, or held while the swing went
 // outward and left the hand out to the side (the charge), until the hand comes back in. The shield hand's shield turned to face ahead before its own side's eye holds ZL (the Z lock), as Link
 // holds his shield. Both arms shaken upward press the D-pad's down (the boots), both hands together before the face
 // its left (the ocarina), both hands beside the head its right (Navi), a hand shaken sideways above the head its up
@@ -1568,10 +1571,10 @@ struct Controls {
     bool ok = false;
     bool trigger_on[2]{}, squeeze_on[2]{};
     uint64_t menu_down = 0, plus_until = 0, minus_until = 0;   // plat_now_ns
-    bool minus_sent = false;
+    bool minus_sent = false, menu_was = false;
     static constexpr uint64_t click_wait_ns = 80000000ull;
-    bool combo_latch = false;   // both sticks clicked together, until both are let go
-    uint64_t click_since = 0;   // one stick clicked alone since (plat_now_ns)
+    bool combo_latch = false;   // (PSVR2) both sticks clicked together, until both are let go
+    uint64_t click_since = 0;   // (PSVR2) one stick clicked alone since (plat_now_ns)
     // the swing: the sword hand's grip positions over the last frames (plat_now_ns). A swing starts once the speed is past
     // swing_on (VR_SWING_SPEED), at least refractory_ns after the last one started (a swing's follow-through is
     // not another), and ends under swing_off. Each is a tap of Y (tap_ns down, at least gap_ns up
@@ -1614,6 +1617,14 @@ struct Controls {
     // (hook_hand: kept while the hookshot is out; pull_hand: the last item pull's, kept after its grip is let go)
     int draw_sword = -1, item_arm = -1, item_hand = -1, hook_hand = -1, pull_hand = -1;
     uint64_t empty_since = 0;   // ((Triforce VR) since when no item has read as held, or the last pull (0: one reads as held)
+    // ((Triforce VR) the fishing pond's rod (vr_game.c: "Weapon_FishingRod" in his hand): rod_hand the hand holding it (-1: the
+    // sword's), drawn as the Biggoron's Sword picks its hand; its trigger the cast's aim (ZR held, aimed where the head looks),
+    // let go with the hand swinging ahead the cast (cast_wait as the boomerang's); the other hand turned round in circles near it,
+    // in the plane ahead and up of the body, the reel (ZR held): reel_turn its turning kept over about half a second, radians
+    int rod_hand = -1;
+    bool cast_wait = false, reeling = false;
+    float reel_turn = 0.0f, reel_dir_was = 0.0f;
+    uint64_t cast_ahead_at = 0, reel_at = 0, reel_seen_at = 0;
     bool boom_wait = false;     // ((Triforce VR) the boomerang aimed, its trigger let go without a throw: ZR kept until one
     uint64_t a_until = 0;       // ((Triforce VR) a bomb's or a Bombchu's drop or release (A), its grip let go
     static constexpr float throw_speed = 0.8f;   // ((Triforce VR) the boomerang's throw: its hand ahead this fast, m/s
@@ -1823,11 +1834,10 @@ struct Controls {
         rumble(session, now);
         uint64_t bits = 0;
         const auto set_bit = [&](int bit, bool down) { bits |= down ? 1ull << bit : 0; };
-        // on the PSVR2 both sticks clicked together (L3+R3) are the Menu, below: one click alone is X (jump) once it has been held
-        // click_wait_ns, so the first of two clicks pressed nearly together is not a jump; held both, no jump until both are up
+        const bool simple = strcmp(cfg_value("VR_CONTROLS"), "simplified") == 0;
         const bool click_l = on(session, click, hand[0]), click_r = on(session, click, hand[1]);
         bool click_x = click_l || click_r;
-        if (x.psvr2) {   // (other headsets have their own Menu button: either click is X at once, as set above)
+        if (x.psvr2) {   // both clicked together are its Menu (below): one alone is X once held click_wait_ns; held both, none until both are up
             const bool combo = click_l && click_r;
             if (combo) combo_latch = true;
             else if (!click_l && !click_r) combo_latch = false;
@@ -1866,7 +1876,6 @@ struct Controls {
                 rt_log("vr: Simplified: the sword hand follows Right handed Link again");
             }
         }
-        const bool simple = strcmp(cfg_value("VR_CONTROLS"), "simplified") == 0;
         if (simple && trigger_on[1] && !triggered_before[1] && in_play) wheel = true;
         if (!simple || !trigger_on[1]) wheel = false;
         {   // the item panel: B backs out (no change), Y changes its order
@@ -1889,13 +1898,13 @@ struct Controls {
             // menus, pauses and events (and this menu over play): a pad's buttons as labelled, the triggers L and R, the grips
             // ZL and ZR, each stick's click its own
             set_bit(A, on(session, a, XR_NULL_PATH)), set_bit(B, on(session, b, XR_NULL_PATH));
-            set_bit(X, on(session, xb, XR_NULL_PATH)), set_bit(Y, on(session, yb, XR_NULL_PATH));
-            set_bit(STICK_L, click_l && !combo_latch), set_bit(STICK_R, click_r && !combo_latch);   // (not the PSVR2's L3+R3 Menu)
+            set_bit(Y, on(session, yb, XR_NULL_PATH));   // (X: the Menu, below)
+            set_bit(STICK_L, click_l && !combo_latch), set_bit(STICK_R, click_r && !combo_latch);
             set_bit(L, trigger_on[0]), set_bit(R, trigger_on[1] && !wheel);
             set_bit(ZL, squeeze_on[0]), set_bit(ZR, squeeze_on[1]);
         } else {
-            // play: X and Y mirror A and B, and either stick's click jumps (X), so a controller with fewer buttons plays it all
-            set_bit(A, on(session, a, XR_NULL_PATH) || on(session, xb, XR_NULL_PATH));
+            // play: either stick's click jumps (X); Full Gesture: Y mirrors B
+            set_bit(A, on(session, a, XR_NULL_PATH));
             set_bit(B, on(session, b, XR_NULL_PATH) || (on(session, yb, XR_NULL_PATH) && !simple));
             set_bit(Y, on(session, yb, XR_NULL_PATH) && simple);   // (Simplified: the left Y is the sword's button)
             // ((Triforce VR) Simplified: the right click alone jumps; the left is the pad's left stick click, the sprint's toggle
@@ -1907,15 +1916,20 @@ struct Controls {
             const int no_trig = x.weapon_out.load() && x.two_handed_sword.load() ? 1 - sword_hand_now() : -1;
             set_bit(L, trigger_on[0] && !simple && no_trig != 0), set_bit(R, trigger_on[1] && !simple && no_trig != 1);   // (simple: ZL and ZR)
         }
-        // the Menu: a tap is Plus for a moment at its release, a second's hold Minus for a moment then
-        if (combo_latch || on(session, menu, XR_NULL_PATH)) {
+        // the Menu, the X button on every controller: a tap is Plus for a moment at its release, a second's hold Minus for a moment then
+        if (on(session, xb, XR_NULL_PATH)) {
             if (!menu_down) menu_down = now, minus_sent = false;
-            if (!minus_sent && now - menu_down >= hold_ns) minus_until = now + press_ns, minus_sent = true, rt_log("vr: Menu held: Minus");
+            if (!minus_sent && now - menu_down >= hold_ns) minus_until = now + press_ns, minus_sent = true, rt_log("vr: X held: Minus");
         } else if (menu_down) {
-            if (!minus_sent) plus_until = now + press_ns, rt_log("vr: Menu tapped: Plus");
+            if (!minus_sent) plus_until = now + press_ns, rt_log("vr: X tapped: Plus");
             menu_down = 0;
         }
         set_bit(PLUS, now < plus_until), set_bit(MINUS, now < minus_until);
+        {   // the headset's Menu (the PSVR2's both sticks clicked): the options overlay opened or shut, at the press
+            const bool m = x.psvr2 ? combo_latch : on(session, menu, XR_NULL_PATH);
+            if (m && !menu_was) g_options_toggle.store(1), rt_log("vr: Menu: the options overlay");
+            menu_was = m;
+        }
         float sticks[2][2]{};
         for (int h = 0; h < 2; h++) {
             XrActionStateGetInfo gi{XR_TYPE_ACTION_STATE_GET_INFO};
@@ -2130,6 +2144,8 @@ struct Controls {
             std::lock_guard<std::mutex> lk(x.gear_mu);
             std::memcpy(held_item, x.held_item, sizeof held_item);
         }
+        const bool fishing = strstr(held_item, "FishingRod") != nullptr;   // ((Triforce VR) the fishing pond's rod
+        if (!fishing) rod_hand = -1, cast_wait = reeling = false, reel_turn = 0.0f;
         if (chosen) {   // the panel shut on an item: the game has it on the item button (ZR), the right grip presses it
             simple_pick = 1, simple_hold = strcmp(cfg_value("VR_HANDEDNESS"), "right") == 0 ? 1 : 0;
             // (an item the game has no held state for: a swing uses it, and the game puts it in his hand then)
@@ -2245,7 +2261,7 @@ struct Controls {
             }
             // ((Triforce VR) the Biggoron's Sword equipped: both grips held, the sword hand alone behind the shoulder (Link draws it
             // with one hand and takes it in both on the way); the other hand anywhere)
-            if (!draw_arm && x.two_handed_sword.load() && pose_ok[0] && pose_ok[1] && sq[0] && sq[1] && (fresh[0] || fresh[1]) &&
+            if (!draw_arm && (x.two_handed_sword.load() || fishing) && pose_ok[0] && pose_ok[1] && sq[0] && sq[1] && (fresh[0] || fresh[1]) &&
                 (back_any[0] > behind_on || back_any[1] > behind_on)) {
                 const bool both_back = back_any[0] > behind_on && back_any[1] > behind_on;
                 draw_arm = true, item_arm = -1;
@@ -2255,7 +2271,10 @@ struct Controls {
             if (draw_arm && (!sq[0] || !sq[1])) draw_arm = false;
             if (draw_arm && pose_ok[draw_sword] && back_any[draw_sword] < -ahead_on) {
                 draw_arm = false;
-                if (!weapon) {
+                if (fishing) {   // ((Triforce VR) the rod: in the hand drawn with, nothing pressed (the game holds it already)
+                    rod_hand = draw_sword, g_live_sword.store(draw_sword), g_live_mirror.store(draw_sword);
+                    rt_log("vr: fishing: the rod in the %s hand", draw_sword ? "right" : "left");
+                } else if (!weapon) {
                     g_live_sword.store(draw_sword), g_live_mirror.store(draw_sword);   // (the sword: mirrored in the right hand)
                     draw_bit = Y, draw_at = now, draw_until = now + press_ns, drawn_by_grips = true;
                     y_down = 0, charging = false, queued = false;   // a swing on the way there is not one
@@ -2377,7 +2396,45 @@ struct Controls {
                 hook_aim = trig || boom_wait;
                 bits &= ~(1ull << (hook_hand ? R : L));
             } else boom_wait = false;
-            g_gaze_aim.store(boomerang && hook_hand >= 0);
+            bool fish_zr = false;
+            if (fishing) {   // ((Triforce VR) the fishing rod: the cast and the reel
+                const int rh = rod_hand >= 0 ? rod_hand : sword_hand_now(), oh = 1 - rh;
+                const bool trig = trigger_on[rh];
+                const float ahead = hv[rh][0] * fx + hv[rh][2] * fz;
+                if (ahead > throw_speed) cast_ahead_at = now;
+                if (trig && !cast_wait) rt_log("vr: fishing: aimed by the %s trigger", rh ? "right" : "left");
+                if (trig) cast_wait = true;
+                else if (cast_wait && (ahead > throw_speed || now - cast_ahead_at < 300000000ull))
+                    cast_wait = false, rt_log("vr: fishing: cast");
+                bits &= ~(1ull << (rh ? R : L));   // (the rod's trigger is not its item bar)
+                // the reel: the other hand near the rod's (within 45 cm), on its inner side, its motion's direction in the plane
+                // ahead and up turning one way, each frame's turn (not a reversal's) kept with a half second's decay
+                const float rx = -fz, rz = fx;   // (the body's right)
+                float d2 = 0;
+                for (int c = 0; c < 3; c++) d2 += (poses[oh].p[c] - poses[rh].p[c]) * (poses[oh].p[c] - poses[rh].p[c]);
+                const float lat = (poses[oh].p[0] - poses[rh].p[0]) * rx + (poses[oh].p[2] - poses[rh].p[2]) * rz;
+                const bool near_rod = pose_ok[0] && pose_ok[1] && d2 < 0.45f * 0.45f && (rh ? lat < 0.05f : lat > -0.05f);
+                const float vf = hv[oh][0] * fx + hv[oh][2] * fz, vu = hv[oh][1];
+                const float dt = reel_at ? (float)(now - reel_at) * 1e-9f : 0.0f;
+                reel_at = now;
+                reel_turn *= std::exp(-std::fmin(dt, 0.2f) / 0.5f);
+                if (near_rod && vf * vf + vu * vu > 0.25f * 0.25f) {
+                    const float dir = std::atan2(vu, vf);
+                    float turn = dir - reel_dir_was;
+                    while (turn > 3.14159265f) turn -= 6.2831853f;
+                    while (turn < -3.14159265f) turn += 6.2831853f;
+                    if (std::fabs(turn) < 1.2f) reel_turn += turn;   // (a reversal, a back-and-forth's, is no turn)
+                    reel_dir_was = dir;
+                    reel_seen_at = now;
+                } else if (!near_rod || now - reel_seen_at > 300000000ull) {
+                    reel_turn = 0.0f;
+                }
+                const bool was = reeling;
+                reeling = std::fabs(reel_turn) > (reeling ? 1.5f : 3.0f);
+                if (reeling != was) rt_log("vr: fishing: %s", reeling ? "reeling" : "reel stopped");
+                fish_zr = cast_wait || reeling;
+            }
+            g_gaze_aim.store((boomerang && hook_hand >= 0) || (fishing && cast_wait));
             if (bomb && item_hand >= 0) {   // ((Triforce VR) a bomb or a Bombchu held by its grip: any face button puts it away (B); the grip let go drops it (A)
                 const uint64_t face = (1ull << A) | (1ull << B);
                 const bool any = bits & face;
@@ -2387,7 +2444,7 @@ struct Controls {
             {   // ((Triforce VR) ZR let go: a shot (the bow's or slingshot's release, the hookshot's trigger, the boomerang's throw):
                 // the aim held where it was just before, as the release's own motion would turn it (vk_xr_pointer)
                 static bool zr_was;
-                const bool zr = now < zr_until || hook_aim || drawing;
+                const bool zr = now < zr_until || hook_aim || drawing || fish_zr;
                 if (zr_was && !zr) g_shot_at.store(now);
                 zr_was = zr;
                 set_bit(ZR, zr);
@@ -4522,6 +4579,8 @@ extern "C" int vk_xr_menu_buttons(uint64_t *buttons, float sticks[2][2]) {
     std::memcpy(sticks, x.hand_sticks, sizeof x.hand_sticks);
     return 1;
 }
+
+extern "C" int vk_xr_options_toggle_take(void) { return g_options_toggle.exchange(0); }
 
 extern "C" void vk_xr_note_upscale(int taken) { xr().upscales++; if (taken) xr().upscales_vr++; }
 

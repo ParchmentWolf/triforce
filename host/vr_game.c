@@ -386,6 +386,11 @@ int vr_session_on(void) {
     const MkwVkXr *x = xr();
     return x && x->active && x->active() && x->head_active && x->head_active();
 }   /* ((Triforce VR) vr_body.c: the arms put on the controllers again before the mirror */
+/* ((Triforce VR) prompts.c: the hand controllers' icons while a VR session plays: 1 Full Gesture, 2 Simplified; 0 none */
+int vr_prompts_scheme(void) {
+    if (!vr_session_on()) return 0;
+    return strcmp(cfg_value("VR_CONTROLS"), "simplified") ? 1 : 2;
+}
 /* ((Triforce VR) oot_sprint.c: VR plays Simplified, whose left stick click is the sprint's toggle (vk_xr.cpp) */
 int vr_simplified_sprint(void) {
     const MkwVkXr *x = xr();
@@ -482,9 +487,18 @@ static int hand_item(char out[96]) {
                         strstr(names, " FaceBattleBoomerang ")) && now_item;
     if (aiming) held = now_item;
     g_aiming = aiming;
+    /* ((Triforce VR) the fishing pond's rod: a state of his own, not an item on a button. His states' names tell it (each set of
+       them logged while he fishes, at most 40, to learn the casting's, reeling's and hooking's own) */
+    const int fishing = strstr(names, "Fish") || strstr(names, "Lure");
+    if (fishing) held = "Weapon_FishingRod";
+    {
+        static char told[512];
+        static int n_told;
+        if (fishing && strcmp(told, names) && n_told < 40) snprintf(told, sizeof told, "%s", names), n_told++, hos_log("vr: fishing: his states:%s", names);
+    }
     static uint64_t out_at;
     const uint64_t t = now_ns();
-    if (aiming || strstr(names, " CommonUpper ") || strstr(names, " WeaponEquipOnUpper ") || strstr(names, "Bottle") ||
+    if (fishing || aiming || strstr(names, " CommonUpper ") || strstr(names, " WeaponEquipOnUpper ") || strstr(names, "Bottle") ||
         strstr(names, "Drink") || strstr(names, " Cut") || strstr(names, " DemoShield") || strstr(names, "Hammer") || quest_now)
         out_at = t;
     /* put away: when he puts it away; otherwise what was brought out last stays his (no timer: an item held still shows
@@ -1187,13 +1201,13 @@ static void navi_away(uint64_t navi, int log) {
                 have_t ? t[3] : 0, have_t ? t[7] : 0, have_t ? t[11] : 0);
     const float under = feet[1] - 30.0f;
     /* (she flies up to the canopy, 4.2 m over his feet seen: the house's size) */
-    #define NEAR(x, y, z) ((hypotf((x) - feet[0], (z) - feet[2]) < 6.0f && fabsf((y) - feet[1]) < 8.0f) || fabsf((y) - under) < 1.0f)
-    if (have_p && NEAR(p[0], p[1], p[2])) {
+    #define BY_FEET(x, y, z) ((hypotf((x) - feet[0], (z) - feet[2]) < 6.0f && fabsf((y) - feet[1]) < 8.0f) || fabsf((y) - under) < 1.0f)
+    if (have_p && BY_FEET(p[0], p[1], p[2])) {
         const float q[3] = {feet[0], under, feet[2]};
         poke(navi + 0x31c, q, sizeof q);
     }
-    if (have_t && NEAR(t[3], t[7], t[11])) t[3] = feet[0], t[7] = under, t[11] = feet[2], poke(m + 0x1f8, t, sizeof t);
-    #undef NEAR
+    if (have_t && BY_FEET(t[3], t[7], t[11])) t[3] = feet[0], t[7] = under, t[11] = feet[2], poke(m + 0x1f8, t, sizeof t);
+    #undef BY_FEET
 }
 
 static void room_pose(int shot, double pos[3], double at[3], float up[3]) {

@@ -1,0 +1,15 @@
+# Tutorial pop-up: SystemMinus (LayoutMsg/ActionGuide_00)
+# Title_ is the heading, Msg_ its line, Guide_..._00/_01/_02 the words beside each step's button icon.
+# The icon beside a step is chosen by the game's code (not a text): write the one you want under [VR icon].
+# [VR2] / [VR2 icon]: the Simplified controls' (empty: [VR] / [VR icon] there too).
+
+=== Guide_SystemMinus_00 ===
+[VR icon] X
+[VR]
+Hold
+
+[VR2 icon] 
+[VR2]
+
+
+

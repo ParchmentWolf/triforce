@@ -1,0 +1,24 @@
+# Tutorial pop-up: HeadShortcut (LayoutMsg/ActionGuide_00)
+# Title_ is the heading, Msg_ its line, Guide_..._00/_01/_02 the words beside each step's button icon.
+# The icon beside a step is chosen by the game's code (not a text): write the one you want under [VR icon].
+# [VR2] / [VR2 icon]: the Simplified controls' (empty: [VR] / [VR icon] there too).
+
+=== Guide_HeadShortcut_00 ===
+[VR icon] -
+[VR]
+Grip on Top of Head
+
+[VR2 icon] R_Trigger
+[VR2]
+Hold + Up
+
+
+=== Msg_HeadShortcut ===
+[VR]
+Grip on top of your head for a mask, or nod for the
+Lens of Truth. Shake your head to take it off.
+
+[VR2]
+<game>
+
+

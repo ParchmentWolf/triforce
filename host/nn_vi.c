@@ -466,7 +466,10 @@ int hos_scene_rgba16f(void) {
 #ifdef HOOKSHOT_RENODX
         /* (Triforce, 11-13: and the menu's RenoDX HDR row on, renodx_hdr=1, which is off unless chosen; RX_VK_RENODX=0 or 1
            over the row, as in gpu/vk/vk_menu.cpp renodx_chosen) */
-        const LONG v = e ? atoi(e) != 0 : hos_ini_option("hdr", 0) == 2 && (r && *r ? atoi(r) != 0 : hos_ini_option("renodx_hdr", 0) == 1);
+        /* ((Triforce VR) with VR on, never: VR holds HDR and RenoDX off (gpu/vk/vk_menu.cpp vr_settings_sync), a file from before
+           that may still say otherwise) */
+        const LONG v = e ? atoi(e) != 0 : !hos_ini_option("vr", 0) && hos_ini_option("hdr", 0) == 2 &&
+                                          (r && *r ? atoi(r) != 0 : hos_ini_option("renodx_hdr", 0) == 1);
 #else   /* (a build without RenoDX's shaders, nx2/build.py HOOKSHOT_RENODX: nothing asks for the wider target) */
         const LONG v = e ? atoi(e) != 0 : 0;
         (void)r;

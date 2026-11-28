@@ -2157,6 +2157,11 @@ def prompt_game_files(romfs):
     except Exception:   # (the tool is not beside this one, or does not load: the prompts are made at every build, as before)
         return None
     names = ["Pack/ZsDic.pack.zs", prompt_assets.FONT, prompt_assets.TEXTURES, prompt_assets.LAYOUTS, prompt_assets.CAMERA]
+    try:   # ((Triforce VR) the letters of the hand controllers' icons, nx2/prompt_vr.py)
+        import prompt_vr
+        names.append(prompt_vr.LETTERS)
+    except Exception:
+        pass
     try:   # (the first by name, as prompt_assets.read_size_table takes it)
         names += ["System/Resource/" + n for n in sorted(os.listdir(os.path.join(romfs, "System", "Resource")))
                   if n.startswith("ResourceSizeTable.") and n.endswith(".rsizetable.zs")][:1]
@@ -2266,6 +2271,22 @@ class EarlyCompile:
               % (said or "no result", "" if not code else ", stopped with status %d" % code, clock(time.time() - waited),
                  "" if not code else ": the build compiles what is missing"), flush=True)
         self.proc = None
+
+
+def vr_texts(out, romfs):
+    """((Triforce VR) VR's texts and HUD hints (scripts/vr_text: the team's wording in edits/, none of the game's): made from
+    this game's own files into <out>/vr_text/gesture and /simplified, one per Control Scheme; host/mods.c serves the scheme's
+    while VR is on, and none in flat-screen play. Without them, or when they fail, VR shows the game's own texts"""
+    tool = os.path.join(ROOT, "scripts", "vr_text", "vr_build.py")
+    folder = os.path.join(out, "vr_text")
+    shutil.rmtree(folder, ignore_errors=True)
+    if not os.path.exists(tool) or importlib.util.find_spec("zstandard") is None:
+        return
+    if run(PY + [tool, out, "--romfs", romfs], check=False, output=sys.stderr):
+        shutil.rmtree(folder, ignore_errors=True)
+        print("VR's texts were not made: VR shows the game's own", flush=True)
+    else:
+        print("VR's texts made (vr_text/)", flush=True)
 
 
 class Prompts:
@@ -3510,6 +3531,7 @@ def main(a=None):
     # (hookshot) the button prompts of other controllers (host/prompts.c): the game's icon font redrawn per controller, with fontTools.
     # Without it the game shows its own icons. (Triforce: drawn since the game files were read, or kept: class Prompts)
     prompts.finish()
+    vr_texts(out, romfs)   # ((Triforce VR) VR's texts, from the prompts' text archive: after them
     icon = os.path.join(ROOT, "assets", "triforce.png")
     if LINUX and os.path.exists(icon):   # (the window's icon: host/posix/display_sdl.c)
         copy_writable(icon, os.path.join(out, "triforce.png"))   # (a second build overwrites the first's)

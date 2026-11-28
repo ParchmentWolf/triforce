@@ -284,6 +284,7 @@ int n64_front = mkwvk::n64_rules::OFF;
 int n64_in_front() { return n64_front; }
 bool n64_env_set() { return false; }
 int n64_rem_row(const int*) { return -1; }
+bool vr_row_locked(const int*) { return false; }   /* ((Triforce VR) VR off here: no row held for it */
 @TEXT@
 @HINT@
 @FIXED@

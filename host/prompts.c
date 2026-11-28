@@ -70,6 +70,12 @@ static const uint16_t switch_code[HOS_SW_N] = {0xE040, 0xE041, 0xE042, 0xE043, 0
 #define FACE_CODES 32
 #define STATIC_AT 24
 #define BIND_BASE 0xF000
+/* ((Triforce VR) nx2/prompt_vr.py: for each control scheme (vr_game.c vr_prompts_scheme, 1 Full Gesture, 2 Simplified) each
+   Switch button's code at VR_SW_BASE + 16 x (scheme - 1) + HOS_SW_*, the hand controllers' control that presses it. While a VR
+   session plays the Switch buttons are pointed at those (cmap4_bind, text_code) */
+#define VR_SW_BASE 0xF680
+int vr_prompts_scheme(void);   /* vr_game.c */
+static int live_vr_now;   /* (the scheme the icons show now, 0 none) */
 /* the pad input whose icon an unbound Switch button shows (nx2/prompt_assets.py DEFAULT: host/nn_hid.c's default controls) */
 static const unsigned char switch_pad[HOS_SW_N] = {
     HOS_PAD_EAST, HOS_PAD_SOUTH, HOS_PAD_NORTH, HOS_PAD_WEST, HOS_PAD_LSTICK, HOS_PAD_RSTICK, HOS_PAD_LSHOULDER,
@@ -267,6 +273,13 @@ static int cmap4_bind(uint8_t *st, size_t n, int face) {
     const unsigned base = FACE_BASE + FACE_CODES * (unsigned)face;
     const int faces = !keys && face < LIVE_FACES && cmap4_glyph(st, n, base + HOS_PAD_SOUTH) != 0;
     int done = 0;
+    if (faces && live_vr_now > 0 && cmap4_glyph(st, n, VR_SW_BASE + 16u * (unsigned)(live_vr_now - 1))) {
+        for (int b = 0; b < HOS_SW_N; b++) {   /* ((Triforce VR) the hand controllers' controls */
+            const unsigned gid = cmap4_glyph(st, n, VR_SW_BASE + 16u * (unsigned)(live_vr_now - 1) + (unsigned)b);
+            if (gid) done += cmap4_point(st, segs, switch_code[b], gid);
+        }
+        return done;
+    }
     for (int b = 0; b < HOS_SW_N + (keys ? 4 : 0); b++) {
         const unsigned code = b < HOS_SW_N ? switch_code[b] : moves[b - HOS_SW_N].code;
         const int pad = bound_input(face, b < HOS_SW_N ? b : moves[b - HOS_SW_N].control);
@@ -1189,6 +1202,8 @@ static int text_code(unsigned c, int face, const int *bind) {   /* the code that
     for (int i = 0; i < 3 && k < 0; i++)
         if (c == static_code[i]) k = i;
     if (c >= BIND_BASE && c < BIND_BASE + LIVE_FACES * HOS_SW_N * HOS_PAD_N) b = (int)((c - BIND_BASE) / HOS_PAD_N % HOS_SW_N);
+    if (c >= VR_SW_BASE && c < VR_SW_BASE + 32) b = (int)((c - VR_SW_BASE) % 16);
+    if (b >= 0 && live_vr_now > 0) return VR_SW_BASE + 16 * (live_vr_now - 1) + b;   /* ((Triforce VR) */
     if (c >= FACE_BASE + STATIC_AT && c < FACE_BASE + FACE_CODES * LIVE_FACES && (c - FACE_BASE) % FACE_CODES >= STATIC_AT &&
         (c - FACE_BASE) % FACE_CODES < STATIC_AT + 3)
         k = (int)((c - FACE_BASE) % FACE_CODES - STATIC_AT);
@@ -1340,6 +1355,9 @@ void hos_prompts_live(void) {
         int bind[HOS_SW_N];
         for (int b = 0; b < HOS_SW_N; b++) bind[b] = hos_binding(HOS_BIND_PAD, b, 0);
         const int face = live_face();
+        const int vr = vr_prompts_scheme();   /* ((Triforce VR) a session's start or end, or another scheme: the font anew */
+        static int part_vr = -1;
+        const int vr_changed = vr != part_vr && font.at != 0;
         /* (the menu asks for a restart then: nothing changes before, no part on another face than the rest) */
         if (face < 0 || face >= LIVE_FACES || (hos_prompts_live_parts() & HOS_PROMPTS_LIVE_ALL) != HOS_PROMPTS_LIVE_ALL) {
             InterlockedExchange(&busy, 0);
@@ -1356,7 +1374,8 @@ void hos_prompts_live(void) {
         for (int p = 0; p < PARTS; p++) {
             if (p == PART_TEXTURES) AcquireSRWLockExclusive(&tex_lock);   /* (the pool kept, or let go, till its writes end) */
             const int here = p == PART_TEXTURES ? tex.l.base != 0 : found[p];
-            if (here && (part_face[p] != face || memcmp(part_bind[p], bind, sizeof bind))) {
+            if (here && (part_face[p] != face || memcmp(part_bind[p], bind, sizeof bind) || (p == PART_FONT && vr_changed))) {
+                if (p == PART_FONT) live_vr_now = vr, part_vr = vr;
                 if (ready < 0) ready = setup(dir, sizeof dir, &ignored);
                 if (ready && p == PART_TEXTURES) live_textures(dir, face, bind);
                 if (ready && p == PART_LAYOUTS) live_layouts(dir, face, bind);

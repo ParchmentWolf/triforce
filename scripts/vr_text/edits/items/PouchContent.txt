@@ -1,0 +1,15 @@
+# ActorMsg/PouchContent.msbt
+# Under each label: your text under [VR] (Full Gesture) and [VR2] (Simplified); empty or <game> keeps the game's.
+# Button icons: [A] [B] [X] [Y] [L] [R] [ZL] [ZR] [Plus] [Minus] [LS] [RS] [Up] [Down] [Left] [Right] ...
+# Keep the {..} tags you want (colours, pauses, a new box {0.4:}); see README.txt.
+
+=== Weapon_Sword_Kokiri_GetCaption ===
+[VR]
+Draw it with 1 hand gripped behind your ear and
+the other behind your back. Release either grip
+to sheath your weapon.
+
+[VR2]
+
+
+
