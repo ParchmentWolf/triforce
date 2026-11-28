@@ -83,8 +83,6 @@ void vk_xr_child(int child);
 void vk_xr_hand_item(const char *model);
 // vr_physics.c: an item's size from its mesh (vk_xr_item_shape)
 int vk_xr_item_shape(const char *actor, float out[3]);
-// vr_game.c's room capture: shot >= 0 saves that shot from this camera (cam: pos, at, up), -1 only says it runs
-void vk_xr_room_shot(int shot, const double cam[9], const double link[3]);
 // vr_body.c, each frame: Link's Weapon_L then Weapon_R in the world (rows of a 3x4, metres); ok bit 0 left, bit 1 right
 void vk_xr_hand_bones(const float bones[24], int ok);
 /* (Triforce VR) the physics' shapes for Show physics shapes: n capsules of 8 floats (end a x y z, radius, end b x y z, kind), world, metres */
@@ -145,7 +143,6 @@ void vk_xr_captured(const VkSemaphoreSubmitInfo *signal);
 // vk_temporal.cpp, the scene's camera: its projection (row major, clip = P * view position) and whether the depth's clip range is
 // -w..w; vk_xr_planes then gives the stored depth d of a view distance z as planes[0] + planes[1] / z, 0 without a recent one
 void vk_xr_note_projection(const float proj[16], int minus_w);
-void vk_xr_note_view(const float view[12]);
 int vk_xr_planes(float planes[2]);
 // a session runs: frame generation and the present's hold stand aside
 int vk_xr_active(void);

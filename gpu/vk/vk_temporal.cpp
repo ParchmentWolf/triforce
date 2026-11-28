@@ -1521,7 +1521,6 @@ void temporal_note_scene_draw(const Texture* color0, uint32_t width, uint32_t he
     k.valid = true;
     upscale_lod_scene(width, height);   // ((Triforce, S8) this frame's scene size for the texture LOD bias: vk_draw.cpp)
     if (vk_xr_depth_wanted()) vk_xr_note_projection(k.proj, host->depth_minus_w());   // (Triforce VR: the depth's planes)
-    if (vk_xr_depth_wanted()) vk_xr_note_view(k.view);
 }
 
 bool temporal_xr_scene(const Texture* out, uint32_t level, float view[12], VkImageView* depth, uint32_t* w, uint32_t* h) {

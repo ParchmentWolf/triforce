@@ -24,8 +24,9 @@ extern "C" {
    program at its create call (RX_VK_LOAD=create). 25: all of them together. 26: (Triforce VR) the Simplified item
    panel's calls (item_menu, item_pick) in MkwVkXr, and aim's and weapon_out's 2 (aiming, its aim not on the pointer yet;
    the sword seen in his hand). 27: (Triforce VR) the grab's and push's calls (grips, grab_hands, item_shape, hand_bones,
-   phys_shapes) in MkwVkXr. 28: (Triforce VR) room_shot in MkwVkXr */
-#define MKWVK_API_VERSION 28
+   phys_shapes) in MkwVkXr. 28: room_shot in MkwVkXr (the VR room, on the vr-debug branch). 29: (Triforce VR) MkwVkXr as
+   27 again, the room out */
+#define MKWVK_API_VERSION 29
 enum { HOS_OPT_CHEAT_HEARTS = 32, HOS_OPT_CHEAT_FLIGHT, HOS_OPT_CHEAT_ACTION, HOS_OPT_CHEAT_CAMERA };
 /* (hookshot) the Motion page's rows (host/pad_sdl.c reads them, vk_replay.cpp's option answers them): Motion controls on
    or off, the horizontal's and the vertical's sensitivity in percent, each turned around, and the deadzone (0 to 2) */
@@ -638,7 +639,6 @@ typedef struct MkwVkXr {
     int (*item_shape)(const char *actor, float out[3]);   /* (Triforce VR, 27) vk_xr_item_shape */
     void (*hand_bones)(const float bones[24], int ok);   /* (Triforce VR, 27) vk_xr_hand_bones */
     void (*phys_shapes)(const float *caps, int n);   /* (Triforce VR, 27) vk_xr_phys_shapes */
-    void (*room_shot)(int shot, const double cam[9], const double link[3]);   /* (Triforce VR, 28) vk_xr_room_shot */
 } MkwVkXr;
 
 /* the DLL's one export: null when Vulkan is not usable (the executable then falls back to WebGPU) */
